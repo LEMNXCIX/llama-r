@@ -1,0 +1,6 @@
+/target
+/agents
+/contextos
+/logs
+.env
+*.txt

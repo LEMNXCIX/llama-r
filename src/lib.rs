@@ -1,0 +1,13 @@
+pub mod api;
+pub mod cli;
+pub mod config;
+pub mod context;
+pub mod core;
+pub mod domain;
+pub mod error;
+pub mod mcp;
+pub mod optimizer;
+pub mod providers;
+pub mod runtime;
+pub mod services;
+pub mod tui;

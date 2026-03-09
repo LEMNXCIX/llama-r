@@ -1,0 +1,37 @@
+{
+  "project_name": "Llama-R: High-Performance Personal AI Agent Gateway",
+  "technologies": ["Rust 2026", "Axum", "Tokio", "Ratatui", "Crossterm", "Tonic", "MCP"],
+  "best_practices": {
+    "rust": [
+      "Follow idiomatic Rust 2026 (async fn, impl Trait, const).",
+      "Use `thiserror` for library errors and `anyhow` for app level.",
+      "Apply `tracing` for structured logs and OpenTelemetry support.",
+      "Prefer zero-copy and minimize allocations (bytes, Cow, smallvec)."
+    ],
+    "performance": [
+      "Prioritize Time-To-First-Token (TTFT) and real streaming.",
+      "Connection pooling and keep-alive for LLM providers.",
+      "Validation cache: do not hit the provider in the hot path."
+    ],
+    "ai_integration": [
+      "One .toml file per agent in `agents/` folder.",
+      "Hot-reload agents and context files using `notify`.",
+      "Standardize on OpenAI-compatible streaming API.",
+      "Unified `LLMProvider` trait for abstraction."
+    ],
+    "tui": [
+      "Keep TUI logic separate from the server.",
+      "Use mpsc channels for cross-thread state/log updates.",
+      "Non-blocking UI using Ratatui + Tokio."
+    ]
+  },
+  "folder_structure": {
+    "agents": "agents/ (agent configs .toml)",
+    "contextos": "contextos/ (knowledge base for agents)",
+    "config": "config/ (global app config)",
+    "src_agents": "src/agents/ (AgentManager and loading logic)",
+    "src_tui": "src/tui/ or src/cli_tui.rs (TUI implementation)",
+    "src_domain": "src/domain/ (core models)",
+    "src_api": "src/api/ (transport layers: HTTP, gRPC, MCP)"
+  }
+}

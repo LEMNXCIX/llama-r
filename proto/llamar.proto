@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package llamar;
+
+service LlamaGateway {
+  rpc Chat (ChatRequest) returns (ChatResponse);
+  rpc ChatStream (ChatRequest) returns (stream ChatStreamEvent);
+  rpc ConnectMcp (stream McpMessage) returns (stream McpMessage); // For Model Context Protocol
+}
+
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+}
+
+message ChatRequest {
+  string model = 1;
+  repeated ChatMessage messages = 2;
+  bool stream = 3;
+}
+
+message ChatResponse {
+  string model = 1;
+  string created_at = 2;
+  ChatMessage message = 3;
+  bool done = 4;
+}
+
+message ChatStreamEvent {
+  string model = 1;
+  string created_at = 2;
+  ChatMessage message = 3;
+  bool done = 4;
+}
+
+// MCP Messages
+message McpMessage {
+  string json_rpc = 1;
+  string method = 2;
+  string params = 3; // JSON encoded string for flexibility
+}
