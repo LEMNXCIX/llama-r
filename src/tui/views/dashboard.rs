@@ -15,7 +15,7 @@ pub fn render_dashboard(f: &mut Frame, state: &AppState) {
         .constraints(
             [
                 Constraint::Length(3),
-                Constraint::Length(6),
+                Constraint::Length(7),
                 Constraint::Min(0),
                 Constraint::Length(3),
             ]
@@ -51,6 +51,7 @@ pub fn render_dashboard(f: &mut Frame, state: &AppState) {
         Span::styled("○ OFFLINE", Style::default().fg(Color::Red))
     };
 
+    let metrics = state.observability.snapshot();
     let main_content = Paragraph::new(vec![
         Line::from(vec![
             Span::raw("API Server: "),
@@ -64,6 +65,12 @@ pub fn render_dashboard(f: &mut Frame, state: &AppState) {
             state.metrics.get_saved_tokens(),
             state.agent_manager.list_agents().len()
         )),
+        Line::from(format!(
+            "HTTP Requests: {} | Chat Requests: {} | Fallbacks: {}",
+            metrics.http_requests,
+            metrics.chat_requests,
+            metrics.fallback_count,
+        )),
     ])
     .block(
         Block::default()
@@ -73,22 +80,27 @@ pub fn render_dashboard(f: &mut Frame, state: &AppState) {
 
     f.render_widget(main_content, chunks[1]);
 
-    let logs_data = state.logs.lock().unwrap();
-    let logs_lines: Vec<Line> = logs_data
-        .iter()
-        .map(|l| {
-            let color = if l.contains("INFO") {
-                Color::Cyan
-            } else if l.contains("WARN") {
-                Color::Yellow
-            } else if l.contains("ERROR") {
-                Color::Red
-            } else {
-                Color::Gray
-            };
-            Line::from(Span::styled(l, Style::default().fg(color)))
-        })
-        .collect();
+    let logs_lines: Vec<Line> = match state.logs.lock() {
+        Ok(logs_data) => logs_data
+            .iter()
+            .map(|line| {
+                let color = if line.contains("INFO") {
+                    Color::Cyan
+                } else if line.contains("WARN") {
+                    Color::Yellow
+                } else if line.contains("ERROR") {
+                    Color::Red
+                } else {
+                    Color::Gray
+                };
+                Line::from(Span::styled(line.clone(), Style::default().fg(color)))
+            })
+            .collect(),
+        Err(_) => vec![Line::from(Span::styled(
+            "Log buffer unavailable",
+            Style::default().fg(Color::Red),
+        ))],
+    };
 
     let logs_panel = Paragraph::new(logs_lines)
         .block(
@@ -104,3 +116,4 @@ pub fn render_dashboard(f: &mut Frame, state: &AppState) {
 
     f.render_widget(footer, chunks[3]);
 }
+

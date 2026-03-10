@@ -14,6 +14,15 @@ pub struct AgentConfig {
     /// Additional context files to inject (paths relative to the Llama-R root).
     #[serde(default)]
     pub context_files: Vec<String>,
+    /// Agent-specific operating rules injected into the final system prompt.
+    #[serde(default)]
+    pub rules: Vec<String>,
+    /// Agent-specific skills to load from the shared skill registry.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// System-managed skills selected from project analysis.
+    #[serde(default)]
+    pub auto_skills: Vec<String>,
     /// Dynamic template variables. Use {{var_name}} in system_prompt.
     #[serde(default)]
     pub variables: HashMap<String, String>,
@@ -31,5 +40,15 @@ pub struct OptimizeConfig {
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub id: String, // Usually the filename without .toml
+    pub project_id: Option<String>,
     pub config: AgentConfig,
+}
+
+impl Agent {
+    pub fn qualified_id(&self) -> String {
+        match &self.project_id {
+            Some(project_id) => format!("{}/{}", project_id, self.id),
+            None => self.id.clone(),
+        }
+    }
 }

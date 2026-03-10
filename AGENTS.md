@@ -16,7 +16,7 @@ This file documents the current developer workflows and commands for working on 
 ## Runtime Model
 - `cargo run` starts the full application: TUI, HTTP API, and gRPC server.
 - On first run, or when `DEFAULT_MODEL` is missing, the app enters interactive provider setup and persists the result to `.env`.
-- Agent configs are loaded from `agents/`.
+- Agent configs are loaded from `agents/` and `contextos/projects/<project_id>/agents/`.
 - Project contexts are stored under `contextos/projects/<project_id>/`.
 - Hot reload watches the base Llama-R directory, so agent and context changes are picked up without restarting.
 - `LLAMA_R_DIR` can override the default base directory for agents and contexts.
@@ -54,21 +54,25 @@ cargo run -- run
 cargo run -- --help
 ```
 
-### Create A Global Agent
+### Create The Project Base Agent
+```powershell
+cargo run -- init
+```
+
+This creates `contextos/projects/<current-directory>/agents/<current-directory>.toml` as the editable default agent for the current project.
+
+### Create A Custom Project Agent
 ```powershell
 cargo run -- init-agent nutricion
 ```
 
-### Create A Project MCP Agent
-```powershell
-cargo run -- init-mcp C:\ruta\al\proyecto
-```
+Run `init-agent <name>` as many times as you need to create more project agents. A name is always required.
 
 ### Analyze A Project And Generate Context
 Requires the server to be running. This calls `POST /api/contexts`.
 
 ```powershell
-cargo run -- analyze C:\ruta\al\proyecto --id mi-proyecto --agent mi-proyecto_mcp
+cargo run -- analyze C:\ruta\al\proyecto --id mi-proyecto --agent nutricion
 ```
 
 ### Refresh An Existing Context
@@ -101,17 +105,17 @@ cargo run -- export-rules mi-proyecto . --format all
 4. Confirm `.env` now contains `OLLAMA_URL` and `DEFAULT_MODEL`.
 
 ### Agent Creation Workflow
-1. Create a base agent with `cargo run -- init-agent <name>`.
-2. Edit the generated TOML in `agents/`.
-3. Keep the server running so hot reload picks up changes.
-4. Test with `POST /api/chat` or `POST /v1/chat/completions`.
+1. Create the base project agent with `cargo run -- init`; it uses the current directory name.
+2. Create specialized agents with `cargo run -- init-agent <name>`; the name is mandatory.
+3. Edit the generated TOML files in `contextos/projects/<project_id>/agents/`.
+4. Keep the server running so hot reload picks up changes.
+5. Test with `POST /api/chat` or `POST /v1/chat/completions`.
 
 ### Project Context Workflow
-1. Create a project MCP agent with `cargo run -- init-mcp <path>`.
-2. Start the server with `cargo run`.
-3. Generate the project context with `cargo run -- analyze <path> --id <project_id> --agent <project_id>_mcp`.
-4. Refresh it later with `cargo run -- reanalyze <project_id>`.
-5. Optionally export the generated rules with `cargo run -- export-rules <project_id> <target_dir>`.
+1. Start the server with `cargo run`.
+2. Generate the project context with `cargo run -- analyze <path> --id <project_id> --agent <agent_id>`.
+3. Refresh it later with `cargo run -- reanalyze <project_id>`.
+4. Optionally export the generated rules with `cargo run -- export-rules <project_id> <target_dir>`.
 
 ## HTTP API Quick Reference
 
@@ -136,7 +140,7 @@ POST /api/chat
 POST /v1/chat/completions
 ```
 
-`X-Agent` is supported and takes priority over `payload.model`.
+`X-Project` selects the project scope and `X-Agent` selects a specific agent inside that project. If `X-Project` is sent without `X-Agent`, Llama-R loads the project general agent whose id matches the project id.
 
 ### Agent API
 ```text
@@ -167,16 +171,16 @@ POST /api/mcp
 ```powershell
 cargo fmt
 cargo check
-cargo test
+cargo test --target-dir target-tests
 ```
 
 ## Storage Layout
-- `agents/`: global agent TOML files
-- `contextos/projects/<project_id>/agents/`: project-scoped MCP agents
-- `contextos/projects/<project_id>/context/`: saved generated context
+- `agents/`: editable global agent TOML files
+- `contextos/projects/<project_id>/agents/`: project-scoped agent TOML files`r`n- `contextos/projects/<project_id>/context/`: saved generated context
 - `logs/llama-r.log`: rolling application logs
 
 ## Notes For Contributors
 - Prefer documenting commands that exist in `src/cli/commands.rs`.
 - Keep `AGENTS.md`, `README.md`, and generated rule exports aligned when workflows change.
 - If you add a new CLI command or endpoint, update this file with the command, whether it requires the server, and what it reads or writes on disk.
+

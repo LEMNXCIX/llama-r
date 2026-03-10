@@ -1,5 +1,6 @@
 use crate::context::store::{ContextStore, ProjectContext};
 use crate::domain::agent::Agent;
+use crate::services::agent_skill_sync::merge_skill_ids;
 use crate::services::skill_manager::SkillManager;
 use crate::services::validation::canonicalize_project_path;
 use std::fs;
@@ -251,6 +252,17 @@ impl ContextEnricher {
         }
         parts.push(sys_prompt);
 
+        if !agent.config.rules.is_empty() {
+            let rendered_rules = agent
+                .config
+                .rules
+                .iter()
+                .map(|rule| format!("- {}", rule))
+                .collect::<Vec<_>>()
+                .join("\n");
+            parts.push(format!("\n## Agent Rules\n{}", rendered_rules));
+        }
+
         if let Some(project_id) = &agent.config.context_project {
             let ctx_md = self.context_store.get_context_md(project_id);
             if !ctx_md.is_empty() {
@@ -264,18 +276,123 @@ impl ContextEnricher {
             }
         }
 
-        let skills = self.skill_manager.list_skills();
-        if !skills.is_empty() {
-            let skill_summaries: Vec<String> = skills
+        let selected_skill_ids = merge_skill_ids(&agent.config.skills, &agent.config.auto_skills);
+        if !selected_skill_ids.is_empty() {
+            let project_path = agent
+                .config
+                .context_project
+                .as_ref()
+                .and_then(|project_id| self.context_store.get_context(project_id))
+                .map(|context| context.path);
+
+            let selected_skills = selected_skill_ids
                 .iter()
-                .map(|skill| format!("- **{}**: {}", skill.id, skill.metadata.description))
-                .collect();
-            parts.push(format!(
-                "\n## Available Skills\nUsa estas skills cuando sean relevantes:\n{}",
-                skill_summaries.join("\n")
-            ));
+                .filter_map(|skill_id| {
+                    if let Some(project_path) = &project_path {
+                        self.skill_manager.get_skill_for_project(skill_id, Path::new(project_path))
+                    } else {
+                        self.skill_manager.get_skill(skill_id)
+                    }
+                    .map(|skill| format!("### {}\nPath: {}\n\n{}", skill.id, skill.path, skill.content))
+                })
+                .collect::<Vec<_>>();
+
+            if !selected_skills.is_empty() {
+                parts.push(format!(
+                    "\n## Agent Skills\nUsa estas skills especificamente para este agente:\n\n{}",
+                    selected_skills.join("\n\n")
+                ));
+            }
         }
 
         parts.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ContextEnricher;
+    use crate::context::store::{ContextStore, ProjectContext};
+    use crate::domain::agent::{Agent, AgentConfig, OptimizeConfig};
+    use crate::services::skill_manager::SkillManager;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap()
+    }
+
+    #[test]
+    fn build_system_prompt_should_include_agent_rules_and_selected_skills_only() {
+        let _guard = lock_env();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let previous_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+        std::env::set_var("LLAMA_R_DIR", temp_dir.path());
+
+        let skill_dir = temp_dir.path().join("skills").join("reviewer-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: reviewer-skill\ndescription: Helps review code\n---\nUse this skill for targeted code review.",
+        )
+        .unwrap();
+
+        let unused_skill_dir = temp_dir.path().join("skills").join("unused-skill");
+        std::fs::create_dir_all(&unused_skill_dir).unwrap();
+        std::fs::write(
+            unused_skill_dir.join("SKILL.md"),
+            "---\nname: unused-skill\ndescription: Should not be injected\n---\nThis must stay out of the prompt.",
+        )
+        .unwrap();
+
+        let skill_manager = Arc::new(SkillManager::new());
+        skill_manager.scan_and_load();
+
+        let context_store = Arc::new(ContextStore::new());
+        context_store
+            .save_context(ProjectContext {
+                project_id: "demo".to_string(),
+                path: temp_dir.path().display().to_string(),
+                context_md: "project context body".to_string(),
+                project_type: "rust".to_string(),
+                skills_injected: vec![],
+                last_analyzed: chrono::Utc::now(),
+                custom_rules: String::new(),
+            })
+            .unwrap();
+
+        let enricher = ContextEnricher::new(context_store, skill_manager, "fallback-model".to_string());
+        let agent = Agent {
+            id: "reviewer".to_string(),
+            project_id: Some("demo".to_string()),
+            config: AgentConfig {
+                name: "Reviewer".to_string(),
+                model: String::new(),
+                system_prompt: "Base prompt".to_string(),
+                context_project: Some("demo".to_string()),
+                context_files: vec![],
+                rules: vec!["Always explain the risk".to_string()],
+                skills: vec!["reviewer-skill".to_string()],
+                auto_skills: vec!["reviewer-skill".to_string()],
+                variables: HashMap::new(),
+                optimize: OptimizeConfig::default(),
+            },
+        };
+
+        let prompt = enricher.build_system_prompt(&agent);
+
+        assert!(prompt.contains("## Agent Rules"));
+        assert!(prompt.contains("Always explain the risk"));
+        assert!(prompt.contains("## Agent Skills"));
+        assert!(prompt.contains("reviewer-skill"));
+        assert!(prompt.contains("Use this skill for targeted code review."));
+        assert!(prompt.contains("project context body"));
+        assert!(!prompt.contains("unused-skill"));
+        assert!(!prompt.contains("This must stay out of the prompt."));
+
+        std::env::set_current_dir(previous_dir).unwrap();
     }
 }

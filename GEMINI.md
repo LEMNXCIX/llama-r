@@ -1,28 +1,186 @@
-# Llama-R: High-Performance Personal AI Agent Gateway
+# AGENTS.md
 
-## Application Context
-Llama-R es un gateway AI ligero y ultrarrápido escrito en Rust. Su propósito principal es actuar como proxy unificado y personal para Ollama (con soporte futuro para OpenAI, Anthropic, vLLM, llama.cpp, etc.). Está diseñado exclusivamente para uso personal y proyectos de desarrolladores que quieran múltiples “agentes” especializados (resúmenes, nutrición, emails profesionales, código Rust, etc.) con su propio system prompt y contexto pre-cargado.
+## Purpose
+Llama-R is a Rust-based personal AI gateway that sits in front of Ollama and exposes:
 
-### Core Objectives
-1. **Low Latency extremo:** Minimizar overhead mediante streaming byte-a-byte, connection pooling y zero-copy (Rust 2026 standards).
-2. **Sistema de Agentes Personalizados:** Cada agente se define en un archivo `.toml` independiente dentro de `agents/` con su propio system prompt y contextos.
-3. **Hot-reload total:** Recarga instantánea de configuraciones y archivos de contexto sin reiniciar el servidor (usando `notify`).
-4. **TUI Nativa:** Interfaz terminal interactiva (`ratatui` + `crossterm`) para gestión de agentes, monitoreo de logs y estado del sistema.
-5. **Library-First:** El núcleo reside en `llama-r-core` para ser reutilizado como librería en otros proyectos Rust.
-6. **Unified Interface:** Streaming compatible con OpenAI, gRPC (`tonic`) y Model Context Protocol (MCP).
-7. **Multi-Provider:** Abstracción total de proveedores mediante el trait `LLMProvider`.
+- A native chat API at `/chat` and `/api/chat`
+- An OpenAI-compatible endpoint at `/v1/chat/completions`
+- Agent management APIs under `/api/agents`
+- Context management APIs under `/api/contexts`
+- Health endpoints at `/health` and `/api/health`
+- MCP over `/api/mcp`
+- A local TUI plus HTTP and gRPC servers started from the same runtime
 
-## Architectural Patterns (Rust 2026)
-- **Domain-Driven Design:** Estructura clara: `domain/`, `agents/`, `providers/`, `api/`, `config/`, `tui/`.
-- **Zero-copy & Eficiencia:** Uso intensivo de `bytes::Bytes`, `Cow<str>` y `smallvec` en el hot path.
-- **Error Handling:** `thiserror` para errores internos, `anyhow` para nivel de aplicación y `tracing` para logs estructurados.
-- **Concurrency:** `tokio` para async total, `mpsc` para comunicación entre el servidor y la TUI.
+This file documents the current developer workflows and commands for working on the repo.
 
-## Model Validation Strategy
-- **Caché en Memoria:** Carga de modelos al inicio + refresh periódico.
-- **Validación Instantánea:** El hot path nunca consulta al proveedor; valida contra la caché y devuelve 404/Invalid Model de inmediato si no existe.
+## Runtime Model
+- `cargo run` starts the full application: TUI, HTTP API, and gRPC server.
+- On first run, or when `DEFAULT_MODEL` is missing, the app enters interactive provider setup and persists the result to `.env`.
+- Agent configs are loaded from `agents/` and `contextos/projects/<project_id>/agents/`.
+- Project contexts are stored under `contextos/projects/<project_id>/`.
+- Hot reload watches the base Llama-R directory, so agent and context changes are picked up without restarting.
+- `LLAMA_R_DIR` can override the default base directory for agents and contexts.
 
-## Development Workflow
-- **Hot-reload:** Cualquier cambio en `agents/*.toml` o `contextos/` se refleja al instante.
-- **TUI/Server:** `cargo run` inicia tanto el servidor como la interfaz terminal en paralelo.
-- **Testing:** Meta de 90%+ coverage con `wiremock` para simular proveedores.
+## Environment
+Primary environment variables:
+
+- `PORT`: HTTP API port, default `3000`
+- `OLLAMA_URL`: provider base URL, default `http://localhost:11434`
+- `DEFAULT_MODEL`: default model used for direct requests and fallback routing
+- `LLAMA_R_DIR`: optional override for the base data directory
+
+Recommended setup:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+## Core Commands
+Use these commands from the repository root.
+
+### Run The App
+```powershell
+cargo run
+```
+
+Explicit subcommand form:
+
+```powershell
+cargo run -- run
+```
+
+### Show CLI Help
+```powershell
+cargo run -- --help
+```
+
+### Create The Project Base Agent
+```powershell
+cargo run -- init
+```
+
+This creates `contextos/projects/<current-directory>/agents/<current-directory>.toml` as the editable default agent for the current project.
+
+### Create A Custom Project Agent
+```powershell
+cargo run -- init-agent nutricion
+```
+
+Run `init-agent <name>` as many times as you need to create more project agents. A name is always required.
+
+### Analyze A Project And Generate Context
+Requires the server to be running. This calls `POST /api/contexts`.
+
+```powershell
+cargo run -- analyze C:\ruta\al\proyecto --id mi-proyecto --agent nutricion
+```
+
+### Refresh An Existing Context
+Requires the server to be running. This calls `POST /api/contexts/:id/analyze`.
+
+```powershell
+cargo run -- reanalyze mi-proyecto
+```
+
+### Export Rules For Other AI Tools
+```powershell
+cargo run -- export-rules mi-proyecto .
+```
+
+Formats:
+
+```powershell
+cargo run -- export-rules mi-proyecto . --format cursor
+cargo run -- export-rules mi-proyecto . --format gemini
+cargo run -- export-rules mi-proyecto . --format claude
+cargo run -- export-rules mi-proyecto . --format all
+```
+
+## Recommended Workflows
+
+### First Run
+1. Ensure Ollama is running locally.
+2. Start Llama-R with `cargo run`.
+3. Complete the interactive setup if prompted.
+4. Confirm `.env` now contains `OLLAMA_URL` and `DEFAULT_MODEL`.
+
+### Agent Creation Workflow
+1. Create the base project agent with `cargo run -- init`; it uses the current directory name.
+2. Create specialized agents with `cargo run -- init-agent <name>`; the name is mandatory.
+3. Edit the generated TOML files in `contextos/projects/<project_id>/agents/`.
+4. Keep the server running so hot reload picks up changes.
+5. Test with `POST /api/chat` or `POST /v1/chat/completions`.
+
+### Project Context Workflow
+1. Start the server with `cargo run`.
+2. Generate the project context with `cargo run -- analyze <path> --id <project_id> --agent <agent_id>`.
+3. Refresh it later with `cargo run -- reanalyze <project_id>`.
+4. Optionally export the generated rules with `cargo run -- export-rules <project_id> <target_dir>`.
+
+## HTTP API Quick Reference
+
+### Health Endpoints
+```text
+GET /health
+GET /api/health
+```
+
+### Basic Endpoints
+```text
+GET  /
+GET  /api
+GET  /models
+GET  /api/models
+```
+
+### Chat Endpoints
+```text
+POST /chat
+POST /api/chat
+POST /v1/chat/completions
+```
+
+`X-Project` selects the project scope and `X-Agent` selects a specific agent inside that project. If `X-Project` is sent without `X-Agent`, Llama-R loads the project general agent whose id matches the project id.
+
+### Agent API
+```text
+GET    /api/agents
+POST   /api/agents
+GET    /api/agents/:id
+PUT    /api/agents/:id
+DELETE /api/agents/:id
+```
+
+### Context API
+```text
+GET    /api/contexts
+POST   /api/contexts
+GET    /api/contexts/:id
+PUT    /api/contexts/:id
+DELETE /api/contexts/:id
+POST   /api/contexts/:id/analyze
+```
+
+### MCP
+```text
+GET  /api/mcp
+POST /api/mcp
+```
+
+## Developer Commands
+```powershell
+cargo fmt
+cargo check
+cargo test --target-dir target-tests
+```
+
+## Storage Layout
+- `agents/`: editable global agent TOML files
+- `contextos/projects/<project_id>/agents/`: project-scoped agent TOML files`r`n- `contextos/projects/<project_id>/context/`: saved generated context
+- `logs/llama-r.log`: rolling application logs
+
+## Notes For Contributors
+- Prefer documenting commands that exist in `src/cli/commands.rs`.
+- Keep `AGENTS.md`, `README.md`, and generated rule exports aligned when workflows change.
+- If you add a new CLI command or endpoint, update this file with the command, whether it requires the server, and what it reads or writes on disk.
+

@@ -1,4 +1,5 @@
 use crate::api::handlers::AppState;
+use crate::api::observability::ObservabilitySnapshot;
 use axum::{extract::State, Json};
 use serde::Serialize;
 use std::sync::atomic::Ordering;
@@ -14,9 +15,11 @@ pub struct HealthResponse {
     pub grpc_running: bool,
     pub saved_tokens: usize,
     pub total_tokens_processed: usize,
+    pub observability: ObservabilitySnapshot,
 }
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    state.observability.record_http_request();
     let provider_healthy = state.provider.health_check().await.is_ok();
     Json(HealthResponse {
         status: if provider_healthy { "ok" } else { "degraded" },
@@ -27,5 +30,6 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
         grpc_running: state.grpc_running.load(Ordering::SeqCst),
         saved_tokens: state.metrics.get_saved_tokens(),
         total_tokens_processed: state.metrics.get_total_processed(),
+        observability: state.observability.snapshot(),
     })
 }

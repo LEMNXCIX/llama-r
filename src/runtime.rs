@@ -3,6 +3,7 @@ use crate::api::context_api::{analyze_project, create_context, delete_context, g
 use crate::api::grpc::{pb::llama_gateway_server::LlamaGatewayServer, GrpcService};
 use crate::api::handlers::{chat, list_models, mcp_message, openai_chat, AppState};
 use crate::api::health::health;
+use crate::api::observability::AppObservability;
 use crate::config::Config;
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::ContextStore;
@@ -41,7 +42,7 @@ pub fn build_app_state(
     let context_enricher = Arc::new(ContextEnricher::new(
         context_store.clone(),
         skill_manager.clone(),
-        default_model,
+        default_model.clone(),
     ));
 
     Arc::new(AppState {
@@ -51,6 +52,8 @@ pub fn build_app_state(
         context_store,
         context_enricher,
         metrics,
+        observability: Arc::new(AppObservability::new()),
+        default_model,
         api_running: AtomicBool::new(false),
         grpc_running: AtomicBool::new(false),
         logs,
@@ -64,6 +67,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .allow_headers([
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
+            axum::http::HeaderName::from_static("x-project"),
             axum::http::HeaderName::from_static("x-agent"),
         ]);
 
@@ -162,7 +166,7 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
                     &agent.config.model
                 };
                 if !model_names.iter().any(|candidate| candidate == model_to_check) {
-                    tracing::warn!(agent_id = %agent.id, model = %model_to_check, available_models = ?model_names, "Agent references unavailable model");
+                    tracing::warn!(agent_id = %agent.qualified_id(), model = %model_to_check, available_models = ?model_names, "Agent references unavailable model");
                 }
             }
         }

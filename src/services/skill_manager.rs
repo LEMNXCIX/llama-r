@@ -34,20 +34,7 @@ impl SkillManager {
         let mut new_skills = HashMap::new();
 
         for path in &self.base_paths {
-            if !path.exists() || !path.is_dir() {
-                continue;
-            }
-
-            if let Ok(entries) = fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    let skill_path = entry.path();
-                    if skill_path.is_dir() {
-                        if let Some(skill) = self.load_skill(&skill_path) {
-                            new_skills.insert(skill.id.clone(), skill);
-                        }
-                    }
-                }
-            }
+            self.load_dir_into(path, &mut new_skills);
         }
 
         match self.skills.write() {
@@ -56,6 +43,23 @@ impl SkillManager {
                 tracing::info!(skill_count = skills_lock.len(), "SkillManager loaded skills");
             }
             Err(_) => tracing::error!("SkillManager lock poisoned while loading skills"),
+        }
+    }
+
+    fn load_dir_into(&self, path: &Path, skills: &mut HashMap<String, Skill>) {
+        if !path.exists() || !path.is_dir() {
+            return;
+        }
+
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let skill_path = entry.path();
+                if skill_path.is_dir() {
+                    if let Some(skill) = self.load_skill(&skill_path) {
+                        skills.insert(skill.id.clone(), skill);
+                    }
+                }
+            }
         }
     }
 
@@ -129,11 +133,38 @@ impl SkillManager {
             .unwrap_or_default()
     }
 
+    pub fn list_skills_for_project(&self, project_path: &Path) -> Vec<Skill> {
+        let mut combined = self
+            .skills
+            .read()
+            .map(|skills_lock| skills_lock.clone())
+            .unwrap_or_default();
+
+        for local_path in [project_path.join("skills"), project_path.join(".agents/skills")] {
+            self.load_dir_into(&local_path, &mut combined);
+        }
+
+        combined.into_values().collect()
+    }
+
     pub fn get_skill(&self, id: &str) -> Option<Skill> {
         self.skills
             .read()
             .ok()
             .and_then(|skills_lock| skills_lock.get(id).cloned())
+    }
+
+    pub fn get_skill_for_project(&self, id: &str, project_path: &Path) -> Option<Skill> {
+        for local_path in [project_path.join("skills"), project_path.join(".agents/skills")] {
+            let skill_path = local_path.join(id);
+            if skill_path.is_dir() {
+                if let Some(skill) = self.load_skill(&skill_path) {
+                    return Some(skill);
+                }
+            }
+        }
+
+        self.get_skill(id)
     }
 }
 

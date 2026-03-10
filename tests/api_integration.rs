@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     http::{Request, StatusCode},
 };
+use llama_r::api::grpc::{pb, GrpcService};
+use llama_r::api::grpc::pb::llama_gateway_server::LlamaGateway;
 use llama_r::context::store::ContextStore;
 use llama_r::domain::agent::AgentConfig;
 use llama_r::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
@@ -17,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 use tokio_stream::Stream;
+use tonic::Request as GrpcRequest;
 use tower::ServiceExt;
 
 static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -76,7 +79,7 @@ impl LLMProvider for FakeProvider {
         } else {
             format!(
                 "model={} role={} content={}",
-                request.model, request.messages[0].role, request.messages[0].content
+                request.model, request.messages.last().map(|m| m.role.clone()).unwrap_or_default(), request.messages.last().map(|m| m.content.clone()).unwrap_or_default()
             )
         };
 
@@ -98,12 +101,15 @@ impl LLMProvider for FakeProvider {
         Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, Box<dyn Error + Send + Sync>>> + Send>>,
         Box<dyn Error + Send + Sync>,
     > {
+        if request.model == "agent-model" && self.fail_primary_once.swap(false, Ordering::SeqCst) {
+            return Err("synthetic provider failure".into());
+        }
         let event = ChatStreamEvent {
             model: request.model,
             created_at: "2026-03-09T00:00:00Z".to_string(),
             message: ChatMessage {
                 role: "assistant".to_string(),
-                content: "stream".to_string(),
+                content: request.messages.last().map(|m| m.content.clone()).unwrap_or_default(),
             },
             done: true,
         };
@@ -115,11 +121,12 @@ struct TestApp {
     _guard: MutexGuard<'static, ()>,
     temp_dir: TempDir,
     router: axum::Router,
+    grpc_service: GrpcService,
     agent_manager: Arc<AgentManager>,
 }
 
 fn setup_app() -> TestApp {
-    let guard = test_lock().lock().unwrap();
+    let guard = test_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp_dir = tempfile::tempdir().unwrap();
     std::env::set_var("LLAMA_R_DIR", temp_dir.path());
     std::env::set_var("DEFAULT_MODEL", "fallback-model");
@@ -141,14 +148,21 @@ fn setup_app() -> TestApp {
         "fallback-model".to_string(),
         logs,
     );
-    let router = build_router(state);
+    let router = build_router(state.clone());
+    let grpc_service = GrpcService::new(state);
 
     TestApp {
         _guard: guard,
         temp_dir,
         router,
+        grpc_service,
         agent_manager,
     }
+}
+
+async fn body_json(response: axum::response::Response) -> serde_json::Value {
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 #[tokio::test]
@@ -156,11 +170,14 @@ async fn health_should_report_runtime_status() {
     let app = setup_app();
     let response = app
         .router
+        .clone()
         .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["status"], "ok");
 }
 
 #[tokio::test]
@@ -276,20 +293,22 @@ async fn context_create_should_conflict_when_project_exists() {
 }
 
 #[tokio::test]
-async fn openai_chat_should_use_x_agent_and_fallback_to_default_model() {
-    let app = setup_app();
-    let agent_path = app.temp_dir.path().join("agents/rusty.toml");
+async fn transport_layers_should_resolve_same_agent_and_fallback() {
+    let openai_app = setup_app();
+    let openai_agent_path = openai_app.temp_dir.path().join("agents/rusty.toml");
     let config = AgentConfig {
         name: "Rusty".to_string(),
         model: "agent-model".to_string(),
         system_prompt: "You are helpful".to_string(),
         context_project: None,
         context_files: vec![],
+        rules: vec![],
+        skills: vec![],
         variables: Default::default(),
         optimize: Default::default(),
     };
-    std::fs::write(&agent_path, toml::to_string(&config).unwrap()).unwrap();
-    app.agent_manager.load_agents().unwrap();
+    std::fs::write(&openai_agent_path, toml::to_string(&config).unwrap()).unwrap();
+    openai_app.agent_manager.load_agents().unwrap();
 
     let body = serde_json::json!({
         "model": "ignored",
@@ -297,8 +316,9 @@ async fn openai_chat_should_use_x_agent_and_fallback_to_default_model() {
         "stream": false
     });
 
-    let response = app
+    let openai_response = openai_app
         .router
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -310,8 +330,173 @@ async fn openai_chat_should_use_x_agent_and_fallback_to_default_model() {
         )
         .await
         .unwrap();
+    assert_eq!(openai_response.status(), StatusCode::OK);
+    let openai_json = body_json(openai_response).await;
+    assert_eq!(openai_json["model"], "fallback-model");
+    drop(openai_app);
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let grpc_app = setup_app();
+    let grpc_agent_path = grpc_app.temp_dir.path().join("agents/rusty.toml");
+    std::fs::write(&grpc_agent_path, toml::to_string(&config).unwrap()).unwrap();
+    grpc_app.agent_manager.load_agents().unwrap();
+
+    let grpc_response = grpc_app
+        .grpc_service
+        .chat(GrpcRequest::new(pb::ChatRequest {
+            model: "rusty".to_string(),
+            messages: vec![pb::ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            stream: false,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(grpc_response.model, "fallback-model");
+}
+
+#[tokio::test]
+async fn validation_errors_should_surface_for_http_and_grpc() {
+    let app = setup_app();
+
+    let http_response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"fallback-model","messages":[],"stream":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(http_response.status(), StatusCode::BAD_REQUEST);
+
+    let grpc_error = app
+        .grpc_service
+        .chat(GrpcRequest::new(pb::ChatRequest {
+            model: "fallback-model".to_string(),
+            messages: vec![],
+            stream: false,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(grpc_error.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn mcp_should_respond_to_initialize_tools_and_tool_call() {
+    let app = setup_app();
+
+    let initialize = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(initialize.status(), StatusCode::OK);
+
+    let tools_list = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/list",
+                        "params": {}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tools_list.status(), StatusCode::OK);
+
+    let tool_call = app
+        .router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "get_api_spec",
+                            "arguments": {}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tool_call.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn health_should_report_non_empty_metrics_after_traffic() {
+    let app = setup_app();
+
+    let _ = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "fallback-model",
+                        "messages": [{ "role": "user", "content": "hello" }],
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let health = app
+        .router
+        .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    let json = body_json(health).await;
+    assert!(json["observability"]["http_requests"].as_u64().unwrap() >= 2);
+    assert!(json["observability"]["chat_requests"].as_u64().unwrap() >= 1);
 }
 
 #[tokio::test]
@@ -356,3 +541,6 @@ async fn context_reanalyze_endpoint_should_refresh_existing_context() {
 
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+
+

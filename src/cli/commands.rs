@@ -13,13 +13,10 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Initialize a new agent configuration
+    /// Initialize the default project agent configuration using the current directory name
+    Init,
+    /// Initialize a new editable project agent configuration
     InitAgent { name: String },
-    /// Initialize an MCP context from a local project directory
-    InitMcp {
-        #[arg(default_value = ".")]
-        path: String,
-    },
     /// Generate AI context for a project (requires a running server)
     Analyze {
         #[arg(default_value = ".")]
@@ -53,12 +50,12 @@ pub async fn handle_cli() -> bool {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::InitAgent { name }) => {
-            init_agent(name).await;
+        Some(Commands::Init) => {
+            init_default_agent().await;
             true
         }
-        Some(Commands::InitMcp { path }) => {
-            init_mcp(path).await;
+        Some(Commands::InitAgent { name }) => {
+            init_named_agent(name).await;
             true
         }
         Some(Commands::Analyze {
@@ -86,84 +83,90 @@ pub async fn handle_cli() -> bool {
     }
 }
 
-async fn init_agent(name: &str) {
-    if let Err(err) = crate::services::validation::validate_identifier(name, "agent name") {
-        println!("{}", err);
-        return;
-    }
+fn current_project_id() -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|err| format!("Could not read current directory: {}", err))?;
+    let project_id = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Could not infer project name from current directory".to_string())?
+        .trim()
+        .to_string();
 
-    dotenv().ok();
-    let default_model = std::env::var("DEFAULT_MODEL").unwrap_or_default();
-
-    let agents_dir = crate::core::paths::get_agents_dir();
-    let filename = format!("{}.toml", name);
-    let path = agents_dir.join(&filename);
-
-    if path.exists() {
-        println!("Agent config '{}' already exists in {}.", filename, agents_dir.display());
-        return;
-    }
-
-    if let Err(err) = fs::create_dir_all(&agents_dir) {
-        println!("Failed to create agents directory: {}", err);
-        return;
-    }
-
-    let model_comment = if default_model.is_empty() {
-        "# model = \"\"  # Falls back to DEFAULT_MODEL from .env".to_string()
-    } else {
-        format!("model = \"{}\"", default_model)
-    };
-
-    let default_config = format!(
-        r#"name = "{name}"
-{model_comment}
-system_prompt = """You are a specialized agent for {name}."""
-
-[optimize]
-enabled = true
-rules = []
-"#
-    );
-
-    match fs::write(&path, default_config) {
-        Ok(_) => {
-            println!("Created agent config at '{}'", filename);
-            if default_model.is_empty() {
-                println!("No DEFAULT_MODEL configured yet. Run `cargo run` first to set one.");
-            } else {
-                println!("Model: {}", default_model);
-            }
-        }
-        Err(err) => println!("Error writing agent config: {}", err),
-    }
+    crate::services::validation::validate_identifier(&project_id, "project name")
+        .map_err(|err| err.to_string())?;
+    Ok(project_id)
 }
 
-async fn init_mcp(path: &str) {
-    dotenv().ok();
-    let default_model = std::env::var("DEFAULT_MODEL").unwrap_or_default();
-
-    let canonical_path = match crate::services::validation::canonicalize_project_path(path) {
-        Ok(path) => path,
+async fn init_default_agent() {
+    let project_id = match current_project_id() {
+        Ok(project_id) => project_id,
         Err(err) => {
             println!("{}", err);
             return;
         }
     };
 
-    let project_name = canonical_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("project");
+    let prompt = format!(
+        "You are the general-purpose assistant for the project '{}'. Help the user clearly, accurately, and concisely.",
+        project_id
+    );
 
-    let project_agents_dir = crate::core::paths::get_project_agents_dir(project_name);
-    let agent_name = format!("{}_mcp", project_name);
-    let agent_file = project_agents_dir.join(format!("{}.toml", agent_name));
+    init_agent_file(
+        &project_id,
+        &project_id,
+        &prompt,
+        Some(&project_id),
+        &[],
+    )
+    .await;
+}
 
-    println!("Scanning project at '{}'...", canonical_path.display());
+async fn init_named_agent(name: &str) {
+    if let Err(err) = crate::services::validation::validate_identifier(name, "agent name") {
+        println!("{}", err);
+        return;
+    }
 
-    if let Err(err) = fs::create_dir_all(&project_agents_dir) {
-        println!("Failed to create project agents directory: {}", err);
+    let project_id = match current_project_id() {
+        Ok(project_id) => project_id,
+        Err(err) => {
+            println!("{}", err);
+            return;
+        }
+    };
+
+    let prompt = format!(
+        "You are a specialized agent named '{}' for the project '{}'.",
+        name, project_id
+    );
+    init_agent_file(name, name, &prompt, Some(&project_id), &[]).await;
+}
+
+async fn init_agent_file(
+    name: &str,
+    display_name: &str,
+    system_prompt: &str,
+    context_project: Option<&str>,
+    optimize_rules: &[&str],
+) {
+    dotenv().ok();
+    let default_model = std::env::var("DEFAULT_MODEL").unwrap_or_default();
+
+    let agents_dir = match context_project {
+        Some(project_id) => crate::core::paths::get_project_agents_dir(project_id),
+        None => crate::core::paths::get_agents_dir(),
+    };
+    let filename = format!("{}.toml", name);
+    let path = agents_dir.join(&filename);
+
+    if path.exists() {
+        println!("Agent config '{}' already exists in {}.", filename, agents_dir.display());
+        println!("You can edit it directly; the file is meant to stay editable.");
+        return;
+    }
+
+    if let Err(err) = fs::create_dir_all(&agents_dir) {
+        println!("Failed to create agents directory: {}", err);
         return;
     }
 
@@ -173,36 +176,45 @@ async fn init_mcp(path: &str) {
         format!("model = \"{}\"", default_model)
     };
 
-    let mcp_config = format!(
-        r#"name = "{agent_name}"
+    let context_project_line = context_project
+        .map(|project_id| format!("context_project = \"{}\"\n", project_id))
+        .unwrap_or_default();
+
+    let optimize_rules_line = if optimize_rules.is_empty() {
+        "rules = []".to_string()
+    } else {
+        format!(
+            "rules = [{}]",
+            optimize_rules
+                .iter()
+                .map(|rule| format!("\"{}\"", rule))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    let config = format!(
+        r#"name = "{display_name}"
 {model_line}
-context_project = "{project_name}"
-system_prompt = """You are a specialized developer agent for the project '{project_name}'.
-You have full context of the project structure and code.
-Always follow the project's established patterns and conventions."""
+system_prompt = """{system_prompt}"""
+{context_project_line}rules = []
+skills = []
 
 [optimize]
 enabled = true
-rules = ["ast_compress"]
+{optimize_rules_line}
 "#
     );
 
-    match fs::write(&agent_file, mcp_config) {
+    match fs::write(&path, config) {
         Ok(_) => {
-            println!("MCP agent created at '{}'", agent_file.display());
-            println!("Project: {}", project_name);
+            println!("Created editable agent config at '{}'", path.display());
             if default_model.is_empty() {
                 println!("No DEFAULT_MODEL configured yet. Run `cargo run` first to set one.");
             } else {
                 println!("Model: {}", default_model);
             }
-            println!("Generate AI context next (requires the server running):");
-            println!(
-                "cargo run -- analyze {} --id {} --agent {}",
-                canonical_path.display(),
-                project_name,
-                agent_name
-            );
+            println!("Edit the TOML file whenever you want to customize it.");
         }
         Err(err) => println!("Error writing agent config: {}", err),
     }
@@ -326,7 +338,7 @@ async fn run_analyze(path: &str, id: Option<&str>, agent: Option<&str>, server: 
                         }
                         if let Some(agent_id) = agent {
                             println!("Context linked to agent '{}'", agent_id);
-                            println!("Use it with POST /api/chat and model = \"{}\"", agent_id);
+                            println!("Use it with headers X-Project: {} and X-Agent: {}", project_id, agent_id);
                         }
                     } else if status == reqwest::StatusCode::CONFLICT {
                         println!("Context for '{}' already exists.", project_id);
@@ -386,3 +398,5 @@ async fn run_reanalyze(project_id: &str, server: &str) {
         Err(err) => println!("Request failed: {}", err),
     }
 }
+
+
