@@ -133,3 +133,14 @@ cargo check
 cargo test --target-dir target-tests
 ```
 
+## Instalar
+
+```powershell
+cargo install --path .
+```
+
+## Desinstalar
+
+```powershell
+cargo uninstall llama-r
+```

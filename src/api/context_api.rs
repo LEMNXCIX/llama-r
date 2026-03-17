@@ -2,6 +2,7 @@ use crate::api::handlers::AppState;
 use crate::context::store::ProjectContext;
 use crate::domain::models::{ChatMessage, ChatRequest};
 use crate::error::AppError;
+use crate::services::agent_skill_sync::{summarize_sync_report, sync_project_agent_skills};
 use crate::services::validation::{canonicalize_project_path, validate_identifier};
 use axum::{
     extract::{Path, State},
@@ -106,14 +107,15 @@ pub async fn create_context(
             .await
             .map_err(AppError::Runtime)?;
         ctx.custom_rules = req.custom_rules.clone();
-        state.context_store.save_context(ctx)?;
-
+        state.context_store.save_context(ctx.clone())?;
+        let sync_report = sync_project_agent_skills(&state, &ctx).await?;
         Ok((
             axum::http::StatusCode::CREATED,
             Json(serde_json::json!({
                 "project_id": req.project_id,
                 "message": format!("Context for '{}' generated and saved", req.project_id),
-                "auto_analyzed": true
+                "auto_analyzed": true,
+                "agent_skill_sync": summarize_sync_report(&sync_report)
             })),
         ))
     } else {
@@ -126,8 +128,7 @@ pub async fn create_context(
             last_analyzed: chrono::Utc::now(),
             custom_rules: req.custom_rules.clone(),
         };
-        state.context_store.save_context(ctx)?;
-
+        state.context_store.save_context(ctx.clone())?;
         Ok((
             axum::http::StatusCode::CREATED,
             Json(serde_json::json!({
@@ -156,7 +157,7 @@ pub async fn update_context(
         ctx.custom_rules = custom_rules.to_string();
     }
 
-    state.context_store.save_context(ctx)?;
+    state.context_store.save_context(ctx.clone())?;
     Ok(Json(serde_json::json!({
         "message": format!("Context '{}' updated", id)
     })))
@@ -210,10 +211,14 @@ pub async fn analyze_project(
         .analyze(&id, &path, responder)
         .await
         .map_err(AppError::Runtime)?;
-    state.context_store.save_context(ctx)?;
-
+    state.context_store.save_context(ctx.clone())?;
+    let sync_report = sync_project_agent_skills(&state, &ctx).await?;
     Ok(Json(serde_json::json!({
         "project_id": id,
-        "message": "Project re-analyzed successfully"
+        "message": "Project re-analyzed successfully",
+        "agent_skill_sync": summarize_sync_report(&sync_report)
     })))
 }
+
+
+
