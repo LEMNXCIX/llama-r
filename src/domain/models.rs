@@ -20,6 +20,9 @@ pub struct ChatResponse {
     pub created_at: String,
     pub message: ChatMessage,
     pub done: bool,
+    /// Optional: the full expanded prompt used for this request (only if requested via headers)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_prompt: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

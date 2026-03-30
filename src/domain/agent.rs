@@ -26,8 +26,14 @@ pub struct AgentConfig {
     /// Dynamic template variables. Use {{var_name}} in system_prompt.
     #[serde(default)]
     pub variables: HashMap<String, String>,
+    #[serde(default = "default_context_budget")]
+    pub max_context_tokens: usize,
     #[serde(default)]
     pub optimize: OptimizeConfig,
+}
+
+fn default_context_budget() -> usize {
+    4096
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

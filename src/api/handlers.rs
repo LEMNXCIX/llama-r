@@ -61,6 +61,7 @@ pub async fn chat(
     let selection = AgentSelection {
         project_id: headers.get("x-project").and_then(|value| value.to_str().ok()),
         agent_id: headers.get("x-agent").and_then(|value| value.to_str().ok()),
+        debug: headers.get("x-debug").and_then(|value| value.to_str().ok()) == Some("true"),
     };
 
     if payload.stream {

@@ -13,17 +13,18 @@ pub fn apply_rule(rule_name: &str, input: &str) -> String {
                 ref language,
                 ref content,
             } => {
-                if rule_name == "compress_rust_code" && language.as_deref() == Some("rust") {
-                    // Simple minification: remove empty lines and comments
+                if rule_name == "compress_code" {
+                    // Minification for common languages: remove empty lines and comments (//, #)
                     let compressed = content
                         .lines()
                         .filter(|l| {
                             let trimmed = l.trim();
-                            !trimmed.is_empty() && !trimmed.starts_with("//")
+                            !trimmed.is_empty() && !trimmed.starts_with("//") && !trimmed.starts_with("#")
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    output.push_str(&format!("```rust\n{}\n```\n", compressed));
+                    let lang = language.as_deref().unwrap_or("");
+                    output.push_str(&format!("```{}\n{}\n```\n", lang, compressed));
                 } else {
                     let lang = language.as_deref().unwrap_or("");
                     output.push_str(&format!("```{}\n{}\n```\n", lang, content));

@@ -244,14 +244,17 @@ impl ContextEnricher {
     }
 
     pub fn build_system_prompt(&self, agent: &Agent) -> String {
-        let mut parts = Vec::new();
+        let budget = agent.config.max_context_tokens;
+        let mut sections = Vec::new();
 
+        // 1. Base System Prompt (Highest priority)
         let mut sys_prompt = agent.config.system_prompt.clone();
         for (key, value) in &agent.config.variables {
             sys_prompt = sys_prompt.replace(&format!("{{{{{}}}}}", key), value);
         }
-        parts.push(sys_prompt);
+        sections.push((sys_prompt, 100)); // (content, priority)
 
+        // 2. Agent Rules
         if !agent.config.rules.is_empty() {
             let rendered_rules = agent
                 .config
@@ -260,22 +263,18 @@ impl ContextEnricher {
                 .map(|rule| format!("- {}", rule))
                 .collect::<Vec<_>>()
                 .join("\n");
-            parts.push(format!("\n## Agent Rules\n{}", rendered_rules));
+            sections.push((format!("\n## Agent Rules\n{}", rendered_rules), 90));
         }
 
+        // 3. Project Context
         if let Some(project_id) = &agent.config.context_project {
             let ctx_md = self.context_store.get_context_md(project_id);
             if !ctx_md.is_empty() {
-                parts.push(format!("\n## Project Context: {}\n{}", project_id, ctx_md));
+                sections.push((format!("\n## Project Context: {}\n{}", project_id, ctx_md), 70));
             }
         }
 
-        for file_path in &agent.config.context_files {
-            if let Ok(content) = std::fs::read_to_string(file_path) {
-                parts.push(format!("\n## Context: {}\n{}", file_path, content));
-            }
-        }
-
+        // 4. Agent Skills
         let selected_skill_ids = merge_skill_ids(&agent.config.skills, &agent.config.auto_skills);
         if !selected_skill_ids.is_empty() {
             let project_path = agent
@@ -298,14 +297,45 @@ impl ContextEnricher {
                 .collect::<Vec<_>>();
 
             if !selected_skills.is_empty() {
-                parts.push(format!(
-                    "\n## Agent Skills\nUsa estas skills especificamente para este agente:\n\n{}",
-                    selected_skills.join("\n\n")
+                sections.push((
+                    format!(
+                        "\n## Agent Skills\nUsa estas skills especificamente para este agente:\n\n{}",
+                        selected_skills.join("\n\n")
+                    ),
+                    60,
                 ));
             }
         }
 
-        parts.join("\n")
+        // 5. Context Files (Lowest priority)
+        for file_path in &agent.config.context_files {
+            if let Ok(content) = std::fs::read_to_string(file_path) {
+                sections.push((format!("\n## Context: {}\n{}", file_path, content), 50));
+            }
+        }
+
+        // Build and prune
+        let mut final_prompt = String::new();
+        let mut current_tokens = 0;
+
+        // Sort sections by priority (highest first)
+        sections.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (content, _priority) in sections {
+            let content_tokens = content.len() / 4; // Rough heuristic
+            if current_tokens + content_tokens <= budget || current_tokens == 0 {
+                final_prompt.push_str(&content);
+                current_tokens += content_tokens;
+            } else {
+                tracing::warn!(
+                    agent_id = %agent.id,
+                    budget = budget,
+                    "Pruning prompt section due to token budget"
+                );
+            }
+        }
+
+        final_prompt
     }
 }
 

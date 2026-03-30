@@ -12,6 +12,7 @@ pub type AppChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, AppEr
 pub struct AgentSelection<'a> {
     pub project_id: Option<&'a str>,
     pub agent_id: Option<&'a str>,
+    pub debug: bool,
 }
 
 impl<'a> AgentSelection<'a> {
@@ -37,9 +38,18 @@ fn prepare_request(
     }
 
     let selected_agent = if selection.project_id.is_some() || selection.agent_id.is_some() {
-        state
+        let agent = state
             .agent_manager
-            .resolve_agent(selection.project_id, selection.agent_id)
+            .resolve_agent(selection.project_id, selection.agent_id);
+
+        if agent.is_none() && selection.project_id.is_some() {
+            let target = selection.agent_id.unwrap_or(selection.project_id.unwrap());
+            return Err(AppError::Validation(format!(
+                "Agent '{}' not found for project '{}'. Ensure the agent exists in 'contextos/projects/{}/agents/'.",
+                target, selection.project_id.unwrap(), selection.project_id.unwrap()
+            )));
+        }
+        agent
     } else {
         state.agent_manager.get_agent(&payload.model)
     };
@@ -173,8 +183,24 @@ pub async fn execute_chat(
 ) -> Result<ChatResponse, AppError> {
     let requested_model = selection.requested_target(&payload.model);
     let prepared = prepare_request(state, payload, selection)?;
+    
+    let debug_prompt = if selection.debug {
+        Some(
+            prepared
+                .messages
+                .iter()
+                .map(|m| format!("[{}] {}", m.role, m.content))
+                .collect::<Vec<_>>()
+                .join("\n---\n"),
+        )
+    } else {
+        None
+    };
+
     let started_at = Instant::now();
-    let response = run_with_fallback(state, prepared, &requested_model).await?;
+    let mut response = run_with_fallback(state, prepared, &requested_model).await?;
+    response.debug_prompt = debug_prompt;
+
     state
         .observability
         .record_chat_request(started_at.elapsed().as_millis() as u64);
@@ -406,6 +432,25 @@ mod tests {
             AgentSelection { project_id: Some("demo"), agent_id: Some("reviewer") },
         ).await.unwrap();
         assert_eq!(response.model, "agent-model");
+    }
+
+    #[tokio::test]
+    async fn project_with_non_existent_agent_should_fail() {
+        let _guard = lock_env();
+        let (_dir, state) = test_state(Arc::new(FakeProvider { fail_primary_once: AtomicBool::new(false), fail_always: false }));
+        
+        // We don't even need to create the project dir, resolve_agent will return None
+        let err = execute_chat(
+            &state,
+            ChatRequest {
+                model: "fallback-model".to_string(),
+                messages: vec![ChatMessage { role: "user".to_string(), content: "hello".to_string() }],
+                stream: false,
+            },
+            AgentSelection { project_id: Some("non-existent-project"), agent_id: Some("ghost-agent") },
+        ).await.unwrap_err();
+
+        assert!(err.to_string().contains("Agent 'ghost-agent' not found for project 'non-existent-project'"));
     }
 
     #[tokio::test]

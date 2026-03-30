@@ -140,7 +140,11 @@ POST /api/chat
 POST /v1/chat/completions
 ```
 
-`X-Project` selects the project scope and `X-Agent` selects a specific agent inside that project. If `X-Project` is sent without `X-Agent`, Llama-R loads the project general agent whose id matches the project id.
+`X-Project` selects the project scope and `X-Agent` selects a specific agent inside that project. 
+
+**Strict Validation:** If `X-Project` is provided, Llama-R **requires** a valid agent to be found within that project context. If the requested agent (or the project's default agent) is missing, the request will fail with a `400 Bad Request` error. This ensures that project-scoped requests never accidentally bypass the intended context and rules.
+
+If `X-Project` is sent without `X-Agent`, Llama-R loads the project general agent whose id matches the project id (e.g., `contextos/projects/my-project/agents/my-project.toml`).
 
 ### Agent API
 ```text

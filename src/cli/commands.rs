@@ -135,6 +135,14 @@ async fn init_named_agent(name: &str) {
         }
     };
 
+    // Check if project context exists
+    let context_dir = crate::core::paths::get_project_context_dir(&project_id);
+    if !context_dir.exists() {
+        println!("Warning: Project '{}' has not been analyzed yet.", project_id);
+        println!("Hint: Run `cargo run -- analyze .` to generate context for this project.");
+        println!();
+    }
+
     let prompt = format!(
         "You are a specialized agent named '{}' for the project '{}'.",
         name, project_id
@@ -208,13 +216,16 @@ enabled = true
 
     match fs::write(&path, config) {
         Ok(_) => {
-            println!("Created editable agent config at '{}'", path.display());
-            if default_model.is_empty() {
-                println!("No DEFAULT_MODEL configured yet. Run `cargo run` first to set one.");
-            } else {
-                println!("Model: {}", default_model);
+            println!("✅ Created agent config at '{}'", path.display());
+            if let Some(project_id) = context_project {
+                println!("\nTo use this agent, send these headers in your HTTP request:");
+                println!("  X-Project: {}", project_id);
+                println!("  X-Agent:   {}", name);
             }
-            println!("Edit the TOML file whenever you want to customize it.");
+            if default_model.is_empty() {
+                println!("\nNote: No DEFAULT_MODEL configured yet. Run `cargo run` first to set one.");
+            }
+            println!("\nEdit the TOML file to customize your agent's behavior.");
         }
         Err(err) => println!("Error writing agent config: {}", err),
     }
