@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::RwLock;
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProjectContext {
     pub project_id: String,
     pub path: String,
@@ -63,10 +64,15 @@ impl ContextStore {
                 Some(ctx) => {
                     contexts.insert(ctx.project_id.clone(), ctx);
                 }
-                None => tracing::warn!(path = %ctx_file.display(), "Skipping unreadable project context"),
+                None => {
+                    tracing::warn!(path = %ctx_file.display(), "Skipping unreadable project context")
+                }
             }
         }
-        tracing::info!(context_count = contexts.len(), "ContextStore loaded project contexts");
+        tracing::info!(
+            context_count = contexts.len(),
+            "ContextStore loaded project contexts"
+        );
     }
 
     pub fn get_context(&self, project_id: &str) -> Option<ProjectContext> {
@@ -95,10 +101,9 @@ impl ContextStore {
         fs::write(&json_path, json)?;
 
         let project_id = ctx.project_id.clone();
-        let mut contexts = self
-            .contexts
-            .write()
-            .map_err(|_| AppError::Runtime("ContextStore lock poisoned while saving context".to_string()))?;
+        let mut contexts = self.contexts.write().map_err(|_| {
+            AppError::Runtime("ContextStore lock poisoned while saving context".to_string())
+        })?;
         contexts.insert(project_id, ctx);
         Ok(())
     }

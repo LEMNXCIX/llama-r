@@ -3,14 +3,16 @@ use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
 };
-use llama_r::api::grpc::{pb, GrpcService};
+use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::api::grpc::pb::llama_gateway_server::LlamaGateway;
+use llama_r::api::grpc::{pb, GrpcService};
 use llama_r::context::store::ContextStore;
 use llama_r::domain::agent::AgentConfig;
 use llama_r::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
+use llama_r::ports::mcp::McpServerRegistry;
 use llama_r::providers::LLMProvider;
 use llama_r::runtime::{build_app_state, build_router};
-use llama_r::services::agent_manager::AgentManager;
+use llama_r::services::agent_registry::AgentRegistry;
 use llama_r::services::skill_manager::SkillManager;
 use std::collections::VecDeque;
 use std::error::Error;
@@ -67,19 +69,38 @@ impl LLMProvider for FakeProvider {
         Ok(self.models.clone())
     }
 
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, Box<dyn Error + Send + Sync>> {
+    async fn chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<ChatResponse, Box<dyn Error + Send + Sync>> {
         if request.model == "agent-model" && self.fail_primary_once.swap(false, Ordering::SeqCst) {
             return Err("synthetic provider failure".into());
         }
 
-        let content = if request.messages[0].content.contains("Analyze this software project") {
+        let content = if request.messages[0]
+            .content
+            .contains("Analyze this software project")
+        {
             "## Project Overview\nTest project\n\n## Architecture\nRouter + provider\n\n## Tech Stack\nRust\n\n## Development Rules\nPrefer safe errors\n\n## Key Conventions\nUse tests".to_string()
-        } else if request.messages[0].content.contains("Select ONLY the skills") {
+        } else if request.messages[0]
+            .content
+            .contains("Select ONLY the skills")
+        {
             "[]".to_string()
         } else {
             format!(
                 "model={} role={} content={}",
-                request.model, request.messages.last().map(|m| m.role.clone()).unwrap_or_default(), request.messages.last().map(|m| m.content.clone()).unwrap_or_default()
+                request.model,
+                request
+                    .messages
+                    .last()
+                    .map(|m| m.role.clone())
+                    .unwrap_or_default(),
+                request
+                    .messages
+                    .last()
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default()
             )
         };
 
@@ -91,6 +112,7 @@ impl LLMProvider for FakeProvider {
                 content,
             },
             done: true,
+            debug_prompt: None,
         })
     }
 
@@ -109,7 +131,11 @@ impl LLMProvider for FakeProvider {
             created_at: "2026-03-09T00:00:00Z".to_string(),
             message: ChatMessage {
                 role: "assistant".to_string(),
-                content: request.messages.last().map(|m| m.content.clone()).unwrap_or_default(),
+                content: request
+                    .messages
+                    .last()
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default(),
             },
             done: true,
         };
@@ -122,11 +148,13 @@ struct TestApp {
     temp_dir: TempDir,
     router: axum::Router,
     grpc_service: GrpcService,
-    agent_manager: Arc<AgentManager>,
+    agent_registry: Arc<AgentRegistry>,
 }
 
 fn setup_app() -> TestApp {
-    let guard = test_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp_dir = tempfile::tempdir().unwrap();
     std::env::set_var("LLAMA_R_DIR", temp_dir.path());
     std::env::set_var("DEFAULT_MODEL", "fallback-model");
@@ -134,19 +162,22 @@ fn setup_app() -> TestApp {
     std::fs::create_dir_all(temp_dir.path().join("agents")).unwrap();
     std::fs::create_dir_all(temp_dir.path().join("contextos/projects")).unwrap();
 
-    let agent_manager = Arc::new(AgentManager::new());
-    agent_manager.load_agents().unwrap();
+    let agent_registry = Arc::new(AgentRegistry::new());
+    agent_registry.reload_all(&[]).unwrap();
     let skill_manager = Arc::new(SkillManager::new());
     let context_store = Arc::new(ContextStore::new());
     let provider = Arc::new(FakeProvider::new());
     let logs = Arc::new(Mutex::new(VecDeque::new()));
+    let mcp_registry: Arc<dyn McpServerRegistry> = Arc::new(StaticMcpRegistry::new());
     let state = build_app_state(
         provider,
-        agent_manager.clone(),
+        agent_registry.clone(),
         skill_manager,
         context_store,
         "fallback-model".to_string(),
         logs,
+        Vec::new(),
+        mcp_registry,
     );
     let router = build_router(state.clone());
     let grpc_service = GrpcService::new(state);
@@ -156,7 +187,7 @@ fn setup_app() -> TestApp {
         temp_dir,
         router,
         grpc_service,
-        agent_manager,
+        agent_registry,
     }
 }
 
@@ -171,7 +202,12 @@ async fn health_should_report_runtime_status() {
     let response = app
         .router
         .clone()
-        .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -208,7 +244,12 @@ async fn agent_crud_should_round_trip_over_http() {
     let get_response = app
         .router
         .clone()
-        .oneshot(Request::builder().uri("/api/agents/writer").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/agents/writer")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(get_response.status(), StatusCode::OK);
@@ -253,7 +294,11 @@ async fn context_create_should_conflict_when_project_exists() {
     let app = setup_app();
     let project_dir = app.temp_dir.path().join("demo-project");
     std::fs::create_dir_all(project_dir.join("src")).unwrap();
-    std::fs::write(project_dir.join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'").unwrap();
+    std::fs::write(
+        project_dir.join("Cargo.toml"),
+        "[package]\nname='demo'\nversion='0.1.0'",
+    )
+    .unwrap();
     std::fs::write(project_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
 
     let body = serde_json::json!({
@@ -300,15 +345,11 @@ async fn transport_layers_should_resolve_same_agent_and_fallback() {
         name: "Rusty".to_string(),
         model: "agent-model".to_string(),
         system_prompt: "You are helpful".to_string(),
-        context_project: None,
-        context_files: vec![],
-        rules: vec![],
-        skills: vec![],
-        variables: Default::default(),
         optimize: Default::default(),
+        ..Default::default()
     };
     std::fs::write(&openai_agent_path, toml::to_string(&config).unwrap()).unwrap();
-    openai_app.agent_manager.load_agents().unwrap();
+    openai_app.agent_registry.reload_all(&[]).unwrap();
 
     let body = serde_json::json!({
         "model": "ignored",
@@ -338,7 +379,7 @@ async fn transport_layers_should_resolve_same_agent_and_fallback() {
     let grpc_app = setup_app();
     let grpc_agent_path = grpc_app.temp_dir.path().join("agents/rusty.toml");
     std::fs::write(&grpc_agent_path, toml::to_string(&config).unwrap()).unwrap();
-    grpc_app.agent_manager.load_agents().unwrap();
+    grpc_app.agent_registry.reload_all(&[]).unwrap();
 
     let grpc_response = grpc_app
         .grpc_service
@@ -368,7 +409,9 @@ async fn validation_errors_should_surface_for_http_and_grpc() {
                 .method("POST")
                 .uri("/api/chat")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"model":"fallback-model","messages":[],"stream":false}"#))
+                .body(Body::from(
+                    r#"{"model":"fallback-model","messages":[],"stream":false}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -490,7 +533,12 @@ async fn health_should_report_non_empty_metrics_after_traffic() {
 
     let health = app
         .router
-        .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(health.status(), StatusCode::OK);
@@ -504,7 +552,11 @@ async fn context_reanalyze_endpoint_should_refresh_existing_context() {
     let app = setup_app();
     let project_dir = app.temp_dir.path().join("refresh-project");
     std::fs::create_dir_all(project_dir.join("src")).unwrap();
-    std::fs::write(project_dir.join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'").unwrap();
+    std::fs::write(
+        project_dir.join("Cargo.toml"),
+        "[package]\nname='demo'\nversion='0.1.0'",
+    )
+    .unwrap();
     std::fs::write(project_dir.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
 
     let body = serde_json::json!({
@@ -541,6 +593,3 @@ async fn context_reanalyze_endpoint_should_refresh_existing_context() {
 
     assert_eq!(response.status(), StatusCode::OK);
 }
-
-
-

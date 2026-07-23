@@ -4,8 +4,9 @@ use axum::{extract::State, Json};
 use serde::Serialize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
     pub status: &'static str,
     pub provider_healthy: bool,
@@ -18,13 +19,21 @@ pub struct HealthResponse {
     pub observability: ObservabilitySnapshot,
 }
 
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Health check with provider, agents, contexts, and observability status", body = HealthResponse),
+    )
+)]
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     state.observability.record_http_request();
     let provider_healthy = state.provider.health_check().await.is_ok();
     Json(HealthResponse {
         status: if provider_healthy { "ok" } else { "degraded" },
         provider_healthy,
-        agent_count: state.agent_manager.list_agents().len(),
+        agent_count: state.agent_registry.list_agents().len(),
         context_count: state.context_store.list_contexts().len(),
         api_running: state.api_running.load(Ordering::SeqCst),
         grpc_running: state.grpc_running.load(Ordering::SeqCst),

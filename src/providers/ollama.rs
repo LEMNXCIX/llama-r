@@ -116,6 +116,7 @@ impl LLMProvider for OllamaProvider {
             created_at: body.created_at,
             message: body.message,
             done: body.done,
+            debug_prompt: None,
         })
     }
 

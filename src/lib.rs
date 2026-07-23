@@ -1,3 +1,4 @@
+pub mod adapters;
 pub mod api;
 pub mod cli;
 pub mod config;
@@ -7,6 +8,7 @@ pub mod domain;
 pub mod error;
 pub mod mcp;
 pub mod optimizer;
+pub mod ports;
 pub mod providers;
 pub mod runtime;
 pub mod services;

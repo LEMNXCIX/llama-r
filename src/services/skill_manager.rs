@@ -14,7 +14,14 @@ impl SkillManager {
         let mut base_paths = Vec::new();
 
         if let Some(home) = dirs::home_dir() {
-            for dir in [".cursor", ".claude", ".agent", ".windsurf", ".agents", ".llama-r"] {
+            for dir in [
+                ".cursor",
+                ".claude",
+                ".agent",
+                ".windsurf",
+                ".agents",
+                ".llama-r",
+            ] {
                 base_paths.push(home.join(dir).join("skills"));
             }
         }
@@ -40,7 +47,10 @@ impl SkillManager {
         match self.skills.write() {
             Ok(mut skills_lock) => {
                 *skills_lock = new_skills;
-                tracing::info!(skill_count = skills_lock.len(), "SkillManager loaded skills");
+                tracing::info!(
+                    skill_count = skills_lock.len(),
+                    "SkillManager loaded skills"
+                );
             }
             Err(_) => tracing::error!("SkillManager lock poisoned while loading skills"),
         }
@@ -97,7 +107,11 @@ impl SkillManager {
 
         for line in yaml_content.lines().map(str::trim) {
             if line.starts_with("name:") {
-                name = line.replace("name:", "").trim().trim_matches('"').to_string();
+                name = line
+                    .replace("name:", "")
+                    .trim()
+                    .trim_matches('"')
+                    .to_string();
             } else if line.starts_with("description:") {
                 description = line
                     .replace("description:", "")
@@ -109,7 +123,13 @@ impl SkillManager {
                 if trimmed.starts_with('[') && trimmed.ends_with(']') {
                     tags = trimmed[1..trimmed.len() - 1]
                         .split(',')
-                        .map(|value| value.trim().trim_matches('"').trim_matches('\'').to_string())
+                        .map(|value| {
+                            value
+                                .trim()
+                                .trim_matches('"')
+                                .trim_matches('\'')
+                                .to_string()
+                        })
                         .collect();
                 }
             }
@@ -140,7 +160,10 @@ impl SkillManager {
             .map(|skills_lock| skills_lock.clone())
             .unwrap_or_default();
 
-        for local_path in [project_path.join("skills"), project_path.join(".agents/skills")] {
+        for local_path in [
+            project_path.join("skills"),
+            project_path.join(".agents/skills"),
+        ] {
             self.load_dir_into(&local_path, &mut combined);
         }
 
@@ -155,7 +178,10 @@ impl SkillManager {
     }
 
     pub fn get_skill_for_project(&self, id: &str, project_path: &Path) -> Option<Skill> {
-        for local_path in [project_path.join("skills"), project_path.join(".agents/skills")] {
+        for local_path in [
+            project_path.join("skills"),
+            project_path.join(".agents/skills"),
+        ] {
             let skill_path = local_path.join(id);
             if skill_path.is_dir() {
                 if let Some(skill) = self.load_skill(&skill_path) {

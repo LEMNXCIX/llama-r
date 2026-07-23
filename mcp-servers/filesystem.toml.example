@@ -1,0 +1,6 @@
+id = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/data/readonly"]
+tool_namespace = "fs"
+enabled = true

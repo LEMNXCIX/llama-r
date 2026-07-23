@@ -61,15 +61,28 @@ pub async fn sync_project_agent_skills(
         let agent_id = path
             .file_stem()
             .and_then(|stem| stem.to_str())
-            .ok_or_else(|| AppError::Runtime(format!("Invalid agent file name: {}", path.display())))?
+            .ok_or_else(|| {
+                AppError::Runtime(format!("Invalid agent file name: {}", path.display()))
+            })?
             .to_string();
 
-        let candidates = candidate_skills_for_agent(&compatible, &agent_id, &config.name, &config.system_prompt);
-        let selected = select_skills_for_agent(state, context, &profile, &agent_id, &config.name, &config.system_prompt, &candidates).await;
+        let candidates =
+            candidate_skills_for_agent(&compatible, &agent_id, &config.name, &config.system_prompt);
+        let selected = select_skills_for_agent(
+            state,
+            context,
+            &profile,
+            &agent_id,
+            &config.name,
+            &config.system_prompt,
+            &candidates,
+        )
+        .await;
 
         if config.auto_skills != selected {
             config.auto_skills = selected.clone();
-            let serialized = toml::to_string(&config).map_err(|err| AppError::Runtime(err.to_string()))?;
+            let serialized =
+                toml::to_string(&config).map_err(|err| AppError::Runtime(err.to_string()))?;
             fs::write(&path, serialized)?;
         }
 
@@ -80,7 +93,7 @@ pub async fn sync_project_agent_skills(
     }
 
     if !updates.is_empty() {
-        state.agent_manager.load_agents()?;
+        state.agent_registry.reload_all(&state.mcp_server_ids())?;
     }
 
     Ok(AgentSkillSyncReport {
@@ -137,7 +150,10 @@ fn build_project_profile(project_path: &Path, project_type: &str) -> ProjectProf
         || project_path.join("app").exists()
         || project_path.join("pages").exists()
         || project_path.join("index.html").exists()
-        || file_contains_any(&package_json, &["react", "next", "vue", "svelte", "vite", "tailwind"]);
+        || file_contains_any(
+            &package_json,
+            &["react", "next", "vue", "svelte", "vite", "tailwind"],
+        );
 
     let is_library = project_path.join("src/lib.rs").exists()
         || project_path.join("lib").exists()
@@ -177,9 +193,15 @@ fn is_skill_compatible(profile: &ProjectProfile, skill: &Skill) -> bool {
     );
 
     let language_match = match profile.language.as_str() {
-        "rust" => !contains_any(&text, &["python", "django", "flask", "pandas", "swiftui", "flutter"]),
+        "rust" => !contains_any(
+            &text,
+            &["python", "django", "flask", "pandas", "swiftui", "flutter"],
+        ),
         "python" => !contains_any(&text, &["rust", "tokio", "cargo", "swiftui", "flutter"]),
-        "javascript" => !contains_any(&text, &["rust async", "tokio", "cargo", "swiftui", "flutter"]),
+        "javascript" => !contains_any(
+            &text,
+            &["rust async", "tokio", "cargo", "swiftui", "flutter"],
+        ),
         "go" => !contains_any(&text, &["tokio", "cargo", "swiftui", "flutter", "django"]),
         "java" => !contains_any(&text, &["tokio", "cargo", "swiftui", "flutter", "django"]),
         _ => true,
@@ -193,7 +215,9 @@ fn is_skill_compatible(profile: &ProjectProfile, skill: &Skill) -> bool {
         return false;
     }
 
-    if contains_any(&text, &["frontend", "ui", "ux", "design", "web interface"]) && !profile.has_frontend_ui {
+    if contains_any(&text, &["frontend", "ui", "ux", "design", "web interface"])
+        && !profile.has_frontend_ui
+    {
         return false;
     }
 
@@ -204,7 +228,12 @@ fn is_skill_compatible(profile: &ProjectProfile, skill: &Skill) -> bool {
     true
 }
 
-fn candidate_skills_for_agent(skills: &[Skill], agent_id: &str, agent_name: &str, system_prompt: &str) -> Vec<Skill> {
+fn candidate_skills_for_agent(
+    skills: &[Skill],
+    agent_id: &str,
+    agent_name: &str,
+    system_prompt: &str,
+) -> Vec<Skill> {
     let purpose = format!(
         "{} {} {}",
         agent_id.to_lowercase(),
@@ -223,19 +252,29 @@ fn candidate_skills_for_agent(skills: &[Skill], agent_id: &str, agent_name: &str
             );
             let mut score = 0i32;
 
-            if contains_any(&purpose, &["api", "backend", "route", "endpoint", "server"]) && contains_any(&text, &["api", "rest", "graphql"]) {
+            if contains_any(&purpose, &["api", "backend", "route", "endpoint", "server"])
+                && contains_any(&text, &["api", "rest", "graphql"])
+            {
                 score += 4;
             }
-            if contains_any(&purpose, &["frontend", "ui", "ux", "design", "component"]) && contains_any(&text, &["frontend", "ui", "ux", "design"]) {
+            if contains_any(&purpose, &["frontend", "ui", "ux", "design", "component"])
+                && contains_any(&text, &["frontend", "ui", "ux", "design"])
+            {
                 score += 4;
             }
-            if contains_any(&purpose, &["rust", "tokio", "async"]) && contains_any(&text, &["rust", "tokio", "async"]) {
+            if contains_any(&purpose, &["rust", "tokio", "async"])
+                && contains_any(&text, &["rust", "tokio", "async"])
+            {
                 score += 4;
             }
-            if contains_any(&purpose, &["review", "audit", "check"]) && contains_any(&text, &["guidelines", "best practices", "review"]) {
+            if contains_any(&purpose, &["review", "audit", "check"])
+                && contains_any(&text, &["guidelines", "best practices", "review"])
+            {
                 score += 3;
             }
-            if contains_any(&purpose, &["error", "failure", "resilience"]) && contains_any(&text, &["error", "resilien"]) {
+            if contains_any(&purpose, &["error", "failure", "resilience"])
+                && contains_any(&text, &["error", "resilien"])
+            {
                 score += 3;
             }
             if contains_any(&text, &["best practices", "architecture", "testing"]) {
@@ -268,7 +307,11 @@ async fn select_skills_for_agent(
         return Vec::new();
     }
 
-    let fallback = candidates.iter().map(|skill| skill.id.clone()).take(5).collect::<Vec<_>>();
+    let fallback = candidates
+        .iter()
+        .map(|skill| skill.id.clone())
+        .take(5)
+        .collect::<Vec<_>>();
     let manifest = candidates
         .iter()
         .map(|skill| format!("- \"{}\": {}", skill.id, skill.metadata.description))
@@ -306,7 +349,10 @@ async fn select_skills_for_agent(
         .ok()
         .and_then(|response| extract_json_array(&response.message.content))
         .map(|ids| {
-            let allowed = candidates.iter().map(|skill| skill.id.as_str()).collect::<HashSet<_>>();
+            let allowed = candidates
+                .iter()
+                .map(|skill| skill.id.as_str())
+                .collect::<HashSet<_>>();
             ids.into_iter()
                 .filter(|id| allowed.contains(id.as_str()))
                 .take(5)
@@ -362,12 +408,19 @@ mod tests {
     #[test]
     fn compatible_skills_should_exclude_mismatched_language() {
         let temp_dir = TempDir::new().unwrap();
-        std::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'\n").unwrap();
+        std::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
         let profile = build_project_profile(temp_dir.path(), "rust");
-        let filtered = compatible_skills(&profile, &[
-            skill("rust-best-practices", "Rust best practices"),
-            skill("python-data", "Python data workflows"),
-        ]);
+        let filtered = compatible_skills(
+            &profile,
+            &[
+                skill("rust-best-practices", "Rust best practices"),
+                skill("python-data", "Python data workflows"),
+            ],
+        );
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, "rust-best-practices");
     }
@@ -376,12 +429,19 @@ mod tests {
     fn compatible_skills_should_exclude_api_skills_for_frontend_only_projects() {
         let temp_dir = TempDir::new().unwrap();
         std::fs::create_dir_all(temp_dir.path().join("src/components")).unwrap();
-        std::fs::write(temp_dir.path().join("package.json"), r#"{"dependencies":{"react":"18.0.0"}}"#).unwrap();
+        std::fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{"dependencies":{"react":"18.0.0"}}"#,
+        )
+        .unwrap();
         let profile = build_project_profile(temp_dir.path(), "node");
-        let filtered = compatible_skills(&profile, &[
-            skill("frontend-design", "Frontend UI work"),
-            skill("api-design-principles", "API design guidance"),
-        ]);
+        let filtered = compatible_skills(
+            &profile,
+            &[
+                skill("frontend-design", "Frontend UI work"),
+                skill("api-design-principles", "API design guidance"),
+            ],
+        );
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, "frontend-design");
     }
@@ -390,12 +450,19 @@ mod tests {
     fn compatible_skills_should_allow_api_skills_for_backend_projects() {
         let temp_dir = TempDir::new().unwrap();
         std::fs::create_dir_all(temp_dir.path().join("src/api")).unwrap();
-        std::fs::write(temp_dir.path().join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'\n").unwrap();
+        std::fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
         let profile = build_project_profile(temp_dir.path(), "rust");
-        let filtered = compatible_skills(&profile, &[
-            skill("rust-best-practices", "Rust best practices"),
-            skill("api-design-principles", "API design guidance"),
-        ]);
+        let filtered = compatible_skills(
+            &profile,
+            &[
+                skill("rust-best-practices", "Rust best practices"),
+                skill("api-design-principles", "API design guidance"),
+            ],
+        );
         assert_eq!(filtered.len(), 2);
     }
 }

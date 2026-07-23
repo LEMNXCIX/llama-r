@@ -7,7 +7,10 @@ use crate::services::validation::{canonicalize_project_path, validate_identifier
 use axum::{http::StatusCode, response::IntoResponse, Json};
 use std::sync::Arc;
 
-pub async fn handle_message(state: Arc<AppState>, payload: JsonRpcRequest) -> axum::response::Response {
+pub async fn handle_message(
+    state: Arc<AppState>,
+    payload: JsonRpcRequest,
+) -> axum::response::Response {
     tracing::debug!(method = %payload.method, id = ?payload.id, "MCP request received");
 
     let response = match payload.method.as_str() {
@@ -53,7 +56,7 @@ fn handle_tools_list(
     payload: &JsonRpcRequest,
 ) -> Result<axum::response::Response, AppError> {
     let mut tools: Vec<serde_json::Value> = state
-        .agent_manager
+        .agent_registry
         .list_agents()
         .into_iter()
         .filter(|agent| !agent.id.ends_with("_mcp"))
@@ -298,7 +301,9 @@ async fn handle_tool_call(
             let skill_name = args["skill_name"].as_str().unwrap_or("");
             match state.skill_manager.get_skill(skill_name) {
                 Some(skill) => tool_text_result(payload, skill.content),
-                None => tool_error_result(payload, format!("Skill '{}' no encontrada.", skill_name)),
+                None => {
+                    tool_error_result(payload, format!("Skill '{}' no encontrada.", skill_name))
+                }
             }
         }
         "agent_query" => agent_query_tool(state, payload, args).await,
@@ -316,7 +321,10 @@ async fn handle_tool_call(
         other => {
             let query = args["query"].as_str().unwrap_or("");
             if query.is_empty() {
-                tool_error_result(payload, "Missing required argument: 'query' is required.".to_string())
+                tool_error_result(
+                    payload,
+                    "Missing required argument: 'query' is required.".to_string(),
+                )
             } else {
                 let response = execute_chat(
                     state,
@@ -348,7 +356,8 @@ async fn create_agent_tool(
     if agent_id.is_empty() || name.is_empty() || system_prompt.is_empty() {
         return tool_error_result(
             payload,
-            "Missing required arguments: 'id', 'name', and 'system_prompt' are required.".to_string(),
+            "Missing required arguments: 'id', 'name', and 'system_prompt' are required."
+                .to_string(),
         );
     }
     validate_identifier(agent_id, "agent_id")?;
@@ -357,11 +366,21 @@ async fn create_agent_tool(
     let project_id = args["project_id"].as_str().unwrap_or("");
     let rules = args["rules"]
         .as_array()
-        .map(|items| items.iter().filter_map(|item| item.as_str()).collect::<Vec<_>>())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let skills = args["skills"]
         .as_array()
-        .map(|items| items.iter().filter_map(|item| item.as_str()).collect::<Vec<_>>())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let toml_content = if let Some(raw) = args["toml"].as_str() {
         raw.to_string()
@@ -395,12 +414,7 @@ async fn create_agent_tool(
         };
         format!(
             "name = \"{}\"\nmodel = \"{}\"\nsystem_prompt = \"\"\"\n{}\n\"\"\"{}{}{}",
-            name,
-            model,
-            system_prompt,
-            context_project_line,
-            rules_line,
-            skills_line
+            name, model, system_prompt, context_project_line, rules_line, skills_line
         )
     };
 
@@ -412,10 +426,17 @@ async fn create_agent_tool(
         dir.join(format!("{}.toml", agent_id))
     };
     std::fs::write(&path, toml_content)?;
-    if let Err(error) = state.agent_manager.load_agents() {
+    if let Err(error) = state.agent_registry.reload_all(&state.mcp_server_ids()) {
         tracing::warn!(error = %error, "Failed to reload agents after MCP create_agent");
     }
-    tool_text_result(payload, format!("Agent '{}' created and loaded at {}.", agent_id, path.display()))
+    tool_text_result(
+        payload,
+        format!(
+            "Agent '{}' created and loaded at {}.",
+            agent_id,
+            path.display()
+        ),
+    )
 }
 
 async fn create_context_tool(
@@ -435,7 +456,10 @@ async fn create_context_tool(
     if state.context_store.get_context(project_id).is_some() {
         return tool_error_result(
             payload,
-            format!("Context for '{}' already exists. Use re-analyze to refresh it.", project_id),
+            format!(
+                "Context for '{}' already exists. Use re-analyze to refresh it.",
+                project_id
+            ),
         );
     }
     let canonical_path = canonicalize_project_path(project_path)?;
@@ -464,7 +488,10 @@ async fn create_context_tool(
         .await
         .map_err(AppError::Runtime)?;
     state.context_store.save_context(context)?;
-    tool_text_result(payload, format!("Context for '{}' generated and saved.", project_id))
+    tool_text_result(
+        payload,
+        format!("Context for '{}' generated and saved.", project_id),
+    )
 }
 
 async fn agent_query_tool(
@@ -474,7 +501,10 @@ async fn agent_query_tool(
 ) -> Result<axum::response::Response, AppError> {
     let query = args["query"].as_str().unwrap_or("");
     if query.is_empty() {
-        return tool_error_result(payload, "Missing required argument: 'query' is required.".to_string());
+        return tool_error_result(
+            payload,
+            "Missing required argument: 'query' is required.".to_string(),
+        );
     }
     let mut agent_id = args["agent_id"].as_str().unwrap_or("").to_string();
     let path = args["path"].as_str().unwrap_or("");
@@ -496,7 +526,11 @@ async fn agent_query_tool(
             }],
             stream: false,
         },
-        AgentSelection { project_id: None, agent_id: Some(&agent_id) },
+        AgentSelection {
+            project_id: None,
+            agent_id: Some(&agent_id),
+            debug: false,
+        },
     )
     .await?;
     tool_text_result(payload, response.message.content)
@@ -609,5 +643,3 @@ fn to_mcp_error_response(payload: &JsonRpcRequest, error: AppError) -> axum::res
         error.into_response()
     }
 }
-
-

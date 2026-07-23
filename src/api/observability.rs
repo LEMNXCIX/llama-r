@@ -1,4 +1,5 @@
 use serde::Serialize;
+use utoipa::ToSchema;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Default)]
@@ -26,8 +27,7 @@ impl AppObservability {
         self.chat_requests.fetch_add(1, Ordering::Relaxed);
         self.chat_latency_ms_total
             .fetch_add(latency_ms, Ordering::Relaxed);
-        self.completed_chat_requests
-            .fetch_add(1, Ordering::Relaxed);
+        self.completed_chat_requests.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_fallback(&self) {
@@ -66,7 +66,7 @@ impl AppObservability {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ObservabilitySnapshot {
     pub http_requests: u64,
     pub chat_requests: u64,

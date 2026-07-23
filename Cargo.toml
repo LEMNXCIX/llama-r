@@ -32,6 +32,7 @@ clap = { version = "4.5.60", features = ["derive"] }
 dialoguer = "0.12.0"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2.0.12"
+utoipa = { version = "5", features = ["chrono"] }
 
 [dev-dependencies]
 tempfile = "3.15.0"

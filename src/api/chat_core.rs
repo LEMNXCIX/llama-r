@@ -39,7 +39,7 @@ fn prepare_request(
 
     let selected_agent = if selection.project_id.is_some() || selection.agent_id.is_some() {
         let agent = state
-            .agent_manager
+            .agent_registry
             .resolve_agent(selection.project_id, selection.agent_id);
 
         if agent.is_none() && selection.project_id.is_some() {
@@ -51,7 +51,7 @@ fn prepare_request(
         }
         agent
     } else {
-        state.agent_manager.get_agent(&payload.model)
+        state.agent_registry.get_agent(&payload.model)
     };
 
     if let Some(agent) = selected_agent {
@@ -160,8 +160,13 @@ async fn run_stream_with_fallback(
                     .await
                     .map(|stream| {
                         Box::pin(stream.map(
-                            |event: Result<ChatStreamEvent, Box<dyn std::error::Error + Send + Sync>>| {
-                                event.map_err(|stream_error| AppError::Provider(stream_error.to_string()))
+                            |event: Result<
+                                ChatStreamEvent,
+                                Box<dyn std::error::Error + Send + Sync>,
+                            >| {
+                                event.map_err(|stream_error| {
+                                    AppError::Provider(stream_error.to_string())
+                                })
                             },
                         )) as AppChatStream
                     })
@@ -183,7 +188,7 @@ pub async fn execute_chat(
 ) -> Result<ChatResponse, AppError> {
     let requested_model = selection.requested_target(&payload.model);
     let prepared = prepare_request(state, payload, selection)?;
-    
+
     let debug_prompt = if selection.debug {
         Some(
             prepared
@@ -232,22 +237,26 @@ pub async fn execute_chat_stream(
 #[cfg(test)]
 mod tests {
     use super::{execute_chat, execute_chat_stream, AgentSelection};
+    use crate::adapters::mcp::StaticMcpRegistry;
     use crate::api::handlers::AppState;
     use crate::api::observability::AppObservability;
     use crate::context::analyzer::ContextEnricher;
     use crate::context::store::{ContextStore, ProjectContext};
     use crate::domain::agent::{AgentConfig, OptimizeConfig};
-    use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
+    use crate::domain::models::{
+        ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo,
+    };
     use crate::optimizer::metrics::TokenMetrics;
+    use crate::ports::mcp::McpServerRegistry;
     use crate::providers::LLMProvider;
-    use crate::services::agent_manager::AgentManager;
+    use crate::services::agent_registry::AgentRegistry;
     use crate::services::skill_manager::SkillManager;
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::error::Error;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::{Arc, Mutex, MutexGuard, RwLock};
     use tempfile::TempDir;
     use tokio_stream::{Stream, StreamExt};
 
@@ -274,16 +283,29 @@ mod tests {
 
         async fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error + Send + Sync>> {
             Ok(vec![
-                ModelInfo { name: "fallback-model".to_string(), modified_at: "now".to_string(), size: 1 },
-                ModelInfo { name: "agent-model".to_string(), modified_at: "now".to_string(), size: 1 },
+                ModelInfo {
+                    name: "fallback-model".to_string(),
+                    modified_at: "now".to_string(),
+                    size: 1,
+                },
+                ModelInfo {
+                    name: "agent-model".to_string(),
+                    modified_at: "now".to_string(),
+                    size: 1,
+                },
             ])
         }
 
-        async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, Box<dyn Error + Send + Sync>> {
+        async fn chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<ChatResponse, Box<dyn Error + Send + Sync>> {
             if self.fail_always {
                 return Err("always fail".into());
             }
-            if request.model == "agent-model" && self.fail_primary_once.swap(false, Ordering::SeqCst) {
+            if request.model == "agent-model"
+                && self.fail_primary_once.swap(false, Ordering::SeqCst)
+            {
                 return Err("fail once".into());
             }
             Ok(ChatResponse {
@@ -291,17 +313,31 @@ mod tests {
                 created_at: "now".to_string(),
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content: request.messages.last().map(|msg| msg.content.clone()).unwrap_or_default(),
+                    content: request
+                        .messages
+                        .last()
+                        .map(|msg| msg.content.clone())
+                        .unwrap_or_default(),
                 },
                 done: true,
+                debug_prompt: None,
             })
         }
 
         async fn chat_stream(
             &self,
             request: ChatRequest,
-        ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, Box<dyn Error + Send + Sync>>> + Send>>, Box<dyn Error + Send + Sync>> {
-            if request.model == "agent-model" && self.fail_primary_once.swap(false, Ordering::SeqCst) {
+        ) -> Result<
+            Pin<
+                Box<
+                    dyn Stream<Item = Result<ChatStreamEvent, Box<dyn Error + Send + Sync>>> + Send,
+                >,
+            >,
+            Box<dyn Error + Send + Sync>,
+        > {
+            if request.model == "agent-model"
+                && self.fail_primary_once.swap(false, Ordering::SeqCst)
+            {
                 return Err("fail once".into());
             }
             Ok(Box::pin(tokio_stream::iter(vec![Ok(ChatStreamEvent {
@@ -309,7 +345,11 @@ mod tests {
                 created_at: "now".to_string(),
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content: request.messages.last().map(|msg| msg.content.clone()).unwrap_or_default(),
+                    content: request
+                        .messages
+                        .last()
+                        .map(|msg| msg.content.clone())
+                        .unwrap_or_default(),
                 },
                 done: true,
             })])))
@@ -319,7 +359,8 @@ mod tests {
     fn test_state(provider: Arc<dyn LLMProvider + Send + Sync>) -> (TempDir, Arc<AppState>) {
         let temp_dir = tempfile::tempdir().unwrap();
         std::env::set_var("LLAMA_R_DIR", temp_dir.path());
-        let agent_manager = Arc::new(AgentManager::new());
+        let agent_registry = Arc::new(AgentRegistry::new());
+        let _ = agent_registry.reload_all(&[]);
         let skill_manager = Arc::new(SkillManager::new());
         let context_store = Arc::new(ContextStore::new());
         let context_enricher = Arc::new(ContextEnricher::new(
@@ -329,7 +370,7 @@ mod tests {
         ));
         let state = Arc::new(AppState {
             provider,
-            agent_manager,
+            agent_registry,
             skill_manager,
             context_store,
             context_enricher,
@@ -339,6 +380,8 @@ mod tests {
             api_running: AtomicBool::new(false),
             grpc_running: AtomicBool::new(false),
             logs: Arc::new(Mutex::new(VecDeque::new())),
+            known_mcp_servers: RwLock::new(Vec::new()),
+            mcp_registry: Arc::new(StaticMcpRegistry::new()),
         });
         (temp_dir, state)
     }
@@ -346,12 +389,18 @@ mod tests {
     #[tokio::test]
     async fn direct_request_should_succeed_without_agent() {
         let _guard = lock_env();
-        let (_dir, state) = test_state(Arc::new(FakeProvider { fail_primary_once: AtomicBool::new(false), fail_always: false }));
+        let (_dir, state) = test_state(Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: false,
+        }));
         let response = execute_chat(
             &state,
             ChatRequest {
                 model: "fallback-model".to_string(),
-                messages: vec![ChatMessage { role: "user".to_string(), content: "hello".to_string() }],
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
                 stream: false,
             },
             AgentSelection::default(),
@@ -364,119 +413,176 @@ mod tests {
     #[tokio::test]
     async fn project_header_without_agent_should_use_project_general_agent() {
         let _guard = lock_env();
-        let (_dir, state) = test_state(Arc::new(FakeProvider { fail_primary_once: AtomicBool::new(false), fail_always: false }));
-        state.context_store.save_context(ProjectContext {
-            project_id: "demo".to_string(),
-            path: ".".to_string(),
-            context_md: "project context".to_string(),
-            project_type: "rust".to_string(),
-            skills_injected: vec![],
-            last_analyzed: chrono::Utc::now(),
-            custom_rules: String::new(),
-        }).unwrap();
+        let (_dir, state) = test_state(Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: false,
+        }));
+        state
+            .context_store
+            .save_context(ProjectContext {
+                project_id: "demo".to_string(),
+                path: ".".to_string(),
+                context_md: "project context".to_string(),
+                project_type: "rust".to_string(),
+                skills_injected: vec![],
+                last_analyzed: chrono::Utc::now(),
+                custom_rules: String::new(),
+            })
+            .unwrap();
         let config = AgentConfig {
             name: "Demo".to_string(),
             model: "agent-model".to_string(),
             system_prompt: "You are helpful".to_string(),
             context_project: Some("demo".to_string()),
-            context_files: vec![],
-            rules: vec![],
-            skills: vec![],
-            variables: Default::default(),
             optimize: OptimizeConfig::default(),
+            ..Default::default()
         };
         let dir = crate::core::paths::get_project_agents_dir("demo");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("demo.toml"), toml::to_string(&config).unwrap()).unwrap();
-        state.agent_manager.load_agents().unwrap();
+        state.agent_registry.reload_all(&[]).unwrap();
 
         let response = execute_chat(
             &state,
             ChatRequest {
                 model: "fallback-model".to_string(),
-                messages: vec![ChatMessage { role: "user".to_string(), content: "question".to_string() }],
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "question".to_string(),
+                }],
                 stream: false,
             },
-            AgentSelection { project_id: Some("demo"), agent_id: None },
-        ).await.unwrap();
+            AgentSelection {
+                project_id: Some("demo"),
+                agent_id: None,
+                debug: false,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(response.model, "agent-model");
     }
 
     #[tokio::test]
     async fn project_and_agent_headers_should_resolve_specific_project_agent() {
         let _guard = lock_env();
-        let (_dir, state) = test_state(Arc::new(FakeProvider { fail_primary_once: AtomicBool::new(false), fail_always: false }));
+        let (_dir, state) = test_state(Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: false,
+        }));
         let config = AgentConfig {
             name: "Reviewer".to_string(),
             model: "agent-model".to_string(),
             system_prompt: "Review this code".to_string(),
             context_project: Some("demo".to_string()),
-            context_files: vec![],
-            rules: vec![],
-            skills: vec![],
-            variables: Default::default(),
             optimize: OptimizeConfig::default(),
+            ..Default::default()
         };
         let dir = crate::core::paths::get_project_agents_dir("demo");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("reviewer.toml"), toml::to_string(&config).unwrap()).unwrap();
-        state.agent_manager.load_agents().unwrap();
+        state.agent_registry.reload_all(&[]).unwrap();
 
         let response = execute_chat(
             &state,
             ChatRequest {
                 model: "fallback-model".to_string(),
-                messages: vec![ChatMessage { role: "user".to_string(), content: "question".to_string() }],
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "question".to_string(),
+                }],
                 stream: false,
             },
-            AgentSelection { project_id: Some("demo"), agent_id: Some("reviewer") },
-        ).await.unwrap();
+            AgentSelection {
+                project_id: Some("demo"),
+                agent_id: Some("reviewer"),
+                debug: false,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(response.model, "agent-model");
     }
 
     #[tokio::test]
     async fn project_with_non_existent_agent_should_fail() {
         let _guard = lock_env();
-        let (_dir, state) = test_state(Arc::new(FakeProvider { fail_primary_once: AtomicBool::new(false), fail_always: false }));
-        
+        let (_dir, state) = test_state(Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: false,
+        }));
+
         // We don't even need to create the project dir, resolve_agent will return None
         let err = execute_chat(
             &state,
             ChatRequest {
                 model: "fallback-model".to_string(),
-                messages: vec![ChatMessage { role: "user".to_string(), content: "hello".to_string() }],
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
                 stream: false,
             },
-            AgentSelection { project_id: Some("non-existent-project"), agent_id: Some("ghost-agent") },
-        ).await.unwrap_err();
+            AgentSelection {
+                project_id: Some("non-existent-project"),
+                agent_id: Some("ghost-agent"),
+                debug: false,
+            },
+        )
+        .await
+        .unwrap_err();
 
-        assert!(err.to_string().contains("Agent 'ghost-agent' not found for project 'non-existent-project'"));
+        assert!(err
+            .to_string()
+            .contains("Agent 'ghost-agent' not found for project 'non-existent-project'"));
     }
 
     #[tokio::test]
     async fn fallback_failure_should_return_error() {
         let _guard = lock_env();
-        let (_dir, state) = test_state(Arc::new(FakeProvider { fail_primary_once: AtomicBool::new(false), fail_always: true }));
+        let (_dir, state) = test_state(Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: true,
+        }));
         let err = execute_chat(
             &state,
-            ChatRequest { model: "agent-model".to_string(), messages: vec![ChatMessage { role: "user".to_string(), content: "hello".to_string() }], stream: false },
+            ChatRequest {
+                model: "agent-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                stream: false,
+            },
             AgentSelection::default(),
-        ).await.unwrap_err();
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("Provider error"));
     }
 
     #[tokio::test]
     async fn streaming_request_should_apply_same_resolution_path() {
         let _guard = lock_env();
-        let (_dir, state) = test_state(Arc::new(FakeProvider { fail_primary_once: AtomicBool::new(false), fail_always: false }));
+        let (_dir, state) = test_state(Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: false,
+        }));
         let mut stream = execute_chat_stream(
             &state,
-            ChatRequest { model: "fallback-model".to_string(), messages: vec![ChatMessage { role: "user".to_string(), content: "hello".to_string() }], stream: true },
+            ChatRequest {
+                model: "fallback-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                stream: true,
+            },
             AgentSelection::default(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let event = stream.next().await.unwrap().unwrap();
         assert_eq!(event.model, "fallback-model");
     }
 }
-
-

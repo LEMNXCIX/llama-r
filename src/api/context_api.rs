@@ -11,8 +11,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa::ToSchema;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateContextRequest {
     pub project_id: String,
     pub project_path: String,
@@ -30,6 +31,14 @@ fn default_true() -> bool {
     true
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/contexts",
+    tag = "Contexts",
+    responses(
+        (status = 200, description = "List all project contexts"),
+    )
+)]
 pub async fn list_contexts(State(state): State<Arc<AppState>>) -> Json<Vec<serde_json::Value>> {
     let summaries = state
         .context_store
@@ -48,6 +57,18 @@ pub async fn list_contexts(State(state): State<Arc<AppState>>) -> Json<Vec<serde
     Json(summaries)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/contexts/{id}",
+    tag = "Contexts",
+    params(
+        ("id" = String, Path, description = "Project/context ID"),
+    ),
+    responses(
+        (status = 200, description = "Project context details", body = ProjectContext),
+        (status = 404, description = "Context not found"),
+    )
+)]
 pub async fn get_context(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -59,6 +80,16 @@ pub async fn get_context(
         .ok_or_else(|| AppError::NotFound(format!("Context '{}' not found", id)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/contexts",
+    tag = "Contexts",
+    request_body = CreateContextRequest,
+    responses(
+        (status = 201, description = "Context created (with optional auto-analysis)"),
+        (status = 409, description = "Context already exists"),
+    )
+)]
 pub async fn create_context(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateContextRequest>,
@@ -94,7 +125,10 @@ pub async fn create_context(
                     .await
                     .map(|response| response.message.content)
                     .map_err(|err| err.to_string())
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
+                >
         };
 
         let analyzer = crate::context::analyzer::ProjectAnalyzer::new(state.skill_manager.clone());
@@ -140,6 +174,18 @@ pub async fn create_context(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/contexts/{id}",
+    tag = "Contexts",
+    params(
+        ("id" = String, Path, description = "Project/context ID"),
+    ),
+    responses(
+        (status = 200, description = "Context updated"),
+        (status = 404, description = "Context not found"),
+    )
+)]
 pub async fn update_context(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -163,6 +209,18 @@ pub async fn update_context(
     })))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/contexts/{id}",
+    tag = "Contexts",
+    params(
+        ("id" = String, Path, description = "Project/context ID"),
+    ),
+    responses(
+        (status = 200, description = "Context deleted"),
+        (status = 404, description = "Context not found"),
+    )
+)]
 pub async fn delete_context(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -176,6 +234,18 @@ pub async fn delete_context(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/contexts/{id}/analyze",
+    tag = "Contexts",
+    params(
+        ("id" = String, Path, description = "Project/context ID"),
+    ),
+    responses(
+        (status = 200, description = "Project re-analyzed successfully"),
+        (status = 404, description = "Context not found"),
+    )
+)]
 pub async fn analyze_project(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -203,7 +273,8 @@ pub async fn analyze_project(
                 .await
                 .map(|response| response.message.content)
                 .map_err(|err| err.to_string())
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+        })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
     };
 
     let analyzer = crate::context::analyzer::ProjectAnalyzer::new(state.skill_manager.clone());
@@ -219,6 +290,3 @@ pub async fn analyze_project(
         "agent_skill_sync": summarize_sync_report(&sync_report)
     })))
 }
-
-
-

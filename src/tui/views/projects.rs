@@ -94,7 +94,7 @@ pub fn render_projects(
 
         // Agents Panel
         let project_id = &selected_project.project_id;
-        let all_agents = state.agent_manager.list_agents();
+        let all_agents = state.agent_registry.list_agents();
         let project_agents: Vec<_> = all_agents
             .iter()
             .filter(|a| {
@@ -180,23 +180,121 @@ pub fn render_agent_form(
 
     f.render_widget(block, area);
 
-    let id_style = if field_index == 0 { Style::default().fg(Color::Yellow) } else { Style::default() };
-    let name_style = if field_index == 1 { Style::default().fg(Color::Yellow) } else { Style::default() };
-    let model_style = if field_index == 2 { Style::default().fg(Color::Yellow) } else { Style::default() };
-    let project_style = if field_index == 3 { Style::default().fg(Color::Yellow) } else { Style::default() };
-    let rules_style = if field_index == 4 { Style::default().fg(Color::Yellow) } else { Style::default() };
-    let opt_rules_style = if field_index == 5 { Style::default().fg(Color::Yellow) } else { Style::default() };
-    let skills_style = if field_index == 6 { Style::default().fg(Color::Yellow) } else { Style::default() };
-    let prompt_style = if field_index == 7 { Style::default().fg(Color::Yellow) } else { Style::default() };
+    let id_style = if field_index == 0 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let name_style = if field_index == 1 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let model_style = if field_index == 2 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let project_style = if field_index == 3 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let rules_style = if field_index == 4 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let opt_rules_style = if field_index == 5 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let skills_style = if field_index == 6 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let prompt_style = if field_index == 7 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
 
-    f.render_widget(Paragraph::new(id).block(Block::default().borders(Borders::ALL).title(" ID ").border_style(id_style)), chunks[0]);
-    f.render_widget(Paragraph::new(name).block(Block::default().borders(Borders::ALL).title(" Name ").border_style(name_style)), chunks[1]);
-    f.render_widget(Paragraph::new(model).block(Block::default().borders(Borders::ALL).title(" Model ").border_style(model_style)), chunks[2]);
-    f.render_widget(Paragraph::new(project_id).block(Block::default().borders(Borders::ALL).title(" Project Context (Arrows to cycle) ").border_style(project_style)), chunks[3]);
-    f.render_widget(Paragraph::new(rules).block(Block::default().borders(Borders::ALL).title(" Rules (comma separated) ").border_style(rules_style)), chunks[4]);
-    f.render_widget(Paragraph::new(optimize_rules).block(Block::default().borders(Borders::ALL).title(" Optimization Rules (comma separated) ").border_style(opt_rules_style)), chunks[5]);
-    f.render_widget(Paragraph::new(skills).block(Block::default().borders(Borders::ALL).title(" Skills/Tools (comma separated) ").border_style(skills_style)), chunks[6]);
-    f.render_widget(Paragraph::new(prompt).block(Block::default().borders(Borders::ALL).title(" System Prompt (Enter for newline) ").border_style(prompt_style)).wrap(Wrap { trim: true }), chunks[7]);
+    f.render_widget(
+        Paragraph::new(id).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" ID ")
+                .border_style(id_style),
+        ),
+        chunks[0],
+    );
+    f.render_widget(
+        Paragraph::new(name).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Name ")
+                .border_style(name_style),
+        ),
+        chunks[1],
+    );
+    f.render_widget(
+        Paragraph::new(model).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Model ")
+                .border_style(model_style),
+        ),
+        chunks[2],
+    );
+    f.render_widget(
+        Paragraph::new(project_id).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Project Context (Arrows to cycle) ")
+                .border_style(project_style),
+        ),
+        chunks[3],
+    );
+    f.render_widget(
+        Paragraph::new(rules).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Rules (comma separated) ")
+                .border_style(rules_style),
+        ),
+        chunks[4],
+    );
+    f.render_widget(
+        Paragraph::new(optimize_rules).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Optimization Rules (comma separated) ")
+                .border_style(opt_rules_style),
+        ),
+        chunks[5],
+    );
+    f.render_widget(
+        Paragraph::new(skills).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Skills/Tools (comma separated) ")
+                .border_style(skills_style),
+        ),
+        chunks[6],
+    );
+    f.render_widget(
+        Paragraph::new(prompt)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" System Prompt (Enter for newline) ")
+                    .border_style(prompt_style),
+            )
+            .wrap(Wrap { trim: true }),
+        chunks[7],
+    );
 
     let help = Paragraph::new(
         " [Tab] Next | [Shift+Tab] Prev | [Enter] in Prompt: Newline | [Arrows in Project] Cycle | [Ctrl+S] Save | [Esc] Cancel "
@@ -207,12 +305,27 @@ pub fn render_agent_form(
     // Set cursor position based on active field
     match field_index {
         0 => f.set_cursor(chunks[0].x + 1 + id.chars().count() as u16, chunks[0].y + 1),
-        1 => f.set_cursor(chunks[1].x + 1 + name.chars().count() as u16, chunks[1].y + 1),
-        2 => f.set_cursor(chunks[2].x + 1 + model.chars().count() as u16, chunks[2].y + 1),
+        1 => f.set_cursor(
+            chunks[1].x + 1 + name.chars().count() as u16,
+            chunks[1].y + 1,
+        ),
+        2 => f.set_cursor(
+            chunks[2].x + 1 + model.chars().count() as u16,
+            chunks[2].y + 1,
+        ),
         3 => {} // Project cycling, no text cursor needed
-        4 => f.set_cursor(chunks[4].x + 1 + rules.chars().count() as u16, chunks[4].y + 1),
-        5 => f.set_cursor(chunks[5].x + 1 + optimize_rules.chars().count() as u16, chunks[5].y + 1),
-        6 => f.set_cursor(chunks[6].x + 1 + skills.chars().count() as u16, chunks[6].y + 1),
+        4 => f.set_cursor(
+            chunks[4].x + 1 + rules.chars().count() as u16,
+            chunks[4].y + 1,
+        ),
+        5 => f.set_cursor(
+            chunks[5].x + 1 + optimize_rules.chars().count() as u16,
+            chunks[5].y + 1,
+        ),
+        6 => f.set_cursor(
+            chunks[6].x + 1 + skills.chars().count() as u16,
+            chunks[6].y + 1,
+        ),
         7 => {
             let width = chunks[7].width.saturating_sub(2) as usize;
             if width > 0 {
@@ -223,7 +336,7 @@ pub fn render_agent_form(
                 for (i, line) in lines.iter().enumerate() {
                     let line_len = line.chars().count();
                     let wrap_count = line_len / width;
-                    
+
                     if i < lines.len() - 1 {
                         y_offset += wrap_count + 1;
                     } else {
@@ -231,9 +344,10 @@ pub fn render_agent_form(
                         x_pos = line_len % width;
                     }
                 }
-                
+
                 // Ensure we don't go out of the prompt area vertically
-                let final_y = (chunks[7].y + 1 + y_offset as u16).min(chunks[7].y + chunks[7].height - 2);
+                let final_y =
+                    (chunks[7].y + 1 + y_offset as u16).min(chunks[7].y + chunks[7].height - 2);
                 f.set_cursor(chunks[7].x + 1 + x_pos as u16, final_y);
             }
         }

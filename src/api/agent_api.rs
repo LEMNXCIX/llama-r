@@ -1,5 +1,6 @@
 use crate::api::handlers::AppState;
 use crate::domain::agent::{Agent, OptimizeConfig};
+use crate::domain::scope::AgentScope;
 use crate::error::AppError;
 use crate::services::validation::validate_identifier;
 use axum::{
@@ -12,8 +13,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use utoipa::ToSchema;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateAgentRequest {
     pub id: String,
     pub name: String,
@@ -36,7 +38,7 @@ pub struct CreateAgentRequest {
     pub optimize: OptimizeConfig,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct AgentResponse {
     pub id: String,
     pub project_id: Option<String>,
@@ -90,14 +92,23 @@ fn resolve_project_id(req: &CreateAgentRequest, headers: &axum::http::HeaderMap)
 
 fn resolve_agent_path(project_id: Option<&str>, agent_id: &str) -> PathBuf {
     match project_id {
-        Some(project_id) => crate::core::paths::get_project_agents_dir(project_id).join(format!("{}.toml", agent_id)),
+        Some(project_id) => crate::core::paths::get_project_agents_dir(project_id)
+            .join(format!("{}.toml", agent_id)),
         None => crate::core::paths::get_agents_dir().join(format!("{}.toml", agent_id)),
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/agents",
+    tag = "Agents",
+    responses(
+        (status = 200, description = "List all registered agents", body = Vec<AgentResponse>),
+    )
+)]
 pub async fn list_agents_api(State(state): State<Arc<AppState>>) -> Json<Vec<AgentResponse>> {
     let agents = state
-        .agent_manager
+        .agent_registry
         .list_agents()
         .into_iter()
         .map(AgentResponse::from)
@@ -105,6 +116,18 @@ pub async fn list_agents_api(State(state): State<Arc<AppState>>) -> Json<Vec<Age
     Json(agents)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}",
+    tag = "Agents",
+    params(
+        ("id" = String, Path, description = "Agent ID"),
+    ),
+    responses(
+        (status = 200, description = "Agent details", body = AgentResponse),
+        (status = 404, description = "Agent not found"),
+    )
+)]
 pub async fn get_agent(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -112,8 +135,11 @@ pub async fn get_agent(
 ) -> Result<Json<AgentResponse>, AppError> {
     let project_id = project_header(&headers);
     let agent = match project_id.as_deref() {
-        Some(project_id) => state.agent_manager.get_project_agent(project_id, &id),
-        None => state.agent_manager.get_agent(&id),
+        Some(project_id) => state.agent_registry.get_project_agent(project_id, &id),
+        None => state
+            .agent_registry
+            .get_agent(&id)
+            .or_else(|| state.agent_registry.list_agents().into_iter().find(|a| a.id == id)),
     };
 
     agent
@@ -121,6 +147,97 @@ pub async fn get_agent(
         .ok_or_else(|| AppError::NotFound(format!("Agent '{}' not found", id)))
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AgentScopeResponse {
+    pub agent_id: String,
+    pub project_id: Option<String>,
+    pub mcp_sources: Vec<String>,
+    pub tools_allow: String,
+    pub rag_sources: Vec<String>,
+    pub rag_write: String,
+    pub max_tool_calls: u32,
+    pub max_iterations: u32,
+    pub timeout_secs: u64,
+}
+
+impl From<AgentScope> for AgentScopeResponse {
+    fn from(scope: AgentScope) -> Self {
+        let tools_allow = match &scope.tools_allow {
+            crate::domain::scope::ToolsAllow::DenyAll => "deny_all".into(),
+            crate::domain::scope::ToolsAllow::AllFromSources => "all_from_sources".into(),
+            crate::domain::scope::ToolsAllow::Allowlist(list) => {
+                let items: Vec<String> = list.iter().map(|t| t.qualified()).collect();
+                format!("allowlist({})", items.join(", "))
+            }
+        };
+        Self {
+            agent_id: scope.agent_id,
+            project_id: scope.project_id,
+            mcp_sources: scope.mcp_sources.into_iter().collect(),
+            tools_allow,
+            rag_sources: scope.rag_sources.into_iter().collect(),
+            rag_write: format!("{:?}", scope.rag_write),
+            max_tool_calls: scope.max_tool_calls,
+            max_iterations: scope.max_iterations,
+            timeout_secs: scope.timeout_secs,
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/scope",
+    tag = "Agents",
+    params(
+        ("id" = String, Path, description = "Agent ID"),
+    ),
+    responses(
+        (status = 200, description = "Agent scope (tools, MCP sources, RAG)", body = AgentScopeResponse),
+        (status = 404, description = "Agent not found"),
+    )
+)]
+pub async fn get_agent_scope(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<AgentScopeResponse>, AppError> {
+    let project_id = headers
+        .get("x-project")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let scope = state
+        .agent_registry
+        .resolve_scope(project_id, Some(&id))
+        .or_else(|| {
+            if project_id.is_some() {
+                return None;
+            }
+            state
+                .agent_registry
+                .list_agents()
+                .into_iter()
+                .find(|a| a.id == id)
+                .and_then(|a| {
+                    state
+                        .agent_registry
+                        .resolve_scope(a.project_id.as_deref(), Some(&id))
+                })
+        })
+        .ok_or_else(|| AppError::NotFound(format!("Agent '{}' not found", id)))?;
+    Ok(Json(scope.into()))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/agents",
+    tag = "Agents",
+    request_body = CreateAgentRequest,
+    responses(
+        (status = 201, description = "Agent created", body = serde_json::Value),
+        (status = 400, description = "Validation error"),
+    )
+)]
 pub async fn create_agent(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -138,7 +255,7 @@ pub async fn create_agent(
     }
 
     fs::write(&path, &toml_content)?;
-    if let Err(err) = state.agent_manager.load_agents() {
+    if let Err(err) = state.agent_registry.reload_all(&state.mcp_server_ids()) {
         tracing::warn!(error = %err, "Failed to reload agents after create");
     }
 
@@ -154,6 +271,19 @@ pub async fn create_agent(
     ))
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/agents/{id}",
+    tag = "Agents",
+    params(
+        ("id" = String, Path, description = "Agent ID"),
+    ),
+    request_body = CreateAgentRequest,
+    responses(
+        (status = 200, description = "Agent updated", body = serde_json::Value),
+        (status = 404, description = "Agent not found"),
+    )
+)]
 pub async fn update_agent(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -170,7 +300,7 @@ pub async fn update_agent(
     }
 
     fs::write(&path, build_agent_toml(&req, project_id.as_deref()))?;
-    if let Err(err) = state.agent_manager.load_agents() {
+    if let Err(err) = state.agent_registry.reload_all(&state.mcp_server_ids()) {
         tracing::warn!(error = %err, "Failed to reload agents after update");
     }
 
@@ -181,19 +311,39 @@ pub async fn update_agent(
     })))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/agents/{id}",
+    tag = "Agents",
+    params(
+        ("id" = String, Path, description = "Agent ID"),
+    ),
+    responses(
+        (status = 200, description = "Agent deleted", body = serde_json::Value),
+        (status = 404, description = "Agent not found"),
+    )
+)]
 pub async fn delete_agent(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let project_id = project_header(&headers);
-    let path = resolve_agent_path(project_id.as_deref(), &id);
+    let resolved_project = project_id.clone().or_else(|| {
+        state
+            .agent_registry
+            .list_agents()
+            .into_iter()
+            .find(|a| a.id == id)
+            .and_then(|a| a.project_id)
+    });
+    let path = resolve_agent_path(resolved_project.as_deref(), &id);
     if !path.exists() {
         return Err(AppError::NotFound(format!("Agent '{}' not found", id)));
     }
 
     fs::remove_file(&path)?;
-    if let Err(err) = state.agent_manager.load_agents() {
+    if let Err(err) = state.agent_registry.reload_all(&state.mcp_server_ids()) {
         tracing::warn!(error = %err, "Failed to reload agents after delete");
     }
 
@@ -236,7 +386,9 @@ fn validate_agent_request(
 ) -> Result<(), AppError> {
     validate_identifier(&req.id, "agent id")?;
     if req.name.trim().is_empty() {
-        return Err(AppError::Validation("agent name cannot be empty".to_string()));
+        return Err(AppError::Validation(
+            "agent name cannot be empty".to_string(),
+        ));
     }
     if req.system_prompt.trim().is_empty() {
         return Err(AppError::Validation(
@@ -250,7 +402,9 @@ fn validate_agent_request(
         validate_identifier(project_id, "context_project")?;
     }
     if req.rules.iter().any(|rule| rule.trim().is_empty()) {
-        return Err(AppError::Validation("agent rules cannot contain empty values".to_string()));
+        return Err(AppError::Validation(
+            "agent rules cannot contain empty values".to_string(),
+        ));
     }
 
     let project_path = project_id
@@ -261,7 +415,11 @@ fn validate_agent_request(
         validate_identifier(skill_id, "skill_id")?;
         let exists = project_path
             .as_ref()
-            .and_then(|path| state.skill_manager.get_skill_for_project(skill_id, FsPath::new(path)))
+            .and_then(|path| {
+                state
+                    .skill_manager
+                    .get_skill_for_project(skill_id, FsPath::new(path))
+            })
             .or_else(|| state.skill_manager.get_skill(skill_id));
         if exists.is_none() {
             return Err(AppError::Validation(format!(

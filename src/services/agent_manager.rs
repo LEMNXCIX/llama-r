@@ -35,10 +35,9 @@ impl AgentManager {
         }
 
         let count = loaded_agents.len();
-        let mut agents_guard = self
-            .agents
-            .write()
-            .map_err(|_| AppError::Runtime("AgentManager lock poisoned while loading agents".to_string()))?;
+        let mut agents_guard = self.agents.write().map_err(|_| {
+            AppError::Runtime("AgentManager lock poisoned while loading agents".to_string())
+        })?;
         *agents_guard = loaded_agents;
 
         tracing::info!(agent_count = count, "Loaded agents from disk");
@@ -100,10 +99,11 @@ impl AgentManager {
     }
 
     pub fn get_project_agent(&self, project_id: &str, id: &str) -> Option<Agent> {
-        self.agents
-            .read()
-            .ok()
-            .and_then(|agents_guard| agents_guard.get(&Self::build_key(Some(project_id), id)).cloned())
+        self.agents.read().ok().and_then(|agents_guard| {
+            agents_guard
+                .get(&Self::build_key(Some(project_id), id))
+                .cloned()
+        })
     }
 
     pub fn resolve_agent(&self, project_id: Option<&str>, agent_id: Option<&str>) -> Option<Agent> {

@@ -63,13 +63,11 @@ pub fn render_dashboard(f: &mut Frame, state: &AppState) {
         Line::from(format!(
             "Tokens Saved: {} | Agents Configured: {}",
             state.metrics.get_saved_tokens(),
-            state.agent_manager.list_agents().len()
+            state.agent_registry.list_agents().len()
         )),
         Line::from(format!(
             "HTTP Requests: {} | Chat Requests: {} | Fallbacks: {}",
-            metrics.http_requests,
-            metrics.chat_requests,
-            metrics.fallback_count,
+            metrics.http_requests, metrics.chat_requests, metrics.fallback_count,
         )),
     ])
     .block(
@@ -116,4 +114,3 @@ pub fn render_dashboard(f: &mut Frame, state: &AppState) {
 
     f.render_widget(footer, chunks[3]);
 }
-

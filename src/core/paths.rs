@@ -2,27 +2,40 @@ use std::env;
 use std::path::PathBuf;
 
 /// Returns the base directory for Llama-R data (agents, contexts, etc.)
-/// Priority: LLAMA_R_DIR env var > Executable location > Current directory.
+/// Priority: LLAMA_R_DIR env var > XDG data home > Development project root > Current directory.
 pub fn get_base_dir() -> PathBuf {
     // 1. Check environment variable
     if let Ok(dir) = env::var("LLAMA_R_DIR") {
         return PathBuf::from(dir);
     }
 
-    // 2. Check executable directory
+    // 2. Check executable directory — only use as data root when inside a
+    //    cargo workspace (target/debug or target/release).  For installed
+    //    binaries we fall through to the XDG path below.
     if let Ok(exe_path) = env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
-            // Avoid creating data inside 'target/debug' or similar during development
             if exe_dir.ends_with("debug") || exe_dir.ends_with("release") {
                 if let Some(project_root) = exe_dir.parent().and_then(|p| p.parent()) {
                     return project_root.to_path_buf();
                 }
             }
-            return exe_dir.to_path_buf();
         }
     }
 
-    // 3. Fallback to current directory
+    // 3. XDG data home (Linux / macOS)
+    if let Ok(xdg) = env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("llama-r");
+        }
+    }
+    // 3b. ~/.local/share/llama-r  (POSIX default)
+    if let Ok(home) = env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".local/share/llama-r");
+        }
+    }
+
+    // 4. Last resort: current working directory
     PathBuf::from(".")
 }
 

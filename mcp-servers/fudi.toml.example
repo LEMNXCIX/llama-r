@@ -1,0 +1,7 @@
+id = "fudi"
+transport = "http"
+url = "http://127.0.0.1:4100/mcp"
+auth_env = "FUDI_MCP_TOKEN"
+timeout_secs = 30
+tool_namespace = "fudi"
+enabled = true

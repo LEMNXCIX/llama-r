@@ -1,0 +1,52 @@
+# Example agent manifest v2 — Fudi Ops (scoped MCP + RAG)
+# Copy into contextos/projects/<project>/agents/ or agents/
+
+name = "Fudi Ops Assistant"
+description = "Opera pedidos y menú de Fudi vía MCP, con RAG de políticas."
+model = "llama3.2"
+provider = "ollama"
+system_prompt = """
+Eres el asistente operativo de Fudi.
+Usa solo las tools permitidas. No inventes IDs de pedidos.
+Si falta contexto, pregunta antes de acciones destructivas.
+"""
+
+rules = [
+  "Nunca exponer PII completa en logs.",
+  "Confirmar cancelaciones de pedidos con el usuario.",
+]
+
+# --- Scope isolation (deny-by-default tools) ---
+mcp_sources = ["fudi"]
+tools_override = [
+  "fudi/list_orders",
+  "fudi/get_order",
+  "fudi/update_order_status",
+  "fudi/search_menu",
+]
+rag_sources = [
+  "fudi/policies",
+  "fudi/menu_docs",
+  "agent:fudi_ops/memory",
+]
+rag_write = "own_memory_only"
+max_tool_calls = 12
+max_iterations = 8
+timeout_secs = 120
+temperature = 0.2
+
+[optimize]
+enabled = true
+rules = []
+
+[memory]
+persist_history = true
+summarize_every_n_turns = 10
+index_summaries = true
+summary_collection = "agent:fudi_ops/memory"
+retention_days = 90
+
+[observability]
+trace = true
+log_tool_args = false
+log_tool_results = false

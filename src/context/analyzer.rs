@@ -45,15 +45,26 @@ fn collect_project_files(path: &Path, project_type: &str) -> String {
         "rust" => {
             let cargo = path.join("Cargo.toml");
             if let Ok(content) = fs::read_to_string(cargo) {
-                let truncated = if content.len() > 1500 { &content[..1500] } else { &content };
+                let truncated = if content.len() > 1500 {
+                    &content[..1500]
+                } else {
+                    &content
+                };
                 parts.push(format!("## Cargo.toml\n```toml\n{}\n```", truncated));
             }
             for entry in &["src/main.rs", "src/lib.rs"] {
                 let entry_path = path.join(entry);
                 if entry_path.exists() {
                     if let Ok(content) = fs::read_to_string(&entry_path) {
-                        let truncated = if content.len() > 1000 { &content[..1000] } else { &content };
-                        parts.push(format!("## {} (partial)\n```rust\n{}\n```", entry, truncated));
+                        let truncated = if content.len() > 1000 {
+                            &content[..1000]
+                        } else {
+                            &content
+                        };
+                        parts.push(format!(
+                            "## {} (partial)\n```rust\n{}\n```",
+                            entry, truncated
+                        ));
                         break;
                     }
                 }
@@ -62,7 +73,11 @@ fn collect_project_files(path: &Path, project_type: &str) -> String {
         "node" => {
             let pkg = path.join("package.json");
             if let Ok(content) = fs::read_to_string(pkg) {
-                let truncated = if content.len() > 1500 { &content[..1500] } else { &content };
+                let truncated = if content.len() > 1500 {
+                    &content[..1500]
+                } else {
+                    &content
+                };
                 parts.push(format!("## package.json\n```json\n{}\n```", truncated));
             }
         }
@@ -71,7 +86,11 @@ fn collect_project_files(path: &Path, project_type: &str) -> String {
                 let file_path = path.join(file_name);
                 if file_path.exists() {
                     if let Ok(content) = fs::read_to_string(&file_path) {
-                        let truncated = if content.len() > 1500 { &content[..1500] } else { &content };
+                        let truncated = if content.len() > 1500 {
+                            &content[..1500]
+                        } else {
+                            &content
+                        };
                         parts.push(format!("## {}\n```\n{}\n```", file_name, truncated));
                         break;
                     }
@@ -131,8 +150,8 @@ impl ProjectAnalyzer {
             Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
         >,
     ) -> Result<ProjectContext, String> {
-        let canonical_path = canonicalize_project_path(project_path)
-            .map_err(|err| err.to_string())?;
+        let canonical_path =
+            canonicalize_project_path(project_path).map_err(|err| err.to_string())?;
         let project_type = detect_project_type(&canonical_path);
         let file_content = collect_project_files(&canonical_path, &project_type);
 
@@ -176,11 +195,12 @@ Return ONLY the JSON array, nothing else. If no skills are relevant, return []."
             match llm_responder(skill_selection_prompt).await {
                 Ok(response) => {
                     let trimmed = response.trim();
-                    let json_str = if let (Some(start), Some(end)) = (trimmed.find('['), trimmed.rfind(']')) {
-                        &trimmed[start..=end]
-                    } else {
-                        "[]"
-                    };
+                    let json_str =
+                        if let (Some(start), Some(end)) = (trimmed.find('['), trimmed.rfind(']')) {
+                            &trimmed[start..=end]
+                        } else {
+                            "[]"
+                        };
 
                     match serde_json::from_str::<Vec<String>>(json_str) {
                         Ok(selected_ids) => {
@@ -270,7 +290,10 @@ impl ContextEnricher {
         if let Some(project_id) = &agent.config.context_project {
             let ctx_md = self.context_store.get_context_md(project_id);
             if !ctx_md.is_empty() {
-                sections.push((format!("\n## Project Context: {}\n{}", project_id, ctx_md), 70));
+                sections.push((
+                    format!("\n## Project Context: {}\n{}", project_id, ctx_md),
+                    70,
+                ));
             }
         }
 
@@ -288,11 +311,17 @@ impl ContextEnricher {
                 .iter()
                 .filter_map(|skill_id| {
                     if let Some(project_path) = &project_path {
-                        self.skill_manager.get_skill_for_project(skill_id, Path::new(project_path))
+                        self.skill_manager
+                            .get_skill_for_project(skill_id, Path::new(project_path))
                     } else {
                         self.skill_manager.get_skill(skill_id)
                     }
-                    .map(|skill| format!("### {}\nPath: {}\n\n{}", skill.id, skill.path, skill.content))
+                    .map(|skill| {
+                        format!(
+                            "### {}\nPath: {}\n\n{}",
+                            skill.id, skill.path, skill.content
+                        )
+                    })
                 })
                 .collect::<Vec<_>>();
 
@@ -345,7 +374,6 @@ mod tests {
     use crate::context::store::{ContextStore, ProjectContext};
     use crate::domain::agent::{Agent, AgentConfig, OptimizeConfig};
     use crate::services::skill_manager::SkillManager;
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex, MutexGuard};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -394,7 +422,8 @@ mod tests {
             })
             .unwrap();
 
-        let enricher = ContextEnricher::new(context_store, skill_manager, "fallback-model".to_string());
+        let enricher =
+            ContextEnricher::new(context_store, skill_manager, "fallback-model".to_string());
         let agent = Agent {
             id: "reviewer".to_string(),
             project_id: Some("demo".to_string()),
@@ -403,12 +432,11 @@ mod tests {
                 model: String::new(),
                 system_prompt: "Base prompt".to_string(),
                 context_project: Some("demo".to_string()),
-                context_files: vec![],
                 rules: vec!["Always explain the risk".to_string()],
                 skills: vec!["reviewer-skill".to_string()],
                 auto_skills: vec!["reviewer-skill".to_string()],
-                variables: HashMap::new(),
                 optimize: OptimizeConfig::default(),
+                ..Default::default()
             },
         };
 

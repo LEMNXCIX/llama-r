@@ -1,0 +1,4 @@
+name = "BaseAgent"
+model = "llama3.2"
+system_prompt = "Eres un asistente útil."
+rules = ["Responde en español.", "Sé conciso."]

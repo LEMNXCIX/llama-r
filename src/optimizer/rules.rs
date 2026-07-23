@@ -19,7 +19,9 @@ pub fn apply_rule(rule_name: &str, input: &str) -> String {
                         .lines()
                         .filter(|l| {
                             let trimmed = l.trim();
-                            !trimmed.is_empty() && !trimmed.starts_with("//") && !trimmed.starts_with("#")
+                            !trimmed.is_empty()
+                                && !trimmed.starts_with("//")
+                                && !trimmed.starts_with("#")
                         })
                         .collect::<Vec<_>>()
                         .join("\n");

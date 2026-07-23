@@ -1,0 +1,28 @@
+name = "FudiOps"
+description = "Operaciones del ERP Fudi"
+model = "llama3.2"
+system_prompt = """Eres un asistente de operaciones para Fudi.
+Puedes consultar pedidos, inventario y finanzas a través de las tools MCP disponibles."""
+
+mcp_sources = ["fudi", "logs"]
+tools_override = ["fudi/list_orders", "fudi/get_order", "logs/search"]
+rag_sources = ["fudi/policies", "agent:fudi_ops/memory"]
+rag_write = "own_memory_only"
+max_tool_calls = 15
+max_iterations = 10
+timeout_secs = 120
+
+[rules]
+0 = "Prioriza la información más reciente."
+1 = "Si un tool call falla, reintenta una vez."
+
+[memory]
+persist_history = true
+summarize_every_n_turns = 5
+index_summaries = true
+summary_collection = "agent:fudi_ops/memory"
+
+[observability]
+trace = true
+log_tool_args = false
+log_tool_results = false

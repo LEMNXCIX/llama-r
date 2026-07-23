@@ -113,14 +113,24 @@ impl TuiApp {
                                 }
                             }
                             KeyCode::Left | KeyCode::Right => {
-                                if self.form_field_index == 3 && !self.available_projects.is_empty() {
-                                    let current_idx = self.available_projects.iter().position(|p| p == &self.form_project_id).unwrap_or(0);
+                                if self.form_field_index == 3 && !self.available_projects.is_empty()
+                                {
+                                    let current_idx = self
+                                        .available_projects
+                                        .iter()
+                                        .position(|p| p == &self.form_project_id)
+                                        .unwrap_or(0);
                                     let next_idx = if key.code == KeyCode::Right {
                                         (current_idx + 1) % self.available_projects.len()
                                     } else {
-                                        if current_idx == 0 { self.available_projects.len() - 1 } else { current_idx - 1 }
+                                        if current_idx == 0 {
+                                            self.available_projects.len() - 1
+                                        } else {
+                                            current_idx - 1
+                                        }
                                     };
-                                    self.form_project_id = self.available_projects[next_idx].clone();
+                                    self.form_project_id =
+                                        self.available_projects[next_idx].clone();
                                 }
                             }
                             KeyCode::Enter => {
@@ -130,26 +140,54 @@ impl TuiApp {
                                     self.form_field_index = (self.form_field_index + 1) % 8;
                                 }
                             }
-                            KeyCode::Char('s') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                            KeyCode::Char('s')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
                                 // Save agent
                                 let project_id = &self.form_project_id;
-                                let rules_vec: Vec<String> = self.form_rules.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                                let opt_rules_vec: Vec<String> = self.form_optimize_rules.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                                let skills_vec: Vec<String> = self.form_skills.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                                
-                                let rules_str = if rules_vec.is_empty() { "[]".to_string() } else { format!("{:?}", rules_vec) };
-                                let opt_rules_str = if opt_rules_vec.is_empty() { "[]".to_string() } else { format!("{:?}", opt_rules_vec) };
-                                let skills_str = if skills_vec.is_empty() { "[]".to_string() } else { format!("{:?}", skills_vec) };
+                                let rules_vec: Vec<String> = self
+                                    .form_rules
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                let opt_rules_vec: Vec<String> = self
+                                    .form_optimize_rules
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                let skills_vec: Vec<String> = self
+                                    .form_skills
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+
+                                let rules_str = if rules_vec.is_empty() {
+                                    "[]".to_string()
+                                } else {
+                                    format!("{:?}", rules_vec)
+                                };
+                                let opt_rules_str = if opt_rules_vec.is_empty() {
+                                    "[]".to_string()
+                                } else {
+                                    format!("{:?}", opt_rules_vec)
+                                };
+                                let skills_str = if skills_vec.is_empty() {
+                                    "[]".to_string()
+                                } else {
+                                    format!("{:?}", skills_vec)
+                                };
 
                                 let toml_content = format!(
                                     "name = \"{}\"\nmodel = \"{}\"\nsystem_prompt = \"\"\"\n{}\n\"\"\"\ncontext_project = \"{}\"\nrules = {}\nskills = {}\n\n[optimize]\nenabled = true\nrules = {}\n",
                                     self.form_name, self.form_model, self.form_prompt, project_id, rules_str, skills_str, opt_rules_str
                                 );
-                                let path =
-                                    crate::core::paths::get_project_agents_dir(project_id)
-                                        .join(format!("{}.toml", self.form_id));
+                                let path = crate::core::paths::get_project_agents_dir(project_id)
+                                    .join(format!("{}.toml", self.form_id));
                                 let _ = std::fs::write(path, toml_content);
-                                let _ = self.state.agent_manager.load_agents();
+                                let _ = self.state.agent_registry.reload_all(&[]);
                                 self.current_view = CurrentView::Projects;
                             }
                             KeyCode::Char(c) => match self.form_field_index {
@@ -164,13 +202,27 @@ impl TuiApp {
                                 _ => {}
                             },
                             KeyCode::Backspace => match self.form_field_index {
-                                0 => { self.form_id.pop(); }
-                                1 => { self.form_name.pop(); }
-                                2 => { self.form_model.pop(); }
-                                4 => { self.form_rules.pop(); }
-                                5 => { self.form_optimize_rules.pop(); }
-                                6 => { self.form_skills.pop(); }
-                                7 => { self.form_prompt.pop(); }
+                                0 => {
+                                    self.form_id.pop();
+                                }
+                                1 => {
+                                    self.form_name.pop();
+                                }
+                                2 => {
+                                    self.form_model.pop();
+                                }
+                                4 => {
+                                    self.form_rules.pop();
+                                }
+                                5 => {
+                                    self.form_optimize_rules.pop();
+                                }
+                                6 => {
+                                    self.form_skills.pop();
+                                }
+                                7 => {
+                                    self.form_prompt.pop();
+                                }
                                 _ => {}
                             },
                             _ => {}
@@ -307,7 +359,7 @@ impl TuiApp {
                                         let project_id = &project.project_id;
                                         let agents: Vec<_> = self
                                             .state
-                                            .agent_manager
+                                            .agent_registry
                                             .list_agents()
                                             .into_iter()
                                             .filter(|a| {
@@ -321,7 +373,7 @@ impl TuiApp {
                                             )
                                             .join(format!("{}.toml", agent.id));
                                             let _ = std::fs::remove_file(path);
-                                            let _ = self.state.agent_manager.load_agents();
+                                            let _ = self.state.agent_registry.reload_all(&[]);
                                             self.agent_index = 0;
                                         }
                                     }
@@ -337,7 +389,13 @@ impl TuiApp {
                                 self.form_rules = String::new();
                                 self.form_optimize_rules = String::new();
                                 self.form_skills = String::new();
-                                self.available_projects = self.state.context_store.list_contexts().into_iter().map(|c| c.project_id).collect();
+                                self.available_projects = self
+                                    .state
+                                    .context_store
+                                    .list_contexts()
+                                    .into_iter()
+                                    .map(|c| c.project_id)
+                                    .collect();
                                 if let Some(p) = self.available_projects.get(self.project_index) {
                                     self.form_project_id = p.clone();
                                 } else {
@@ -357,7 +415,7 @@ impl TuiApp {
                                     let project_id = &project.project_id;
                                     let agents: Vec<_> = self
                                         .state
-                                        .agent_manager
+                                        .agent_registry
                                         .list_agents()
                                         .into_iter()
                                         .filter(|a| {
@@ -370,7 +428,8 @@ impl TuiApp {
                                         self.form_model = agent.config.model.clone();
                                         self.form_prompt = agent.config.system_prompt.clone();
                                         self.form_rules = agent.config.rules.join(", ");
-                                        self.form_optimize_rules = agent.config.optimize.rules.join(", ");
+                                        self.form_optimize_rules =
+                                            agent.config.optimize.rules.join(", ");
                                         self.form_skills = agent.config.skills.join(", ");
                                         self.form_project_id = project_id.clone();
                                         self.available_projects = vec![project_id.clone()];

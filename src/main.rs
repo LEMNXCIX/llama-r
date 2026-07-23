@@ -3,7 +3,7 @@ use llama_r::runtime::{build_runtime, start_grpc_server, start_http_server};
 use llama_r::tui::app::TuiApp;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 
 struct TuiLogLayer {
@@ -61,9 +61,16 @@ async fn main() {
     let file_appender = tracing_appender::rolling::daily("logs", "llama-r.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
+    use tracing_subscriber::filter::Targets;
+
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
-        .with_ansi(false);
+        .with_ansi(false)
+        .with_filter(
+            Targets::new()
+                .with_target("notify", tracing::Level::WARN)
+                .with_default(tracing::Level::INFO),
+        );
 
     let tui_layer = TuiLogLayer {
         logs: logs_buffer.clone(),

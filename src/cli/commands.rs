@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use dotenvy::dotenv;
 use serde_json;
 use std::fs;
 use std::path::Path;
@@ -25,14 +24,14 @@ pub enum Commands {
         id: Option<String>,
         #[arg(long)]
         agent: Option<String>,
-        #[arg(long, default_value = "http://localhost:3000")]
-        server: String,
+        #[arg(long)]
+        server: Option<String>,
     },
     /// Refresh an existing project context (requires a running server)
     Reanalyze {
         project_id: String,
-        #[arg(long, default_value = "http://localhost:3000")]
-        server: String,
+        #[arg(long)]
+        server: Option<String>,
     },
     /// Export project context as rules for specific AI tools
     ExportRules {
@@ -46,7 +45,13 @@ pub enum Commands {
     Run,
 }
 
+fn default_server_url() -> String {
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    format!("http://localhost:{}", port)
+}
+
 pub async fn handle_cli() -> bool {
+    dotenvy::dotenv().ok();
     let cli = Cli::parse();
 
     match &cli.command {
@@ -64,11 +69,13 @@ pub async fn handle_cli() -> bool {
             agent,
             server,
         }) => {
-            run_analyze(path, id.as_deref(), agent.as_deref(), server).await;
+            let server = server.clone().unwrap_or_else(default_server_url);
+            run_analyze(path, id.as_deref(), agent.as_deref(), &server).await;
             true
         }
         Some(Commands::Reanalyze { project_id, server }) => {
-            run_reanalyze(project_id, server).await;
+            let server = server.clone().unwrap_or_else(default_server_url);
+            run_reanalyze(project_id, &server).await;
             true
         }
         Some(Commands::ExportRules {
@@ -84,7 +91,8 @@ pub async fn handle_cli() -> bool {
 }
 
 fn current_project_id() -> Result<String, String> {
-    let cwd = std::env::current_dir().map_err(|err| format!("Could not read current directory: {}", err))?;
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("Could not read current directory: {}", err))?;
     let project_id = cwd
         .file_name()
         .and_then(|name| name.to_str())
@@ -111,14 +119,7 @@ async fn init_default_agent() {
         project_id
     );
 
-    init_agent_file(
-        &project_id,
-        &project_id,
-        &prompt,
-        Some(&project_id),
-        &[],
-    )
-    .await;
+    init_agent_file(&project_id, &project_id, &prompt, Some(&project_id), &[]).await;
 }
 
 async fn init_named_agent(name: &str) {
@@ -138,7 +139,10 @@ async fn init_named_agent(name: &str) {
     // Check if project context exists
     let context_dir = crate::core::paths::get_project_context_dir(&project_id);
     if !context_dir.exists() {
-        println!("Warning: Project '{}' has not been analyzed yet.", project_id);
+        println!(
+            "Warning: Project '{}' has not been analyzed yet.",
+            project_id
+        );
         println!("Hint: Run `cargo run -- analyze .` to generate context for this project.");
         println!();
     }
@@ -157,7 +161,6 @@ async fn init_agent_file(
     context_project: Option<&str>,
     optimize_rules: &[&str],
 ) {
-    dotenv().ok();
     let default_model = std::env::var("DEFAULT_MODEL").unwrap_or_default();
 
     let agents_dir = match context_project {
@@ -168,7 +171,11 @@ async fn init_agent_file(
     let path = agents_dir.join(&filename);
 
     if path.exists() {
-        println!("Agent config '{}' already exists in {}.", filename, agents_dir.display());
+        println!(
+            "Agent config '{}' already exists in {}.",
+            filename,
+            agents_dir.display()
+        );
         println!("You can edit it directly; the file is meant to stay editable.");
         return;
     }
@@ -223,7 +230,9 @@ enabled = true
                 println!("  X-Agent:   {}", name);
             }
             if default_model.is_empty() {
-                println!("\nNote: No DEFAULT_MODEL configured yet. Run `cargo run` first to set one.");
+                println!(
+                    "\nNote: No DEFAULT_MODEL configured yet. Run `cargo run` first to set one."
+                );
             }
             println!("\nEdit the TOML file to customize your agent's behavior.");
         }
@@ -236,8 +245,15 @@ async fn run_export_rules(project_id: &str, target_path: &str, format: &str) {
     let context_file = project_context_dir.join("context.json");
 
     if !context_file.exists() {
-        println!("Context for '{}' not found at {}.", project_id, context_file.display());
-        println!("Hint: run `cargo run -- analyze <path> --id {}` or `cargo run -- reanalyze {}` first.", project_id, project_id);
+        println!(
+            "Context for '{}' not found at {}.",
+            project_id,
+            context_file.display()
+        );
+        println!(
+            "Hint: run `cargo run -- analyze <path> --id {}` or `cargo run -- reanalyze {}` first.",
+            project_id, project_id
+        );
         return;
     }
 
@@ -313,7 +329,11 @@ async fn run_analyze(path: &str, id: Option<&str>, agent: Option<&str>, server: 
         return;
     }
 
-    println!("Analyzing project '{}' at '{}'...", project_id, canonical_path.display());
+    println!(
+        "Analyzing project '{}' at '{}'...",
+        project_id,
+        canonical_path.display()
+    );
     println!("Server: {}", server);
     println!("This may take 30-60s while the LLM generates context and selects skills.");
     println!();
@@ -344,12 +364,16 @@ async fn run_analyze(path: &str, id: Option<&str>, agent: Option<&str>, server: 
                         let project_dir = crate::core::paths::get_project_dir(project_id);
                         println!("Context generated for '{}'", project_id);
                         println!("Saved to: {}", project_dir.display());
-                        if let Some(message) = json.get("message").and_then(|value| value.as_str()) {
+                        if let Some(message) = json.get("message").and_then(|value| value.as_str())
+                        {
                             println!("{}", message);
                         }
                         if let Some(agent_id) = agent {
                             println!("Context linked to agent '{}'", agent_id);
-                            println!("Use it with headers X-Project: {} and X-Agent: {}", project_id, agent_id);
+                            println!(
+                                "Use it with headers X-Project: {} and X-Agent: {}",
+                                project_id, agent_id
+                            );
                         }
                     } else if status == reqwest::StatusCode::CONFLICT {
                         println!("Context for '{}' already exists.", project_id);
@@ -396,7 +420,11 @@ async fn run_reanalyze(project_id: &str, server: &str) {
             println!("Context '{}' was not found. Create it first with `cargo run -- analyze <path> --id {}`.", project_id, project_id);
         }
         Ok(resp) => {
-            println!("Server returned {} while refreshing '{}'.", resp.status(), project_id);
+            println!(
+                "Server returned {} while refreshing '{}'.",
+                resp.status(),
+                project_id
+            );
         }
         Err(err) if err.is_connect() => {
             println!("Could not connect to server at {}", server);
@@ -409,5 +437,3 @@ async fn run_reanalyze(project_id: &str, server: &str) {
         Err(err) => println!("Request failed: {}", err),
     }
 }
-
-

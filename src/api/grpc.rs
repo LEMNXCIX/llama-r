@@ -67,6 +67,7 @@ impl LlamaGateway for GrpcService {
         let selection = AgentSelection {
             project_id: project_id.as_deref(),
             agent_id: agent_id.as_deref(),
+            debug: false,
         };
         let response = execute_chat(&self.state, domain_req, selection)
             .await
@@ -95,6 +96,7 @@ impl LlamaGateway for GrpcService {
         let selection = AgentSelection {
             project_id: project_id.as_deref(),
             agent_id: agent_id.as_deref(),
+            debug: false,
         };
         let stream = execute_chat_stream(&self.state, domain_req, selection)
             .await
@@ -113,7 +115,9 @@ impl LlamaGateway for GrpcService {
             Err(error) => Err(to_status(&state, error)),
         });
 
-        Ok(Response::new(Box::pin(grpc_stream) as Self::ChatStreamStream))
+        Ok(Response::new(
+            Box::pin(grpc_stream) as Self::ChatStreamStream
+        ))
     }
 
     type ConnectMcpStream = Pin<Box<dyn Stream<Item = Result<pb::McpMessage, Status>> + Send>>;
@@ -136,4 +140,3 @@ impl LlamaGateway for GrpcService {
         Ok(Response::new(Box::pin(output) as Self::ConnectMcpStream))
     }
 }
-
