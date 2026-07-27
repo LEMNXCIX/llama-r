@@ -44,7 +44,9 @@ impl McpClient for TimeoutMcpClient {
         } else {
             tokio::time::timeout(self.timeout, self.inner.call_tool(req))
                 .await
-                .map_err(|_| format!("MCP call_tool timeout for server '{sid}' tool '{tool_name}'"))?
+                .map_err(|_| {
+                    format!("MCP call_tool timeout for server '{sid}' tool '{tool_name}'")
+                })?
         }
     }
 

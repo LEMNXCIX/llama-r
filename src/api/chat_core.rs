@@ -187,6 +187,7 @@ pub async fn execute_chat(
     selection: AgentSelection<'_>,
 ) -> Result<ChatResponse, AppError> {
     let requested_model = selection.requested_target(&payload.model);
+    let had_agent_headers = selection.project_id.is_some() || selection.agent_id.is_some();
     let prepared = prepare_request(state, payload, selection)?;
 
     let debug_prompt = if selection.debug {
@@ -201,6 +202,59 @@ pub async fn execute_chat(
     } else {
         None
     };
+
+    // Use agent engine when project/agent headers resolve an agent
+    if had_agent_headers {
+        if let Some(runtime) = &state.agent_runtime {
+            let system = prepared
+                .messages
+                .iter()
+                .find(|m| m.role == "system")
+                .map(|m| m.content.clone());
+            let user_message = prepared
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.clone())
+                .ok_or_else(|| AppError::Validation("missing user message".into()))?;
+
+            let rt_req = crate::services::agent_runtime::RuntimeChatRequest {
+                project_id: selection.project_id.map(str::to_string),
+                agent_id: selection.agent_id.map(str::to_string),
+                conversation_id: None,
+                user_message,
+                model_override: Some(prepared.model.clone()),
+                system_prompt: system,
+                default_model: state.default_model.clone(),
+            };
+
+            match runtime.chat(rt_req).await {
+                Ok(text) => {
+                    let response = ChatResponse {
+                        model: prepared.model.clone(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        message: ChatMessage {
+                            role: "assistant".to_string(),
+                            content: text,
+                        },
+                        done: true,
+                        debug_prompt,
+                    };
+                    state.observability.record_chat_request(0);
+                    tracing::info!(
+                        requested_model = %requested_model,
+                        final_model = %response.model,
+                        "Completed chat request via agent engine"
+                    );
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "agent engine failed; falling back to legacy chat");
+                }
+            }
+        }
+    }
 
     let started_at = Instant::now();
     let mut response = run_with_fallback(state, prepared, &requested_model).await?;
@@ -247,8 +301,10 @@ mod tests {
         ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo,
     };
     use crate::optimizer::metrics::TokenMetrics;
+    use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
     use crate::providers::LLMProvider;
     use crate::services::agent_registry::AgentRegistry;
+    use crate::services::agent_runtime::AgentRuntime;
     use crate::services::skill_manager::SkillManager;
     use async_trait::async_trait;
     use std::collections::VecDeque;
@@ -257,7 +313,38 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard, RwLock};
     use tempfile::TempDir;
+    use tokio::sync::mpsc;
     use tokio_stream::{Stream, StreamExt};
+
+    struct FakeEngine {
+        response: String,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl AgentEngine for FakeEngine {
+        async fn run(&self, req: AgentRunRequest) -> Result<AgentRunResult, String> {
+            if self.fail {
+                return Err("engine down".into());
+            }
+            Ok(AgentRunResult {
+                text: format!("{}|{}", self.response, req.user_message),
+                tool_calls: 0,
+                iterations: 1,
+                model: req.model,
+            })
+        }
+
+        async fn run_stream(
+            &self,
+            req: AgentRunRequest,
+        ) -> Result<mpsc::Receiver<AgentRunEvent>, String> {
+            let (tx, rx) = mpsc::channel(1);
+            let result = self.run(req).await?;
+            let _ = tx.send(AgentRunEvent::Completed { result }).await;
+            Ok(rx)
+        }
+    }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -356,9 +443,19 @@ mod tests {
     }
 
     fn test_state(provider: Arc<dyn LLMProvider + Send + Sync>) -> (TempDir, Arc<AppState>) {
+        test_state_with_runtime(provider, None)
+    }
+
+    fn test_state_with_runtime(
+        provider: Arc<dyn LLMProvider + Send + Sync>,
+        agent_runtime: Option<Arc<AgentRuntime>>,
+    ) -> (TempDir, Arc<AppState>) {
         let temp_dir = tempfile::tempdir().unwrap();
         std::env::set_var("LLAMA_R_DIR", temp_dir.path());
-        let agent_registry = Arc::new(AgentRegistry::new());
+        let agent_registry = agent_runtime
+            .as_ref()
+            .map(|rt| rt.registry.clone())
+            .unwrap_or_else(|| Arc::new(AgentRegistry::new()));
         let _ = agent_registry.reload_all(&[]);
         let skill_manager = Arc::new(SkillManager::new());
         let context_store = Arc::new(ContextStore::new());
@@ -381,6 +478,7 @@ mod tests {
             logs: Arc::new(Mutex::new(VecDeque::new())),
             known_mcp_servers: RwLock::new(Vec::new()),
             mcp_registry: Arc::new(StaticMcpRegistry::new()),
+            agent_runtime,
         });
         (temp_dir, state)
     }
@@ -583,5 +681,212 @@ mod tests {
         .unwrap();
         let event = stream.next().await.unwrap().unwrap();
         assert_eq!(event.model, "fallback-model");
+    }
+
+    #[tokio::test]
+    async fn agent_runtime_returns_engine_text() {
+        let _guard = lock_env();
+        let engine = Arc::new(FakeEngine {
+            response: "engine-echo".to_string(),
+            fail: false,
+        });
+        let registry = Arc::new(AgentRegistry::new());
+        let runtime = Arc::new(AgentRuntime {
+            registry: registry.clone(),
+            engine,
+            history: None,
+            rag: None,
+        });
+        let provider = Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: false,
+        });
+        let (_dir, state) = test_state_with_runtime(provider, Some(runtime));
+
+        // Create a project agent
+        use crate::domain::agent::AgentConfig;
+        let config = AgentConfig {
+            name: "test-agent".to_string(),
+            model: "agent-model".to_string(),
+            system_prompt: "You are helpful".to_string(),
+            context_project: Some("test-proj".to_string()),
+            ..Default::default()
+        };
+        let dir = crate::core::paths::get_project_agents_dir("test-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("test-agent.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        registry.reload_all(&[]).unwrap();
+
+        let response = execute_chat(
+            &state,
+            ChatRequest {
+                model: "fallback-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "ping".to_string(),
+                }],
+                stream: false,
+            },
+            AgentSelection {
+                project_id: Some("test-proj"),
+                agent_id: Some("test-agent"),
+                debug: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(response.message.content.contains("engine-echo"));
+        assert!(response.message.content.contains("ping"));
+    }
+
+    #[tokio::test]
+    async fn chat_uses_engine_when_agent_present() {
+        let _guard = lock_env();
+        // Provider panics if called (engine should handle it)
+        let engine = Arc::new(FakeEngine {
+            response: "from-engine".to_string(),
+            fail: false,
+        });
+        let registry = Arc::new(AgentRegistry::new());
+        let runtime = Arc::new(AgentRuntime {
+            registry: registry.clone(),
+            engine,
+            history: None,
+            rag: None,
+        });
+        let provider = Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: true,
+        });
+        let (_dir, state) = test_state_with_runtime(provider, Some(runtime));
+
+        let config = AgentConfig {
+            name: "engine-agent".to_string(),
+            model: "agent-model".to_string(),
+            system_prompt: "You are helpful".to_string(),
+            context_project: Some("engine-proj".to_string()),
+            ..Default::default()
+        };
+        let dir = crate::core::paths::get_project_agents_dir("engine-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("engine-agent.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        registry.reload_all(&[]).unwrap();
+
+        let response = execute_chat(
+            &state,
+            ChatRequest {
+                model: "fallback-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                stream: false,
+            },
+            AgentSelection {
+                project_id: Some("engine-proj"),
+                agent_id: Some("engine-agent"),
+                debug: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(response.message.content.contains("from-engine"));
+    }
+
+    #[tokio::test]
+    async fn chat_falls_back_when_engine_fails() {
+        let _guard = lock_env();
+        let engine = Arc::new(FakeEngine {
+            response: "".to_string(),
+            fail: true,
+        });
+        let registry = Arc::new(AgentRegistry::new());
+        let runtime = Arc::new(AgentRuntime {
+            registry: registry.clone(),
+            engine,
+            history: None,
+            rag: None,
+        });
+        let provider = Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: false,
+        });
+        let (_dir, state) = test_state_with_runtime(provider, Some(runtime));
+
+        let config = AgentConfig {
+            name: "fallback-agent".to_string(),
+            model: "agent-model".to_string(),
+            system_prompt: "You are helpful".to_string(),
+            context_project: Some("fallback-proj".to_string()),
+            ..Default::default()
+        };
+        let dir = crate::core::paths::get_project_agents_dir("fallback-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("fallback-agent.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        registry.reload_all(&[]).unwrap();
+
+        // Engine fails -> falls back to FakeProvider
+        let response = execute_chat(
+            &state,
+            ChatRequest {
+                model: "fallback-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "fallback-msg".to_string(),
+                }],
+                stream: false,
+            },
+            AgentSelection {
+                project_id: Some("fallback-proj"),
+                agent_id: Some("fallback-agent"),
+                debug: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(response.message.content.contains("fallback-msg"));
+    }
+
+    #[tokio::test]
+    async fn project_missing_agent_still_400() {
+        let _guard = lock_env();
+        let (_dir, state) = test_state(Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: false,
+        }));
+
+        let err = execute_chat(
+            &state,
+            ChatRequest {
+                model: "fallback-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                stream: false,
+            },
+            AgentSelection {
+                project_id: Some("ghost-project"),
+                agent_id: Some("ghost-agent"),
+                debug: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Agent 'ghost-agent' not found for project 'ghost-project'"));
     }
 }

@@ -16,10 +16,13 @@ use crate::context::store::ContextStore;
 use crate::core::hot_reload::HotReloader;
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
+#[cfg(feature = "rig-engine")]
+use crate::ports::engine::AgentEngine;
 use crate::ports::mcp::McpServerRegistry;
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
+use crate::services::agent_runtime::AgentRuntime;
 use crate::services::skill_manager::SkillManager;
 use axum::{
     routing::{get, post},
@@ -50,6 +53,7 @@ pub fn build_app_state(
     logs: Arc<Mutex<VecDeque<String>>>,
     known_mcp_servers: Vec<String>,
     mcp_registry: Arc<dyn McpServerRegistry>,
+    agent_runtime: Option<Arc<AgentRuntime>>,
 ) -> Arc<AppState> {
     let metrics = Arc::new(TokenMetrics::new());
     let context_enricher = Arc::new(ContextEnricher::new(
@@ -72,6 +76,7 @@ pub fn build_app_state(
         logs,
         known_mcp_servers: RwLock::new(known_mcp_servers),
         mcp_registry,
+        agent_runtime,
     })
 }
 
@@ -245,6 +250,9 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     }
 
     let context_store = Arc::new(ContextStore::new());
+
+    let agent_runtime =
+        build_agent_runtime(&config, mcp_registry_inner.clone(), agent_registry.clone());
     let state = build_app_state(
         provider_impl,
         agent_registry.clone(),
@@ -254,6 +262,7 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         logs,
         known_mcp_servers,
         mcp_registry,
+        agent_runtime,
     );
     let router = build_router(state.clone());
 
@@ -284,6 +293,37 @@ pub async fn start_http_server(runtime: &Runtime) -> Result<tokio::task::JoinHan
             tracing::error!(error = %err, "HTTP server stopped unexpectedly");
         }
     }))
+}
+
+/// Build the agent runtime (Rig engine) when the feature is enabled.
+fn build_agent_runtime(
+    config: &Config,
+    mcp_registry: Arc<StaticMcpRegistry>,
+    agent_registry: Arc<AgentRegistry>,
+) -> Option<Arc<AgentRuntime>> {
+    #[cfg(feature = "rig-engine")]
+    {
+        use crate::adapters::rig_engine::RigAgentEngine;
+
+        let engine: Arc<dyn AgentEngine> = Arc::new(RigAgentEngine::new(
+            config.ollama_url.clone(),
+            mcp_registry,
+            None,
+        ));
+
+        Some(Arc::new(AgentRuntime {
+            registry: agent_registry,
+            engine,
+            history: None,
+            rag: None,
+        }))
+    }
+
+    #[cfg(not(feature = "rig-engine"))]
+    {
+        let _ = (config, mcp_registry, agent_registry);
+        None
+    }
 }
 
 /// Load MCP server configs from the `mcp-servers/` directory.

@@ -85,8 +85,16 @@ pub fn render_projects(
             Line::from(vec![
                 "Status: ".bold(),
                 Span::styled(
-                    if is_analyzed { "Analyzed" } else { "Not analyzed (press 'a' to analyze)" },
-                    Style::default().fg(if is_analyzed { Color::Green } else { Color::Yellow }),
+                    if is_analyzed {
+                        "Analyzed"
+                    } else {
+                        "Not analyzed (press 'a' to analyze)"
+                    },
+                    Style::default().fg(if is_analyzed {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    }),
                 ),
             ]),
         ])
@@ -97,18 +105,19 @@ pub fn render_projects(
         );
         f.render_widget(details, right_chunks[0]);
 
-        // Agents Panel
-        let project_id = &selected_project.project_id;
+        // Agents Panel (all agents with project tag)
         let all_agents = state.agent_registry.list_agents();
-        let project_agents: Vec<_> = all_agents
-            .iter()
-            .filter(|a| {
-                // Check if it belongs to this project
-                a.config.context_project.as_ref() == Some(project_id)
-            })
-            .collect();
+        let mut sorted_agents: Vec<_> = all_agents.iter().collect();
+        let selected_project_id = &selected_project.project_id;
+        sorted_agents.sort_by_key(|a| {
+            match &a.project_id {
+                Some(p) if p == selected_project_id => 0,
+                Some(_) => 1,
+                None => 2,
+            }
+        });
 
-        let agent_items: Vec<ListItem> = project_agents
+        let agent_items: Vec<ListItem> = sorted_agents
             .iter()
             .enumerate()
             .map(|(i, a)| {
@@ -119,7 +128,11 @@ pub fn render_projects(
                 } else {
                     Style::default().fg(Color::White)
                 };
-                ListItem::new(format!(" {} (Model: {})", a.id, a.config.model)).style(style)
+                let tag = match &a.project_id {
+                    Some(p) => format!("[{p}]"),
+                    None => "[Global]".to_string(),
+                };
+                ListItem::new(format!(" {} {tag} (Model: {})", a.id, a.config.model)).style(style)
             })
             .collect();
 
@@ -127,7 +140,7 @@ pub fn render_projects(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Specialized Agents "),
+                    .title(" All Agents "),
             )
             .highlight_style(Style::default().bg(Color::DarkGray));
         f.render_widget(agent_list, right_chunks[1]);
@@ -309,28 +322,31 @@ pub fn render_agent_form(
 
     // Set cursor position based on active field
     match field_index {
-        0 => f.set_cursor(chunks[0].x + 1 + id.chars().count() as u16, chunks[0].y + 1),
-        1 => f.set_cursor(
+        0 => f.set_cursor_position((
+            chunks[0].x + 1 + id.chars().count() as u16,
+            chunks[0].y + 1,
+        )),
+        1 => f.set_cursor_position((
             chunks[1].x + 1 + name.chars().count() as u16,
             chunks[1].y + 1,
-        ),
-        2 => f.set_cursor(
+        )),
+        2 => f.set_cursor_position((
             chunks[2].x + 1 + model.chars().count() as u16,
             chunks[2].y + 1,
-        ),
+        )),
         3 => {} // Project cycling, no text cursor needed
-        4 => f.set_cursor(
+        4 => f.set_cursor_position((
             chunks[4].x + 1 + rules.chars().count() as u16,
             chunks[4].y + 1,
-        ),
-        5 => f.set_cursor(
+        )),
+        5 => f.set_cursor_position((
             chunks[5].x + 1 + optimize_rules.chars().count() as u16,
             chunks[5].y + 1,
-        ),
-        6 => f.set_cursor(
+        )),
+        6 => f.set_cursor_position((
             chunks[6].x + 1 + skills.chars().count() as u16,
             chunks[6].y + 1,
-        ),
+        )),
         7 => {
             let width = chunks[7].width.saturating_sub(2) as usize;
             if width > 0 {
@@ -350,21 +366,16 @@ pub fn render_agent_form(
                     }
                 }
 
-                // Ensure we don't go out of the prompt area vertically
                 let final_y =
                     (chunks[7].y + 1 + y_offset as u16).min(chunks[7].y + chunks[7].height - 2);
-                f.set_cursor(chunks[7].x + 1 + x_pos as u16, final_y);
+                f.set_cursor_position((chunks[7].x + 1 + x_pos as u16, final_y));
             }
         }
         _ => {}
     }
 }
 
-pub fn render_analysis(
-    f: &mut Frame,
-    analysis_state: &AnalysisState,
-) {
-    
+pub fn render_analysis(f: &mut Frame, analysis_state: &AnalysisState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -406,10 +417,7 @@ pub fn render_analysis(
             let content = Paragraph::new(Line::from(vec![
                 Span::styled(frame, Style::default().fg(Color::Cyan)),
                 Span::raw(" Analyzing project... "),
-                Span::styled(
-                    format!("({}s)", elapsed),
-                    Style::default().fg(Color::Gray),
-                ),
+                Span::styled(format!("({}s)", elapsed), Style::default().fg(Color::Gray)),
             ]))
             .block(Block::default().borders(Borders::ALL).title(" Analysis "))
             .wrap(Wrap { trim: true });
@@ -417,17 +425,28 @@ pub fn render_analysis(
         }
         AnalysisState::Loaded(content_md) => {
             let content = Paragraph::new(content_md.as_str())
-                .block(Block::default().borders(Borders::ALL).title(" Analysis Result "))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Analysis Result "),
+                )
                 .wrap(Wrap { trim: true })
                 .scroll((0, 0));
             f.render_widget(content, chunks[1]);
         }
         AnalysisState::Error(err) => {
             let content = Paragraph::new(Line::from(vec![
-                Span::styled("Error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Error: ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(err),
             ]))
-            .block(Block::default().borders(Borders::ALL).title(" Analysis Error "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Analysis Error "),
+            )
             .wrap(Wrap { trim: true });
             f.render_widget(content, chunks[1]);
         }
@@ -439,18 +458,16 @@ pub fn render_analysis(
     f.render_widget(footer, chunks[2]);
 }
 
-pub fn render_context(
-    f: &mut Frame,
-    state: &AppState,
-    project_index: usize,
-) {
+pub fn render_context(f: &mut Frame, state: &AppState, project_index: usize, scroll: usize) {
     let projects = state.context_store.list_all_projects();
     let project = projects.get(project_index);
-    
+
     let (project_id, context_md) = match project {
         Some(p) => {
             let ctx = state.context_store.get_context(&p.project_id);
-            let md = ctx.map(|c| c.context_md).unwrap_or_else(|| "No context analyzed yet. Press 'a' to analyze.".to_string());
+            let md = ctx
+                .map(|c| c.context_md)
+                .unwrap_or_else(|| "No context analyzed yet. Press 'a' to analyze.".to_string());
             (p.project_id.clone(), md)
         }
         None => ("Unknown".to_string(), "No project selected".to_string()),
@@ -484,13 +501,64 @@ pub fn render_context(
 
     // Content
     let content = Paragraph::new(context_md)
-        .block(Block::default().borders(Borders::ALL).title(" Project Context "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Project Context "),
+        )
         .wrap(Wrap { trim: true })
-        .scroll((0, 0));
+        .scroll((scroll as u16, 0));
     f.render_widget(content, chunks[1]);
 
     // Footer
     let footer = Paragraph::new(" [Esc] Return to Projects | [↑/↓] Scroll")
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
+}
+
+pub fn render_confirm_delete(f: &mut Frame, confirm_type: &str, confirm_id: &str) {
+    let area = f.area();
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Percentage(40),
+                Constraint::Length(5),
+                Constraint::Percentage(40),
+            ]
+            .as_ref(),
+        )
+        .split(area);
+    let horiz = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(
+            [
+                Constraint::Percentage(25),
+                Constraint::Length(50),
+                Constraint::Percentage(25),
+            ]
+        .as_ref(),
+        )
+        .split(vert[1]);
+
+    let dialog = Paragraph::new(vec![
+        Line::from(Span::styled(
+            format!(" Delete {confirm_type}: \"{confirm_id}\"?"),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            " [y] Yes   [n] No   [Esc] Cancel",
+            Style::default().fg(Color::Gray),
+        )),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Confirm Delete "),
+    )
+    .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(dialog, horiz[1]);
 }

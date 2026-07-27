@@ -1,25 +1,35 @@
 use crate::api::handlers::AppState;
+use crate::domain::models::ChatMessage;
+use crate::services::agent_runtime::RuntimeChatRequest;
+use crate::tui::views::chat::render_chat;
 use crate::tui::views::dashboard::render_dashboard;
-use crate::tui::views::projects::{render_agent_form, render_analysis, render_context, render_projects};
+use crate::tui::views::projects::render_confirm_delete;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use ratatui::{
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Terminal,
+};
 use std::io;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 pub enum CurrentView {
     Dashboard,
     Projects,
     AgentForm,
     Analysis,
     ContextView,
+    Chat,
 }
 
 #[derive(Clone)]
@@ -51,6 +61,21 @@ pub struct TuiApp {
     editing_agent: Option<String>,
     // Analysis state
     analysis_state: Arc<Mutex<AnalysisState>>,
+    // Dashboard scroll
+    log_scroll: usize,
+    // Context view scroll
+    context_scroll: usize,
+    // Delete confirmation
+    confirm_delete: Option<(String, String)>,
+    // Chat state
+    chat_messages: Arc<Mutex<Vec<(String, String)>>>,
+    chat_input: String,
+    chat_loading: Arc<AtomicBool>,
+    chat_auto_scroll: bool,
+    chat_agent_index: usize,
+    chat_selected_agent: Option<String>,
+    available_agents: Vec<String>,
+    chat_scroll: usize,
 }
 
 impl TuiApp {
@@ -74,6 +99,17 @@ impl TuiApp {
             available_models: Vec::new(),
             editing_agent: None,
             analysis_state: Arc::new(Mutex::new(AnalysisState::Idle)),
+            log_scroll: 0,
+            context_scroll: 0,
+            confirm_delete: None,
+            chat_messages: Arc::new(Mutex::new(Vec::new())),
+            chat_input: String::new(),
+            chat_loading: Arc::new(AtomicBool::new(false)),
+            chat_auto_scroll: true,
+            chat_agent_index: 0,
+            chat_selected_agent: None,
+            available_agents: Vec::new(),
+            chat_scroll: 0,
         }
     }
 
@@ -94,11 +130,13 @@ impl TuiApp {
     fn trigger_analysis(&self, project_id: String, project_path: String) {
         let state = self.state.clone();
         let analysis_state = self.analysis_state.clone();
-        
+
         // Set loading state immediately
         let analysis_state_clone = analysis_state.clone();
         tokio::spawn(async move {
-            *analysis_state_clone.lock().await = AnalysisState::Loading { started_at: Instant::now() };
+            *analysis_state_clone.lock().unwrap() = AnalysisState::Loading {
+                started_at: Instant::now(),
+            };
         });
 
         tokio::spawn(async move {
@@ -110,12 +148,10 @@ impl TuiApp {
                     let chat_req = ChatRequest {
                         model: std::env::var("DEFAULT_MODEL")
                             .unwrap_or_else(|_| "llama3".to_string()),
-                        messages: vec![
-                            crate::domain::models::ChatMessage {
-                                role: "user".to_string(),
-                                content: prompt,
-                            },
-                        ],
+                        messages: vec![crate::domain::models::ChatMessage {
+                            role: "user".to_string(),
+                            content: prompt,
+                        }],
                         stream: false,
                     };
                     provider
@@ -125,20 +161,14 @@ impl TuiApp {
                         .map_err(|e| e.to_string())
                 })
                     as std::pin::Pin<
-                        Box<
-                            dyn std::future::Future<
-                                Output = Result<String, String>,
-                            > + Send,
-                        >,
+                        Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
                     >
             };
 
             let analyzer =
-                crate::context::analyzer::ProjectAnalyzer::new(
-                    state.skill_manager.clone(),
-                );
+                crate::context::analyzer::ProjectAnalyzer::new(state.skill_manager.clone());
             log::info!("Starting TUI Analyze for {}...", project_id);
-            
+
             let result = analyzer
                 .analyze(&project_id, &project_path, responder)
                 .await;
@@ -155,7 +185,105 @@ impl TuiApp {
                 }
             };
 
-            *analysis_state.lock().await = final_state;
+            *analysis_state.lock().unwrap() = final_state;
+        });
+    }
+
+    fn refresh_available_agents(&mut self) {
+        let mut agents: Vec<String> = self
+            .state
+            .agent_registry
+            .list_agents()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        agents.sort();
+        agents.insert(0, "Direct (no agent)".to_string());
+        self.available_agents = agents;
+    }
+
+    fn update_chat_selected_agent(&mut self) {
+        if self.available_agents.is_empty() || self.chat_agent_index == 0 {
+            self.chat_selected_agent = None;
+        } else {
+            self.chat_selected_agent = Some(self.available_agents[self.chat_agent_index].clone());
+        }
+    }
+
+    fn send_chat_message(&mut self) {
+        let input = std::mem::take(&mut self.chat_input);
+        if input.trim().is_empty() {
+            return;
+        }
+
+        self.chat_messages
+            .lock()
+            .unwrap()
+            .push(("user".to_string(), input.clone()));
+        self.chat_loading.store(true, Ordering::SeqCst);
+        self.chat_auto_scroll = true;
+
+        let state = self.state.clone();
+        let messages = self.chat_messages.clone();
+        let loading = self.chat_loading.clone();
+        let agent_id = self.chat_selected_agent.clone();
+        let agent_project_id = agent_id.as_ref().and_then(|aid| {
+            self.state
+                .agent_registry
+                .list_agents()
+                .into_iter()
+                .find(|a| a.id == *aid)
+                .and_then(|a| a.project_id)
+        });
+
+        tokio::spawn(async move {
+            let result = if let Some(ref aid) = agent_id {
+                if let Some(runtime) = &state.agent_runtime {
+                    runtime
+                        .chat(RuntimeChatRequest {
+                            project_id: agent_project_id,
+                            agent_id: Some(aid.clone()),
+                            conversation_id: None,
+                            user_message: input,
+                            model_override: None,
+                            system_prompt: None,
+                            default_model: state.default_model.clone(),
+                        })
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    Err("Agent runtime not available (rig-engine feature disabled)".to_string())
+                }
+            } else {
+                let req = crate::domain::models::ChatRequest {
+                    model: state.default_model.clone(),
+                    messages: vec![ChatMessage {
+                        role: "user".to_string(),
+                        content: input,
+                    }],
+                    stream: false,
+                };
+                match state.provider.chat(req).await {
+                    Ok(resp) => Ok(resp.message.content),
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+
+            match result {
+                Ok(text) => {
+                    messages
+                        .lock()
+                        .unwrap()
+                        .push(("assistant".to_string(), text));
+                }
+                Err(e) => {
+                    messages
+                        .lock()
+                        .unwrap()
+                        .push(("assistant".to_string(), format!("Error: {e}")));
+                }
+            }
+            loading.store(false, Ordering::SeqCst);
         });
     }
 
@@ -167,44 +295,76 @@ impl TuiApp {
         let mut terminal = Terminal::new(backend)?;
 
         loop {
-            terminal.draw(|f| match self.current_view {
-                CurrentView::Dashboard => render_dashboard(f, &self.state),
-                CurrentView::Projects => {
-                    crate::tui::views::projects::render_projects(
-                        f,
-                        &self.state,
-                        self.project_index,
-                        self.agent_index,
-                        self.active_in_project_list,
-                    );
+            if self.current_view == CurrentView::Chat && self.chat_auto_scroll {
+                self.chat_scroll = usize::MAX;
+            }
+
+            terminal.draw(|f| {
+                render_tab_bar(f, &self.current_view);
+                match self.current_view {
+                    CurrentView::Dashboard => {
+                        render_dashboard(f, &self.state, self.log_scroll)
+                    }
+                    CurrentView::Projects => {
+                        crate::tui::views::projects::render_projects(
+                            f,
+                            &self.state,
+                            self.project_index,
+                            self.agent_index,
+                            self.active_in_project_list,
+                        );
+                    }
+                    CurrentView::AgentForm => {
+                        crate::tui::views::projects::render_agent_form(
+                            f,
+                            &self.form_id,
+                            &self.form_name,
+                            &self.form_model,
+                            &self.form_project_id,
+                            &self.form_rules,
+                            &self.form_optimize_rules,
+                            &self.form_skills,
+                            &self.form_prompt,
+                            self.form_field_index,
+                        );
+                    }
+                    CurrentView::Analysis => {
+                        let analysis_state = self
+                            .analysis_state
+                            .try_lock()
+                            .map(|g| g.clone())
+                            .unwrap_or(AnalysisState::Idle);
+                        crate::tui::views::projects::render_analysis(f, &analysis_state);
+                    }
+                    CurrentView::ContextView => {
+                        crate::tui::views::projects::render_context(
+                            f,
+                            &self.state,
+                            self.project_index,
+                            self.context_scroll,
+                        );
+                    }
+                    CurrentView::Chat => {
+                        let messages = self
+                            .chat_messages
+                            .lock()
+                            .map(|g| g.clone())
+                            .unwrap_or_default();
+                        let loading = self.chat_loading.load(Ordering::SeqCst);
+                        render_chat(
+                            f,
+                            &messages,
+                            &self.chat_input,
+                            loading,
+                            &self.chat_selected_agent,
+                            &self.available_agents,
+                            self.chat_agent_index,
+                            self.chat_scroll,
+                        );
+                    }
                 }
-                CurrentView::AgentForm => {
-                    crate::tui::views::projects::render_agent_form(
-                        f,
-                        &self.form_id,
-                        &self.form_name,
-                        &self.form_model,
-                        &self.form_project_id,
-                        &self.form_rules,
-                        &self.form_optimize_rules,
-                        &self.form_skills,
-                        &self.form_prompt,
-                        self.form_field_index,
-                    );
-                }
-                CurrentView::Analysis => {
-                    let analysis_state = self.analysis_state.try_lock().map(|g| g.clone()).unwrap_or(AnalysisState::Idle);
-                    crate::tui::views::projects::render_analysis(
-                        f,
-                        &analysis_state,
-                    );
-                }
-                CurrentView::ContextView => {
-                    crate::tui::views::projects::render_context(
-                        f,
-                        &self.state,
-                        self.project_index,
-                    );
+                if let Some((ref confirm_type, ref confirm_id)) = self.confirm_delete {
+                    render_confirm_delete(f, confirm_type, confirm_id);
                 }
             })?;
 
@@ -227,8 +387,7 @@ impl TuiApp {
                                 }
                             }
                             KeyCode::Left | KeyCode::Right => {
-                                if self.form_field_index == 2 && !self.available_models.is_empty()
-                                {
+                                if self.form_field_index == 2 && !self.available_models.is_empty() {
                                     let current_idx = self
                                         .available_models
                                         .iter()
@@ -244,7 +403,8 @@ impl TuiApp {
                                         }
                                     };
                                     self.form_model = self.available_models[next_idx].clone();
-                                } else if self.form_field_index == 3 && !self.available_projects.is_empty()
+                                } else if self.form_field_index == 3
+                                    && !self.available_projects.is_empty()
                                 {
                                     let current_idx = self
                                         .available_projects
@@ -361,16 +521,139 @@ impl TuiApp {
                         continue;
                     }
 
+                    // Confirm delete interception
+                    if self.confirm_delete.is_some() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Enter => {
+                                let action = self.confirm_delete.take();
+                                if let Some((ref confirm_type, ref confirm_id)) = action {
+                                    match confirm_type.as_str() {
+                                        "project" => {
+                                            let _ = self
+                                                .state
+                                                .context_store
+                                                .delete_context(confirm_id);
+                                            self.project_index = 0;
+                                        }
+                                        "agent" => {
+                                            let agents =
+                                                self.state.agent_registry.list_agents();
+                                            if let Some(agent) =
+                                                agents.iter().find(|a| a.id == *confirm_id)
+                                            {
+                                                let path =
+                                                    if let Some(ref pid) = agent.project_id
+                                                    {
+                                                        crate::core::paths::
+                                                            get_project_agents_dir(pid)
+                                                            .join(format!(
+                                                                "{}.toml",
+                                                                agent.id
+                                                            ))
+                                                    } else {
+                                                        crate::core::paths::get_agents_dir()
+                                                            .join(format!(
+                                                                "{}.toml",
+                                                                agent.id
+                                                            ))
+                                                    };
+                                                let _ = std::fs::remove_file(path);
+                                                let _ = self
+                                                    .state
+                                                    .agent_registry
+                                                    .reload_all(&[]);
+                                            }
+                                            self.agent_index = 0;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            KeyCode::Char('n') | KeyCode::Esc => {
+                                self.confirm_delete = None;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Chat view handling
+                    if self.current_view == CurrentView::Chat {
+                        match key.code {
+                            KeyCode::Esc => {
+                                self.current_view = CurrentView::Projects;
+                            }
+                            KeyCode::Tab | KeyCode::BackTab => {
+                                // Let Tab fall through to main navigation
+                            }
+                            KeyCode::Left => {
+                                self.refresh_available_agents();
+                                let count = self.available_agents.len();
+                                if count > 0 {
+                                    self.chat_agent_index = if self.chat_agent_index == 0 {
+                                        count - 1
+                                    } else {
+                                        self.chat_agent_index - 1
+                                    };
+                                    self.update_chat_selected_agent();
+                                }
+                            }
+                            KeyCode::Right => {
+                                self.refresh_available_agents();
+                                let count = self.available_agents.len();
+                                if count > 0 {
+                                    self.chat_agent_index =
+                                        (self.chat_agent_index + 1) % count;
+                                    self.update_chat_selected_agent();
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if !self.chat_loading.load(Ordering::SeqCst) {
+                                    self.send_chat_message();
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                self.chat_input.pop();
+                            }
+                            KeyCode::Up => {
+                                self.chat_auto_scroll = false;
+                                self.chat_scroll = self.chat_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                self.chat_scroll = self.chat_scroll.saturating_add(1);
+                            }
+                            KeyCode::PageUp => {
+                                self.chat_auto_scroll = false;
+                                self.chat_scroll = self.chat_scroll.saturating_sub(10);
+                            }
+                            KeyCode::PageDown => {
+                                self.chat_scroll = self.chat_scroll.saturating_add(10);
+                            }
+                            KeyCode::Char(c) => {
+                                if !self.chat_loading.load(Ordering::SeqCst) {
+                                    self.chat_input.push(c);
+                                }
+                            }
+                            _ => {}
+                        }
+                        if key.code != KeyCode::Tab && key.code != KeyCode::BackTab {
+                            continue;
+                        }
+                    }
+
                     match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Tab => {
                             self.current_view = match self.current_view {
                                 CurrentView::Dashboard => CurrentView::Projects,
-                                CurrentView::Projects => CurrentView::Dashboard,
-                                CurrentView::AgentForm => CurrentView::AgentForm,
-                                CurrentView::Analysis => CurrentView::Analysis,
-                                CurrentView::ContextView => CurrentView::ContextView,
+                                CurrentView::Projects => CurrentView::Chat,
+                                CurrentView::Chat => CurrentView::Dashboard,
+                                _ => self.current_view.clone(),
                             };
+                            if self.current_view == CurrentView::Chat {
+                                self.refresh_available_agents();
+                                self.chat_auto_scroll = true;
+                            }
                         }
                         KeyCode::Char('j') | KeyCode::Down => {
                             if self.current_view == CurrentView::Projects {
@@ -378,12 +661,19 @@ impl TuiApp {
                                     let count = self.state.context_store.list_all_projects().len();
                                     if count > 0 {
                                         self.project_index = (self.project_index + 1) % count;
-                                        self.agent_index = 0;
                                     }
                                 } else {
-                                    // Handle agent navigation logic later
-                                    self.agent_index = self.agent_index.saturating_add(1);
+                                    let agent_count =
+                                        self.state.agent_registry.list_agents().len();
+                                    if agent_count > 0 {
+                                        self.agent_index =
+                                            (self.agent_index + 1) % agent_count;
+                                    }
                                 }
+                            } else if self.current_view == CurrentView::Dashboard {
+                                self.log_scroll = self.log_scroll.saturating_add(1);
+                            } else if self.current_view == CurrentView::ContextView {
+                                self.context_scroll = self.context_scroll.saturating_add(1);
                             }
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
@@ -396,11 +686,22 @@ impl TuiApp {
                                         } else {
                                             self.project_index - 1
                                         };
-                                        self.agent_index = 0;
                                     }
                                 } else {
-                                    self.agent_index = self.agent_index.saturating_sub(1);
+                                    let agent_count =
+                                        self.state.agent_registry.list_agents().len();
+                                    if agent_count > 0 {
+                                        self.agent_index = if self.agent_index == 0 {
+                                            agent_count - 1
+                                        } else {
+                                            self.agent_index - 1
+                                        };
+                                    }
                                 }
+                            } else if self.current_view == CurrentView::Dashboard {
+                                self.log_scroll = self.log_scroll.saturating_sub(1);
+                            } else if self.current_view == CurrentView::ContextView {
+                                self.context_scroll = self.context_scroll.saturating_sub(1);
                             }
                         }
                         KeyCode::Char('l')
@@ -412,7 +713,7 @@ impl TuiApp {
                             }
                         }
                         // Placeholder for actions
-KeyCode::Char('a') => {
+                        KeyCode::Char('a') => {
                             if self.current_view == CurrentView::Projects {
                                 let projects = self.state.context_store.list_all_projects();
                                 if let Some(project) = projects.get(self.project_index) {
@@ -433,36 +734,18 @@ KeyCode::Char('a') => {
                                 if self.active_in_project_list {
                                     let projects = self.state.context_store.list_all_projects();
                                     if let Some(project) = projects.get(self.project_index) {
-                                        let _ = self
-                                            .state
-                                            .context_store
-                                            .delete_context(&project.project_id);
-                                        self.project_index = 0;
+                                        self.confirm_delete = Some((
+                                            "project".to_string(),
+                                            project.project_id.clone(),
+                                        ));
                                     }
                                 } else {
-                                    // Delete agent
-                                    let projects = self.state.context_store.list_all_projects();
-                                    if let Some(project) = projects.get(self.project_index) {
-                                        let project_id = &project.project_id;
-                                        let agents: Vec<_> = self
-                                            .state
-                                            .agent_registry
-                                            .list_agents()
-                                            .into_iter()
-                                            .filter(|a| {
-                                                a.config.context_project.as_ref()
-                                                    == Some(project_id)
-                                            })
-                                            .collect();
-                                        if let Some(agent) = agents.get(self.agent_index) {
-                                            let path = crate::core::paths::get_project_agents_dir(
-                                                project_id,
-                                            )
-                                            .join(format!("{}.toml", agent.id));
-                                            let _ = std::fs::remove_file(path);
-                                            let _ = self.state.agent_registry.reload_all(&[]);
-                                            self.agent_index = 0;
-                                        }
+                                    let agents = self.state.agent_registry.list_agents();
+                                    if let Some(agent) = agents.get(self.agent_index) {
+                                        self.confirm_delete = Some((
+                                            "agent".to_string(),
+                                            agent.id.clone(),
+                                        ));
                                     }
                                 }
                             }
@@ -498,34 +781,36 @@ KeyCode::Char('a') => {
                             if self.current_view == CurrentView::Projects
                                 && !self.active_in_project_list
                             {
-                                let projects = self.state.context_store.list_all_projects();
-                                if let Some(project) = projects.get(self.project_index) {
-                                    let project_id = &project.project_id;
-                                    let agents: Vec<_> = self
-                                        .state
-                                        .agent_registry
-                                        .list_agents()
-                                        .into_iter()
-                                        .filter(|a| {
-                                            a.config.context_project.as_ref() == Some(project_id)
-                                        })
-                                        .collect();
-                                    if let Some(agent) = agents.get(self.agent_index) {
-                                        self.form_id = agent.id.clone();
-                                        self.form_name = agent.config.name.clone();
-                                        self.form_model = agent.config.model.clone();
-                                        self.form_prompt = agent.config.system_prompt.clone();
-                                        self.form_rules = agent.config.rules.join(", ");
-                                        self.form_optimize_rules =
-                                            agent.config.optimize.rules.join(", ");
-                                        self.form_skills = agent.config.skills.join(", ");
-                                        self.form_project_id = project_id.clone();
-                                        self.available_projects = vec![project_id.clone()];
-                                        self.form_field_index = 0;
-                                        self.editing_agent = Some(agent.id.clone());
-                                        self.current_view = CurrentView::AgentForm;
-                                        self.load_models().await;
-                                    }
+                                let agents = self.state.agent_registry.list_agents();
+                                if let Some(agent) = agents.get(self.agent_index) {
+                                    self.form_id = agent.id.clone();
+                                    self.form_name = agent.config.name.clone();
+                                    self.form_model = agent.config.model.clone();
+                                    self.form_prompt = agent.config.system_prompt.clone();
+                                    self.form_rules = agent.config.rules.join(", ");
+                                    self.form_optimize_rules =
+                                        agent.config.optimize.rules.join(", ");
+                                    self.form_skills = agent.config.skills.join(", ");
+                                    self.form_project_id = agent
+                                        .project_id
+                                        .clone()
+                                        .unwrap_or_default();
+                                    self.available_projects = if let Some(ref pid) =
+                                        agent.project_id
+                                    {
+                                        vec![pid.clone()]
+                                    } else {
+                                        self.state
+                                            .context_store
+                                            .list_all_projects()
+                                            .into_iter()
+                                            .map(|c| c.project_id)
+                                            .collect()
+                                    };
+                                    self.form_field_index = 0;
+                                    self.editing_agent = Some(agent.id.clone());
+                                    self.current_view = CurrentView::AgentForm;
+                                    self.load_models().await;
                                 }
                             }
                         }
@@ -536,6 +821,7 @@ KeyCode::Char('a') => {
                     if self.current_view == CurrentView::Analysis {
                         match key.code {
                             KeyCode::Esc => self.current_view = CurrentView::Projects,
+                            KeyCode::Tab => self.current_view = CurrentView::Projects,
                             KeyCode::Char('r') => {
                                 // Re-analyze current project
                                 let projects = self.state.context_store.list_all_projects();
@@ -554,6 +840,13 @@ KeyCode::Char('a') => {
                     if self.current_view == CurrentView::ContextView {
                         match key.code {
                             KeyCode::Esc => self.current_view = CurrentView::Projects,
+                            KeyCode::Tab => self.current_view = CurrentView::Projects,
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                self.context_scroll = self.context_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                self.context_scroll = self.context_scroll.saturating_add(1);
+                            }
                             _ => {}
                         }
                         continue;
@@ -573,4 +866,39 @@ KeyCode::Char('a') => {
 
         Ok(())
     }
+}
+
+fn render_tab_bar(f: &mut ratatui::Frame, current: &CurrentView) {
+    let area = f.area();
+    let bar_rect = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    let active_style = |active: bool| {
+        if active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    };
+    let bar = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "  [Dashboard]",
+            active_style(*current == CurrentView::Dashboard),
+        ),
+        Span::styled(
+            "  [Projects]",
+            active_style(*current == CurrentView::Projects),
+        ),
+        Span::styled(
+            "  [Chat]",
+            active_style(*current == CurrentView::Chat),
+        ),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(bar, bar_rect);
 }

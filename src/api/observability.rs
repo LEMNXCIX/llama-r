@@ -1,6 +1,6 @@
 use serde::Serialize;
-use utoipa::ToSchema;
 use std::sync::atomic::{AtomicU64, Ordering};
+use utoipa::ToSchema;
 
 #[derive(Debug, Default)]
 pub struct AppObservability {

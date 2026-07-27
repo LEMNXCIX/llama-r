@@ -93,7 +93,7 @@ impl ContextStore {
     /// List all projects including those without analyzed context (just agents)
     pub fn list_all_projects(&self) -> Vec<ProjectContext> {
         let mut projects = self.list_contexts();
-        
+
         // Also scan for projects with agents but no context
         if let Ok(entries) = fs::read_dir(get_contexts_dir()) {
             for entry in entries.flatten() {
@@ -102,15 +102,19 @@ impl ContextStore {
                     continue;
                 }
                 let project_id = entry.file_name().to_string_lossy().to_string();
-                
+
                 // Skip if already has context
                 if projects.iter().any(|p| p.project_id == project_id) {
                     continue;
                 }
-                
+
                 // Check if project has agents
                 let agents_dir = get_project_agents_dir(&project_id);
-                if agents_dir.exists() && fs::read_dir(&agents_dir).map(|d| d.count() > 0).unwrap_or(false) {
+                if agents_dir.exists()
+                    && fs::read_dir(&agents_dir)
+                        .map(|d| d.count() > 0)
+                        .unwrap_or(false)
+                {
                     // Create a placeholder project context
                     projects.push(ProjectContext {
                         project_id: project_id.clone(),
@@ -124,7 +128,7 @@ impl ContextStore {
                 }
             }
         }
-        
+
         projects
     }
 

@@ -1,12 +1,10 @@
 //! Rig.rs agent engine adapter (feature-gated wiring documented in ARCHITECTURE_PLAN).
-//!
-//! This module provides a compile-ready bridge that enforces scope on every tool
-//! call. Full `rig-core` integration is enabled once the dependency is added:
-//!
-//! ```toml
-//! [features]
-//! rig-engine = ["dep:rig-core"]
-//! ```
+
+#[cfg(feature = "rig-engine")]
+pub mod builder;
+pub mod limits;
+#[cfg(feature = "rig-engine")]
+pub mod tools;
 
 use crate::domain::scope::AgentScope;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
@@ -55,9 +53,7 @@ impl ScopedMcpTool {
     }
 }
 
-/// Engine implementation. Until `rig-core` is added, `run` returns a clear error
-/// after performing scoped tool discovery + optional RAG retrieve (side-effect free
-/// prep that production code will reuse).
+/// Engine implementation backed by rig-core Ollama provider.
 pub struct RigAgentEngine {
     pub ollama_url: String,
     pub mcp_registry: Arc<dyn McpServerRegistry>,
@@ -126,21 +122,56 @@ impl AgentEngine for RigAgentEngine {
     async fn run(&self, req: AgentRunRequest) -> Result<AgentRunResult, String> {
         let (tools, system) = self.prepare(&req).await?;
 
-        // Future: construct rig agent with preamble=system, tools=tools, model=req.model
-        // against Ollama at self.ollama_url, respecting scope.max_iterations / max_tool_calls.
-        let _ = (system, &self.ollama_url, req.model.clone());
+        #[cfg(feature = "rig-engine")]
+        {
+            return builder::run_with_rig(&self.ollama_url, &self.mcp_registry, req, system, tools)
+                .await;
+        }
 
-        Err(format!(
-            "RigAgentEngine not fully wired (scoped tools prepared: {}). \
-             Add rig-core dependency and complete adapter (ARCHITECTURE_PLAN §6.6 / Fase 3).",
-            tools.len()
-        ))
+        #[cfg(not(feature = "rig-engine"))]
+        {
+            let _ = (system, tools);
+            Err("feature `rig-engine` disabled".into())
+        }
     }
 
     async fn run_stream(
         &self,
-        _req: AgentRunRequest,
+        req: AgentRunRequest,
     ) -> Result<mpsc::Receiver<AgentRunEvent>, String> {
-        Err("RigAgentEngine streaming not implemented yet".into())
+        let (tools, system) = self.prepare(&req).await?;
+
+        #[cfg(feature = "rig-engine")]
+        {
+            let (tx, rx) = mpsc::channel(32);
+            let ollama_url = self.ollama_url.clone();
+            let mcp_registry = self.mcp_registry.clone();
+
+            tokio::spawn(async move {
+                let result =
+                    builder::run_with_rig(&ollama_url, &mcp_registry, req, system, tools).await;
+                match result {
+                    Ok(res) => {
+                        let _ = tx
+                            .send(AgentRunEvent::Token {
+                                text: res.text.clone(),
+                            })
+                            .await;
+                        let _ = tx.send(AgentRunEvent::Completed { result: res }).await;
+                    }
+                    Err(msg) => {
+                        let _ = tx.send(AgentRunEvent::Error { message: msg }).await;
+                    }
+                }
+            });
+
+            Ok(rx)
+        }
+
+        #[cfg(not(feature = "rig-engine"))]
+        {
+            let _ = (tools, system);
+            Err("feature `rig-engine` disabled".into())
+        }
     }
 }

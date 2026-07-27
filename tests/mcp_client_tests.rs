@@ -107,8 +107,8 @@ fn make_tool(name: &str, description: &str) -> Value {
 
 use llama_r::adapters::mcp::CachedMcpClient;
 use llama_r::adapters::mcp::HttpMcpClient;
-use llama_r::adapters::mcp::NamespacedMcpClient;
 use llama_r::adapters::mcp::McpServerConfig;
+use llama_r::adapters::mcp::NamespacedMcpClient;
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::adapters::mcp::StdioMcpClient;
 use llama_r::adapters::mcp::StreamingHttpMcpClient;
@@ -149,7 +149,11 @@ async fn http_client_call_tool() {
 
     let client = HttpMcpClient::new("test-server", format!("http://{}/", addr));
     let result = client
-        .call_tool(McpCallRequest::new("test-server", "echo", json!({"msg": "hello"})))
+        .call_tool(McpCallRequest::new(
+            "test-server",
+            "echo",
+            json!({"msg": "hello"}),
+        ))
         .await
         .expect("call_tool failed");
 
@@ -526,16 +530,15 @@ done
         Duration::from_secs(5),
     );
 
-    let tools = client.list_tools("stdio-server").await.expect("stdio list_tools");
+    let tools = client
+        .list_tools("stdio-server")
+        .await
+        .expect("stdio list_tools");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "stdio_ping");
 
     let result = client
-        .call_tool(McpCallRequest::new(
-            "stdio-server",
-            "stdio_ping",
-            json!({}),
-        ))
+        .call_tool(McpCallRequest::new("stdio-server", "stdio_ping", json!({})))
         .await
         .expect("stdio call_tool");
 
@@ -648,15 +651,14 @@ async fn streaming_http_client_sse_events() {
     assert_eq!(list_res[0].name, "stream_tool");
 
     let call_res = client
-        .call_tool(McpCallRequest::new(
-            "sse-server",
-            "stream_tool",
-            json!({}),
-        ))
+        .call_tool(McpCallRequest::new("sse-server", "stream_tool", json!({})))
         .await
         .expect("call_tool via SSE");
     assert!(!call_res.is_error);
-    assert!(call_res.content.to_string().contains("sse called stream_tool"));
+    assert!(call_res
+        .content
+        .to_string()
+        .contains("sse called stream_tool"));
 }
 
 #[tokio::test]
@@ -690,11 +692,7 @@ async fn namespaced_client_wraps_tool_names() {
     assert_eq!(list_res[0].name, "my_prefix_fetch");
 
     let call_res = ns_client
-        .call_tool(McpCallRequest::new(
-            "server",
-            "my_prefix_fetch",
-            json!({}),
-        ))
+        .call_tool(McpCallRequest::new("server", "my_prefix_fetch", json!({})))
         .await
         .expect("call_tool");
     assert!(!call_res.is_error);

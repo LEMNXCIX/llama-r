@@ -34,8 +34,7 @@ impl McpClient for NamespacedMcpClient {
         let prefix_slash = format!("{}/", self.namespace);
 
         for tool in &mut tools {
-            if !tool.name.starts_with(&prefix_underscore) && !tool.name.starts_with(&prefix_slash)
-            {
+            if !tool.name.starts_with(&prefix_underscore) && !tool.name.starts_with(&prefix_slash) {
                 tool.name = format!("{}_{}", self.namespace, tool.name);
             }
         }

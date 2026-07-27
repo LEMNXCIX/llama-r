@@ -8,7 +8,7 @@ use ratatui::{
 };
 use std::sync::atomic::Ordering;
 
-pub fn render_dashboard(f: &mut Frame, state: &AppState) {
+pub fn render_dashboard(f: &mut Frame, state: &AppState, log_scroll: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -100,7 +100,9 @@ pub fn render_dashboard(f: &mut Frame, state: &AppState) {
         ))],
     };
 
+    let log_lines_count = logs_lines.len();
     let logs_panel = Paragraph::new(logs_lines)
+        .scroll((log_scroll.min(log_lines_count.saturating_sub(1)) as u16, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -110,7 +112,7 @@ pub fn render_dashboard(f: &mut Frame, state: &AppState) {
 
     f.render_widget(logs_panel, chunks[2]);
 
-    let footer = Paragraph::new("Press 'q' to exit").block(Block::default().borders(Borders::ALL));
+    let footer = Paragraph::new(" [Tab] Next View  [↑/↓] Scroll Logs  [q] Quit").block(Block::default().borders(Borders::ALL));
 
     f.render_widget(footer, chunks[3]);
 }

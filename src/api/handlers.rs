@@ -3,12 +3,15 @@ use crate::api::mcp_api;
 use crate::api::observability::AppObservability;
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::ContextStore;
-use crate::domain::models::{ChatRequest, ChatResponse, JsonRpcRequest, JsonRpcResponse, ListModelsResponse};
+use crate::domain::models::{
+    ChatRequest, ChatResponse, JsonRpcRequest, JsonRpcResponse, ListModelsResponse,
+};
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::mcp::McpServerRegistry;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
+use crate::services::agent_runtime::AgentRuntime;
 use crate::services::skill_manager::SkillManager;
 use axum::{
     extract::State,
@@ -40,6 +43,8 @@ pub struct AppState {
     pub known_mcp_servers: RwLock<Vec<String>>,
     /// Runtime MCP server registry for tool discovery and execution.
     pub mcp_registry: Arc<dyn McpServerRegistry>,
+    /// Agent runtime (Rig engine) for agent-scoped chat. None when feature is off.
+    pub agent_runtime: Option<Arc<AgentRuntime>>,
 }
 
 impl AppState {

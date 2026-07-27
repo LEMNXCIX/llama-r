@@ -1,6 +1,4 @@
-use crate::api::agent_api::{
-    AgentResponse, AgentScopeResponse, CreateAgentRequest,
-};
+use crate::api::agent_api::{AgentResponse, AgentScopeResponse, CreateAgentRequest};
 use crate::api::context_api::CreateContextRequest;
 use crate::api::health::HealthResponse;
 use crate::context::store::ProjectContext;
