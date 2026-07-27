@@ -107,6 +107,7 @@ fn resolve_agent_path(project_id: Option<&str>, agent_id: &str) -> PathBuf {
     )
 )]
 pub async fn list_agents_api(State(state): State<Arc<AppState>>) -> Json<Vec<AgentResponse>> {
+    log::info!("Listando agentes:");
     let agents = state
         .agent_registry
         .list_agents()
@@ -136,10 +137,13 @@ pub async fn get_agent(
     let project_id = project_header(&headers);
     let agent = match project_id.as_deref() {
         Some(project_id) => state.agent_registry.get_project_agent(project_id, &id),
-        None => state
-            .agent_registry
-            .get_agent(&id)
-            .or_else(|| state.agent_registry.list_agents().into_iter().find(|a| a.id == id)),
+        None => state.agent_registry.get_agent(&id).or_else(|| {
+            state
+                .agent_registry
+                .list_agents()
+                .into_iter()
+                .find(|a| a.id == id)
+        }),
     };
 
     agent

@@ -30,9 +30,22 @@ impl McpClient for TimeoutMcpClient {
     async fn call_tool(&self, req: McpCallRequest) -> Result<McpCallResult, String> {
         let sid = req.server_id.clone();
         let tool_name = req.tool_name.clone();
-        tokio::time::timeout(self.timeout, self.inner.call_tool(req))
-            .await
-            .map_err(|_| format!("MCP call_tool timeout for server '{sid}' tool '{tool_name}'"))?
+        let token = req.cancel_token.clone();
+
+        if let Some(token) = token {
+            tokio::select! {
+                res = tokio::time::timeout(self.timeout, self.inner.call_tool(req)) => {
+                    res.map_err(|_| format!("MCP call_tool timeout for server '{sid}' tool '{tool_name}'"))?
+                }
+                _ = token.cancelled() => {
+                    Err(format!("MCP call_tool cancelled for server '{sid}' tool '{tool_name}'"))
+                }
+            }
+        } else {
+            tokio::time::timeout(self.timeout, self.inner.call_tool(req))
+                .await
+                .map_err(|_| format!("MCP call_tool timeout for server '{sid}' tool '{tool_name}'"))?
+        }
     }
 
     async fn health(&self, server_id: &str) -> Result<(), String> {

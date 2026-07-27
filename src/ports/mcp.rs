@@ -5,6 +5,51 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
+use tokio::sync::watch;
+
+/// Cancellation token for explicit tool call cancellation.
+#[derive(Clone, Debug)]
+pub struct CancellationToken {
+    tx: Arc<watch::Sender<bool>>,
+    rx: watch::Receiver<bool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        let (tx, rx) = watch::channel(false);
+        Self {
+            tx: Arc::new(tx),
+            rx,
+        }
+    }
+
+    pub fn cancel(&self) {
+        let _ = self.tx.send(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.rx.borrow()
+    }
+
+    pub async fn cancelled(&self) {
+        let mut rx = self.rx.clone();
+        if *rx.borrow() {
+            return;
+        }
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() {
+                break;
+            }
+        }
+    }
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct McpToolDef {
     pub server_id: String,
@@ -18,6 +63,27 @@ pub struct McpCallRequest {
     pub server_id: String,
     pub tool_name: String,
     pub arguments: Value,
+    pub cancel_token: Option<CancellationToken>,
+}
+
+impl McpCallRequest {
+    pub fn new(
+        server_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        arguments: Value,
+    ) -> Self {
+        Self {
+            server_id: server_id.into(),
+            tool_name: tool_name.into(),
+            arguments,
+            cancel_token: None,
+        }
+    }
+
+    pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
 }
 
 #[derive(Debug, Clone)]

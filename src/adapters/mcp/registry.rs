@@ -1,7 +1,9 @@
 //! In-memory MCP server registry loaded from config structs.
 
 use crate::adapters::mcp::http::HttpMcpClient;
+use crate::adapters::mcp::namespaced::NamespacedMcpClient;
 use crate::adapters::mcp::stdio::StdioMcpClient;
+use crate::adapters::mcp::streaming::StreamingHttpMcpClient;
 use crate::ports::mcp::{McpClient, McpServerRegistry};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -78,7 +80,7 @@ impl StaticMcpRegistry {
     }
 
     fn build_client(config: &McpServerConfig) -> Result<Arc<dyn McpClient>, String> {
-        match config.transport.as_str() {
+        let client: Arc<dyn McpClient> = match config.transport.as_str() {
             "http" => {
                 let url = config
                     .url
@@ -91,7 +93,21 @@ impl StaticMcpRegistry {
                 let client = HttpMcpClient::new(config.id.clone(), url)
                     .with_auth(token)
                     .with_timeout(Duration::from_secs(config.timeout_secs));
-                Ok(Arc::new(client) as Arc<dyn McpClient>)
+                Arc::new(client)
+            }
+            "sse" | "streaming" => {
+                let url = config
+                    .url
+                    .clone()
+                    .ok_or_else(|| format!("MCP server '{}' missing url", config.id))?;
+                let token = config
+                    .auth_env
+                    .as_ref()
+                    .and_then(|name| std::env::var(name).ok());
+                let client = StreamingHttpMcpClient::new(config.id.clone(), url)
+                    .with_auth(token)
+                    .with_timeout(Duration::from_secs(config.timeout_secs));
+                Arc::new(client)
             }
             "stdio" => {
                 let command = config
@@ -105,13 +121,23 @@ impl StaticMcpRegistry {
                     args,
                     Duration::from_secs(config.timeout_secs),
                 );
-                Ok(Arc::new(client) as Arc<dyn McpClient>)
+                Arc::new(client)
             }
-            other => Err(format!(
-                "unsupported MCP transport '{other}' for server '{}'",
-                config.id
-            )),
+            other => {
+                return Err(format!(
+                    "unsupported MCP transport '{other}' for server '{}'",
+                    config.id
+                ))
+            }
+        };
+
+        if let Some(ref ns) = config.tool_namespace {
+            if !ns.is_empty() {
+                return Ok(Arc::new(NamespacedMcpClient::new(client, ns.clone())));
+            }
         }
+
+        Ok(client)
     }
 
     pub fn insert_client(&self, server_id: impl Into<String>, client: Arc<dyn McpClient>) {

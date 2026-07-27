@@ -1,5 +1,6 @@
 use crate::api::handlers::AppState;
 use crate::tui::views::dashboard::render_dashboard;
+use crate::tui::views::projects::{render_agent_form, render_analysis, render_context, render_projects};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -9,12 +10,24 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 #[derive(PartialEq)]
 pub enum CurrentView {
     Dashboard,
     Projects,
     AgentForm,
+    Analysis,
+    ContextView,
+}
+
+#[derive(Clone)]
+pub enum AnalysisState {
+    Idle,
+    Loading { started_at: Instant },
+    Loaded(String),
+    Error(String),
 }
 
 pub struct TuiApp {
@@ -34,7 +47,10 @@ pub struct TuiApp {
     form_project_id: String,
     form_field_index: usize, // 0: ID, 1: Name, 2: Model, 3: Project, 4: Rules, 5: Optim. Rules, 6: Skills, 7: Prompt
     available_projects: Vec<String>,
+    available_models: Vec<String>,
     editing_agent: Option<String>,
+    // Analysis state
+    analysis_state: Arc<Mutex<AnalysisState>>,
 }
 
 impl TuiApp {
@@ -55,8 +71,92 @@ impl TuiApp {
             form_project_id: String::new(),
             form_field_index: 0,
             available_projects: Vec::new(),
+            available_models: Vec::new(),
             editing_agent: None,
+            analysis_state: Arc::new(Mutex::new(AnalysisState::Idle)),
         }
+    }
+
+    async fn load_models(&mut self) {
+        match self.state.provider.list_models().await {
+            Ok(models) => {
+                self.available_models = models.into_iter().map(|m| m.name).collect();
+                if !self.available_models.is_empty() && self.form_model.is_empty() {
+                    self.form_model = self.available_models[0].clone();
+                }
+            }
+            Err(_) => {
+                self.available_models = Vec::new();
+            }
+        }
+    }
+
+    fn trigger_analysis(&self, project_id: String, project_path: String) {
+        let state = self.state.clone();
+        let analysis_state = self.analysis_state.clone();
+        
+        // Set loading state immediately
+        let analysis_state_clone = analysis_state.clone();
+        tokio::spawn(async move {
+            *analysis_state_clone.lock().await = AnalysisState::Loading { started_at: Instant::now() };
+        });
+
+        tokio::spawn(async move {
+            let provider = state.provider.clone();
+            let responder = move |prompt: String| {
+                let provider = provider.clone();
+                Box::pin(async move {
+                    use crate::domain::models::ChatRequest;
+                    let chat_req = ChatRequest {
+                        model: std::env::var("DEFAULT_MODEL")
+                            .unwrap_or_else(|_| "llama3".to_string()),
+                        messages: vec![
+                            crate::domain::models::ChatMessage {
+                                role: "user".to_string(),
+                                content: prompt,
+                            },
+                        ],
+                        stream: false,
+                    };
+                    provider
+                        .chat(chat_req)
+                        .await
+                        .map(|r| r.message.content)
+                        .map_err(|e| e.to_string())
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                Output = Result<String, String>,
+                            > + Send,
+                        >,
+                    >
+            };
+
+            let analyzer =
+                crate::context::analyzer::ProjectAnalyzer::new(
+                    state.skill_manager.clone(),
+                );
+            log::info!("Starting TUI Analyze for {}...", project_id);
+            
+            let result = analyzer
+                .analyze(&project_id, &project_path, responder)
+                .await;
+
+            let final_state = match result {
+                Ok(ctx) => {
+                    let _ = state.context_store.save_context(ctx);
+                    log::info!("TUI Analysis complete for {}", project_id);
+                    AnalysisState::Loaded("Analysis complete! Context saved.".to_string())
+                }
+                Err(e) => {
+                    log::error!("TUI Analysis failed: {}", e);
+                    AnalysisState::Error(format!("Analysis failed: {}", e))
+                }
+            };
+
+            *analysis_state.lock().await = final_state;
+        });
     }
 
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -92,6 +192,20 @@ impl TuiApp {
                         self.form_field_index,
                     );
                 }
+                CurrentView::Analysis => {
+                    let analysis_state = self.analysis_state.try_lock().map(|g| g.clone()).unwrap_or(AnalysisState::Idle);
+                    crate::tui::views::projects::render_analysis(
+                        f,
+                        &analysis_state,
+                    );
+                }
+                CurrentView::ContextView => {
+                    crate::tui::views::projects::render_context(
+                        f,
+                        &self.state,
+                        self.project_index,
+                    );
+                }
             })?;
 
             if event::poll(std::time::Duration::from_millis(50))? {
@@ -113,7 +227,24 @@ impl TuiApp {
                                 }
                             }
                             KeyCode::Left | KeyCode::Right => {
-                                if self.form_field_index == 3 && !self.available_projects.is_empty()
+                                if self.form_field_index == 2 && !self.available_models.is_empty()
+                                {
+                                    let current_idx = self
+                                        .available_models
+                                        .iter()
+                                        .position(|m| m == &self.form_model)
+                                        .unwrap_or(0);
+                                    let next_idx = if key.code == KeyCode::Right {
+                                        (current_idx + 1) % self.available_models.len()
+                                    } else {
+                                        if current_idx == 0 {
+                                            self.available_models.len() - 1
+                                        } else {
+                                            current_idx - 1
+                                        }
+                                    };
+                                    self.form_model = self.available_models[next_idx].clone();
+                                } else if self.form_field_index == 3 && !self.available_projects.is_empty()
                                 {
                                     let current_idx = self
                                         .available_projects
@@ -237,12 +368,14 @@ impl TuiApp {
                                 CurrentView::Dashboard => CurrentView::Projects,
                                 CurrentView::Projects => CurrentView::Dashboard,
                                 CurrentView::AgentForm => CurrentView::AgentForm,
+                                CurrentView::Analysis => CurrentView::Analysis,
+                                CurrentView::ContextView => CurrentView::ContextView,
                             };
                         }
                         KeyCode::Char('j') | KeyCode::Down => {
                             if self.current_view == CurrentView::Projects {
                                 if self.active_in_project_list {
-                                    let count = self.state.context_store.list_contexts().len();
+                                    let count = self.state.context_store.list_all_projects().len();
                                     if count > 0 {
                                         self.project_index = (self.project_index + 1) % count;
                                         self.agent_index = 0;
@@ -256,7 +389,7 @@ impl TuiApp {
                         KeyCode::Char('k') | KeyCode::Up => {
                             if self.current_view == CurrentView::Projects {
                                 if self.active_in_project_list {
-                                    let count = self.state.context_store.list_contexts().len();
+                                    let count = self.state.context_store.list_all_projects().len();
                                     if count > 0 {
                                         self.project_index = if self.project_index == 0 {
                                             count - 1
@@ -279,72 +412,26 @@ impl TuiApp {
                             }
                         }
                         // Placeholder for actions
-                        KeyCode::Char('a') => {
+KeyCode::Char('a') => {
                             if self.current_view == CurrentView::Projects {
-                                let projects = self.state.context_store.list_contexts();
+                                let projects = self.state.context_store.list_all_projects();
                                 if let Some(project) = projects.get(self.project_index) {
                                     let project_id = project.project_id.clone();
                                     let project_path = project.path.clone();
-                                    let state = self.state.clone();
-
-                                    tokio::spawn(async move {
-                                        let provider = state.provider.clone();
-                                        let responder = move |prompt: String| {
-                                            let provider = provider.clone();
-                                            Box::pin(async move {
-                                                use crate::domain::models::ChatRequest;
-                                                let chat_req = ChatRequest {
-                                                    model: std::env::var("DEFAULT_MODEL")
-                                                        .unwrap_or_else(|_| "llama3".to_string()),
-                                                    messages: vec![
-                                                        crate::domain::models::ChatMessage {
-                                                            role: "user".to_string(),
-                                                            content: prompt,
-                                                        },
-                                                    ],
-                                                    stream: false,
-                                                };
-                                                provider
-                                                    .chat(chat_req)
-                                                    .await
-                                                    .map(|r| r.message.content)
-                                                    .map_err(|e| e.to_string())
-                                            })
-                                                as std::pin::Pin<
-                                                    Box<
-                                                        dyn std::future::Future<
-                                                                Output = Result<String, String>,
-                                                            > + Send,
-                                                    >,
-                                                >
-                                        };
-
-                                        let analyzer =
-                                            crate::context::analyzer::ProjectAnalyzer::new(
-                                                state.skill_manager.clone(),
-                                            );
-                                        log::info!("Starting TUI Analyze for {}...", project_id);
-                                        match analyzer
-                                            .analyze(&project_id, &project_path, responder)
-                                            .await
-                                        {
-                                            Ok(ctx) => {
-                                                let _ = state.context_store.save_context(ctx);
-                                                log::info!(
-                                                    "TUI Analysis complete for {}",
-                                                    project_id
-                                                );
-                                            }
-                                            Err(e) => log::error!("TUI Analysis failed: {}", e),
-                                        }
-                                    });
+                                    self.trigger_analysis(project_id, project_path);
+                                    self.current_view = CurrentView::Analysis;
                                 }
+                            }
+                        }
+                        KeyCode::Char('v') => {
+                            if self.current_view == CurrentView::Projects {
+                                self.current_view = CurrentView::ContextView;
                             }
                         }
                         KeyCode::Char('d') => {
                             if self.current_view == CurrentView::Projects {
                                 if self.active_in_project_list {
-                                    let projects = self.state.context_store.list_contexts();
+                                    let projects = self.state.context_store.list_all_projects();
                                     if let Some(project) = projects.get(self.project_index) {
                                         let _ = self
                                             .state
@@ -354,7 +441,7 @@ impl TuiApp {
                                     }
                                 } else {
                                     // Delete agent
-                                    let projects = self.state.context_store.list_contexts();
+                                    let projects = self.state.context_store.list_all_projects();
                                     if let Some(project) = projects.get(self.project_index) {
                                         let project_id = &project.project_id;
                                         let agents: Vec<_> = self
@@ -392,7 +479,7 @@ impl TuiApp {
                                 self.available_projects = self
                                     .state
                                     .context_store
-                                    .list_contexts()
+                                    .list_all_projects()
                                     .into_iter()
                                     .map(|c| c.project_id)
                                     .collect();
@@ -404,13 +491,14 @@ impl TuiApp {
                                 self.form_field_index = 0;
                                 self.editing_agent = None;
                                 self.current_view = CurrentView::AgentForm;
+                                self.load_models().await;
                             }
                         }
                         KeyCode::Char('e') => {
                             if self.current_view == CurrentView::Projects
                                 && !self.active_in_project_list
                             {
-                                let projects = self.state.context_store.list_contexts();
+                                let projects = self.state.context_store.list_all_projects();
                                 if let Some(project) = projects.get(self.project_index) {
                                     let project_id = &project.project_id;
                                     let agents: Vec<_> = self
@@ -436,11 +524,39 @@ impl TuiApp {
                                         self.form_field_index = 0;
                                         self.editing_agent = Some(agent.id.clone());
                                         self.current_view = CurrentView::AgentForm;
+                                        self.load_models().await;
                                     }
                                 }
                             }
                         }
                         _ => {}
+                    }
+
+                    // Handle Analysis view keys
+                    if self.current_view == CurrentView::Analysis {
+                        match key.code {
+                            KeyCode::Esc => self.current_view = CurrentView::Projects,
+                            KeyCode::Char('r') => {
+                                // Re-analyze current project
+                                let projects = self.state.context_store.list_all_projects();
+                                if let Some(project) = projects.get(self.project_index) {
+                                    let project_id = project.project_id.clone();
+                                    let project_path = project.path.clone();
+                                    self.trigger_analysis(project_id, project_path);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Handle ContextView keys
+                    if self.current_view == CurrentView::ContextView {
+                        match key.code {
+                            KeyCode::Esc => self.current_view = CurrentView::Projects,
+                            _ => {}
+                        }
+                        continue;
                     }
                 }
             }

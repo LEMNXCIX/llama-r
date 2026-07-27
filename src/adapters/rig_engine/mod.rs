@@ -41,11 +41,11 @@ impl ScopedMcpTool {
 
         let result = self
             .client
-            .call_tool(McpCallRequest {
-                server_id: self.def.server_id.clone(),
-                tool_name: self.def.name.clone(),
-                arguments: args,
-            })
+            .call_tool(McpCallRequest::new(
+                self.def.server_id.clone(),
+                self.def.name.clone(),
+                args,
+            ))
             .await?;
 
         if result.is_error {

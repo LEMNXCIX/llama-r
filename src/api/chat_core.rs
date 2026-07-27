@@ -247,7 +247,6 @@ mod tests {
         ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo,
     };
     use crate::optimizer::metrics::TokenMetrics;
-    use crate::ports::mcp::McpServerRegistry;
     use crate::providers::LLMProvider;
     use crate::services::agent_registry::AgentRegistry;
     use crate::services::skill_manager::SkillManager;

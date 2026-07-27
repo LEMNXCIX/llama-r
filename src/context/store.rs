@@ -1,3 +1,4 @@
+use crate::core::paths::{get_contexts_dir, get_project_agents_dir};
 use crate::error::AppError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,44 @@ impl ContextStore {
             .read()
             .map(|contexts| contexts.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// List all projects including those without analyzed context (just agents)
+    pub fn list_all_projects(&self) -> Vec<ProjectContext> {
+        let mut projects = self.list_contexts();
+        
+        // Also scan for projects with agents but no context
+        if let Ok(entries) = fs::read_dir(get_contexts_dir()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let project_id = entry.file_name().to_string_lossy().to_string();
+                
+                // Skip if already has context
+                if projects.iter().any(|p| p.project_id == project_id) {
+                    continue;
+                }
+                
+                // Check if project has agents
+                let agents_dir = get_project_agents_dir(&project_id);
+                if agents_dir.exists() && fs::read_dir(&agents_dir).map(|d| d.count() > 0).unwrap_or(false) {
+                    // Create a placeholder project context
+                    projects.push(ProjectContext {
+                        project_id: project_id.clone(),
+                        path: path.to_string_lossy().to_string(),
+                        context_md: String::new(),
+                        project_type: "unanalyzed".to_string(),
+                        skills_injected: Vec::new(),
+                        last_analyzed: Utc::now(),
+                        custom_rules: String::new(),
+                    });
+                }
+            }
+        }
+        
+        projects
     }
 
     pub fn save_context(&self, ctx: ProjectContext) -> Result<(), AppError> {

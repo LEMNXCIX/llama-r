@@ -9,29 +9,36 @@ pub fn get_base_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
 
-    // 2. Check executable directory — only use as data root when inside a
-    //    cargo workspace (target/debug or target/release).  For installed
-    //    binaries we fall through to the XDG path below.
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            if exe_dir.ends_with("debug") || exe_dir.ends_with("release") {
-                if let Some(project_root) = exe_dir.parent().and_then(|p| p.parent()) {
-                    return project_root.to_path_buf();
-                }
-            }
-        }
-    }
-
-    // 3. XDG data home (Linux / macOS)
+    // 2. XDG data home (Linux / macOS)
     if let Ok(xdg) = env::var("XDG_DATA_HOME") {
         if !xdg.is_empty() {
             return PathBuf::from(xdg).join("llama-r");
         }
     }
-    // 3b. ~/.local/share/llama-r  (POSIX default)
+    // 2b. ~/.local/share/llama-r  (POSIX default)
     if let Ok(home) = env::var("HOME") {
         if !home.is_empty() {
             return PathBuf::from(home).join(".local/share/llama-r");
+        }
+    }
+
+    // 3. Check executable directory — only use as data root when inside a
+    //    cargo workspace (target/debug or target/release).  For installed
+    //    binaries we fall through to the XDG path above.
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let check_dir = if exe_dir.ends_with("deps") {
+                exe_dir.parent()
+            } else {
+                Some(exe_dir)
+            };
+            if let Some(d) = check_dir {
+                if d.ends_with("debug") || d.ends_with("release") {
+                    if let Some(project_root) = d.parent().and_then(|p| p.parent()) {
+                        return project_root.to_path_buf();
+                    }
+                }
+            }
         }
     }
 

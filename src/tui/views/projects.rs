@@ -1,4 +1,5 @@
 use crate::api::handlers::AppState;
+use crate::tui::app::AnalysisState;
 use ratatui::style::Stylize;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
@@ -48,7 +49,7 @@ pub fn render_projects(
         .split(chunks[1]);
 
     // 1. Project List
-    let projects = state.context_store.list_contexts();
+    let projects = state.context_store.list_all_projects();
     let project_items: Vec<ListItem> = projects
         .iter()
         .enumerate()
@@ -77,12 +78,16 @@ pub fn render_projects(
             .split(main_chunks[1]);
 
         // Details Panel
+        let is_analyzed = selected_project.project_type != "unanalyzed";
         let details = Paragraph::new(vec![
             Line::from(vec!["ID: ".bold(), Span::raw(&selected_project.project_id)]),
             Line::from(vec!["Path: ".bold(), Span::raw(&selected_project.path)]),
             Line::from(vec![
-                "Analyzed: ".bold(),
-                Span::styled("YES", Style::default().fg(Color::Green)),
+                "Status: ".bold(),
+                Span::styled(
+                    if is_analyzed { "Analyzed" } else { "Not analyzed (press 'a' to analyze)" },
+                    Style::default().fg(if is_analyzed { Color::Green } else { Color::Yellow }),
+                ),
             ]),
         ])
         .block(
@@ -353,4 +358,139 @@ pub fn render_agent_form(
         }
         _ => {}
     }
+}
+
+pub fn render_analysis(
+    f: &mut Frame,
+    analysis_state: &AnalysisState,
+) {
+    
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints(
+            [
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(3),
+            ]
+            .as_ref(),
+        )
+        .split(f.area());
+
+    // Title
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "Project Analysis ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("(Esc to return)", Style::default().fg(Color::Gray)),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(title, chunks[0]);
+
+    // Content
+    match analysis_state {
+        AnalysisState::Idle => {
+            let content = Paragraph::new("Press 'a' on a project to start analysis")
+                .block(Block::default().borders(Borders::ALL).title(" Analysis "))
+                .wrap(Wrap { trim: true });
+            f.render_widget(content, chunks[1]);
+        }
+        AnalysisState::Loading { started_at } => {
+            let elapsed = started_at.elapsed().as_secs();
+            let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let frame = spinner[(elapsed as usize) % spinner.len()];
+            let content = Paragraph::new(Line::from(vec![
+                Span::styled(frame, Style::default().fg(Color::Cyan)),
+                Span::raw(" Analyzing project... "),
+                Span::styled(
+                    format!("({}s)", elapsed),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]))
+            .block(Block::default().borders(Borders::ALL).title(" Analysis "))
+            .wrap(Wrap { trim: true });
+            f.render_widget(content, chunks[1]);
+        }
+        AnalysisState::Loaded(content_md) => {
+            let content = Paragraph::new(content_md.as_str())
+                .block(Block::default().borders(Borders::ALL).title(" Analysis Result "))
+                .wrap(Wrap { trim: true })
+                .scroll((0, 0));
+            f.render_widget(content, chunks[1]);
+        }
+        AnalysisState::Error(err) => {
+            let content = Paragraph::new(Line::from(vec![
+                Span::styled("Error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::raw(err),
+            ]))
+            .block(Block::default().borders(Borders::ALL).title(" Analysis Error "))
+            .wrap(Wrap { trim: true });
+            f.render_widget(content, chunks[1]);
+        }
+    }
+
+    // Footer
+    let footer = Paragraph::new(" [Esc] Return to Projects | [r] Re-analyze")
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(footer, chunks[2]);
+}
+
+pub fn render_context(
+    f: &mut Frame,
+    state: &AppState,
+    project_index: usize,
+) {
+    let projects = state.context_store.list_all_projects();
+    let project = projects.get(project_index);
+    
+    let (project_id, context_md) = match project {
+        Some(p) => {
+            let ctx = state.context_store.get_context(&p.project_id);
+            let md = ctx.map(|c| c.context_md).unwrap_or_else(|| "No context analyzed yet. Press 'a' to analyze.".to_string());
+            (p.project_id.clone(), md)
+        }
+        None => ("Unknown".to_string(), "No project selected".to_string()),
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints(
+            [
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(3),
+            ]
+            .as_ref(),
+        )
+        .split(f.area());
+
+    // Title
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!(" Context: {project_id} "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("(Esc to return)", Style::default().fg(Color::Gray)),
+    ]))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(title, chunks[0]);
+
+    // Content
+    let content = Paragraph::new(context_md)
+        .block(Block::default().borders(Borders::ALL).title(" Project Context "))
+        .wrap(Wrap { trim: true })
+        .scroll((0, 0));
+    f.render_widget(content, chunks[1]);
+
+    // Footer
+    let footer = Paragraph::new(" [Esc] Return to Projects | [↑/↓] Scroll")
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(footer, chunks[2]);
 }

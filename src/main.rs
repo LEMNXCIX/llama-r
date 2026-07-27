@@ -3,6 +3,7 @@ use llama_r::runtime::{build_runtime, start_grpc_server, start_http_server};
 use llama_r::tui::app::TuiApp;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -61,20 +62,24 @@ async fn main() {
     let file_appender = tracing_appender::rolling::daily("logs", "llama-r.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-    use tracing_subscriber::filter::Targets;
+    // ─── CORRECCIÓN DEL FILTRO DE LOGS ───────────────────────────────────────
+    // Se silenciaron explícitamente los módulos "notify", "inotify" y "notify_types"
+    // para evitar que los eventos del kernel generen escrituras en bucle.
+    let targets_filter = Targets::new()
+        .with_target("notify", tracing::Level::WARN)
+        .with_target("inotify", tracing::Level::WARN)
+        .with_target("notify_types", tracing::Level::WARN)
+        .with_default(tracing::Level::INFO);
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
         .with_ansi(false)
-        .with_filter(
-            Targets::new()
-                .with_target("notify", tracing::Level::WARN)
-                .with_default(tracing::Level::INFO),
-        );
+        .with_filter(targets_filter.clone());
 
     let tui_layer = TuiLogLayer {
         logs: logs_buffer.clone(),
-    };
+    }
+    .with_filter(targets_filter);
 
     tracing_subscriber::registry()
         .with(file_layer)

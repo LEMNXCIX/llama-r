@@ -122,15 +122,22 @@ impl McpClient for HttpMcpClient {
             return Err("server_id mismatch".to_string());
         }
 
-        let result = self
-            .rpc(
-                "tools/call",
-                json!({
-                    "name": req.tool_name,
-                    "arguments": req.arguments,
-                }),
-            )
-            .await?;
+        let fut = self.rpc(
+            "tools/call",
+            json!({
+                "name": req.tool_name,
+                "arguments": req.arguments,
+            }),
+        );
+
+        let result = if let Some(token) = &req.cancel_token {
+            tokio::select! {
+                res = fut => res?,
+                _ = token.cancelled() => return Err(format!("MCP call_tool cancelled for server '{}'", self.server_id)),
+            }
+        } else {
+            fut.await?
+        };
 
         let is_error = result
             .get("isError")

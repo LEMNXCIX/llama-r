@@ -215,7 +215,7 @@ fn is_skill_compatible(profile: &ProjectProfile, skill: &Skill) -> bool {
         return false;
     }
 
-    if contains_any(&text, &["frontend", "ui", "ux", "design", "web interface"])
+    if contains_any(&text, &["frontend", "ui ", " ui", "ux", "web interface"])
         && !profile.has_frontend_ui
     {
         return false;
