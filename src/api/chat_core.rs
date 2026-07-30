@@ -2,6 +2,8 @@ use crate::api::handlers::AppState;
 use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent};
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
+use crate::ports::engine::AgentRunEvent;
+use crate::services::agent_runtime::RuntimeChatRequest;
 use std::pin::Pin;
 use std::time::Instant;
 use tokio_stream::{Stream, StreamExt};
@@ -12,6 +14,7 @@ pub type AppChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, AppEr
 pub struct AgentSelection<'a> {
     pub project_id: Option<&'a str>,
     pub agent_id: Option<&'a str>,
+    pub conversation_id: Option<&'a str>,
     pub debug: bool,
 }
 
@@ -24,6 +27,140 @@ impl<'a> AgentSelection<'a> {
             (None, None) => fallback_model.to_string(),
         }
     }
+
+    fn has_agent_headers(&self) -> bool {
+        self.project_id.is_some() || self.agent_id.is_some()
+    }
+}
+
+/// Split prepared messages into system prompt, prior turns, and current user message.
+fn split_engine_messages(
+    messages: &[ChatMessage],
+) -> Result<(Option<String>, Vec<ChatMessage>, String), AppError> {
+    let system = messages
+        .iter()
+        .find(|m| m.role == "system")
+        .map(|m| m.content.clone());
+
+    let last_user_idx = messages
+        .iter()
+        .rposition(|m| m.role == "user")
+        .ok_or_else(|| AppError::Validation("missing user message".into()))?;
+
+    let user_message = messages[last_user_idx].content.clone();
+    let history: Vec<ChatMessage> = messages
+        .iter()
+        .enumerate()
+        .filter(|(i, m)| *i != last_user_idx && m.role != "system")
+        .map(|(_, m)| m.clone())
+        .collect();
+
+    Ok((system, history, user_message))
+}
+
+/// Decide whether the engine path should run, and which project/agent ids to resolve.
+///
+/// Engine is used when headers select an agent, or when `model` matches a global agent id.
+fn engine_target(
+    state: &AppState,
+    selection: AgentSelection<'_>,
+    original_model: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    if selection.has_agent_headers() {
+        return Some((
+            selection.project_id.map(str::to_string),
+            selection.agent_id.map(str::to_string),
+        ));
+    }
+
+    if state.agent_registry.get_agent(original_model).is_some() {
+        return Some((None, Some(original_model.to_string())));
+    }
+
+    None
+}
+
+fn build_runtime_request(
+    state: &AppState,
+    prepared: &ChatRequest,
+    project_id: Option<String>,
+    agent_id: Option<String>,
+    conversation_id: Option<String>,
+) -> Result<RuntimeChatRequest, AppError> {
+    let (system, history, user_message) = split_engine_messages(&prepared.messages)?;
+    Ok(RuntimeChatRequest {
+        project_id,
+        agent_id,
+        conversation_id,
+        user_message,
+        history,
+        model_override: Some(prepared.model.clone()),
+        system_prompt: system,
+        default_model: state.default_model.clone(),
+    })
+}
+
+fn engine_events_to_chat_stream(
+    model: String,
+    mut rx: tokio::sync::mpsc::Receiver<AgentRunEvent>,
+) -> AppChatStream {
+    Box::pin(async_stream::stream! {
+        let mut final_text = String::new();
+        let mut saw_completed = false;
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentRunEvent::Token { text } => {
+                    final_text = text.clone();
+                    yield Ok(ChatStreamEvent {
+                        model: model.clone(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        message: ChatMessage {
+                            role: "assistant".to_string(),
+                            content: text,
+                        },
+                        done: false,
+                    });
+                }
+                AgentRunEvent::Completed { result } => {
+                    saw_completed = true;
+                    // If we already streamed the same text as a Token, only emit the done marker.
+                    let content = if final_text == result.text && !final_text.is_empty() {
+                        String::new()
+                    } else {
+                        result.text
+                    };
+                    yield Ok(ChatStreamEvent {
+                        model: model.clone(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        message: ChatMessage {
+                            role: "assistant".to_string(),
+                            content,
+                        },
+                        done: true,
+                    });
+                }
+                AgentRunEvent::Error { message } => {
+                    yield Err(AppError::Runtime(message));
+                }
+                AgentRunEvent::ToolCall { .. } | AgentRunEvent::ToolResult { .. } => {
+                    // Tool progress is not mapped to ChatStreamEvent yet (Nivel-A streaming).
+                }
+            }
+        }
+
+        if !saw_completed && !final_text.is_empty() {
+            yield Ok(ChatStreamEvent {
+                model,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                },
+                done: true,
+            });
+        }
+    })
 }
 
 fn prepare_request(
@@ -187,7 +324,8 @@ pub async fn execute_chat(
     selection: AgentSelection<'_>,
 ) -> Result<ChatResponse, AppError> {
     let requested_model = selection.requested_target(&payload.model);
-    let had_agent_headers = selection.project_id.is_some() || selection.agent_id.is_some();
+    let original_model = payload.model.clone();
+    let engine_ids = engine_target(state, selection, &original_model);
     let prepared = prepare_request(state, payload, selection)?;
 
     let debug_prompt = if selection.debug {
@@ -203,32 +341,13 @@ pub async fn execute_chat(
         None
     };
 
-    // Use agent engine when project/agent headers resolve an agent
-    if had_agent_headers {
+    // Use agent engine when headers or model resolve an agent and runtime is available.
+    if let Some((project_id, agent_id)) = engine_ids {
         if let Some(runtime) = &state.agent_runtime {
-            let system = prepared
-                .messages
-                .iter()
-                .find(|m| m.role == "system")
-                .map(|m| m.content.clone());
-            let user_message = prepared
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.role == "user")
-                .map(|m| m.content.clone())
-                .ok_or_else(|| AppError::Validation("missing user message".into()))?;
-
-            let rt_req = crate::services::agent_runtime::RuntimeChatRequest {
-                project_id: selection.project_id.map(str::to_string),
-                agent_id: selection.agent_id.map(str::to_string),
-                conversation_id: None,
-                user_message,
-                model_override: Some(prepared.model.clone()),
-                system_prompt: system,
-                default_model: state.default_model.clone(),
-            };
-
+            let conversation_id = selection.conversation_id.map(|s| s.to_string());
+            let rt_req =
+                build_runtime_request(state, &prepared, project_id, agent_id, conversation_id)?;
+            let started_at = Instant::now();
             match runtime.chat(rt_req).await {
                 Ok(text) => {
                     let response = ChatResponse {
@@ -241,7 +360,9 @@ pub async fn execute_chat(
                         done: true,
                         debug_prompt,
                     };
-                    state.observability.record_chat_request(0);
+                    state
+                        .observability
+                        .record_chat_request(started_at.elapsed().as_millis() as u64);
                     tracing::info!(
                         requested_model = %requested_model,
                         final_model = %response.model,
@@ -278,8 +399,37 @@ pub async fn execute_chat_stream(
 ) -> Result<AppChatStream, AppError> {
     payload.stream = true;
     let requested_model = selection.requested_target(&payload.model);
+    let original_model = payload.model.clone();
+    let engine_ids = engine_target(state, selection, &original_model);
     let prepared = prepare_request(state, payload, selection)?;
     let started_at = Instant::now();
+
+    if let Some((project_id, agent_id)) = engine_ids {
+        if let Some(runtime) = &state.agent_runtime {
+            let conversation_id = selection.conversation_id.map(|s| s.to_string());
+            let rt_req =
+                build_runtime_request(state, &prepared, project_id, agent_id, conversation_id)?;
+            match runtime.chat_stream(rt_req).await {
+                Ok(rx) => {
+                    state
+                        .observability
+                        .record_chat_request(started_at.elapsed().as_millis() as u64);
+                    tracing::info!(
+                        requested_model = %requested_model,
+                        "Started streaming chat request via agent engine"
+                    );
+                    return Ok(engine_events_to_chat_stream(prepared.model.clone(), rx));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "agent engine stream failed; falling back to legacy stream"
+                    );
+                }
+            }
+        }
+    }
+
     let stream = run_stream_with_fallback(state, prepared, &requested_model).await?;
     state
         .observability
@@ -327,8 +477,9 @@ mod tests {
             if self.fail {
                 return Err("engine down".into());
             }
+            let hist_len = req.history.len();
             Ok(AgentRunResult {
-                text: format!("{}|{}", self.response, req.user_message),
+                text: format!("{}|{}|h{}", self.response, req.user_message, hist_len),
                 tool_calls: 0,
                 iterations: 1,
                 model: req.model,
@@ -339,8 +490,13 @@ mod tests {
             &self,
             req: AgentRunRequest,
         ) -> Result<mpsc::Receiver<AgentRunEvent>, String> {
-            let (tx, rx) = mpsc::channel(1);
+            let (tx, rx) = mpsc::channel(4);
             let result = self.run(req).await?;
+            let _ = tx
+                .send(AgentRunEvent::Token {
+                    text: result.text.clone(),
+                })
+                .await;
             let _ = tx.send(AgentRunEvent::Completed { result }).await;
             Ok(rx)
         }
@@ -479,6 +635,9 @@ mod tests {
             known_mcp_servers: RwLock::new(Vec::new()),
             mcp_registry: Arc::new(StaticMcpRegistry::new()),
             agent_runtime,
+            rag_store: None,
+            rag_ingest: None,
+            history_store: None,
         });
         (temp_dir, state)
     }
@@ -552,6 +711,7 @@ mod tests {
             AgentSelection {
                 project_id: Some("demo"),
                 agent_id: None,
+                conversation_id: None,
                 debug: false,
             },
         )
@@ -593,6 +753,7 @@ mod tests {
             AgentSelection {
                 project_id: Some("demo"),
                 agent_id: Some("reviewer"),
+                conversation_id: None,
                 debug: false,
             },
         )
@@ -623,6 +784,7 @@ mod tests {
             AgentSelection {
                 project_id: Some("non-existent-project"),
                 agent_id: Some("ghost-agent"),
+                conversation_id: None,
                 debug: false,
             },
         )
@@ -734,6 +896,7 @@ mod tests {
             AgentSelection {
                 project_id: Some("test-proj"),
                 agent_id: Some("test-agent"),
+                conversation_id: None,
                 debug: false,
             },
         )
@@ -793,6 +956,7 @@ mod tests {
             AgentSelection {
                 project_id: Some("engine-proj"),
                 agent_id: Some("engine-agent"),
+                conversation_id: None,
                 debug: false,
             },
         )
@@ -851,6 +1015,7 @@ mod tests {
             AgentSelection {
                 project_id: Some("fallback-proj"),
                 agent_id: Some("fallback-agent"),
+                conversation_id: None,
                 debug: false,
             },
         )
@@ -880,6 +1045,7 @@ mod tests {
             AgentSelection {
                 project_id: Some("ghost-project"),
                 agent_id: Some("ghost-agent"),
+                conversation_id: None,
                 debug: false,
             },
         )
@@ -888,5 +1054,231 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Agent 'ghost-agent' not found for project 'ghost-project'"));
+    }
+
+    #[tokio::test]
+    async fn engine_receives_prior_history_turns() {
+        let _guard = lock_env();
+        let engine = Arc::new(FakeEngine {
+            response: "hist".to_string(),
+            fail: false,
+        });
+        let registry = Arc::new(AgentRegistry::new());
+        let runtime = Arc::new(AgentRuntime {
+            registry: registry.clone(),
+            engine,
+            history: None,
+            rag: None,
+        });
+        let provider = Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: true,
+        });
+        let (_dir, state) = test_state_with_runtime(provider, Some(runtime));
+
+        let config = AgentConfig {
+            name: "hist-agent".to_string(),
+            model: "agent-model".to_string(),
+            system_prompt: "You are helpful".to_string(),
+            context_project: Some("hist-proj".to_string()),
+            ..Default::default()
+        };
+        let dir = crate::core::paths::get_project_agents_dir("hist-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("hist-agent.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        registry.reload_all(&[]).unwrap();
+
+        let response = execute_chat(
+            &state,
+            ChatRequest {
+                model: "fallback-model".to_string(),
+                messages: vec![
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: "first".to_string(),
+                    },
+                    ChatMessage {
+                        role: "assistant".to_string(),
+                        content: "reply".to_string(),
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: "second".to_string(),
+                    },
+                ],
+                stream: false,
+            },
+            AgentSelection {
+                project_id: Some("hist-proj"),
+                agent_id: Some("hist-agent"),
+                conversation_id: None,
+                debug: false,
+            },
+        )
+        .await
+        .unwrap();
+        // FakeEngine encodes history length as hN; two prior turns (user+assistant).
+        assert!(
+            response.message.content.contains("|h2"),
+            "expected history length 2, got {}",
+            response.message.content
+        );
+        assert!(response.message.content.contains("second"));
+    }
+
+    #[tokio::test]
+    async fn streaming_uses_engine_when_agent_present() {
+        let _guard = lock_env();
+        let engine = Arc::new(FakeEngine {
+            response: "stream-engine".to_string(),
+            fail: false,
+        });
+        let registry = Arc::new(AgentRegistry::new());
+        let runtime = Arc::new(AgentRuntime {
+            registry: registry.clone(),
+            engine,
+            history: None,
+            rag: None,
+        });
+        let provider = Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: true,
+        });
+        let (_dir, state) = test_state_with_runtime(provider, Some(runtime));
+
+        let config = AgentConfig {
+            name: "stream-agent".to_string(),
+            model: "agent-model".to_string(),
+            system_prompt: "You are helpful".to_string(),
+            context_project: Some("stream-proj".to_string()),
+            ..Default::default()
+        };
+        let dir = crate::core::paths::get_project_agents_dir("stream-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("stream-agent.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        registry.reload_all(&[]).unwrap();
+
+        let mut stream = execute_chat_stream(
+            &state,
+            ChatRequest {
+                model: "fallback-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "hi".to_string(),
+                }],
+                stream: true,
+            },
+            AgentSelection {
+                project_id: Some("stream-proj"),
+                agent_id: Some("stream-agent"),
+                conversation_id: None,
+                debug: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut saw_engine = false;
+        let mut saw_done = false;
+        while let Some(item) = stream.next().await {
+            let event = item.unwrap();
+            if event.message.content.contains("stream-engine") {
+                saw_engine = true;
+            }
+            if event.done {
+                saw_done = true;
+            }
+        }
+        assert!(saw_engine, "stream should include engine text");
+        assert!(saw_done, "stream should complete");
+    }
+
+    #[tokio::test]
+    async fn engine_used_when_model_is_global_agent_id() {
+        let _guard = lock_env();
+        let engine = Arc::new(FakeEngine {
+            response: "by-model".to_string(),
+            fail: false,
+        });
+        let registry = Arc::new(AgentRegistry::new());
+        let runtime = Arc::new(AgentRuntime {
+            registry: registry.clone(),
+            engine,
+            history: None,
+            rag: None,
+        });
+        let provider = Arc::new(FakeProvider {
+            fail_primary_once: AtomicBool::new(false),
+            fail_always: true,
+        });
+        let (_dir, state) = test_state_with_runtime(provider, Some(runtime));
+
+        // Global agent (no project) whose id matches the request model field.
+        let config = AgentConfig {
+            name: "global-bot".to_string(),
+            model: "agent-model".to_string(),
+            system_prompt: "You are helpful".to_string(),
+            ..Default::default()
+        };
+        let dir = crate::core::paths::get_agents_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("global-bot.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        registry.reload_all(&[]).unwrap();
+
+        let response = execute_chat(
+            &state,
+            ChatRequest {
+                model: "global-bot".to_string(),
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: "ping".to_string(),
+                }],
+                stream: false,
+            },
+            AgentSelection::default(),
+        )
+        .await
+        .unwrap();
+        assert!(response.message.content.contains("by-model"));
+    }
+
+    #[test]
+    fn split_engine_messages_extracts_history() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "sys".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "u1".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "a1".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "u2".into(),
+            },
+        ];
+        let (system, history, user) = super::split_engine_messages(&messages).unwrap();
+        assert_eq!(system.as_deref(), Some("sys"));
+        assert_eq!(user, "u2");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "u1");
+        assert_eq!(history[1].content, "a1");
     }
 }

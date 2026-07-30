@@ -179,6 +179,9 @@ fn setup_app() -> TestApp {
         Vec::new(),
         mcp_registry,
         None,
+        None,
+        None,
+        None,
     );
     let router = build_router(state.clone());
     let grpc_service = GrpcService::new(state);

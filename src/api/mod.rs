@@ -5,6 +5,8 @@ pub mod docs;
 pub mod grpc;
 pub mod handlers;
 pub mod health;
+pub mod history_api;
 pub mod mcp_api;
 pub mod observability;
+pub mod rag_api;
 pub mod sse;

@@ -1,21 +1,35 @@
-use crate::adapters::rig_engine::limits::{RunDeadline, ToolCallBudget};
+use crate::adapters::rig_engine::limits::ToolCallBudget;
 use crate::adapters::rig_engine::tools::McpToolBridge;
 use crate::adapters::rig_engine::ScopedMcpTool;
+use crate::domain::models::ChatMessage;
 use crate::ports::engine::{AgentRunRequest, AgentRunResult};
-use crate::ports::mcp::McpServerRegistry;
 use rig_core::agent::Agent;
 use rig_core::client::completion::CompletionClient;
 use rig_core::client::Nothing;
-use rig_core::completion::Prompt;
+use rig_core::completion::{Message, Prompt};
 use rig_core::providers::ollama;
 use rig_core::providers::ollama::CompletionModel;
 use rig_core::tool::ToolDyn;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Convert llama-r chat history into Rig completion messages.
+/// System messages are skipped (preamble already carries the system prompt).
+pub fn to_rig_history(history: &[ChatMessage]) -> Vec<Message> {
+    history
+        .iter()
+        .filter_map(|msg| match msg.role.as_str() {
+            "system" => None,
+            "assistant" => Some(Message::assistant(msg.content.clone())),
+            // Treat tool / unknown roles as user-side context so they are not dropped.
+            _ => Some(Message::user(msg.content.clone())),
+        })
+        .collect()
+}
+
+/// Run a single agent turn via Rig (Ollama). Caller is responsible for overall timeout.
 pub async fn run_with_rig(
     ollama_url: &str,
-    _mcp_registry: &Arc<dyn McpServerRegistry>,
     req: AgentRunRequest,
     system: String,
     tools: Vec<ScopedMcpTool>,
@@ -64,25 +78,49 @@ pub async fn run_with_rig(
         builder.build()
     };
 
-    let deadline = RunDeadline::new(req.scope.timeout_secs);
-    let timeout = deadline.remaining();
+    let history = to_rig_history(&req.history);
+    let text = agent
+        .prompt(req.user_message.as_str())
+        .history(history)
+        .await
+        .map_err(|e| format!("ollama chat failed: {}", e))?;
 
-    let result = tokio::time::timeout(timeout, agent.prompt(&req.user_message)).await;
+    let tool_calls = {
+        let b = budget.lock().await;
+        b.used()
+    };
+    // Approximate completed turns: one LLM turn plus one per tool call.
+    let iterations = (1u32).saturating_add(tool_calls).min(max_iterations as u32);
 
-    match result {
-        Ok(Ok(text)) => Ok(AgentRunResult {
-            text,
-            tool_calls: {
-                let b = budget.lock().await;
-                b.used()
+    Ok(AgentRunResult {
+        text,
+        tool_calls,
+        iterations,
+        model: req.model,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_rig_history_skips_system_and_maps_roles() {
+        let history = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "ignore".into(),
             },
-            iterations: max_iterations as u32,
-            model: req.model,
-        }),
-        Ok(Err(e)) => Err(format!("ollama chat failed: {}", e)),
-        Err(_) => Err(format!(
-            "agent run timed out after {}s",
-            req.scope.timeout_secs
-        )),
+            ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "hello".into(),
+            },
+        ];
+        let msgs = to_rig_history(&history);
+        assert_eq!(msgs.len(), 2);
     }
 }

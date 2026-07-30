@@ -105,42 +105,53 @@ pub fn render_projects(
         );
         f.render_widget(details, right_chunks[0]);
 
-        // Agents Panel (all agents with project tag)
-        let all_agents = state.agent_registry.list_agents();
-        let mut sorted_agents: Vec<_> = all_agents.iter().collect();
+        // Agents Panel — only agents for the selected project
         let selected_project_id = &selected_project.project_id;
-        sorted_agents.sort_by_key(|a| {
-            match &a.project_id {
-                Some(p) if p == selected_project_id => 0,
-                Some(_) => 1,
-                None => 2,
-            }
-        });
+        let project_agents: Vec<_> = {
+            let all_agents = state.agent_registry.list_agents();
+            all_agents
+                .into_iter()
+                .filter(|a| {
+                    a.project_id
+                        .as_deref()
+                        .map(|pid| pid == selected_project_id.as_str())
+                        .unwrap_or(false)
+                })
+                .collect()
+        };
 
-        let agent_items: Vec<ListItem> = sorted_agents
-            .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                let style = if !active_in_project_list && i == agent_index {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                let tag = match &a.project_id {
-                    Some(p) => format!("[{p}]"),
-                    None => "[Global]".to_string(),
-                };
-                ListItem::new(format!(" {} {tag} (Model: {})", a.id, a.config.model)).style(style)
-            })
-            .collect();
+        let agent_items: Vec<ListItem> = if project_agents.is_empty() {
+            vec![ListItem::new(Span::styled(
+                " No agents for this project. Press 'n' to create one.",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            project_agents
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let style = if !active_in_project_list && i == agent_index {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    ListItem::new(format!(
+                        " {} (Model: {})",
+                        a.id, a.config.model
+                    ))
+                    .style(style)
+                })
+                .collect()
+        };
 
+        let panel_title = format!(" Agents — {} ", selected_project_id);
         let agent_list = List::new(agent_items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" All Agents "),
+                    .title(panel_title),
             )
             .highlight_style(Style::default().bg(Color::DarkGray));
         f.render_widget(agent_list, right_chunks[1]);
@@ -322,10 +333,7 @@ pub fn render_agent_form(
 
     // Set cursor position based on active field
     match field_index {
-        0 => f.set_cursor_position((
-            chunks[0].x + 1 + id.chars().count() as u16,
-            chunks[0].y + 1,
-        )),
+        0 => f.set_cursor_position((chunks[0].x + 1 + id.chars().count() as u16, chunks[0].y + 1)),
         1 => f.set_cursor_position((
             chunks[1].x + 1 + name.chars().count() as u16,
             chunks[1].y + 1,
@@ -537,7 +545,7 @@ pub fn render_confirm_delete(f: &mut Frame, confirm_type: &str, confirm_id: &str
                 Constraint::Length(50),
                 Constraint::Percentage(25),
             ]
-        .as_ref(),
+            .as_ref(),
         )
         .split(vert[1]);
 

@@ -140,7 +140,7 @@ POST /api/chat
 POST /v1/chat/completions
 ```
 
-`X-Project` selects the project scope and `X-Agent` selects a specific agent inside that project. 
+`X-Project` selects the project scope, `X-Agent` selects a specific agent inside that project, and `X-Conversation-Id` optionally resumes an existing conversation history session. 
 
 **Strict Validation:** If `X-Project` is provided, Llama-R **requires** a valid agent to be found within that project context. If the requested agent (or the project's default agent) is missing, the request will fail with a `400 Bad Request` error. This ensures that project-scoped requests never accidentally bypass the intended context and rules.
 
@@ -165,6 +165,15 @@ DELETE /api/contexts/:id
 POST   /api/contexts/:id/analyze
 ```
 
+### Conversation History API
+```text
+GET    /api/conversations
+GET    /api/conversations/:id
+GET    /api/conversations/:id/messages
+DELETE /api/conversations/:id
+POST   /api/conversations/:id/export
+```
+
 ### MCP
 ```text
 GET  /api/mcp
@@ -182,6 +191,19 @@ cargo test --target-dir target-tests
 - `agents/`: editable global agent TOML files
 - `contextos/projects/<project_id>/agents/`: project-scoped agent TOML files`r`n- `contextos/projects/<project_id>/context/`: saved generated context
 - `logs/llama-r.log`: rolling application logs
+
+## Agent engine (Rig)
+
+- Feature: `rig-engine` (default ON). Kept as a compile-time flag so light builds can disable `rig-core`; runtime always prefers Rig when the feature is on.
+- Build without engine: `cargo build --no-default-features`
+- Agent chat with tools uses Rig when:
+  - `X-Project` / `X-Agent` resolve an agent, or
+  - `model` matches a global agent id
+- Multi-turn: prior user/assistant messages in the request body are forwarded to Rig as chat history
+- Streaming (`stream: true` / SSE): agent path uses `AgentEngine::run_stream` (Nivel-A: final token + completed). Tool call/result events are not yet mapped to SSE.
+- On engine failure, requests fall back to legacy Ollama chat
+- Direct model requests (no agent resolved) always use the legacy provider path
+- Source modules: `src/adapters/rig_engine/` (`builder.rs`, `tools.rs`, `limits.rs`)
 
 ## Notes For Contributors
 - Prefer documenting commands that exist in `src/cli/commands.rs`.

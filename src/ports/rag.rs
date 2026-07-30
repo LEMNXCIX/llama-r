@@ -1,4 +1,9 @@
 //! RAG port: embeddings + vector store, always scoped per agent.
+//!
+//! Contract is frozen for Phase 4. Adapters (`InMemoryRagStore`, `FileRagStore`)
+//! and services (`RagIngestService`, Rig `prepare`) must honor scope checks:
+//! - `query_scoped` only reads `scope.rag_sources`
+//! - `upsert_scoped` only writes when `scope.allows_rag_write`
 
 use crate::domain::scope::AgentScope;
 use async_trait::async_trait;

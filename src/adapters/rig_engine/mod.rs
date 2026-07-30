@@ -13,6 +13,7 @@ use crate::ports::rag::RagStore;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// MCP tool already filtered by scope, re-checked on every invoke.
@@ -115,17 +116,14 @@ impl RigAgentEngine {
 
         Ok((tools, system))
     }
-}
 
-#[async_trait]
-impl AgentEngine for RigAgentEngine {
-    async fn run(&self, req: AgentRunRequest) -> Result<AgentRunResult, String> {
+    /// Full run body (prepare + Rig prompt). Wrapped by timeout at the trait boundary.
+    async fn run_inner(&self, req: AgentRunRequest) -> Result<AgentRunResult, String> {
         let (tools, system) = self.prepare(&req).await?;
 
         #[cfg(feature = "rig-engine")]
         {
-            return builder::run_with_rig(&self.ollama_url, &self.mcp_registry, req, system, tools)
-                .await;
+            return builder::run_with_rig(&self.ollama_url, req, system, tools).await;
         }
 
         #[cfg(not(feature = "rig-engine"))]
@@ -134,44 +132,59 @@ impl AgentEngine for RigAgentEngine {
             Err("feature `rig-engine` disabled".into())
         }
     }
+}
+
+#[async_trait]
+impl AgentEngine for RigAgentEngine {
+    async fn run(&self, req: AgentRunRequest) -> Result<AgentRunResult, String> {
+        let timeout_secs = req.scope.timeout_secs.max(1);
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), self.run_inner(req)).await {
+            Ok(result) => result,
+            Err(_) => Err(format!("agent run timed out after {timeout_secs}s")),
+        }
+    }
 
     async fn run_stream(
         &self,
         req: AgentRunRequest,
     ) -> Result<mpsc::Receiver<AgentRunEvent>, String> {
-        let (tools, system) = self.prepare(&req).await?;
+        let (tx, rx) = mpsc::channel(32);
+        let ollama_url = self.ollama_url.clone();
+        let mcp_registry = self.mcp_registry.clone();
+        let rag = self.rag.clone();
+        let timeout_secs = req.scope.timeout_secs.max(1);
 
-        #[cfg(feature = "rig-engine")]
-        {
-            let (tx, rx) = mpsc::channel(32);
-            let ollama_url = self.ollama_url.clone();
-            let mcp_registry = self.mcp_registry.clone();
+        tokio::spawn(async move {
+            let engine = RigAgentEngine {
+                ollama_url,
+                mcp_registry,
+                rag,
+            };
+            let result = match tokio::time::timeout(
+                Duration::from_secs(timeout_secs),
+                engine.run_inner(req),
+            )
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_) => Err(format!("agent run timed out after {timeout_secs}s")),
+            };
 
-            tokio::spawn(async move {
-                let result =
-                    builder::run_with_rig(&ollama_url, &mcp_registry, req, system, tools).await;
-                match result {
-                    Ok(res) => {
-                        let _ = tx
-                            .send(AgentRunEvent::Token {
-                                text: res.text.clone(),
-                            })
-                            .await;
-                        let _ = tx.send(AgentRunEvent::Completed { result: res }).await;
-                    }
-                    Err(msg) => {
-                        let _ = tx.send(AgentRunEvent::Error { message: msg }).await;
-                    }
+            match result {
+                Ok(res) => {
+                    let _ = tx
+                        .send(AgentRunEvent::Token {
+                            text: res.text.clone(),
+                        })
+                        .await;
+                    let _ = tx.send(AgentRunEvent::Completed { result: res }).await;
                 }
-            });
+                Err(msg) => {
+                    let _ = tx.send(AgentRunEvent::Error { message: msg }).await;
+                }
+            }
+        });
 
-            Ok(rx)
-        }
-
-        #[cfg(not(feature = "rig-engine"))]
-        {
-            let _ = (tools, system);
-            Err("feature `rig-engine` disabled".into())
-        }
+        Ok(rx)
     }
 }

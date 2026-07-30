@@ -112,7 +112,8 @@ pub fn render_dashboard(f: &mut Frame, state: &AppState, log_scroll: usize) {
 
     f.render_widget(logs_panel, chunks[2]);
 
-    let footer = Paragraph::new(" [Tab] Next View  [↑/↓] Scroll Logs  [q] Quit").block(Block::default().borders(Borders::ALL));
+    let footer = Paragraph::new(" [Tab] Next View  [↑/↓] Scroll Logs  [q] Quit")
+        .block(Block::default().borders(Borders::ALL));
 
     f.render_widget(footer, chunks[3]);
 }

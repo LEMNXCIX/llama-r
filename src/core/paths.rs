@@ -71,9 +71,29 @@ pub fn get_project_agents_dir(project_id: &str) -> PathBuf {
     get_project_dir(project_id).join("agents")
 }
 
+/// Runtime data root: `{base}/data`
+pub fn get_data_dir() -> PathBuf {
+    get_base_dir().join("data")
+}
+
+/// Persistent RAG root: `{base}/data/lancedb`
+///
+/// Phase 4 stores FileRagStore collections here (JSONL per source_id).
+/// Path name kept for plan compatibility; LanceDB can reuse the same root later.
+pub fn get_lancedb_dir() -> PathBuf {
+    get_data_dir().join("lancedb")
+}
+
+/// Returns the path to the SQLite history database file.
+pub fn get_history_db_path() -> PathBuf {
+    get_data_dir().join("history.db")
+}
+
 /// Helper to ensure global directories exist
 pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(get_agents_dir())?;
     std::fs::create_dir_all(get_contexts_dir())?;
+    std::fs::create_dir_all(get_data_dir())?;
+    std::fs::create_dir_all(get_lancedb_dir())?;
     Ok(())
 }

@@ -529,6 +529,7 @@ async fn agent_query_tool(
         AgentSelection {
             project_id: None,
             agent_id: Some(&agent_id),
+            conversation_id: None,
             debug: false,
         },
     )

@@ -63,10 +63,12 @@ impl LlamaGateway for GrpcService {
     ) -> Result<Response<pb::ChatResponse>, Status> {
         let project_id = metadata_value(request.metadata(), "x-project");
         let agent_id = metadata_value(request.metadata(), "x-agent");
+        let conversation_id = metadata_value(request.metadata(), "x-conversation-id");
         let domain_req = to_domain_request(request.into_inner(), false);
         let selection = AgentSelection {
             project_id: project_id.as_deref(),
             agent_id: agent_id.as_deref(),
+            conversation_id: conversation_id.as_deref(),
             debug: false,
         };
         let response = execute_chat(&self.state, domain_req, selection)
@@ -92,10 +94,12 @@ impl LlamaGateway for GrpcService {
     ) -> Result<Response<Self::ChatStreamStream>, Status> {
         let project_id = metadata_value(request.metadata(), "x-project");
         let agent_id = metadata_value(request.metadata(), "x-agent");
+        let conversation_id = metadata_value(request.metadata(), "x-conversation-id");
         let domain_req = to_domain_request(request.into_inner(), true);
         let selection = AgentSelection {
             project_id: project_id.as_deref(),
             agent_id: agent_id.as_deref(),
+            conversation_id: conversation_id.as_deref(),
             debug: false,
         };
         let stream = execute_chat_stream(&self.state, domain_req, selection)

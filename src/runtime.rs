@@ -1,4 +1,5 @@
 use crate::adapters::mcp::{McpServerConfig, StaticMcpRegistry};
+use crate::adapters::rag::{FileRagStore, OllamaEmbeddings};
 use crate::api::agent_api::{
     create_agent, delete_agent, get_agent, get_agent_scope, list_agents_api, update_agent,
 };
@@ -9,7 +10,12 @@ use crate::api::docs::{serve_openapi_json, serve_scalar_ui};
 use crate::api::grpc::{pb::llama_gateway_server::LlamaGatewayServer, GrpcService};
 use crate::api::handlers::{chat, list_models, mcp_message, openai_chat, AppState};
 use crate::api::health::health;
+use crate::api::history_api::{
+    delete_conversation_handler, export_conversation_handler, get_conversation_handler,
+    get_conversation_messages_handler, list_conversations_handler,
+};
 use crate::api::observability::AppObservability;
+use crate::api::rag_api::{rag_ingest, rag_query};
 use crate::config::Config;
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::ContextStore;
@@ -18,11 +24,14 @@ use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 #[cfg(feature = "rig-engine")]
 use crate::ports::engine::AgentEngine;
+use crate::ports::history::ConversationStore;
 use crate::ports::mcp::McpServerRegistry;
+use crate::ports::rag::{EmbeddingProvider, RagStore};
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::agent_runtime::AgentRuntime;
+use crate::services::rag_ingest::RagIngestService;
 use crate::services::skill_manager::SkillManager;
 use axum::{
     routing::{get, post},
@@ -54,6 +63,9 @@ pub fn build_app_state(
     known_mcp_servers: Vec<String>,
     mcp_registry: Arc<dyn McpServerRegistry>,
     agent_runtime: Option<Arc<AgentRuntime>>,
+    rag_store: Option<Arc<dyn RagStore>>,
+    rag_ingest: Option<Arc<RagIngestService>>,
+    history_store: Option<Arc<dyn ConversationStore>>,
 ) -> Arc<AppState> {
     let metrics = Arc::new(TokenMetrics::new());
     let context_enricher = Arc::new(ContextEnricher::new(
@@ -77,6 +89,9 @@ pub fn build_app_state(
         known_mcp_servers: RwLock::new(known_mcp_servers),
         mcp_registry,
         agent_runtime,
+        rag_store,
+        rag_ingest,
+        history_store,
     })
 }
 
@@ -89,6 +104,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::http::header::AUTHORIZATION,
             axum::http::HeaderName::from_static("x-project"),
             axum::http::HeaderName::from_static("x-agent"),
+            axum::http::HeaderName::from_static("x-debug"),
+            axum::http::HeaderName::from_static("x-conversation-id"),
         ]);
 
     Router::new()
@@ -121,6 +138,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/contexts", get(list_contexts).post(create_context))
         .route("/api/contexts/:id", get(get_context).put(update_context).delete(delete_context))
         .route("/api/contexts/:id/analyze", post(analyze_project))
+        .route("/api/rag/ingest", post(rag_ingest))
+        .route("/api/rag/query", post(rag_query))
+        .route("/api/conversations", get(list_conversations_handler))
+        .route(
+            "/api/conversations/:id",
+            get(get_conversation_handler).delete(delete_conversation_handler),
+        )
+        .route(
+            "/api/conversations/:id/messages",
+            get(get_conversation_messages_handler),
+        )
+        .route(
+            "/api/conversations/:id/export",
+            post(export_conversation_handler),
+        )
         .route("/openapi.json", get(serve_openapi_json))
         .route("/docs", get(serve_scalar_ui))
         .layer(cors)
@@ -251,8 +283,40 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
 
     let context_store = Arc::new(ContextStore::new());
 
-    let agent_runtime =
-        build_agent_runtime(&config, mcp_registry_inner.clone(), agent_registry.clone());
+    let (rag_store, rag_ingest) = build_rag(&config);
+    let history_store = build_history_store(&config);
+
+    if let Some(history_arc) = history_store.clone() {
+        let retention = config.history_retention_days;
+        let h1 = history_arc.clone();
+        tokio::spawn(async move {
+            match h1.purge_old_conversations(retention).await {
+                Ok(n) => tracing::info!(deleted = n, "History purge on startup completed"),
+                Err(e) => tracing::warn!(error = %e, "History purge on startup failed"),
+            }
+        });
+
+        let h2 = history_arc.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(86_400));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                match h2.purge_old_conversations(retention).await {
+                    Ok(n) => tracing::info!(deleted = n, "History purge completed"),
+                    Err(e) => tracing::warn!(error = %e, "History purge failed"),
+                }
+            }
+        });
+    }
+
+    let agent_runtime = build_agent_runtime(
+        &config,
+        mcp_registry_inner.clone(),
+        agent_registry.clone(),
+        rag_store.clone(),
+        history_store.clone(),
+    );
     let state = build_app_state(
         provider_impl,
         agent_registry.clone(),
@@ -263,6 +327,9 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         known_mcp_servers,
         mcp_registry,
         agent_runtime,
+        rag_store,
+        rag_ingest,
+        history_store,
     );
     let router = build_router(state.clone());
 
@@ -295,11 +362,81 @@ pub async fn start_http_server(runtime: &Runtime) -> Result<tokio::task::JoinHan
     }))
 }
 
+/// Build embeddings + persistent RAG store when enabled.
+fn build_rag(config: &Config) -> (Option<Arc<dyn RagStore>>, Option<Arc<RagIngestService>>) {
+    if !config.rag_enabled {
+        tracing::info!("RAG disabled via RAG_ENABLED=false");
+        return (None, None);
+    }
+
+    #[cfg(feature = "rag")]
+    {
+        let embeddings: Arc<dyn EmbeddingProvider> = Arc::new(OllamaEmbeddings::new(
+            config.ollama_url.clone(),
+            config.embedding_model.clone(),
+            config.embedding_dimensions,
+        ));
+        let dir = crate::core::paths::get_lancedb_dir();
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), error = %err, "failed to create RAG data dir");
+        }
+        tracing::info!(
+            path = %dir.display(),
+            embedding_model = %config.embedding_model,
+            dimensions = config.embedding_dimensions,
+            "RAG store initialized (FileRagStore)"
+        );
+        let store: Arc<dyn RagStore> = Arc::new(FileRagStore::new(dir, embeddings));
+        let ingest = Arc::new(RagIngestService::new(store.clone()));
+        (Some(store), Some(ingest))
+    }
+
+    #[cfg(not(feature = "rag"))]
+    {
+        tracing::warn!("RAG feature disabled at compile time; store unavailable");
+        let _ = config;
+        (None, None)
+    }
+}
+
+/// Build history store (SQLite) when feature is enabled.
+fn build_history_store(config: &Config) -> Option<Arc<dyn ConversationStore>> {
+    #[cfg(feature = "history")]
+    {
+        use crate::adapters::history::SqliteConversationStore;
+
+        let path = crate::core::paths::get_history_db_path();
+        match SqliteConversationStore::open(
+            &path,
+            config.ollama_url.clone(),
+            config.default_model.clone(),
+        ) {
+            Ok(store) => {
+                tracing::info!(path = %path.display(), "History store (SQLite) initialized");
+                Some(Arc::new(store))
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to open history store; history disabled");
+                None
+            }
+        }
+    }
+
+    #[cfg(not(feature = "history"))]
+    {
+        let _ = config;
+        tracing::info!("History feature disabled at compile time");
+        None
+    }
+}
+
 /// Build the agent runtime (Rig engine) when the feature is enabled.
 fn build_agent_runtime(
     config: &Config,
     mcp_registry: Arc<StaticMcpRegistry>,
     agent_registry: Arc<AgentRegistry>,
+    rag: Option<Arc<dyn RagStore>>,
+    history_store: Option<Arc<dyn ConversationStore>>,
 ) -> Option<Arc<AgentRuntime>> {
     #[cfg(feature = "rig-engine")]
     {
@@ -308,20 +445,20 @@ fn build_agent_runtime(
         let engine: Arc<dyn AgentEngine> = Arc::new(RigAgentEngine::new(
             config.ollama_url.clone(),
             mcp_registry,
-            None,
+            rag.clone(),
         ));
 
         Some(Arc::new(AgentRuntime {
             registry: agent_registry,
             engine,
-            history: None,
-            rag: None,
+            history: history_store,
+            rag,
         }))
     }
 
     #[cfg(not(feature = "rig-engine"))]
     {
-        let _ = (config, mcp_registry, agent_registry);
+        let _ = (config, mcp_registry, agent_registry, rag, history_store);
         None
     }
 }

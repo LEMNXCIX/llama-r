@@ -4,8 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["rig-engine"]
+default = ["rig-engine", "rag", "history"]
+# Agent engine (Rig.rs). Disable with --no-default-features or --no-default-features --features rag
 rig-engine = ["dep:rig-core"]
+# RAG pipeline (FileRagStore persistence + ingest + admin API).
+# LanceDB is intentionally not a hard dep (heavy arrow/datafusion stack); FileRagStore
+# implements the same RagStore port with disk persistence under data/lancedb/.
+rag = []
+history = ["dep:rusqlite"]
 
 [dependencies]
 axum = "0.7"
@@ -37,6 +43,8 @@ dialoguer = "0.12.0"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2.0.12"
 utoipa = { version = "5", features = ["chrono"] }
+uuid = { version = "1.10", features = ["v4"] }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 rig-core = { version = "0.40", optional = true }
 
 [dev-dependencies]

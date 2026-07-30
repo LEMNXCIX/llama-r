@@ -9,6 +9,14 @@ pub struct Config {
     pub port: u16,
     pub ollama_url: String,
     pub default_model: String,
+    /// Embedding model for RAG (Ollama). Default: `nomic-embed-text`.
+    pub embedding_model: String,
+    /// Expected embedding vector size (must match model output).
+    pub embedding_dimensions: usize,
+    /// When false, RAG store is not built (chat works without retrieval).
+    pub rag_enabled: bool,
+    /// History retention period in days (default: 90).
+    pub history_retention_days: u32,
 }
 
 impl Config {
@@ -38,10 +46,49 @@ impl Config {
             .trim()
             .to_string();
 
+        let embedding_model = env::var("EMBEDDING_MODEL")
+            .unwrap_or_else(|_| "nomic-embed-text".to_string())
+            .trim()
+            .to_string();
+        if embedding_model.is_empty() {
+            return Err(AppError::Config(
+                "EMBEDDING_MODEL cannot be empty when provided".to_string(),
+            ));
+        }
+
+        let raw_dims = env::var("EMBEDDING_DIMENSIONS").unwrap_or_else(|_| "768".to_string());
+        let embedding_dimensions = raw_dims.parse().map_err(|_| {
+            AppError::Config(format!(
+                "EMBEDDING_DIMENSIONS must be a positive usize, received '{}'",
+                raw_dims
+            ))
+        })?;
+        if embedding_dimensions == 0 {
+            return Err(AppError::Config(
+                "EMBEDDING_DIMENSIONS must be greater than 0".to_string(),
+            ));
+        }
+
+        let rag_enabled = env::var("RAG_ENABLED")
+            .map(|value| {
+                let lower = value.trim().to_ascii_lowercase();
+                !(lower == "0" || lower == "false" || lower == "no" || lower == "off")
+            })
+            .unwrap_or(true);
+
+        let history_retention_days = env::var("HISTORY_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90);
+
         Ok(Self {
             port,
             ollama_url,
             default_model,
+            embedding_model,
+            embedding_dimensions,
+            rag_enabled,
+            history_retention_days,
         })
     }
 

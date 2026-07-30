@@ -1,0 +1,11 @@
+name = "RAG Demo"
+description = "Example agent with scoped RAG sources for Phase 4 testing"
+model = "llama3.2"
+system_prompt = """You are a demo agent with retrieval-augmented knowledge.
+Use the retrieved knowledge section when present. If nothing was retrieved, say so clearly.
+"""
+rag_sources = ["project:demo/context", "agent:demo/memory"]
+rag_write = "own_memory_only"
+max_tool_calls = 4
+max_iterations = 4
+timeout_secs = 60

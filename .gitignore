@@ -3,5 +3,6 @@
 /agents
 /contextos
 /logs
+/data
 .env
 *.txt

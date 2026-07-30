@@ -202,6 +202,23 @@ impl TuiApp {
         self.available_agents = agents;
     }
 
+    /// Returns only agents belonging to the currently selected project.
+    fn project_agents(&self) -> Vec<crate::domain::agent::Agent> {
+        let projects = self.state.context_store.list_all_projects();
+        let selected_project_id = projects
+            .get(self.project_index)
+            .map(|p| p.project_id.as_str());
+
+        let all_agents = self.state.agent_registry.list_agents();
+        all_agents
+            .into_iter()
+            .filter(|a| match (&a.project_id, selected_project_id) {
+                (Some(pid), Some(sel)) => pid.as_str() == sel,
+                _ => false,
+            })
+            .collect()
+    }
+
     fn update_chat_selected_agent(&mut self) {
         if self.available_agents.is_empty() || self.chat_agent_index == 0 {
             self.chat_selected_agent = None;
@@ -239,12 +256,28 @@ impl TuiApp {
         tokio::spawn(async move {
             let result = if let Some(ref aid) = agent_id {
                 if let Some(runtime) = &state.agent_runtime {
+                    // Prior turns already in the UI buffer (excluding the just-appended user msg).
+                    let history: Vec<ChatMessage> = {
+                        let msgs = messages.lock().unwrap();
+                        msgs.iter()
+                            .rev()
+                            .skip(1) // drop current user turn
+                            .map(|(role, content)| ChatMessage {
+                                role: role.clone(),
+                                content: content.clone(),
+                            })
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect()
+                    };
                     runtime
                         .chat(RuntimeChatRequest {
                             project_id: agent_project_id,
                             agent_id: Some(aid.clone()),
                             conversation_id: None,
                             user_message: input,
+                            history,
                             model_override: None,
                             system_prompt: None,
                             default_model: state.default_model.clone(),
@@ -302,9 +335,7 @@ impl TuiApp {
             terminal.draw(|f| {
                 render_tab_bar(f, &self.current_view);
                 match self.current_view {
-                    CurrentView::Dashboard => {
-                        render_dashboard(f, &self.state, self.log_scroll)
-                    }
+                    CurrentView::Dashboard => render_dashboard(f, &self.state, self.log_scroll),
                     CurrentView::Projects => {
                         crate::tui::views::projects::render_projects(
                             f,
@@ -529,39 +560,24 @@ impl TuiApp {
                                 if let Some((ref confirm_type, ref confirm_id)) = action {
                                     match confirm_type.as_str() {
                                         "project" => {
-                                            let _ = self
-                                                .state
-                                                .context_store
-                                                .delete_context(confirm_id);
+                                            let _ =
+                                                self.state.context_store.delete_context(confirm_id);
                                             self.project_index = 0;
                                         }
                                         "agent" => {
-                                            let agents =
-                                                self.state.agent_registry.list_agents();
+                                            let agents = self.state.agent_registry.list_agents();
                                             if let Some(agent) =
                                                 agents.iter().find(|a| a.id == *confirm_id)
                                             {
-                                                let path =
-                                                    if let Some(ref pid) = agent.project_id
-                                                    {
-                                                        crate::core::paths::
-                                                            get_project_agents_dir(pid)
-                                                            .join(format!(
-                                                                "{}.toml",
-                                                                agent.id
-                                                            ))
-                                                    } else {
-                                                        crate::core::paths::get_agents_dir()
-                                                            .join(format!(
-                                                                "{}.toml",
-                                                                agent.id
-                                                            ))
-                                                    };
+                                                let path = if let Some(ref pid) = agent.project_id {
+                                                    crate::core::paths::get_project_agents_dir(pid)
+                                                        .join(format!("{}.toml", agent.id))
+                                                } else {
+                                                    crate::core::paths::get_agents_dir()
+                                                        .join(format!("{}.toml", agent.id))
+                                                };
                                                 let _ = std::fs::remove_file(path);
-                                                let _ = self
-                                                    .state
-                                                    .agent_registry
-                                                    .reload_all(&[]);
+                                                let _ = self.state.agent_registry.reload_all(&[]);
                                             }
                                             self.agent_index = 0;
                                         }
@@ -602,8 +618,7 @@ impl TuiApp {
                                 self.refresh_available_agents();
                                 let count = self.available_agents.len();
                                 if count > 0 {
-                                    self.chat_agent_index =
-                                        (self.chat_agent_index + 1) % count;
+                                    self.chat_agent_index = (self.chat_agent_index + 1) % count;
                                     self.update_chat_selected_agent();
                                 }
                             }
@@ -620,7 +635,14 @@ impl TuiApp {
                                 self.chat_scroll = self.chat_scroll.saturating_sub(1);
                             }
                             KeyCode::Down => {
+                                // If already at max (usize::MAX ~ auto-scroll), keep auto-scroll on.
+                                // Otherwise scroll down and disable auto-scroll only while not at bottom.
                                 self.chat_scroll = self.chat_scroll.saturating_add(1);
+                                // When user explicitly scrolls down, turn auto-scroll back on if
+                                // they push past the logical max (render will clamp anyway).
+                                if self.chat_scroll >= usize::MAX / 2 {
+                                    self.chat_auto_scroll = true;
+                                }
                             }
                             KeyCode::PageUp => {
                                 self.chat_auto_scroll = false;
@@ -628,6 +650,9 @@ impl TuiApp {
                             }
                             KeyCode::PageDown => {
                                 self.chat_scroll = self.chat_scroll.saturating_add(10);
+                                if self.chat_scroll >= usize::MAX / 2 {
+                                    self.chat_auto_scroll = true;
+                                }
                             }
                             KeyCode::Char(c) => {
                                 if !self.chat_loading.load(Ordering::SeqCst) {
@@ -661,13 +686,12 @@ impl TuiApp {
                                     let count = self.state.context_store.list_all_projects().len();
                                     if count > 0 {
                                         self.project_index = (self.project_index + 1) % count;
+                                        self.agent_index = 0;
                                     }
                                 } else {
-                                    let agent_count =
-                                        self.state.agent_registry.list_agents().len();
+                                    let agent_count = self.project_agents().len();
                                     if agent_count > 0 {
-                                        self.agent_index =
-                                            (self.agent_index + 1) % agent_count;
+                                        self.agent_index = (self.agent_index + 1) % agent_count;
                                     }
                                 }
                             } else if self.current_view == CurrentView::Dashboard {
@@ -686,10 +710,10 @@ impl TuiApp {
                                         } else {
                                             self.project_index - 1
                                         };
+                                        self.agent_index = 0;
                                     }
                                 } else {
-                                    let agent_count =
-                                        self.state.agent_registry.list_agents().len();
+                                    let agent_count = self.project_agents().len();
                                     if agent_count > 0 {
                                         self.agent_index = if self.agent_index == 0 {
                                             agent_count - 1
@@ -740,12 +764,10 @@ impl TuiApp {
                                         ));
                                     }
                                 } else {
-                                    let agents = self.state.agent_registry.list_agents();
+                                    let agents = self.project_agents();
                                     if let Some(agent) = agents.get(self.agent_index) {
-                                        self.confirm_delete = Some((
-                                            "agent".to_string(),
-                                            agent.id.clone(),
-                                        ));
+                                        self.confirm_delete =
+                                            Some(("agent".to_string(), agent.id.clone()));
                                     }
                                 }
                             }
@@ -781,7 +803,7 @@ impl TuiApp {
                             if self.current_view == CurrentView::Projects
                                 && !self.active_in_project_list
                             {
-                                let agents = self.state.agent_registry.list_agents();
+                                let agents = self.project_agents();
                                 if let Some(agent) = agents.get(self.agent_index) {
                                     self.form_id = agent.id.clone();
                                     self.form_name = agent.config.name.clone();
@@ -791,22 +813,19 @@ impl TuiApp {
                                     self.form_optimize_rules =
                                         agent.config.optimize.rules.join(", ");
                                     self.form_skills = agent.config.skills.join(", ");
-                                    self.form_project_id = agent
-                                        .project_id
-                                        .clone()
-                                        .unwrap_or_default();
-                                    self.available_projects = if let Some(ref pid) =
-                                        agent.project_id
-                                    {
-                                        vec![pid.clone()]
-                                    } else {
-                                        self.state
-                                            .context_store
-                                            .list_all_projects()
-                                            .into_iter()
-                                            .map(|c| c.project_id)
-                                            .collect()
-                                    };
+                                    self.form_project_id =
+                                        agent.project_id.clone().unwrap_or_default();
+                                    self.available_projects =
+                                        if let Some(ref pid) = agent.project_id {
+                                            vec![pid.clone()]
+                                        } else {
+                                            self.state
+                                                .context_store
+                                                .list_all_projects()
+                                                .into_iter()
+                                                .map(|c| c.project_id)
+                                                .collect()
+                                        };
                                     self.form_field_index = 0;
                                     self.editing_agent = Some(agent.id.clone());
                                     self.current_view = CurrentView::AgentForm;
@@ -894,10 +913,7 @@ fn render_tab_bar(f: &mut ratatui::Frame, current: &CurrentView) {
             "  [Projects]",
             active_style(*current == CurrentView::Projects),
         ),
-        Span::styled(
-            "  [Chat]",
-            active_style(*current == CurrentView::Chat),
-        ),
+        Span::styled("  [Chat]", active_style(*current == CurrentView::Chat)),
     ]))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(bar, bar_rect);

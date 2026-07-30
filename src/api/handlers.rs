@@ -9,9 +9,11 @@ use crate::domain::models::{
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::mcp::McpServerRegistry;
+use crate::ports::rag::RagStore;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::agent_runtime::AgentRuntime;
+use crate::services::rag_ingest::RagIngestService;
 use crate::services::skill_manager::SkillManager;
 use axum::{
     extract::State,
@@ -26,6 +28,8 @@ use std::convert::Infallible;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio_stream::StreamExt as _;
+
+use crate::ports::history::ConversationStore;
 
 pub struct AppState {
     pub provider: Arc<dyn LLMProvider + Send + Sync>,
@@ -45,6 +49,12 @@ pub struct AppState {
     pub mcp_registry: Arc<dyn McpServerRegistry>,
     /// Agent runtime (Rig engine) for agent-scoped chat. None when feature is off.
     pub agent_runtime: Option<Arc<AgentRuntime>>,
+    /// Segmented RAG vector store. None when RAG is disabled.
+    pub rag_store: Option<Arc<dyn RagStore>>,
+    /// Ingest pipeline for admin API / analyze hooks.
+    pub rag_ingest: Option<Arc<RagIngestService>>,
+    /// Conversation history store. None when feature is off or uninitialized.
+    pub history_store: Option<Arc<dyn ConversationStore>>,
 }
 
 impl AppState {
@@ -101,6 +111,9 @@ pub async fn chat(
             .get("x-project")
             .and_then(|value| value.to_str().ok()),
         agent_id: headers.get("x-agent").and_then(|value| value.to_str().ok()),
+        conversation_id: headers
+            .get("x-conversation-id")
+            .and_then(|value| value.to_str().ok()),
         debug: headers.get("x-debug").and_then(|value| value.to_str().ok()) == Some("true"),
     };
 

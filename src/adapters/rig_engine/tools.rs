@@ -25,10 +25,23 @@ impl McpToolBridge {
     }
 
     pub async fn invoke_json(&self, args: Value) -> Result<String, String> {
+        // Defense in depth: re-check scope before charging budget or calling MCP.
+        if !self
+            .inner
+            .scope
+            .allows_tool(&self.inner.def.server_id, &self.inner.def.name)
+        {
+            return Err(format!(
+                "tool '{}/{}' denied by agent scope",
+                self.inner.def.server_id, self.inner.def.name
+            ));
+        }
+
         {
             let mut b = self.budget.lock().await;
             b.try_consume()?;
         }
+
         self.inner.invoke(args).await
     }
 }
@@ -105,7 +118,8 @@ mod tests {
         }
     }
 
-    fn make_scoped_tool(allowed: bool) -> ScopedMcpTool {
+    fn make_scoped_tool(allowed: bool) -> (ScopedMcpTool, Arc<AtomicU32>) {
+        let call_count = Arc::new(AtomicU32::new(0));
         let mut mcp_sources = HashSet::new();
         mcp_sources.insert("mock".into());
         let scope = AgentScope {
@@ -123,7 +137,7 @@ mod tests {
             max_iterations: 5,
             timeout_secs: 30,
         };
-        ScopedMcpTool {
+        let tool = ScopedMcpTool {
             def: McpToolDef {
                 server_id: "mock".into(),
                 name: "test_tool".into(),
@@ -131,32 +145,45 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
             },
             client: Arc::new(MockMcpClient {
-                call_count: Arc::new(AtomicU32::new(0)),
+                call_count: call_count.clone(),
             }),
             scope,
-        }
+        };
+        (tool, call_count)
     }
 
     #[tokio::test]
     async fn allowed_tool_invokes_mcp() {
-        let tool = make_scoped_tool(true);
+        let (tool, call_count) = make_scoped_tool(true);
         let bridge = McpToolBridge::new(tool, Arc::new(Mutex::new(ToolCallBudget::new(5))));
         let result = bridge
             .invoke_json(serde_json::json!({"key": "value"}))
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "\"mock result\"");
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn denied_tool_returns_error() {
-        let tool = make_scoped_tool(false);
-        let bridge = McpToolBridge::new(tool, Arc::new(Mutex::new(ToolCallBudget::new(5))));
+        let (tool, call_count) = make_scoped_tool(false);
+        let budget = Arc::new(Mutex::new(ToolCallBudget::new(5)));
+        let bridge = McpToolBridge::new(tool, budget.clone());
         let result = bridge
             .invoke_json(serde_json::json!({"key": "value"}))
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("denied by agent scope"));
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "denied tools must not call MCP"
+        );
+        assert_eq!(
+            budget.lock().await.used(),
+            0,
+            "denied tools must not consume budget"
+        );
     }
 
     #[test]

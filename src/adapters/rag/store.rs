@@ -117,6 +117,16 @@ impl RagStore for InMemoryRagStore {
             return Ok(0);
         }
 
+        // Deny before embed (defense in depth + saves CPU).
+        for doc in &docs {
+            if !scope.allows_rag_write(&doc.source_id) {
+                return Err(format!(
+                    "RAG write denied for source '{}' on agent '{}'",
+                    doc.source_id, scope.agent_id
+                ));
+            }
+        }
+
         let texts = docs.iter().map(|doc| doc.text.clone()).collect::<Vec<_>>();
         let vectors = self.embeddings.embed(&texts).await?;
         if vectors.len() != docs.len() {
@@ -263,5 +273,101 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn listed_write_policy_allows_rag_sources_only() {
+        let store = InMemoryRagStore::new(Arc::new(HashEmbeddingProvider::new(16)));
+        let scope = scope_for(
+            "ops",
+            &["fudi/policies", "other/docs"],
+            RagWritePolicy::Listed,
+        );
+        store
+            .upsert_scoped(
+                &scope,
+                vec![RagUpsert {
+                    source_id: "fudi/policies".into(),
+                    id: "p1".into(),
+                    text: "policy text".into(),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .upsert_scoped(
+                &scope,
+                vec![RagUpsert {
+                    source_id: "secret/other".into(),
+                    id: "x".into(),
+                    text: "nope".into(),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn own_memory_write_matches_scope_helper() {
+        let store = InMemoryRagStore::new(Arc::new(HashEmbeddingProvider::new(16)));
+        let mut scope = scope_for(
+            "ops",
+            &["agent:fudi/ops/memory"],
+            RagWritePolicy::OwnMemoryOnly,
+        );
+        scope.project_id = Some("fudi".into());
+        let own = scope.own_memory_source_id();
+        assert_eq!(own, "agent:fudi/ops/memory");
+        store
+            .upsert_scoped(
+                &scope,
+                vec![RagUpsert {
+                    source_id: own,
+                    id: "m1".into(),
+                    text: "memory note".into(),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_does_not_return_other_collection() {
+        let store = InMemoryRagStore::new(Arc::new(HashEmbeddingProvider::new(16)));
+        let writer = scope_for("a", &["col/a", "col/b"], RagWritePolicy::Listed);
+        store
+            .upsert_scoped(
+                &writer,
+                vec![
+                    RagUpsert {
+                        source_id: "col/a".into(),
+                        id: "1".into(),
+                        text: "alpha only content unique-aaa".into(),
+                        metadata: serde_json::json!({}),
+                    },
+                    RagUpsert {
+                        source_id: "col/b".into(),
+                        id: "2".into(),
+                        text: "beta only content unique-bbb".into(),
+                        metadata: serde_json::json!({}),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let reader = scope_for("a", &["col/a"], RagWritePolicy::None);
+        let hits = store
+            .query_scoped(&reader, "unique-bbb unique-aaa", 10)
+            .await
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|h| h.source_id == "col/a"));
+        assert!(hits.iter().all(|h| !h.text.contains("unique-bbb")));
     }
 }
