@@ -1,11 +1,13 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
+/// Returns `(scroll_max, messages_rect)` so the caller can drive scroll
+/// state and hit-test mouse events on the messages region.
 pub fn render_chat(
     f: &mut Frame,
     messages: &[(String, String)],
@@ -15,7 +17,7 @@ pub fn render_chat(
     _available_agents: &[String],
     _agent_index: usize,
     scroll: usize,
-) {
+) -> (usize, Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -88,7 +90,11 @@ pub fn render_chat(
     let total_wrapped_rows: usize = lines
         .iter()
         .map(|l| {
-            let raw_len = l.spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+            let raw_len = l
+                .spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>();
             if inner_width == 0 || raw_len == 0 {
                 1
             } else {
@@ -149,4 +155,6 @@ pub fn render_chat(
     let x = chunks[2].x + 1 + input.chars().count() as u16;
     let y = chunks[2].y + 1;
     f.set_cursor_position((x.min(chunks[2].x + chunks[2].width.saturating_sub(2)), y));
+
+    (scroll_max, chunks[1])
 }

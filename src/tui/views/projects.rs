@@ -137,22 +137,14 @@ pub fn render_projects(
                     } else {
                         Style::default().fg(Color::White)
                     };
-                    ListItem::new(format!(
-                        " {} (Model: {})",
-                        a.id, a.config.model
-                    ))
-                    .style(style)
+                    ListItem::new(format!(" {} (Model: {})", a.id, a.config.model)).style(style)
                 })
                 .collect()
         };
 
         let panel_title = format!(" Agents — {} ", selected_project_id);
         let agent_list = List::new(agent_items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(panel_title),
-            )
+            .block(Block::default().borders(Borders::ALL).title(panel_title))
             .highlight_style(Style::default().bg(Color::DarkGray));
         f.render_widget(agent_list, right_chunks[1]);
     } else {
