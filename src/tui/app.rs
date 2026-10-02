@@ -411,12 +411,17 @@ impl TuiApp {
             CurrentView::Dashboard => {
                 vec![("Tab", "next view"), ("↑/↓", "scroll logs"), ("q", "quit")]
             }
+            // One row, and a hint that does not fit is clipped from the right,
+            // which takes `q: quit` first — the one key nobody can do without.
+            // Sized to fit 80 columns: the design's own mockup for this view
+            // advertises `n`, `a` and `d` only (`design.md:103`), and `e` edits
+            // an agent of the selected project, which the list no longer shows.
+            // `e` still works in the app; it is just not advertised here.
             CurrentView::Projects => vec![
                 ("Tab", "switch list"),
                 ("←/→", "navigate"),
                 ("a", "analyze"),
                 ("n", "new agent"),
-                ("e", "edit"),
                 ("d", "delete"),
                 ("q", "quit"),
             ],
@@ -1386,6 +1391,49 @@ mod tests {
             "the chat hints are {width} columns wide and get clipped: {row:?}"
         );
         println!("chat hints render {width} columns of the 80 available");
+    }
+
+    /// The same pin for the projects row, which was 86 columns wide and lost
+    /// `q: quit` to the clip.
+    ///
+    /// The pin is the rendered row, not the hint list: `render_footer` clips at
+    /// the area width with no ellipsis, so a hint pushed past 80 columns simply
+    /// stops being drawn. Comparing the row against the text the hints describe
+    /// fails the moment one of them is cut, which a `width <= 80` check cannot
+    /// do — the buffer is 80 columns wide whatever was written into it.
+    #[test]
+    fn the_projects_hints_fit_one_row() {
+        let hints = TuiApp::hints_for(CurrentView::Projects);
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|f| chrome::render_footer(f, f.area(), &hints))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+
+        // Measured from the hints, not from the row: the row is 80 columns wide
+        // whatever was written into it, so measuring it there proves nothing.
+        let width = hints
+            .iter()
+            .map(|(key, hint)| Line::from(format!("{key}: {hint}")).width() + 2)
+            .sum::<usize>()
+            - 2;
+        assert!(
+            width <= 80,
+            "the projects hints are {width} columns wide and get clipped: {row:?}"
+        );
+        assert_eq!(
+            row.trim_end(),
+            hints
+                .iter()
+                .map(|(key, hint)| format!("{key}: {hint}"))
+                .collect::<Vec<_>>()
+                .join("  "),
+            "every hint must survive the 80-column row"
+        );
+        println!("projects hints render {width} columns of the 80 available");
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> event::KeyEvent {

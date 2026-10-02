@@ -1,6 +1,6 @@
 use crate::api::handlers::AppState;
 use crate::tui::app::AnalysisState;
-use ratatui::style::Stylize;
+use crate::tui::{chrome, theme};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -9,154 +9,111 @@ use ratatui::{
     Frame,
 };
 
+/// Blank columns between a project's name and the fields that follow it.
+const FIELD_GAP: usize = 2;
+
+/// `project_type` of a project that has never been analysed.
+const UNANALYZED: &str = "unanalyzed";
+
 /// Draws the projects view inside `body`, the part of the screen the shared
 /// chrome left over.
+///
+/// One row per project: the name, how many agents it has, and whether it has
+/// been analysed. The counts are a column the eye compares down the list, so
+/// every row's count ends in the same place.
+///
+/// The key hints are the chrome footer's job, not this function's.
+///
+/// `agent_index` stays in the signature so the call site does not change. This
+/// view no longer draws the agent list — the count on each row is what it is
+/// reduced to, and the context bar already carries the agent in force.
 pub fn render_projects(
     f: &mut Frame,
     body: Rect,
     state: &AppState,
     project_index: usize,
-    agent_index: usize,
+    _agent_index: usize,
     active_in_project_list: bool,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints(
-            [
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
-            ]
-            .as_ref(),
-        )
-        .split(body);
-
-    // Title
-    let title = Paragraph::new(Line::from(Span::styled(
-        "Projects Management ",
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )))
-    .block(Block::default().borders(Borders::ALL));
-    f.render_widget(title, chunks[0]);
-
-    // Middle Content: Project List (Left) | Details & Specialized Agents (Right)
-    let main_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
-        .split(chunks[1]);
-
-    // 1. Project List
     let projects = state.context_store.list_all_projects();
-    let project_items: Vec<ListItem> = projects
+
+    if projects.is_empty() {
+        // A rule under a list with no rows would point at nothing.
+        let empty = Paragraph::new(Line::from(Span::styled("No projects", theme::chrome())));
+        f.render_widget(empty, body);
+        return;
+    }
+
+    let agents = state.agent_registry.list_agents();
+    let counts: Vec<String> = projects
         .iter()
-        .enumerate()
-        .map(|(i, ctx)| {
-            let style = if active_in_project_list && i == project_index {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            ListItem::new(format!(" {} ", ctx.project_id)).style(style)
+        .map(|project| {
+            let count = agents
+                .iter()
+                .filter(|agent| agent.project_id.as_deref() == Some(project.project_id.as_str()))
+                .count();
+            format!("{count} agentes")
         })
         .collect();
 
-    let project_list = List::new(project_items)
-        .block(Block::default().borders(Borders::ALL).title(" Projects "))
-        .highlight_style(Style::default().bg(Color::DarkGray));
-    f.render_widget(project_list, main_chunks[0]);
+    // Widths, not character counts: a name with accents or CJK in it takes
+    // more columns than it has characters, and `chars().count` would push that
+    // row's count off the column every other row lines up on.
+    let widest_name = projects
+        .iter()
+        .map(|project| Line::from(project.project_id.as_str()).width())
+        .max()
+        .unwrap_or(0);
+    let widest_count = counts
+        .iter()
+        .map(|count| Line::from(count.as_str()).width())
+        .max()
+        .unwrap_or(0);
+    // One leading space on every row, the counts after the widest name, and
+    // the analysed marker after the widest count.
+    let count_column = 1 + widest_name + FIELD_GAP + widest_count;
 
-    // 2. Right Side: Details & Agents
-    if let Some(selected_project) = projects.get(project_index) {
-        let right_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(8), Constraint::Min(0)].as_ref())
-            .split(main_chunks[1]);
+    let items: Vec<ListItem> = projects
+        .iter()
+        .zip(&counts)
+        .enumerate()
+        .map(|(index, (project, count))| {
+            // Bold is the only bold in the interface, so it marks the row the
+            // next keystroke acts on — and only while this list has focus.
+            let name_style = if active_in_project_list && index == project_index {
+                theme::active()
+            } else {
+                theme::content()
+            };
+            let name = format!(" {}", project.project_id);
+            let pad = " ".repeat(count_column.saturating_sub(
+                Line::from(name.as_str()).width() + Line::from(count.as_str()).width(),
+            ));
 
-        // Details Panel
-        let is_analyzed = selected_project.project_type != "unanalyzed";
-        let details = Paragraph::new(vec![
-            Line::from(vec!["ID: ".bold(), Span::raw(&selected_project.project_id)]),
-            Line::from(vec!["Path: ".bold(), Span::raw(&selected_project.path)]),
-            Line::from(vec![
-                "Status: ".bold(),
-                Span::styled(
-                    if is_analyzed {
-                        "Analyzed"
-                    } else {
-                        "Not analyzed (press 'a' to analyze)"
-                    },
-                    Style::default().fg(if is_analyzed {
-                        Color::Green
-                    } else {
-                        Color::Yellow
-                    }),
-                ),
-            ]),
+            let mut spans = vec![
+                Span::styled(name, name_style),
+                Span::styled(format!("{pad}{count}"), theme::chrome()),
+            ];
+            if project.project_type != UNANALYZED {
+                spans.push(Span::styled("  ", theme::chrome()));
+                spans.push(Span::styled("●", theme::ok()));
+                spans.push(Span::styled(" analizado", theme::chrome()));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    // The rule gets the last row, so a list that fills the body loses its last
+    // project rather than the separator under it.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((items.len() as u16).min(body.height.saturating_sub(1))),
+            Constraint::Length(1),
         ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Project Details "),
-        );
-        f.render_widget(details, right_chunks[0]);
-
-        // Agents Panel — only agents for the selected project
-        let selected_project_id = &selected_project.project_id;
-        let project_agents: Vec<_> = {
-            let all_agents = state.agent_registry.list_agents();
-            all_agents
-                .into_iter()
-                .filter(|a| {
-                    a.project_id
-                        .as_deref()
-                        .map(|pid| pid == selected_project_id.as_str())
-                        .unwrap_or(false)
-                })
-                .collect()
-        };
-
-        let agent_items: Vec<ListItem> = if project_agents.is_empty() {
-            vec![ListItem::new(Span::styled(
-                " No agents for this project. Press 'n' to create one.",
-                Style::default().fg(Color::DarkGray),
-            ))]
-        } else {
-            project_agents
-                .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    let style = if !active_in_project_list && i == agent_index {
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    ListItem::new(format!(" {} (Model: {})", a.id, a.config.model)).style(style)
-                })
-                .collect()
-        };
-
-        let panel_title = format!(" Agents — {} ", selected_project_id);
-        let agent_list = List::new(agent_items)
-            .block(Block::default().borders(Borders::ALL).title(panel_title))
-            .highlight_style(Style::default().bg(Color::DarkGray));
-        f.render_widget(agent_list, right_chunks[1]);
-    } else {
-        let empty = Paragraph::new("No projects found. Use 'llama-r analyze' to add one.")
-            .block(Block::default().borders(Borders::ALL).title(" Details "));
-        f.render_widget(empty, main_chunks[1]);
-    }
-
-    // Footer. The hints come from `TuiApp::hints_for` now; this bordered row
-    // stays until the old chrome is deleted.
-    let footer = Paragraph::new("").block(Block::default().borders(Borders::ALL));
-    f.render_widget(footer, chunks[2]);
+        .split(body);
+    f.render_widget(List::new(items), chunks[0]);
+    chrome::separator(f, chunks[1]);
 }
 
 pub fn render_agent_form(
@@ -653,9 +610,299 @@ pub fn render_skill_proposals(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::mcp::StaticMcpRegistry;
+    use crate::context::store::{ContextStore, ProjectContext};
+    use crate::providers::ollama::OllamaProvider;
+    use crate::runtime::build_app_state;
+    use crate::services::agent_registry::AgentRegistry;
+    use crate::services::skill_manager::SkillManager;
     use crate::tui::chrome::{self, Context};
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::Terminal;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    fn all_text(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| row_text(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The row `needle` was drawn on.
+    fn row_of(buffer: &Buffer, needle: &str) -> u16 {
+        (0..buffer.area.height)
+            .find(|y| row_text(buffer, *y).contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is not on screen: {}", all_text(buffer)))
+    }
+
+    /// The terminal column each character of row `y` was drawn in.
+    ///
+    /// Comparing character offsets instead of columns is wrong exactly where
+    /// this view is easiest to get wrong: `日本語` is three characters and six
+    /// columns, so a row carrying one puts every later character several
+    /// columns left of where the screen actually puts it. What makes the two
+    /// differ is that a wide glyph and the blank cell beside it are one
+    /// character between two columns.
+    fn char_columns(buffer: &Buffer, y: u16) -> Vec<usize> {
+        let mut columns = Vec::new();
+        let mut written = 0;
+        for x in 0..buffer.area.width {
+            columns.push(written);
+            written += buffer[(x, y)].symbol().chars().count();
+        }
+        columns
+    }
+
+    /// The terminal column where `needle` starts on row `y`.
+    ///
+    /// `str::find` answers in bytes and a CJK glyph is three of them, so the
+    /// offset is converted to a character index before being read as a column.
+    /// Left in bytes it would move the CJK row's count *with* its name, which
+    /// is the opposite of what this asserts.
+    fn column_of(buffer: &Buffer, y: u16, needle: &str) -> Option<usize> {
+        let row = row_text(buffer, y);
+        let characters = row[..row.find(needle)?].chars().count();
+        char_columns(buffer, y).get(characters).copied()
+    }
+
+    /// The projects view on an 80x24 terminal, inside the body the chrome
+    /// leaves under the bar.
+    fn render(state: &AppState, project_index: usize, active_in_project_list: bool) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                render_projects(
+                    f,
+                    Rect::new(0, 1, 80, 22),
+                    state,
+                    project_index,
+                    0,
+                    active_in_project_list,
+                );
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// An `AppState` reading a throwaway data dir holding `projects` (id,
+    /// project type) and, per project, how many agents it has.
+    ///
+    /// Agent ids do not matter to this view, only how many there are.
+    /// `LLAMA_R_DIR` is process-wide, so every caller holds the env lock.
+    fn state_with(projects: &[(&str, &str)], agents: &[(&str, usize)]) -> (TempDir, Arc<AppState>) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LLAMA_R_DIR", temp_dir.path());
+
+        let context_store = Arc::new(ContextStore::new());
+        for (project_id, project_type) in projects {
+            context_store
+                .save_context(ProjectContext {
+                    project_id: (*project_id).to_string(),
+                    path: temp_dir.path().join(project_id).display().to_string(),
+                    context_md: String::new(),
+                    project_type: (*project_type).to_string(),
+                    skills_injected: Vec::new(),
+                    last_analyzed: chrono::Utc::now(),
+                    custom_rules: String::new(),
+                })
+                .unwrap();
+        }
+
+        let agent_registry = Arc::new(AgentRegistry::new());
+        for (project_id, count) in agents {
+            let dir = crate::core::paths::get_project_agents_dir(project_id);
+            std::fs::create_dir_all(&dir).unwrap();
+            for index in 0..*count {
+                std::fs::write(
+                    dir.join(format!("agent-{index}.toml")),
+                    "name = \"agente\"\nmodel = \"llama3\"\nsystem_prompt = \"hola\"\n",
+                )
+                .unwrap();
+            }
+        }
+        agent_registry.reload_all(&[]).unwrap();
+
+        let state = build_app_state(
+            Arc::new(OllamaProvider::new("http://localhost:11434".to_string())),
+            agent_registry,
+            Arc::new(SkillManager::new()),
+            context_store,
+            "llama3".to_string(),
+            Arc::new(Mutex::new(VecDeque::new())),
+            Vec::new(),
+            Arc::new(StaticMcpRegistry::new()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        (temp_dir, state)
+    }
+
+    #[test]
+    fn projects_render_without_borders_and_show_counts() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(&[("fudi", "rust"), ("clinica", "unanalyzed")], &[]);
+        let buffer = render(&state, 0, true);
+        let text = all_text(&buffer);
+        for ch in ['┌', '┐', '└', '┘', '│'] {
+            assert!(
+                !text.contains(ch),
+                "projects must not draw box char {ch:?}: {text}"
+            );
+        }
+        assert!(
+            text.contains("agente"),
+            "the agent count must be shown: {text}"
+        );
+        assert!(
+            text.contains('─'),
+            "the thin rule under the list must render: {text}"
+        );
+    }
+
+    #[test]
+    fn projects_renders_an_empty_state_instead_of_a_bare_divider() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(&[], &[]);
+        let buffer = render(&state, 0, true);
+        let text = all_text(&buffer);
+        assert!(
+            text.contains("No projects"),
+            "an empty list must say so: {text}"
+        );
+        assert!(
+            !text.contains('─'),
+            "no separator should point at nothing: {text}"
+        );
+    }
+
+    /// The count is a column the eye compares down the list, so it has to be
+    /// placed by display width. `日本語` is three characters and six columns,
+    /// and `chars().count()` gets that wrong in both directions: counting
+    /// characters puts its row's count nine columns off from everyone else's,
+    /// and the row stops reading as a column at all.
+    #[test]
+    fn the_agent_count_column_aligns_with_multibyte_names() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        // One and two digit counts on purpose: right-aligned means both end in
+        // the same column, not that they start in it.
+        let (_dir, state) = state_with(
+            &[
+                ("fudi", "rust"),
+                ("clinica", "rust"),
+                ("日本語プロジェクト", "rust"),
+            ],
+            &[("fudi", 2), ("clinica", 1), ("日本語プロジェクト", 12)],
+        );
+        let buffer = render(&state, 0, true);
+        let columns: Vec<usize> = (0..buffer.area.height)
+            .filter_map(|y| column_of(&buffer, y, "agentes"))
+            .collect();
+        assert_eq!(
+            columns.len(),
+            3,
+            "each project row must show a count: {columns:?}"
+        );
+        assert!(
+            columns.windows(2).all(|w| w[0] == w[1]),
+            "the count column must align across multibyte names: {columns:?}"
+        );
+    }
+
+    #[test]
+    fn an_analysed_project_is_marked_and_one_awaiting_analysis_is_not() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(&[("fudi", "rust"), ("clinica", "unanalyzed")], &[]);
+        let buffer = render(&state, 0, true);
+        let analysed = row_text(&buffer, row_of(&buffer, "fudi"));
+        assert!(
+            analysed.contains("● analizado"),
+            "an analysed project must say so: {analysed:?}"
+        );
+        let pending = row_text(&buffer, row_of(&buffer, "clinica"));
+        assert!(
+            !pending.contains('●'),
+            "a project without analysis must not claim one: {pending:?}"
+        );
+    }
+
+    #[test]
+    fn the_selected_project_is_the_only_row_in_the_active_style() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(&[("fudi", "rust"), ("clinica", "rust")], &[]);
+        // `list_all_projects` comes out of a `HashMap`, so which project sits at
+        // an index is not the test's to assume: ask the store.
+        let projects = state.context_store.list_all_projects();
+        let selected = projects[1].project_id.clone();
+
+        let buffer = render(&state, 1, true);
+        assert!(
+            wears(&buffer, row_of(&buffer, &selected), theme::active()),
+            "{selected} is the selected project and must wear active: {:?}",
+            row_text(&buffer, row_of(&buffer, &selected))
+        );
+        for project in projects.iter().filter(|p| p.project_id != selected) {
+            let row = row_of(&buffer, &project.project_id);
+            assert!(
+                wears(&buffer, row, theme::content()),
+                "{} is not selected and must wear content: {:?}",
+                project.project_id,
+                row_text(&buffer, row)
+            );
+        }
+
+        // With the agent list focused nothing here is selected, so no row may
+        // claim to be.
+        let unfocused = render(&state, 1, false);
+        for project in &projects {
+            assert!(
+                !wears(
+                    &unfocused,
+                    row_of(&unfocused, &project.project_id),
+                    theme::active()
+                ),
+                "{} must not look selected while the project list is unfocused",
+                project.project_id
+            );
+        }
+    }
+
+    /// Does the project's name on row `y` wear `token`?
+    ///
+    /// Only the fields a token sets: a buffer cell always carries a colour and
+    /// a modifier set, so the whole `Style` never compares equal to a token.
+    fn wears(buffer: &Buffer, y: u16, token: Style) -> bool {
+        let cell = &buffer[(1, y)];
+        Some(cell.fg) == token.fg && cell.modifier == token.add_modifier
+    }
+
+    /// The layout subtracts one row for the rule and clamps against
+    /// `body.height`, and `project_index` may point past the end. Nothing may
+    /// panic on a terminal too small to draw the list, or on an index that no
+    /// longer exists.
+    #[test]
+    fn projects_survives_a_tiny_terminal_and_an_out_of_range_index() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(&[("fudi", "rust"), ("clinica", "rust")], &[]);
+        for (width, height) in [(1u16, 1u16), (2, 2), (3, 3), (10, 1), (2, 40), (80, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let c = chrome::layout(Rect::new(0, 0, width, height));
+            terminal
+                .draw(|f| render_projects(f, c.body, &state, 99, 99, true))
+                .unwrap();
+        }
+    }
 
     /// The bug this whole refactor exists to fix: a view laid out over
     /// `f.area()` covers the bar's row, and the bar disappears.
