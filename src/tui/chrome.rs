@@ -79,11 +79,12 @@ pub fn layout(area: Rect) -> Chrome {
     }
 }
 
-/// Draws the context bar: view names, the active one bold, then the context
-/// and the provider's health.
+/// Draws the context bar: view names on the left with the active one bold, the
+/// context and the provider's health pushed to the right edge.
 ///
-/// View names are never dropped. When the line is too long it is the context
-/// that shrinks, from the right, ending in `…`.
+/// The context group — label, gap, health dot — is what gives way when the row
+/// is too narrow: the label truncates from the right and ends in `…`. View
+/// names are never dropped.
 pub fn render_bar(
     f: &mut Frame,
     rect: Rect,
@@ -108,22 +109,27 @@ pub fn render_bar(
         };
         line.push_span(Span::styled(*name, style));
     }
-    line.push_span(GAP);
 
     let health = if healthy {
         Span::styled("●", theme::ok())
     } else {
         Span::styled("○", theme::error())
     };
-    let budget = (rect.width as usize)
-        .saturating_sub(line.width())
-        .saturating_sub(width_of(GAP))
-        .saturating_sub(health.width());
+    let gap_width = width_of(GAP);
 
-    line.push_span(Span::styled(
-        fit(&context_label(ctx), budget),
-        theme::chrome(),
-    ));
+    // Columns the context group may use, measured from where the views end.
+    let room = (rect.width as usize).saturating_sub(line.width());
+    let label = fit(
+        &context_label(ctx),
+        room.saturating_sub(gap_width)
+            .saturating_sub(health.width()),
+    );
+    let group_width = width_of(&label)
+        .saturating_add(gap_width)
+        .saturating_add(health.width());
+
+    line.push_span(Span::raw(" ".repeat(room.saturating_sub(group_width))));
+    line.push_span(Span::styled(label, theme::chrome()));
     line.push_span(GAP);
     line.push_span(health);
 
@@ -290,6 +296,15 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let row = row_text(&buffer, 0);
+        // `row_text` always returns exactly `width` symbols, so counting them
+        // proves nothing. What matters is that the bar occupied one row: nothing
+        // wrapped or was pushed into row 1.
+        assert_eq!(
+            row_text(&buffer, 1).trim(),
+            "",
+            "the bar must not spill into row 1: {:?}",
+            row_text(&buffer, 1)
+        );
         assert!(
             row.contains("Dashboard"),
             "view names must survive: {row:?}"
@@ -298,7 +313,6 @@ mod tests {
             row.contains('…'),
             "the long context must be truncated: {row:?}"
         );
-        assert_eq!(row.chars().count(), 50, "the bar must stay on one row");
     }
 
     #[tokio::test]
