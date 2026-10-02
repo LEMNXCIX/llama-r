@@ -413,13 +413,16 @@ impl TuiApp {
             }
             // One row, and a hint that does not fit is clipped from the right,
             // which takes `q: quit` first — the one key nobody can do without.
-            // Sized to fit 80 columns: the design's own mockup for this view
-            // advertises `n`, `a` and `d` only (`design.md:103`), and `e` edits
-            // an agent of the selected project, which the list no longer shows.
-            // `e` still works in the app; it is just not advertised here.
+            // Sized to fit 80 columns. Two hints are absent because what they
+            // act on is not drawn here: `e` edits an agent and `←/→` toggles
+            // focus to the agent list (`app.rs:1066`), neither of which this
+            // view shows. `design.md:103` advertises `n`, `a` and `d` for this
+            // screen. Both keys still work in the app; they are just not
+            // advertised. `↑/↓` is advertised instead, because it moves the
+            // selection in the one list that *is* drawn.
             CurrentView::Projects => vec![
                 ("Tab", "switch list"),
-                ("←/→", "navigate"),
+                ("↑/↓", "select"),
                 ("a", "analyze"),
                 ("n", "new agent"),
                 ("d", "delete"),
@@ -1385,7 +1388,14 @@ mod tests {
             row.contains("Shift+Enter: newline"),
             "the newline hint is the point of the one-line input: {row:?}"
         );
-        let width = Line::from(row.trim_end()).width();
+        // Measured from the hints, not from the row: the row is 80 columns
+        // wide whatever was written into it, so measuring it there proves
+        // nothing.
+        let width = hints
+            .iter()
+            .map(|(key, hint)| Line::from(format!("{key}: {hint}")).width() + 2)
+            .sum::<usize>()
+            - 2;
         assert!(
             width <= 80,
             "the chat hints are {width} columns wide and get clipped: {row:?}"

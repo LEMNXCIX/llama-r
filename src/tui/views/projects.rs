@@ -38,21 +38,42 @@ pub fn render_projects(
     let projects = state.context_store.list_all_projects();
 
     if projects.is_empty() {
-        // A rule under a list with no rows would point at nothing.
-        let empty = Paragraph::new(Line::from(Span::styled("No projects", theme::chrome())));
+        // A rule under a list with no rows would point at nothing. The footer
+        // is no help either — `a` no-ops with nothing to analyse and `n` opens
+        // a form with an empty project id — so the next step is named here.
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "No projects — run 'llama-r analyze <path>' to add one",
+            theme::chrome(),
+        )));
         f.render_widget(empty, body);
         return;
     }
 
     let agents = state.agent_registry.list_agents();
-    let counts: Vec<String> = projects
+    let totals: Vec<usize> = projects
         .iter()
         .map(|project| {
-            let count = agents
+            agents
                 .iter()
                 .filter(|agent| agent.project_id.as_deref() == Some(project.project_id.as_str()))
-                .count();
-            format!("{count} agentes")
+                .count()
+        })
+        .collect();
+
+    // The number is right-aligned in its own field, so the word after it is a
+    // column: ` 2 agentes` beside `12 agentes`, not `2 agentes` beside
+    // `12 agentes` with the words a column apart. `1 agente`, `3 agentes`
+    // (`design.md:100-101`).
+    let digits = totals
+        .iter()
+        .map(|total| total.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let counts: Vec<String> = totals
+        .iter()
+        .map(|total| {
+            let plural = if *total == 1 { "" } else { "s" };
+            format!("{total:>digits$} agente{plural}")
         })
         .collect();
 
@@ -69,9 +90,8 @@ pub fn render_projects(
         .map(|count| Line::from(count.as_str()).width())
         .max()
         .unwrap_or(0);
-    // One leading space on every row, the counts after the widest name, and
-    // the analysed marker after the widest count.
-    let count_column = 1 + widest_name + FIELD_GAP + widest_count;
+    // One leading space on every row, then the counts.
+    let count_column = 1 + widest_name + FIELD_GAP;
 
     let items: Vec<ListItem> = projects
         .iter()
@@ -86,16 +106,19 @@ pub fn render_projects(
                 theme::content()
             };
             let name = format!(" {}", project.project_id);
-            let pad = " ".repeat(count_column.saturating_sub(
-                Line::from(name.as_str()).width() + Line::from(count.as_str()).width(),
-            ));
+            let pad = " ".repeat(count_column.saturating_sub(Line::from(name.as_str()).width()));
 
+            // The count starts in its column, which is what `design.md:100-101`
+            // draws: `3 agentes` and `1 agente` begin at the same column.
             let mut spans = vec![
                 Span::styled(name, name_style),
                 Span::styled(format!("{pad}{count}"), theme::chrome()),
             ];
             if project.project_type != UNANALYZED {
-                spans.push(Span::styled("  ", theme::chrome()));
+                // Pad the count out so the marker below it is a column too.
+                let tail =
+                    " ".repeat(widest_count.saturating_sub(Line::from(count.as_str()).width()));
+                spans.push(Span::styled(format!("{tail}  "), theme::chrome()));
                 spans.push(Span::styled("●", theme::ok()));
                 spans.push(Span::styled(" analizado", theme::chrome()));
             }
@@ -781,6 +804,14 @@ mod tests {
             text.contains("No projects"),
             "an empty list must say so: {text}"
         );
+        // Saying so is not enough to be useful. With no projects the footer is
+        // no help either — `a` no-ops and `n` opens a form with an empty
+        // project id — so the empty state is the only place the next step can
+        // be named.
+        assert!(
+            text.contains("llama-r analyze"),
+            "an empty list must name the way out: {text}"
+        );
         assert!(
             !text.contains('─'),
             "no separator should point at nothing: {text}"
@@ -806,8 +837,11 @@ mod tests {
             &[("fudi", 2), ("clinica", 1), ("日本語プロジェクト", 12)],
         );
         let buffer = render(&state, 0, true);
+        // `agente`, not `agentes`: one of the three projects has exactly one
+        // agent and correctly reads `1 agente`, so the plural needle would find
+        // two rows and the test would pass on a broken column.
         let columns: Vec<usize> = (0..buffer.area.height)
-            .filter_map(|y| column_of(&buffer, y, "agentes"))
+            .filter_map(|y| column_of(&buffer, y, "agente"))
             .collect();
         assert_eq!(
             columns.len(),
@@ -818,6 +852,23 @@ mod tests {
             columns.windows(2).all(|w| w[0] == w[1]),
             "the count column must align across multibyte names: {columns:?}"
         );
+    }
+
+    /// The count is a word, and Spanish inflects it: `1 agente` is not
+    /// `1 agentes`. The row still has to read as a column.
+    #[test]
+    fn a_project_with_one_agent_does_not_say_agentes() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(&[("fudi", "rust"), ("clinica", "rust")], &[("fudi", 1)]);
+        let buffer = render(&state, 0, true);
+        let one = row_text(&buffer, row_of(&buffer, "fudi"));
+        assert!(one.contains("1 agente"), "one agent is `1 agente`: {one:?}");
+        assert!(
+            !one.contains("1 agentes"),
+            "one agent is not `1 agentes`: {one:?}"
+        );
+        let none = row_text(&buffer, row_of(&buffer, "clinica"));
+        assert!(none.contains("0 agentes"), "zero is plural: {none:?}");
     }
 
     #[test]
