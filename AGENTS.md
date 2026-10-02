@@ -223,6 +223,16 @@ cargo test --target-dir target-tests
 - Direct model requests (no agent resolved) always use the legacy provider path
 - Source modules: `src/adapters/rig_engine/` (`builder.rs`, `tools.rs`, `limits.rs`)
 
+## Skills
+
+- A skill is a directory containing `SKILL.md` with YAML frontmatter (`name`, `description`, optional `tags`). **The id is the directory name**, not `name:`.
+- Discovery uses one shared list (`SKILL_DIR_NAMES` in `src/services/skill_manager.rs`): `skills/`, `.agents/skills/`, `.claude/skills/`, `.cursor/skills/`, `.agent/skills/` — searched under `~` globally and under the project root per project.
+- `SkillScope` is assigned by *how* a skill was found, not by a path table: `Project` > `LlamaR` > `Harness` (Claude/Cursor/Windsurf). Shadowing is recorded and logged (`SkillManager::shadowed`), never applied silently.
+- Assignment in the agent TOML: `skills` (manual) and `auto_skills` (chosen by `sync_project_agent_skills` from the project profile).
+- **Relevance ranking** (`SkillIndex`) narrows the declared skills using embeddings. It is deliberately not a `RagStore` collection: `query_scoped` only reads `scope.rag_sources`, so indexing skills there would force every agent manifest to list a shared catalog. Manual skills get a ranking boost, not a guarantee; anything dropped is logged with its score. Without embeddings (or on provider failure) every declared skill is used.
+- **Generation**: `analyze` proposes new skills (`AnalysisState::Proposals`). Nothing is written until approved in the TUI. Approved proposals go to `<project>/skills/<id>/SKILL.md` with `generated_by: llama-r` in the frontmatter. Regeneration only replaces files carrying that marker, so a hand-written skill sharing an id is never clobbered.
+- Modules: `src/services/skill_manager.rs`, `skill_index.rs`, `skill_generation.rs`, `agent_skill_sync.rs`
+
 ## RAG
 
 - Disk-backed `FileRagStore` implements the `RagStore` port (LanceDB deferred: heavy arrow/datafusion stack).
