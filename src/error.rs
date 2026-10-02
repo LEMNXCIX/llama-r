@@ -25,6 +25,10 @@ pub enum AppError {
     NotFound(String),
     #[error("Conflict: {0}")]
     Conflict(String),
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+    #[error("Not available: {0}")]
+    Unavailable(String),
     #[error("Provider error: {0}")]
     Provider(String),
     #[error("IO error: {0}")]
@@ -48,6 +52,8 @@ impl AppError {
             Self::Validation(_) => "validation_error",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
+            Self::Forbidden(_) => "forbidden",
+            Self::Unavailable(_) => "unavailable",
             Self::Provider(_) => "provider_error",
             Self::Io(_) => "io_error",
             Self::SerdeJson(_) => "serialization_error",
@@ -63,6 +69,9 @@ impl AppError {
             Self::Validation(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            // A deliberately disabled feature is not a server fault.
+            Self::Unavailable(_) => StatusCode::NOT_IMPLEMENTED,
             Self::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Provider(_) => StatusCode::BAD_GATEWAY,
             Self::Io(_)

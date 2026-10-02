@@ -201,6 +201,89 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn rag_admin_requires_debug_header() {
+    let app = setup_app();
+
+    for uri in ["/api/rag/ingest", "/api/rag/query"] {
+        let body = serde_json::json!({
+            "source_id": "agent:writer/memory",
+            "texts": ["some knowledge"],
+            "query": "knowledge",
+        })
+        .to_string();
+
+        // Missing X-Debug header must be rejected as forbidden.
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{uri} without X-Debug must return 403"
+        );
+
+        // Wrong header value must also be rejected.
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("x-debug", "false")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{uri} with X-Debug: false must return 403"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rag_admin_reports_not_implemented_when_store_absent() {
+    // setup_app() passes rag_store = None (RAG off / feature compiled out).
+    let app = setup_app();
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rag/query")
+                .header("content-type", "application/json")
+                .header("x-debug", "true")
+                .body(Body::from(
+                    serde_json::json!({"query": "anything"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // A disabled feature is not a server fault: 501, not 500.
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let json = body_json(response).await;
+    assert_eq!(json["error"]["code"], "unavailable");
+}
+
+#[tokio::test]
 async fn health_should_report_runtime_status() {
     let app = setup_app();
     let response = app

@@ -15,7 +15,7 @@ fn require_debug(headers: &HeaderMap) -> Result<(), AppError> {
     if ok {
         Ok(())
     } else {
-        Err(AppError::Validation(
+        Err(AppError::Forbidden(
             "RAG admin endpoints require header X-Debug: true".into(),
         ))
     }
@@ -61,6 +61,16 @@ pub struct RagIngestResponse {
     pub chunks_written: usize,
     pub files_read: usize,
     pub source_id: String,
+    /// Requested files that were not indexed, with the reason. Lets a caller tell
+    /// "nothing to index" from "indexed, but some inputs were skipped".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedFileDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkippedFileDto {
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,7 +105,7 @@ pub async fn rag_ingest(
     require_debug(&headers)?;
 
     let store = state.rag_store.as_ref().ok_or_else(|| {
-        AppError::Runtime("RAG is disabled (RAG_ENABLED=false or unavailable)".into())
+        AppError::Unavailable("RAG is disabled (RAG_ENABLED=false or unavailable)".into())
     })?;
     let ingest = state
         .rag_ingest
@@ -106,6 +116,7 @@ pub async fn rag_ingest(
 
     let mut chunks_written = 0usize;
     let mut files_read = 0usize;
+    let mut skipped: Vec<SkippedFileDto> = Vec::new();
 
     if !body.texts.is_empty() {
         let documents = body
@@ -148,6 +159,10 @@ pub async fn rag_ingest(
             .await?;
         chunks_written += result.chunks_written;
         files_read += result.files_read;
+        skipped.extend(result.skipped.into_iter().map(|item| SkippedFileDto {
+            path: item.path,
+            reason: item.reason,
+        }));
     }
 
     if chunks_written == 0 && files_read == 0 {
@@ -160,6 +175,7 @@ pub async fn rag_ingest(
         chunks_written,
         files_read,
         source_id: body.source_id,
+        skipped,
     }))
 }
 
@@ -173,7 +189,7 @@ pub async fn rag_query(
     require_debug(&headers)?;
 
     let store = state.rag_store.as_ref().ok_or_else(|| {
-        AppError::Runtime("RAG is disabled (RAG_ENABLED=false or unavailable)".into())
+        AppError::Unavailable("RAG is disabled (RAG_ENABLED=false or unavailable)".into())
     })?;
 
     if body.query.trim().is_empty() {
@@ -186,7 +202,7 @@ pub async fn rag_query(
         .query_scoped(&scope, &body.query, body.top_k.max(1))
         .await
         .map_err(|err| {
-            if err.contains("denied") {
+            if err.starts_with(crate::services::rag_ingest::RAG_WRITE_DENIED) {
                 AppError::Validation(err)
             } else {
                 AppError::Runtime(err)
