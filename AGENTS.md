@@ -15,7 +15,9 @@ This file documents the current developer workflows and commands for working on 
 
 ## Runtime Model
 - `cargo run` starts the full application: TUI, HTTP API, and gRPC server.
-- On first run, or when `DEFAULT_MODEL` is missing, the app enters interactive provider setup and persists the result to `.env`.
+- On first run, when `DEFAULT_MODEL` is missing **and** a terminal is available, the app enters interactive provider setup and persists the result to `.env`.
+- The provider being unreachable is **not** a startup failure. With `DEFAULT_MODEL` set, llama-r boots degraded and `GET /api/health` reports `"status":"degraded"` with the underlying cause; chat and RAG requests fail with a `502`/`500` naming the connection error. It recovers on its own once the provider is reachable.
+- Without a TTY (systemd, Docker, CI) llama-r never blocks on an interactive prompt: it boots and logs a warning.
 - Agent configs are loaded from `agents/` and `contextos/projects/<project_id>/agents/`.
 - Project contexts are stored under `contextos/projects/<project_id>/`.
 - Hot reload watches the base Llama-R directory, so agent and context changes are picked up without restarting.

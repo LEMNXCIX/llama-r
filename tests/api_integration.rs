@@ -347,6 +347,62 @@ async fn rag_delete_document_gate_precedes_body_validation() {
     );
 }
 
+#[test]
+fn startup_does_not_enter_interactive_setup_when_provider_is_down() {
+    use llama_r::runtime::startup_plan::{plan, PlanInput, StartupPlan};
+
+    // A configured gateway whose provider is temporarily down must boot and
+    // report "degraded", not drop into interactive setup and refuse to start.
+    assert_eq!(
+        plan(PlanInput {
+            health_ok: false,
+            model_configured: true,
+            is_terminal: true,
+        }),
+        StartupPlan::Degraded,
+        "provider down with a configured model must not trigger setup"
+    );
+
+    // Even with no TTY at all (systemd, Docker, CI) it must not abort.
+    assert_eq!(
+        plan(PlanInput {
+            health_ok: false,
+            model_configured: true,
+            is_terminal: false,
+        }),
+        StartupPlan::Degraded
+    );
+
+    // Healthy and configured: nothing to do.
+    assert_eq!(
+        plan(PlanInput {
+            health_ok: true,
+            model_configured: true,
+            is_terminal: true,
+        }),
+        StartupPlan::Proceed
+    );
+
+    // Unconfigured: interactive setup only when a terminal can answer it.
+    assert_eq!(
+        plan(PlanInput {
+            health_ok: true,
+            model_configured: false,
+            is_terminal: true,
+        }),
+        StartupPlan::InteractiveSetup
+    );
+    assert_eq!(
+        plan(PlanInput {
+            health_ok: false,
+            model_configured: false,
+            is_terminal: false,
+        }),
+        StartupPlan::Unconfigured,
+        "no TTY and no model must boot degraded, not abort"
+    );
+}
+
 #[tokio::test]
 async fn health_should_report_runtime_status() {
     let app = setup_app();

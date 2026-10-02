@@ -237,35 +237,52 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
 
     tracing::info!(provider_url = %config.ollama_url, "Verifying LLM provider health");
     let health_ok = provider_impl.health_check().await.is_ok();
-    let needs_setup = !health_ok || !config.is_configured();
+    let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let plan = startup_plan::plan(startup_plan::PlanInput {
+        health_ok,
+        model_configured: config.is_configured(),
+        is_terminal,
+    });
 
-    if needs_setup {
-        if !health_ok {
-            println!(
-                "WARNING: LLM Provider at {} is not reachable.",
-                config.ollama_url
+    match plan {
+        startup_plan::StartupPlan::Proceed => {}
+        startup_plan::StartupPlan::Degraded => {
+            // Never fatal: serve the API and let /health report "degraded".
+            tracing::warn!(
+                provider_url = %config.ollama_url,
+                "LLM provider is not reachable; starting degraded. \
+                 /api/health will report degraded until it recovers."
             );
-        } else {
+        }
+        startup_plan::StartupPlan::Unconfigured => {
+            tracing::warn!(
+                "No DEFAULT_MODEL configured and no terminal available for interactive setup; \
+                 starting degraded. Set DEFAULT_MODEL in .env and restart."
+            );
+        }
+        startup_plan::StartupPlan::InteractiveSetup => {
             println!("Welcome to Llama-R. Let's configure your default provider.");
-        }
-
-        match crate::cli::interactive::run_interactive_setup(config.ollama_url.clone()).await {
-            Ok((new_provider, selected_model)) => {
-                config.ollama_url = new_provider.get_base_url();
-                config.default_model = selected_model;
-                if let Err(err) = config.save_to_env() {
-                    tracing::error!(error = %err, "Failed to persist configuration to .env");
+            match crate::cli::interactive::run_interactive_setup(config.ollama_url.clone()).await {
+                Ok((new_provider, selected_model)) => {
+                    config.ollama_url = new_provider.get_base_url();
+                    config.default_model = selected_model;
+                    if let Err(err) = config.save_to_env() {
+                        tracing::error!(error = %err, "Failed to persist configuration to .env");
+                    }
+                    provider_impl = new_provider;
                 }
-                provider_impl = new_provider;
-            }
-            Err(err) => {
-                return Err(AppError::Runtime(format!(
-                    "Interactive setup failed and no healthy provider is available: {}",
-                    err
-                )));
+                Err(err) => {
+                    // Setup is a convenience, not a precondition. Keep serving.
+                    tracing::error!(
+                        error = %err,
+                        "Interactive setup did not complete; starting with the existing configuration"
+                    );
+                }
             }
         }
-    } else {
+    }
+
+    if matches!(plan, startup_plan::StartupPlan::Proceed) {
         tracing::info!(default_model = %config.default_model, "Provider healthy; validating configured agent models");
         if let Ok(models) = provider_impl.list_models().await {
             let model_names: Vec<String> = models.iter().map(|model| model.name.clone()).collect();
@@ -364,6 +381,54 @@ pub async fn start_http_server(runtime: &Runtime) -> Result<tokio::task::JoinHan
             tracing::error!(error = %err, "HTTP server stopped unexpectedly");
         }
     }))
+}
+
+/// Startup decision, kept pure so the rules are testable without a provider.
+pub mod startup_plan {
+    /// What the runtime should do about provider setup on boot.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StartupPlan {
+        /// Provider reachable and a model configured.
+        Proceed,
+        /// A model is configured but the provider is unreachable. Boot anyway:
+        /// `/health` reports `degraded` and chat requests fail with a clear
+        /// provider error. A gateway that refuses to start is worse than one
+        /// that starts and says it is unhealthy.
+        Degraded,
+        /// No model configured and a terminal is available to ask for one.
+        InteractiveSetup,
+        /// No model configured and no terminal (systemd, Docker, CI). Boot
+        /// anyway with a warning instead of aborting on an interactive prompt.
+        Unconfigured,
+    }
+
+    /// Inputs to the startup decision.
+    #[derive(Debug, Clone, Copy)]
+    pub struct PlanInput {
+        pub health_ok: bool,
+        pub model_configured: bool,
+        pub is_terminal: bool,
+    }
+
+    /// Decide how to handle provider configuration at boot.
+    ///
+    /// The provider being unreachable must not by itself trigger interactive
+    /// setup: that path needs a TTY, so on a headless host it turned a
+    /// recoverable "provider is down" into a hard startup failure.
+    pub fn plan(input: PlanInput) -> StartupPlan {
+        if !input.model_configured {
+            return if input.is_terminal {
+                StartupPlan::InteractiveSetup
+            } else {
+                StartupPlan::Unconfigured
+            };
+        }
+        if input.health_ok {
+            StartupPlan::Proceed
+        } else {
+            StartupPlan::Degraded
+        }
+    }
 }
 
 /// Build embeddings + persistent RAG store when enabled.
