@@ -1,3 +1,4 @@
 pub mod app;
+pub mod chrome;
 pub mod theme;
 pub mod views;
