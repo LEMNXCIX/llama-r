@@ -502,10 +502,8 @@ mod tests {
         }
     }
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     fn lock_env() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap()
+        crate::core::paths::lock_env_for_tests()
     }
 
     struct FakeProvider {

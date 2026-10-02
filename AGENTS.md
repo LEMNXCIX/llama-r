@@ -28,6 +28,10 @@ Primary environment variables:
 - `OLLAMA_URL`: provider base URL, default `http://localhost:11434`
 - `DEFAULT_MODEL`: default model used for direct requests and fallback routing
 - `LLAMA_R_DIR`: optional override for the base data directory
+- `EMBEDDING_MODEL`: Ollama embedding model for RAG, default `nomic-embed-text`
+- `EMBEDDING_DIMENSIONS`: expected vector size, default `768`
+- `RAG_ENABLED`: build/use RAG store at runtime, default `true`
+- `HISTORY_RETENTION_DAYS`: purge conversations older than this many days, default `90`. `0` disables purging.
 
 Recommended setup:
 
@@ -180,6 +184,14 @@ GET  /api/mcp
 POST /api/mcp
 ```
 
+### RAG (debug/admin — requires `X-Debug: true`)
+```text
+POST /api/rag/ingest
+POST /api/rag/query
+```
+
+Returns `403` without the header, and `501` when RAG is disabled (`RAG_ENABLED=false`).
+
 ## Developer Commands
 ```powershell
 cargo fmt
@@ -189,7 +201,10 @@ cargo test --target-dir target-tests
 
 ## Storage Layout
 - `agents/`: editable global agent TOML files
-- `contextos/projects/<project_id>/agents/`: project-scoped agent TOML files`r`n- `contextos/projects/<project_id>/context/`: saved generated context
+- `contextos/projects/<project_id>/agents/`: project-scoped agent TOML files
+- `contextos/projects/<project_id>/context/`: saved generated context
+- `data/lancedb/`: persistent RAG collections (gitignored; FileRagStore JSONL per `source_id`)
+- `data/history.db`: SQLite conversation history (gitignored)
 - `logs/llama-r.log`: rolling application logs
 
 ## Agent engine (Rig)
@@ -204,6 +219,57 @@ cargo test --target-dir target-tests
 - On engine failure, requests fall back to legacy Ollama chat
 - Direct model requests (no agent resolved) always use the legacy provider path
 - Source modules: `src/adapters/rig_engine/` (`builder.rs`, `tools.rs`, `limits.rs`)
+
+## RAG
+
+- Feature: `rag` (default ON). Disk-backed `FileRagStore` implements the `RagStore` port (LanceDB deferred: heavy arrow/datafusion stack).
+- Embeddings: `OllamaEmbeddings` batches all texts into one `POST /api/embed` call (current Ollama API) and falls back to the legacy `POST /api/embeddings` when that endpoint returns 404.
+- Build without RAG: `cargo build --no-default-features` or omit feature `rag`.
+- Data path: `{LLAMA_R_DIR}/data/lancedb/<encoded_source_id>/docs.jsonl` (gitignored via `/data`).
+- Env:
+  - `EMBEDDING_MODEL` (default `nomic-embed-text`)
+  - `EMBEDDING_DIMENSIONS` (default `768`)
+  - `RAG_ENABLED` (default `true`)
+- Agent TOML: `rag_sources`, `rag_write` (`none` | `own_memory_only` | `listed`)
+- Isolation: agents only **read** listed `rag_sources`; **writes** follow `rag_write` (enforced in store + ingest).
+- Memory ids: a project agent's own memory is `agent:{project}/{agent}/memory`; a global agent's is `agent:{agent}/memory`. `rag_write = "own_memory_only"` grants exactly that one id — never the unqualified form for a project agent.
+- Changing `EMBEDDING_MODEL` or `EMBEDDING_DIMENSIONS` invalidates existing vectors: upsert rejects a dimension mismatch, so delete and re-ingest the affected collections.
+- Re-ingest replaces a document's chunks (ids are `{doc_key}#chunk-{index}`), so a shorter document does not leave stale chunks behind. An empty/whitespace document is skipped and reported in `skipped`, never treated as a deletion.
+- Document keys may not contain `#` (reserved for chunk ids), and must be unique within one ingest request.
+- One ingest is atomic per collection: it goes through `replace_batch_scoped`, so a failure partway through leaves nothing behind. To drop a single document, re-ingest it shorter — an empty document is a no-op, not a deletion.
+- Chat path: when an agent has `rag_sources`, Rig `prepare()` queries the store and injects `## Retrieved knowledge` into the system prompt.
+- Debug API (requires header `X-Debug: true`):
+  - `POST /api/rag/ingest` — body: `project_id?`, `agent_id?`, `source_id`, `texts[]`, optional `files[]` under base dir. Response reports `chunks_written`, `files_read`, and `skipped[]` (paths not indexed, with a reason)
+  - `POST /api/rag/query` — body: `project_id?`, `agent_id?`, `query`, `top_k?`
+- Example agent: `examples/agents/rag-demo.toml`
+- Modules: `src/adapters/rag/` (`file_store`, `embeddings`, `chunker`, `namespace`, `store`), `src/services/rag_ingest.rs`, `src/api/rag_api.rs`
+
+### Manual RAG smoke (Ollama + embed model)
+
+```bash
+ollama pull nomic-embed-text
+cargo run
+# Ingest (adjust agent/project and source_id to match own_memory / rag_write)
+curl -s http://127.0.0.1:3000/api/rag/ingest \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug: true' \
+  -d '{"agent_id":"demo","source_id":"agent:demo/memory","texts":["Refunds within 24h."]}'
+curl -s http://127.0.0.1:3000/api/rag/query \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug: true' \
+  -d '{"agent_id":"demo","query":"refunds","top_k":3}'
+```
+
+## Conversation history
+
+- Feature: `history` (default ON). Disable: `cargo build --no-default-features --features rig-engine,rag`
+- DB: `{LLAMA_R_DIR}/data/history.db`
+- Continue a thread: request header `X-Conversation-Id` (gRPC metadata with the same name)
+- Persist follows the agent `[memory] persist_history` flag
+- Summaries: set `index_summaries = true`; chunks go to `summary_collection` or `agent.memory_source_id()` if RAG write policy allows
+- Admin API: `GET/DELETE /api/conversations`, `GET /api/conversations/:id/messages`, `POST /api/conversations/:id/export`
+- Retention: `HISTORY_RETENTION_DAYS` (default 90); purge on boot and daily. `0` disables purging entirely.
+- Execution plan (verify remaining gaps): [`PHASE_5_HISTORY_PLAN.md`](./PHASE_5_HISTORY_PLAN.md)
 
 ## Notes For Contributors
 - Prefer documenting commands that exist in `src/cli/commands.rs`.

@@ -97,3 +97,13 @@ pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(get_lancedb_dir())?;
     Ok(())
 }
+
+/// Process-wide lock for tests that mutate `LLAMA_R_DIR` / cwd.
+/// All such tests must hold this guard for the duration of the test.
+#[cfg(test)]
+pub fn lock_env_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}

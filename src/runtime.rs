@@ -1,4 +1,5 @@
 use crate::adapters::mcp::{McpServerConfig, StaticMcpRegistry};
+#[cfg(feature = "rag")]
 use crate::adapters::rag::{FileRagStore, OllamaEmbeddings};
 use crate::api::agent_api::{
     create_agent, delete_agent, get_agent, get_agent_scope, list_agents_api, update_agent,
@@ -26,7 +27,9 @@ use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::engine::AgentEngine;
 use crate::ports::history::ConversationStore;
 use crate::ports::mcp::McpServerRegistry;
-use crate::ports::rag::{EmbeddingProvider, RagStore};
+#[cfg(feature = "rag")]
+use crate::ports::rag::EmbeddingProvider;
+use crate::ports::rag::RagStore;
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;

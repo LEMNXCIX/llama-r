@@ -374,12 +374,10 @@ mod tests {
     use crate::context::store::{ContextStore, ProjectContext};
     use crate::domain::agent::{Agent, AgentConfig, OptimizeConfig};
     use crate::services::skill_manager::SkillManager;
-    use std::sync::{Arc, Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use std::sync::{Arc, MutexGuard};
 
     fn lock_env() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap()
+        crate::core::paths::lock_env_for_tests()
     }
 
     #[test]
