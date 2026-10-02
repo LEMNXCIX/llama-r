@@ -204,7 +204,11 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
 async fn rag_admin_requires_debug_header() {
     let app = setup_app();
 
-    for uri in ["/api/rag/ingest", "/api/rag/query"] {
+    for uri in [
+        "/api/rag/ingest",
+        "/api/rag/query",
+        "/api/rag/delete-document",
+    ] {
         let body = serde_json::json!({
             "source_id": "agent:writer/memory",
             "texts": ["some knowledge"],
@@ -281,6 +285,66 @@ async fn rag_admin_reports_not_implemented_when_store_absent() {
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     let json = body_json(response).await;
     assert_eq!(json["error"]["code"], "unavailable");
+}
+
+#[tokio::test]
+async fn rag_delete_document_reports_rag_disabled() {
+    // setup_app() passes rag_ingest = None, so the endpoint is mounted but RAG
+    // is off: 501, not 500 and not a silent success.
+    let app = setup_app();
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rag/delete-document")
+                .header("content-type", "application/json")
+                .header("x-debug", "true")
+                .body(Body::from(
+                    serde_json::json!({
+                        "source_id": "agent:writer/memory",
+                        "doc_key": "policy",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let json = body_json(response).await;
+    assert_eq!(json["error"]["code"], "unavailable");
+}
+
+#[tokio::test]
+async fn rag_delete_document_gate_precedes_body_validation() {
+    // An unauthorized caller must get 403 even with a body that would not
+    // deserialize: the gate runs before parsing, so the request schema is not
+    // leaked to callers without the header.
+    let app = setup_app();
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rag/delete-document")
+                .header("content-type", "application/json")
+                .body(Body::from("this is not json at all"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "the debug gate must be evaluated before the body is parsed"
+    );
 }
 
 #[tokio::test]

@@ -87,7 +87,7 @@ fn map_store_err(err: String) -> AppError {
 }
 
 /// Prefix every store uses for a scope write-policy denial.
-pub const RAG_WRITE_DENIED: &str = "RAG write denied";
+pub use crate::ports::rag::RAG_WRITE_DENIED;
 
 pub struct RagIngestService {
     pub store: Arc<dyn RagStore>,
@@ -174,6 +174,32 @@ impl RagIngestService {
             source_id: req.source_id,
             skipped,
         })
+    }
+
+    /// Remove every chunk belonging to one document.
+    ///
+    /// This is the explicit way to retract a document. It is deliberately *not*
+    /// the same as ingesting an empty document: an empty document is treated as
+    /// "nothing to index" (a file truncated mid-write must not wipe good data),
+    /// whereas this call is an intentional deletion and goes through the store's
+    /// scoped delete.
+    ///
+    /// Returns the number of chunks removed.
+    pub async fn delete_document(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+        doc_key: &str,
+    ) -> Result<usize, AppError> {
+        validate_source_id(source_id).map_err(AppError::Validation)?;
+        validate_doc_key(doc_key)?;
+
+        let removed = self
+            .store
+            .delete_document_scoped(scope, source_id, &chunk_id_prefix(doc_key))
+            .await
+            .map_err(map_store_err)?;
+        Ok(removed)
     }
 
     pub async fn ingest_project_context(
@@ -702,6 +728,99 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn delete_document_removes_only_that_document() {
+        let store: Arc<dyn RagStore> = Arc::new(InMemoryRagStore::new(Arc::new(
+            HashEmbeddingProvider::new(16),
+        )));
+        let ingest = RagIngestService::new(store.clone());
+        let sc = scope(
+            "demo",
+            &["agent:demo/memory"],
+            RagWritePolicy::OwnMemoryOnly,
+        );
+
+        ingest
+            .ingest(IngestRequest {
+                scope: sc.clone(),
+                source_id: "agent:demo/memory".into(),
+                documents: vec![
+                    IngestDocument {
+                        id_hint: Some("keep".into()),
+                        text: "Knowledge about refunds that must survive.".into(),
+                        metadata: json!({}),
+                    },
+                    IngestDocument {
+                        id_hint: Some("drop".into()),
+                        text: "Knowledge about obsolete warranty terms.".into(),
+                        metadata: json!({}),
+                    },
+                ],
+                chunk: ChunkConfig::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .query_scoped(&sc, "refunds warranty", 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let removed = ingest
+            .delete_document(&sc, "agent:demo/memory", "drop")
+            .await
+            .unwrap();
+        assert_eq!(removed, 1, "should report the chunks it removed");
+
+        let hits = store
+            .query_scoped(&sc, "refunds warranty", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "only the deleted document should be gone");
+        assert!(hits[0].text.contains("refunds"));
+        assert!(!hits.iter().any(|h| h.text.contains("obsolete")));
+    }
+
+    #[tokio::test]
+    async fn delete_document_respects_write_policy() {
+        let store: Arc<dyn RagStore> = Arc::new(InMemoryRagStore::new(Arc::new(
+            HashEmbeddingProvider::new(16),
+        )));
+        let ingest = RagIngestService::new(store.clone());
+        let sc = scope("demo", &["agent:demo/memory"], RagWritePolicy::None);
+
+        let err = ingest
+            .delete_document(&sc, "agent:demo/memory", "anything")
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("denied"), "got: {msg}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_document_rejects_invalid_key() {
+        let store: Arc<dyn RagStore> = Arc::new(InMemoryRagStore::new(Arc::new(
+            HashEmbeddingProvider::new(16),
+        )));
+        let ingest = RagIngestService::new(store);
+        let sc = scope(
+            "demo",
+            &["agent:demo/memory"],
+            RagWritePolicy::OwnMemoryOnly,
+        );
+
+        let err = ingest
+            .delete_document(&sc, "agent:demo/memory", "bad#chunk-key")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
     }
 
     #[tokio::test]

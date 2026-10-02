@@ -1,13 +1,21 @@
-//! Admin/debug RAG endpoints (`POST /api/rag/ingest`, `POST /api/rag/query`).
+//! Admin/debug RAG endpoints (`POST /api/rag/ingest`, `POST /api/rag/query`,
+//! `POST /api/rag/delete-document`).
 //!
-//! Gated by `X-Debug: true` header (same pattern as chat debug flag).
+//! Gated by `X-Debug: true` header (same pattern as chat debug flag). The gate is
+//! checked before the body is parsed, so an unauthorized caller always gets 403
+//! and never learns the request schema from a 422.
 
 use crate::api::handlers::AppState;
 use crate::domain::scope::AgentScope;
 use crate::error::AppError;
 use crate::services::rag_ingest::{IngestDocument, IngestRequest, RagIngestService};
-use axum::{extract::State, http::HeaderMap, response::IntoResponse, Json};
-use serde::{Deserialize, Serialize};
+use axum::{
+    extract::{FromRequest, State},
+    http::HeaderMap,
+    response::IntoResponse,
+    Json,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::Arc;
 
 fn require_debug(headers: &HeaderMap) -> Result<(), AppError> {
@@ -18,6 +26,29 @@ fn require_debug(headers: &HeaderMap) -> Result<(), AppError> {
         Err(AppError::Forbidden(
             "RAG admin endpoints require header X-Debug: true".into(),
         ))
+    }
+}
+
+/// Parse a JSON body *after* the debug gate has passed.
+///
+/// Implemented as a custom extractor so the ordering is enforced by the type
+/// system rather than by argument order in each handler.
+pub struct GatedJson<T>(pub T);
+
+#[async_trait::async_trait]
+impl<S, T> FromRequest<S> for GatedJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        require_debug(req.headers())?;
+        let Json(body) = Json::<T>::from_request(req, state)
+            .await
+            .map_err(|err| AppError::Validation(format!("invalid request body: {err}")))?;
+        Ok(GatedJson(body))
     }
 }
 
@@ -74,6 +105,22 @@ pub struct SkippedFileDto {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RagDeleteDocumentBody {
+    pub project_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub source_id: String,
+    /// Key of the document to retract, as used at ingest time.
+    pub doc_key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RagDeleteDocumentResponse {
+    pub chunks_removed: usize,
+    pub source_id: String,
+    pub doc_key: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RagQueryBody {
     pub project_id: Option<String>,
     pub agent_id: Option<String>,
@@ -98,11 +145,9 @@ pub struct RagHitDto {
 /// `POST /api/rag/ingest` — chunk + embed + upsert under agent scope.
 pub async fn rag_ingest(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<RagIngestBody>,
+    GatedJson(body): GatedJson<RagIngestBody>,
 ) -> Result<impl IntoResponse, AppError> {
     state.observability.record_http_request();
-    require_debug(&headers)?;
 
     let store = state.rag_store.as_ref().ok_or_else(|| {
         AppError::Unavailable("RAG is disabled (RAG_ENABLED=false or unavailable)".into())
@@ -179,14 +224,37 @@ pub async fn rag_ingest(
     }))
 }
 
+/// `POST /api/rag/delete-document` — retract one document from a collection.
+pub async fn rag_delete_document(
+    State(state): State<Arc<AppState>>,
+    GatedJson(body): GatedJson<RagDeleteDocumentBody>,
+) -> Result<impl IntoResponse, AppError> {
+    state.observability.record_http_request();
+
+    let ingest = state
+        .rag_ingest
+        .clone()
+        .ok_or_else(|| AppError::Unavailable("RAG is disabled (RAG_ENABLED=false)".into()))?;
+
+    let scope = resolve_scope(&state, body.project_id.as_deref(), body.agent_id.as_deref())?;
+
+    let chunks_removed = ingest
+        .delete_document(&scope, &body.source_id, &body.doc_key)
+        .await?;
+
+    Ok(Json(RagDeleteDocumentResponse {
+        chunks_removed,
+        source_id: body.source_id,
+        doc_key: body.doc_key,
+    }))
+}
+
 /// `POST /api/rag/query` — scoped similarity search for debugging.
 pub async fn rag_query(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<RagQueryBody>,
+    GatedJson(body): GatedJson<RagQueryBody>,
 ) -> Result<impl IntoResponse, AppError> {
     state.observability.record_http_request();
-    require_debug(&headers)?;
 
     let store = state.rag_store.as_ref().ok_or_else(|| {
         AppError::Unavailable("RAG is disabled (RAG_ENABLED=false or unavailable)".into())
