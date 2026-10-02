@@ -32,6 +32,10 @@ pub trait EmbeddingProvider: Send + Sync {
     fn dimensions(&self) -> usize;
 }
 
+/// A set of documents to replace within one collection, as
+/// `(id_prefix, docs)` pairs.
+pub type RagReplaceBatch = Vec<(String, Vec<RagUpsert>)>;
+
 #[async_trait]
 pub trait RagStore: Send + Sync {
     /// Query only collections listed in the agent scope.
@@ -49,5 +53,53 @@ pub trait RagStore: Send + Sync {
         docs: Vec<RagUpsert>,
     ) -> Result<usize, String>;
 
+    /// Atomically replace several documents in `source_id`.
+    ///
+    /// Equivalent to calling [`RagStore::replace_scoped`] once per prefix, except
+    /// that either every replacement is applied or none is: a failure partway
+    /// through (e.g. the embedding provider erroring on the third document)
+    /// leaves the collection exactly as it was, instead of leaving the earlier
+    /// documents committed while the caller is told the ingest failed.
+    async fn replace_batch_scoped(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+        batch: RagReplaceBatch,
+    ) -> Result<usize, String>;
+
+    /// Atomically replace every chunk in `source_id` whose id starts with
+    /// `id_prefix` by `docs`.
+    ///
+    /// Chunk ids are `{source_key}#chunk-{index}`, so a plain upsert leaves the
+    /// high-index chunks of a previously longer document behind forever. This
+    /// removes them in the same operation that writes the new ones.
+    ///
+    /// Contract:
+    /// - `id_prefix` must be non-empty; an empty prefix would match every id.
+    /// - `docs` must all belong to `source_id`.
+    /// - `docs` empty deletes every chunk matching the prefix. Callers must not
+    ///   use this to represent "the document is now empty" — see
+    ///   `RagIngestService`, which skips empty documents instead.
+    /// - On error, the collection must be left exactly as it was.
+    async fn replace_scoped(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+        id_prefix: &str,
+        docs: Vec<RagUpsert>,
+    ) -> Result<usize, String>;
+
+    /// Delete a collection only if the scope's write policy allows it.
+    ///
+    /// Scoped counterpart to [`RagStore::delete_collection`], which is unscoped and
+    /// therefore must never be reachable from a request handler.
+    async fn delete_collection_scoped(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+    ) -> Result<(), String>;
+
+    /// Unscoped removal. Admin/internal only: no scope is checked, so any caller
+    /// can delete any collection. Never call this from a request handler.
     async fn delete_collection(&self, source_id: &str) -> Result<(), String>;
 }

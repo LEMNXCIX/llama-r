@@ -102,10 +102,13 @@ impl AgentScope {
     pub fn allows_rag_write(&self, source_id: &str) -> bool {
         match self.rag_write {
             RagWritePolicy::None => false,
-            RagWritePolicy::OwnMemoryOnly => {
-                source_id == self.own_memory_source_id()
-                    || source_id == format!("agent:{}/memory", self.agent_id)
-            }
+            // Exactly the scope's own memory id. For a project agent that is
+            // `agent:{project}/{agent}/memory`; for a global agent it is
+            // `agent:{agent}/memory`. Never the unqualified form for a project
+            // agent: that id belongs to the global same-named agent and to every
+            // other project's same-named agent, so allowing it is cross-project
+            // memory injection.
+            RagWritePolicy::OwnMemoryOnly => source_id == self.own_memory_source_id(),
             RagWritePolicy::Listed => self.rag_sources.contains(source_id),
         }
     }
@@ -154,6 +157,34 @@ mod tests {
         assert!(scope.allows_tool("fudi", "get_order"));
         assert!(!scope.allows_tool("fudi", "delete_all"));
         assert!(!scope.allows_tool("other", "list_orders"));
+    }
+
+    #[test]
+    fn rag_write_own_memory_only_rejects_other_projects_memory() {
+        // Project agent "asistente" in project "fudi".
+        let scope = base_scope(ToolsAllow::DenyAll);
+        assert_eq!(scope.agent_id, "ops");
+        assert_eq!(scope.project_id.as_deref(), Some("fudi"));
+
+        assert!(scope.allows_rag_write("agent:fudi/ops/memory"));
+        // The unqualified form belongs to the *global* `ops` agent (and to any
+        // same-named agent in another project). A project agent must not write there.
+        assert!(
+            !scope.allows_rag_write("agent:ops/memory"),
+            "project agent must not write to the unqualified memory collection"
+        );
+        // Nor to a same-named agent's memory in a different project.
+        assert!(!scope.allows_rag_write("agent:clinica/ops/memory"));
+    }
+
+    #[test]
+    fn rag_write_own_memory_only_global_agent_uses_unqualified() {
+        // A global agent (project_id = None) owns the unqualified id.
+        let mut scope = base_scope(ToolsAllow::DenyAll);
+        scope.project_id = None;
+        assert_eq!(scope.own_memory_source_id(), "agent:ops/memory");
+        assert!(scope.allows_rag_write("agent:ops/memory"));
+        assert!(!scope.allows_rag_write("agent:fudi/ops/memory"));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! Same port contract → swapping the adapter does not change services.
 
 use crate::domain::scope::AgentScope;
-use crate::ports::rag::{EmbeddingProvider, RagChunk, RagStore, RagUpsert};
+use crate::ports::rag::{EmbeddingProvider, RagChunk, RagReplaceBatch, RagStore, RagUpsert};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -160,6 +160,107 @@ impl RagStore for InMemoryRagStore {
         }
 
         Ok(written)
+    }
+
+    async fn replace_scoped(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+        id_prefix: &str,
+        docs: Vec<RagUpsert>,
+    ) -> Result<usize, String> {
+        self.replace_batch_scoped(scope, source_id, vec![(id_prefix.to_string(), docs)])
+            .await
+    }
+
+    async fn replace_batch_scoped(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+        batch: RagReplaceBatch,
+    ) -> Result<usize, String> {
+        // An empty prefix matches every id: refuse before anything else, so this
+        // can never be used to wipe a collection.
+        for (id_prefix, _) in &batch {
+            if id_prefix.is_empty() {
+                return Err("replace_batch_scoped requires a non-empty id_prefix".into());
+            }
+        }
+        // Deny before embed (defense in depth + saves CPU).
+        if !scope.allows_rag_write(source_id) {
+            return Err(format!(
+                "RAG write denied for source '{source_id}' on agent '{}'",
+                scope.agent_id
+            ));
+        }
+        for (id_prefix, docs) in &batch {
+            for doc in docs {
+                if doc.source_id != source_id {
+                    return Err(format!(
+                        "replace doc '{}' does not belong to source '{source_id}'",
+                        doc.id
+                    ));
+                }
+                // Every doc must belong to the prefix being replaced, or this call
+                // would delete another document's chunks while writing outside the
+                // declared scope.
+                if !doc.id.starts_with(id_prefix.as_str()) {
+                    return Err(format!(
+                        "replace doc '{}' does not match id_prefix '{id_prefix}'",
+                        doc.id
+                    ));
+                }
+            }
+        }
+
+        // Embed everything before touching the collection, so a provider failure
+        // on any document leaves the collection untouched.
+        let all_docs: Vec<RagUpsert> = batch
+            .iter()
+            .flat_map(|(_, docs)| docs.iter().cloned())
+            .collect();
+        let texts: Vec<String> = all_docs.iter().map(|doc| doc.text.clone()).collect();
+        let vectors = self.embeddings.embed(&texts).await?;
+        if vectors.len() != all_docs.len() {
+            return Err("embedding count mismatch".to_string());
+        }
+
+        let mut collections = self.collections.write().await;
+        let entry = collections.entry(source_id.to_string()).or_default();
+        let written = all_docs.len();
+
+        let mut cursor = 0usize;
+        for (id_prefix, docs) in batch {
+            // Drop chunks from a previous, longer version of this same document.
+            entry.retain(|item| !item.id.starts_with(id_prefix.as_str()));
+            for doc in docs {
+                let embedding = vectors[cursor].clone();
+                cursor += 1;
+                entry.push(StoredDoc {
+                    id: doc.id,
+                    text: doc.text,
+                    embedding,
+                    metadata: doc.metadata,
+                });
+            }
+        }
+
+        Ok(written)
+    }
+
+    async fn delete_collection_scoped(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+    ) -> Result<(), String> {
+        if !scope.allows_rag_write(source_id) {
+            return Err(format!(
+                "RAG write denied for source '{source_id}' on agent '{}'",
+                scope.agent_id
+            ));
+        }
+        self.collections.write().await.remove(source_id);
+        Ok(())
     }
 
     async fn delete_collection(&self, source_id: &str) -> Result<(), String> {

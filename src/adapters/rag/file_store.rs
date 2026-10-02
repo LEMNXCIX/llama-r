@@ -8,7 +8,7 @@
 
 use super::namespace::{encode_source_id_for_path, validate_source_id};
 use crate::domain::scope::AgentScope;
-use crate::ports::rag::{EmbeddingProvider, RagChunk, RagStore, RagUpsert};
+use crate::ports::rag::{EmbeddingProvider, RagChunk, RagReplaceBatch, RagStore, RagUpsert};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -220,6 +220,20 @@ impl RagStore for FileRagStore {
         if vectors.len() != docs.len() {
             return Err("embedding count mismatch".to_string());
         }
+        // Reject dimension mismatches loudly. Storing vectors whose length differs
+        // from the collection's would make cosine_similarity return 0.0, surfacing
+        // stale/unrelated documents as the top hits with no signal to the caller.
+        let expected = self.embeddings.dimensions();
+        for (index, vector) in vectors.iter().enumerate() {
+            if vector.len() != expected {
+                return Err(format!(
+                    "embedding dimension mismatch for doc '{}': expected {expected}, got {} \
+                     (re-ingest the collection after changing EMBEDDING_MODEL/EMBEDDING_DIMENSIONS)",
+                    docs[index].id,
+                    vector.len()
+                ));
+            }
+        }
 
         // Group by source_id for batch disk writes.
         let mut by_source: HashMap<String, Vec<(RagUpsert, Vec<f32>)>> = HashMap::new();
@@ -259,6 +273,127 @@ impl RagStore for FileRagStore {
         Ok(written)
     }
 
+    async fn replace_scoped(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+        id_prefix: &str,
+        docs: Vec<RagUpsert>,
+    ) -> Result<usize, String> {
+        self.replace_batch_scoped(scope, source_id, vec![(id_prefix.to_string(), docs)])
+            .await
+    }
+
+    async fn replace_batch_scoped(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+        batch: RagReplaceBatch,
+    ) -> Result<usize, String> {
+        // An empty prefix matches every id: refuse before anything else, so this
+        // can never be used to wipe a collection.
+        for (id_prefix, _) in &batch {
+            if id_prefix.is_empty() {
+                return Err("replace_batch_scoped requires a non-empty id_prefix".into());
+            }
+        }
+        validate_source_id(source_id)?;
+        // Deny before embed (defense in depth + saves CPU).
+        if !scope.allows_rag_write(source_id) {
+            return Err(format!(
+                "RAG write denied for source '{source_id}' on agent '{}'",
+                scope.agent_id
+            ));
+        }
+        for (id_prefix, docs) in &batch {
+            for doc in docs {
+                if doc.source_id != source_id {
+                    return Err(format!(
+                        "replace doc '{}' does not belong to source '{source_id}'",
+                        doc.id
+                    ));
+                }
+                // Every doc must belong to the prefix being replaced, or this call
+                // would delete another document's chunks while writing outside the
+                // declared scope.
+                if !doc.id.starts_with(id_prefix.as_str()) {
+                    return Err(format!(
+                        "replace doc '{}' does not match id_prefix '{id_prefix}'",
+                        doc.id
+                    ));
+                }
+            }
+        }
+
+        // Embed everything before touching the collection or the disk, so a
+        // provider failure on any document leaves both untouched.
+        let all_docs: Vec<RagUpsert> = batch
+            .iter()
+            .flat_map(|(_, docs)| docs.iter().cloned())
+            .collect();
+        let texts: Vec<String> = all_docs.iter().map(|doc| doc.text.clone()).collect();
+        let vectors = self.embeddings.embed(&texts).await?;
+        if vectors.len() != all_docs.len() {
+            return Err("embedding count mismatch".to_string());
+        }
+        let expected = self.embeddings.dimensions();
+        for (index, vector) in vectors.iter().enumerate() {
+            if vector.len() != expected {
+                return Err(format!(
+                    "embedding dimension mismatch for doc '{}': expected {expected}, got {} \
+                     (re-ingest the collection after changing EMBEDDING_MODEL/EMBEDDING_DIMENSIONS)",
+                    all_docs[index].id,
+                    vector.len()
+                ));
+            }
+        }
+
+        self.ensure_loaded(source_id).await?;
+        let mut cache = self.cache.write().await;
+
+        // Build the new collection without mutating the cache, so a failed disk
+        // write cannot leave the cache permanently missing the old chunks (which
+        // a later successful write would then persist, making the loss permanent).
+        let mut updated: Vec<StoredDoc> = cache.get(source_id).cloned().unwrap_or_default();
+        let mut cursor = 0usize;
+        for (id_prefix, docs) in batch {
+            // Drop chunks from a previous, longer version of this same document.
+            updated.retain(|item| !item.id.starts_with(id_prefix.as_str()));
+            for doc in docs {
+                let embedding = vectors[cursor].clone();
+                cursor += 1;
+                updated.push(StoredDoc {
+                    id: doc.id,
+                    text: doc.text,
+                    embedding,
+                    metadata: doc.metadata,
+                });
+            }
+        }
+
+        let path = Self::docs_path(&self.collection_dir(source_id));
+        Self::write_to_disk(&path, &updated)?;
+
+        // Disk is authoritative: publish the new state only after it is durable.
+        let written = all_docs.len();
+        cache.insert(source_id.to_string(), updated);
+        Ok(written)
+    }
+
+    async fn delete_collection_scoped(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+    ) -> Result<(), String> {
+        if !scope.allows_rag_write(source_id) {
+            return Err(format!(
+                "RAG write denied for source '{source_id}' on agent '{}'",
+                scope.agent_id
+            ));
+        }
+        self.delete_collection(source_id).await
+    }
+
     async fn delete_collection(&self, source_id: &str) -> Result<(), String> {
         validate_source_id(source_id)?;
         self.cache.write().await.remove(source_id);
@@ -291,6 +426,45 @@ mod tests {
             max_iterations: 6,
             timeout_secs: 90,
         }
+    }
+
+    #[tokio::test]
+    async fn file_store_rejects_vector_dimension_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        // Provider claims 32 dims but emits 16-dim vectors: a misconfigured
+        // EMBEDDING_DIMENSIONS / EMBEDDING_MODEL mismatch.
+        struct WrongDim;
+        #[async_trait]
+        impl EmbeddingProvider for WrongDim {
+            async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+                Ok(texts
+                    .iter()
+                    .map(|_| vec![0.5f32; 16])
+                    .collect::<Vec<Vec<f32>>>())
+            }
+            fn dimensions(&self) -> usize {
+                32
+            }
+        }
+
+        let store = FileRagStore::new(dir.path(), Arc::new(WrongDim));
+        let scope = scope_for("a", &["agent:a/memory"], RagWritePolicy::OwnMemoryOnly);
+        let err = store
+            .upsert_scoped(
+                &scope,
+                vec![RagUpsert {
+                    source_id: "agent:a/memory".into(),
+                    id: "1".into(),
+                    text: "some knowledge".into(),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("dimension"),
+            "dim mismatch must fail loudly, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -347,6 +521,235 @@ mod tests {
         let hits = store.query_scoped(&reader, "refunds", 3).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "persist-1");
+    }
+
+    #[tokio::test]
+    async fn file_store_replace_drops_stale_chunks_on_disk() {
+        use crate::adapters::rag::chunker::{chunk_text, ChunkConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let emb: Arc<dyn EmbeddingProvider> = Arc::new(HashEmbeddingProvider::new(16));
+        let scope = scope_for("a", &["agent:a/memory"], RagWritePolicy::OwnMemoryOnly);
+
+        // Long version: many chunks.
+        {
+            let store = FileRagStore::new(dir.path(), emb.clone());
+            let chunks = chunk_text(
+                "policy",
+                &"Refund policy detail sentence. ".repeat(120),
+                &ChunkConfig {
+                    max_chars: 200,
+                    overlap_chars: 20,
+                },
+            );
+            let docs: Vec<RagUpsert> = chunks
+                .into_iter()
+                .map(|c| RagUpsert {
+                    source_id: "agent:a/memory".into(),
+                    id: c.id,
+                    text: c.text,
+                    metadata: serde_json::json!({}),
+                })
+                .collect();
+            assert!(docs.len() >= 4);
+            store
+                .replace_scoped(&scope, "agent:a/memory", "policy#chunk-", docs)
+                .await
+                .unwrap();
+        }
+
+        // Short version in a fresh instance: replaces, and the deletion must be
+        // persisted, not just cached.
+        {
+            let store = FileRagStore::new(dir.path(), emb.clone());
+            let chunks = chunk_text("policy", "Short updated policy.", &ChunkConfig::default());
+            let docs: Vec<RagUpsert> = chunks
+                .into_iter()
+                .map(|c| RagUpsert {
+                    source_id: "agent:a/memory".into(),
+                    id: c.id,
+                    text: c.text,
+                    metadata: serde_json::json!({}),
+                })
+                .collect();
+            store
+                .replace_scoped(&scope, "agent:a/memory", "policy#chunk-", docs)
+                .await
+                .unwrap();
+        }
+
+        // Third read: only the short chunk remains on disk.
+        let store = FileRagStore::new(dir.path(), emb);
+        let hits = store
+            .query_scoped(&scope, "refund policy detail sentence", 50)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "stale chunks survived on disk");
+        assert!(hits[0].text.contains("Short updated policy"));
+    }
+
+    #[tokio::test]
+    async fn file_store_replace_respects_write_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileRagStore::new(dir.path(), Arc::new(HashEmbeddingProvider::new(16)));
+        let scope = scope_for("a", &["shared/docs"], RagWritePolicy::None);
+        let err = store
+            .replace_scoped(
+                &scope,
+                "shared/docs",
+                "policy#chunk-",
+                vec![RagUpsert {
+                    source_id: "shared/docs".into(),
+                    id: "policy#chunk-0".into(),
+                    text: "nope".into(),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("denied"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn file_store_replace_rejects_empty_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileRagStore::new(dir.path(), Arc::new(HashEmbeddingProvider::new(16)));
+        let scope = scope_for("a", &["agent:a/memory"], RagWritePolicy::OwnMemoryOnly);
+        store
+            .upsert_scoped(
+                &scope,
+                vec![RagUpsert {
+                    source_id: "agent:a/memory".into(),
+                    id: "summary-abc".into(),
+                    text: "a summary written by the history summarizer".into(),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // An empty prefix matches every id and must be refused, not wipe the collection.
+        let err = store
+            .replace_scoped(&scope, "agent:a/memory", "", vec![])
+            .await
+            .unwrap_err();
+        assert!(err.contains("non-empty"), "got: {err}");
+
+        let hits = store.query_scoped(&scope, "summary", 5).await.unwrap();
+        assert_eq!(hits.len(), 1, "collection must be untouched");
+    }
+
+    #[tokio::test]
+    async fn file_store_replace_rejects_doc_outside_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileRagStore::new(dir.path(), Arc::new(HashEmbeddingProvider::new(16)));
+        let scope = scope_for("a", &["agent:a/memory"], RagWritePolicy::OwnMemoryOnly);
+        store
+            .upsert_scoped(
+                &scope,
+                vec![RagUpsert {
+                    source_id: "agent:a/memory".into(),
+                    id: "alpha#chunk-0".into(),
+                    text: "alpha knowledge".into(),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Declaring prefix "alpha#chunk-" while writing a "beta" id would delete
+        // alpha's chunks and write beta's under an undeclared prefix.
+        let err = store
+            .replace_scoped(
+                &scope,
+                "agent:a/memory",
+                "alpha#chunk-",
+                vec![RagUpsert {
+                    source_id: "agent:a/memory".into(),
+                    id: "beta#chunk-0".into(),
+                    text: "beta knowledge".into(),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("id_prefix"), "got: {err}");
+
+        // alpha must be untouched.
+        let hits = store
+            .query_scoped(&scope, "alpha knowledge", 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "rejected replace must not delete data");
+    }
+
+    #[tokio::test]
+    async fn file_store_replace_returns_docs_written_not_collection_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileRagStore::new(dir.path(), Arc::new(HashEmbeddingProvider::new(16)));
+        let scope = scope_for("a", &["agent:a/memory"], RagWritePolicy::OwnMemoryOnly);
+
+        // Three separate single-chunk documents in one collection.
+        let mut total = 0usize;
+        for index in 0..3 {
+            let key = format!("doc-{index}");
+            let written = store
+                .replace_scoped(
+                    &scope,
+                    "agent:a/memory",
+                    &format!("{key}#chunk-"),
+                    vec![RagUpsert {
+                        source_id: "agent:a/memory".into(),
+                        id: format!("{key}#chunk-0"),
+                        text: format!("knowledge number {index}"),
+                        metadata: serde_json::json!({}),
+                    }],
+                )
+                .await
+                .unwrap();
+            assert_eq!(written, 1, "each replace writes exactly one doc");
+            total += written;
+        }
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn file_store_delete_scoped_enforces_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileRagStore::new(dir.path(), Arc::new(HashEmbeddingProvider::new(16)));
+        let writer = scope_for("a", &["agent:a/memory"], RagWritePolicy::OwnMemoryOnly);
+        store
+            .upsert_scoped(
+                &writer,
+                vec![RagUpsert {
+                    source_id: "agent:a/memory".into(),
+                    id: "1".into(),
+                    text: "knowledge".into(),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // An agent with no write rights must not be able to delete the collection.
+        let bystander = scope_for("b", &["agent:a/memory"], RagWritePolicy::None);
+        let err = store
+            .delete_collection_scoped(&bystander, "agent:a/memory")
+            .await
+            .unwrap_err();
+        assert!(err.contains("denied"), "got: {err}");
+
+        // The owner's collection is still intact.
+        let hits = store.query_scoped(&writer, "knowledge", 5).await.unwrap();
+        assert_eq!(hits.len(), 1, "denied delete must not remove data");
+
+        // The owner can delete it.
+        store
+            .delete_collection_scoped(&writer, "agent:a/memory")
+            .await
+            .unwrap();
+        let hits = store.query_scoped(&writer, "knowledge", 5).await.unwrap();
+        assert!(hits.is_empty());
     }
 
     #[tokio::test]
