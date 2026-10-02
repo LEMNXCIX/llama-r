@@ -225,9 +225,9 @@ cargo test --target-dir target-tests
 
 ## RAG
 
-- Feature: `rag` (default ON). Disk-backed `FileRagStore` implements the `RagStore` port (LanceDB deferred: heavy arrow/datafusion stack).
+- Disk-backed `FileRagStore` implements the `RagStore` port (LanceDB deferred: heavy arrow/datafusion stack).
 - Embeddings: `OllamaEmbeddings` batches all texts into one `POST /api/embed` call (current Ollama API) and falls back to the legacy `POST /api/embeddings` when that endpoint returns 404.
-- Build without RAG: `cargo build --no-default-features` or omit feature `rag`.
+- Build without RAG: there is no build-time flag — RAG pulls in no optional dependency, so it is controlled at runtime with `RAG_ENABLED=false`.
 - Data path: `{LLAMA_R_DIR}/data/lancedb/<encoded_source_id>/docs.jsonl` (gitignored via `/data`).
 - Env:
   - `EMBEDDING_MODEL` (default `nomic-embed-text`)
@@ -268,7 +268,7 @@ curl -s http://127.0.0.1:3000/api/rag/query \
 
 ## Conversation history
 
-- Feature: `history` (default ON). Disable: `cargo build --no-default-features --features rig-engine,rag`
+- Feature: `history` (default ON). Disable: `cargo build --no-default-features --features rig-engine`
 - DB: `{LLAMA_R_DIR}/data/history.db`
 - Continue a thread: request header `X-Conversation-Id` (gRPC metadata with the same name)
 - Persist follows the agent `[memory] persist_history` flag

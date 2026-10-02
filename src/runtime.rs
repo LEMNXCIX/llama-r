@@ -1,5 +1,4 @@
 use crate::adapters::mcp::{McpServerConfig, StaticMcpRegistry};
-#[cfg(feature = "rag")]
 use crate::adapters::rag::{FileRagStore, OllamaEmbeddings};
 use crate::api::agent_api::{
     create_agent, delete_agent, get_agent, get_agent_scope, list_agents_api, update_agent,
@@ -27,9 +26,7 @@ use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::engine::AgentEngine;
 use crate::ports::history::ConversationStore;
 use crate::ports::mcp::McpServerRegistry;
-#[cfg(feature = "rag")]
-use crate::ports::rag::EmbeddingProvider;
-use crate::ports::rag::RagStore;
+use crate::ports::rag::{EmbeddingProvider, RagStore};
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
@@ -432,40 +429,32 @@ pub mod startup_plan {
 }
 
 /// Build embeddings + persistent RAG store when enabled.
+///
+/// Always compiled; `RAG_ENABLED` decides at runtime whether a store is built.
 fn build_rag(config: &Config) -> (Option<Arc<dyn RagStore>>, Option<Arc<RagIngestService>>) {
     if !config.rag_enabled {
         tracing::info!("RAG disabled via RAG_ENABLED=false");
         return (None, None);
     }
 
-    #[cfg(feature = "rag")]
-    {
-        let embeddings: Arc<dyn EmbeddingProvider> = Arc::new(OllamaEmbeddings::new(
-            config.ollama_url.clone(),
-            config.embedding_model.clone(),
-            config.embedding_dimensions,
-        ));
-        let dir = crate::core::paths::get_lancedb_dir();
-        if let Err(err) = std::fs::create_dir_all(&dir) {
-            tracing::warn!(path = %dir.display(), error = %err, "failed to create RAG data dir");
-        }
-        tracing::info!(
-            path = %dir.display(),
-            embedding_model = %config.embedding_model,
-            dimensions = config.embedding_dimensions,
-            "RAG store initialized (FileRagStore)"
-        );
-        let store: Arc<dyn RagStore> = Arc::new(FileRagStore::new(dir, embeddings));
-        let ingest = Arc::new(RagIngestService::new(store.clone()));
-        (Some(store), Some(ingest))
+    let embeddings: Arc<dyn EmbeddingProvider> = Arc::new(OllamaEmbeddings::new(
+        config.ollama_url.clone(),
+        config.embedding_model.clone(),
+        config.embedding_dimensions,
+    ));
+    let dir = crate::core::paths::get_lancedb_dir();
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(path = %dir.display(), error = %err, "failed to create RAG data dir");
     }
-
-    #[cfg(not(feature = "rag"))]
-    {
-        tracing::warn!("RAG feature disabled at compile time; store unavailable");
-        let _ = config;
-        (None, None)
-    }
+    tracing::info!(
+        path = %dir.display(),
+        embedding_model = %config.embedding_model,
+        dimensions = config.embedding_dimensions,
+        "RAG store initialized (FileRagStore)"
+    );
+    let store: Arc<dyn RagStore> = Arc::new(FileRagStore::new(dir, embeddings));
+    let ingest = Arc::new(RagIngestService::new(store.clone()));
+    (Some(store), Some(ingest))
 }
 
 /// Build history store (SQLite) when feature is enabled.

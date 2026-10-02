@@ -4,14 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["rig-engine", "rag", "history"]
-# Agent engine (Rig.rs). Disable with --no-default-features or --no-default-features --features rag
+default = ["rig-engine", "history"]
+# Agent engine (Rig.rs). Disable with --no-default-features to skip the heavy
+# rig-core dependency; chat then falls back to the plain Ollama path.
 rig-engine = ["dep:rig-core"]
-# RAG pipeline (FileRagStore persistence + ingest + admin API).
-# LanceDB is intentionally not a hard dep (heavy arrow/datafusion stack); FileRagStore
-# implements the same RagStore port with disk persistence under data/lancedb/.
-rag = []
+# Conversation history (SQLite via rusqlite, bundled).
 history = ["dep:rusqlite"]
+# RAG has no feature flag: it pulls in no optional dependency, so a flag would
+# gate nothing. Control it at runtime with RAG_ENABLED instead.
 
 [dependencies]
 axum = "0.7"
