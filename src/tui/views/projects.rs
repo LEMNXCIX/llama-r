@@ -2,7 +2,7 @@ use crate::api::handlers::AppState;
 use crate::tui::app::AnalysisState;
 use ratatui::style::Stylize;
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
@@ -430,6 +430,14 @@ pub fn render_analysis(f: &mut Frame, analysis_state: &AnalysisState) {
             .wrap(Wrap { trim: true });
             f.render_widget(content, chunks[1]);
         }
+        AnalysisState::Proposals {
+            proposals,
+            selected,
+            results,
+            ..
+        } => {
+            render_skill_proposals(f, f.area(), proposals, *selected, results);
+        }
         AnalysisState::Loaded(content_md) => {
             let content = Paragraph::new(content_md.as_str())
                 .block(
@@ -568,4 +576,76 @@ pub fn render_confirm_delete(f: &mut Frame, confirm_type: &str, confirm_id: &str
     )
     .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(dialog, horiz[1]);
+}
+
+/// Render the skill proposals awaiting approval.
+///
+/// The generated bodies are shown, not just the names: the user is being asked
+/// to let the model write instructions that will shape future behaviour, and
+/// approving without reading would make the approval meaningless.
+pub fn render_skill_proposals(
+    f: &mut Frame,
+    area: Rect,
+    proposals: &[crate::services::skill_generation::SkillProposal],
+    selected: usize,
+    results: &[String],
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let title = Paragraph::new(Line::from(Span::styled(
+        " Skill proposals — nothing is written until you approve ",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )))
+    .block(Block::default().borders(Borders::ALL));
+    f.render_widget(title, chunks[0]);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if proposals.is_empty() {
+        lines.push(Line::from("No skill proposals."));
+    }
+    for (index, proposal) in proposals.iter().enumerate() {
+        let marker = if index == selected { ">" } else { " " };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                proposal.id.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" — {}", proposal.description),
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+        for line in proposal.content.lines().take(6) {
+            lines.push(Line::from(format!("    {line}")));
+        }
+        lines.push(Line::from(""));
+    }
+    for result in results {
+        lines.push(Line::from(Span::styled(
+            result.clone(),
+            Style::default().fg(Color::Green),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(" Proposals "))
+            .wrap(Wrap { trim: true }),
+        chunks[1],
+    );
+
+    let footer = Paragraph::new("[Enter] approve  [a] approve all  [d] discard  [Esc] back")
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(footer, chunks[2]);
 }

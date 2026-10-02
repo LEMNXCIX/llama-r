@@ -132,6 +132,18 @@ impl SkillManager {
         }
     }
 
+    /// A manager restricted to `paths`.
+    ///
+    /// Used by tests and by any caller that must not pick up the developer's
+    /// real home-directory skills.
+    pub fn with_paths(paths: Vec<PathBuf>) -> Self {
+        Self {
+            skills: Arc::new(RwLock::new(HashMap::new())),
+            base_paths: paths,
+            shadowed: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
     /// Skills shadowed by a narrower scope, for display in the TUI.
     pub fn shadowed(&self) -> Vec<ShadowedSkill> {
         self.shadowed.read().map(|s| s.clone()).unwrap_or_default()
@@ -195,7 +207,11 @@ impl SkillManager {
         })
     }
 
-    fn parse_skill_metadata(&self, content: &str) -> Option<SkillMetadata> {
+    /// Parse the YAML frontmatter of a `SKILL.md`.
+    ///
+    /// Public so generated skills can be validated against the same reader
+    /// that will load them, rather than assuming the two agree.
+    pub fn parse_skill_metadata(&self, content: &str) -> Option<SkillMetadata> {
         if !content.starts_with("---") {
             return None;
         }
@@ -359,8 +375,7 @@ mod tests {
     /// A manager whose global scan points at `<root>/skills`, so tests do not read
     /// the developer's real ~/.claude/skills.
     fn manager_with_root(root: &Path) -> SkillManager {
-        let mut manager = SkillManager::new();
-        manager.base_paths = vec![root.join("skills")];
+        let manager = SkillManager::with_paths(vec![root.join("skills")]);
         manager.scan_and_load();
         manager
     }

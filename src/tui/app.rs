@@ -35,9 +35,21 @@ pub enum CurrentView {
 #[derive(Clone)]
 pub enum AnalysisState {
     Idle,
-    Loading { started_at: Instant },
+    Loading {
+        started_at: Instant,
+    },
     Loaded(String),
     Error(String),
+    /// Skills the analysis proposed, awaiting the user's decision.
+    ///
+    /// Nothing is written until a proposal is approved here.
+    Proposals {
+        project_path: String,
+        proposals: Vec<crate::services::skill_generation::SkillProposal>,
+        selected: usize,
+        /// One line per proposal: what was written, or why it was refused.
+        results: Vec<String>,
+    },
 }
 
 pub struct TuiApp {
@@ -199,9 +211,33 @@ impl TuiApp {
 
             let final_state = match result {
                 Ok(ctx) => {
+                    let project_type = ctx.project_type.clone();
+                    let context_excerpt: String = ctx.context_md.chars().take(3000).collect();
                     let _ = state.context_store.save_context(ctx);
                     log::info!("TUI Analysis complete for {}", project_id);
-                    AnalysisState::Loaded("Analysis complete! Context saved.".to_string())
+
+                    // Propose skills; the user decides whether anything is written.
+                    let proposals = crate::services::skill_generation::generate_proposals(
+                        state.provider.clone(),
+                        &state.default_model,
+                        &project_id,
+                        &project_type,
+                        &context_excerpt,
+                    )
+                    .await;
+
+                    if proposals.is_empty() {
+                        AnalysisState::Loaded(
+                            "Analysis complete! Context saved. No skill proposals.".to_string(),
+                        )
+                    } else {
+                        AnalysisState::Proposals {
+                            project_path: project_path.clone(),
+                            proposals,
+                            selected: 0,
+                            results: Vec::new(),
+                        }
+                    }
                 }
                 Err(e) => {
                     log::error!("TUI Analysis failed: {}", e);
@@ -211,6 +247,116 @@ impl TuiApp {
 
             *analysis_state.lock().unwrap() = final_state;
         });
+    }
+
+    fn move_proposal_selection(&self, delta: isize) {
+        let mut lock = self.analysis_state.lock().unwrap();
+        if let AnalysisState::Proposals {
+            proposals,
+            selected,
+            ..
+        } = &mut *lock
+        {
+            if proposals.is_empty() {
+                return;
+            }
+            let len = proposals.len() as isize;
+            let next = (*selected as isize + delta).rem_euclid(len);
+            *selected = next as usize;
+        }
+    }
+
+    /// Human-readable outcome of an approval, for the results list.
+    fn describe_write(outcome: &crate::services::skill_generation::WriteOutcome) -> String {
+        use crate::services::skill_generation::WriteOutcome;
+        match outcome {
+            WriteOutcome::Written(path) => format!("written: {}", path.display()),
+            WriteOutcome::RejectedInvalidId(reason) => {
+                format!("refused (unsafe id): {reason}")
+            }
+            WriteOutcome::RejectedHandwritten(id) => {
+                format!("refused: '{id}' already exists and was written by hand")
+            }
+        }
+    }
+
+    fn approve_selected_proposal(&mut self) {
+        use crate::services::skill_generation::write_proposal as write;
+        let mut lock = self.analysis_state.lock().unwrap();
+        let AnalysisState::Proposals {
+            project_path,
+            proposals,
+            selected,
+            results,
+        } = &mut *lock
+        else {
+            return;
+        };
+        let Some(proposal) = proposals.get(*selected).cloned() else {
+            return;
+        };
+        match write(std::path::Path::new(project_path), &proposal) {
+            Ok(outcome) => {
+                let line = Self::describe_write(&outcome);
+                results.push(line);
+                proposals.remove(*selected);
+                if *selected >= proposals.len() {
+                    *selected = proposals.len().saturating_sub(1);
+                }
+            }
+            Err(err) => results.push(format!("failed: {err}")),
+        }
+        let done = proposals.is_empty();
+        drop(lock);
+        if done {
+            // Re-scan so the freshly written skills are discoverable at once.
+            self.state.skill_manager.scan_and_load();
+        }
+    }
+
+    fn approve_all_proposals(&mut self) {
+        use crate::services::skill_generation::write_proposal as write;
+        let mut lock = self.analysis_state.lock().unwrap();
+        let AnalysisState::Proposals {
+            project_path,
+            proposals,
+            results,
+            ..
+        } = &mut *lock
+        else {
+            return;
+        };
+        let root = std::path::Path::new(project_path).to_path_buf();
+        let pending = std::mem::take(proposals);
+        for proposal in &pending {
+            match write(&root, proposal) {
+                Ok(outcome) => results.push(Self::describe_write(&outcome)),
+                Err(err) => results.push(format!("failed: {err}")),
+            }
+        }
+        drop(lock);
+        self.state.skill_manager.scan_and_load();
+    }
+
+    fn discard_selected_proposal(&mut self) {
+        let mut lock = self.analysis_state.lock().unwrap();
+        let AnalysisState::Proposals {
+            proposals,
+            selected,
+            results,
+            ..
+        } = &mut *lock
+        else {
+            return;
+        };
+        let Some(proposal) = proposals.get(*selected).cloned() else {
+            return;
+        };
+        results.push(format!("discarded: {}", proposal.id));
+        proposals.remove(*selected);
+        if *selected >= proposals.len() {
+            *selected = proposals.len().saturating_sub(1);
+        }
     }
 
     fn refresh_available_agents(&mut self) {
@@ -928,8 +1074,18 @@ impl TuiApp {
                         // Handle Analysis view keys
                         if self.current_view == CurrentView::Analysis {
                             match key.code {
-                                KeyCode::Esc => self.current_view = CurrentView::Projects,
-                                KeyCode::Tab => self.current_view = CurrentView::Projects,
+                                KeyCode::Esc | KeyCode::Tab => {
+                                    self.current_view = CurrentView::Projects
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    self.move_proposal_selection(-1)
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    self.move_proposal_selection(1)
+                                }
+                                KeyCode::Enter => self.approve_selected_proposal(),
+                                KeyCode::Char('a') => self.approve_all_proposals(),
+                                KeyCode::Char('d') => self.discard_selected_proposal(),
                                 KeyCode::Char('r') => {
                                     // Re-analyze current project
                                     let projects = self.state.context_store.list_all_projects();
