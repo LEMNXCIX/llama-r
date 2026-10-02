@@ -166,8 +166,11 @@ impl TuiApp {
     /// Larger scroll step for PageUp/PageDown. Uses the messages rect
     /// height reported by the last render when available, falling back
     /// to a fixed jump otherwise.
+    ///
+    /// The messages rect has no borders, so its height is already the number
+    /// of message rows on screen.
     fn page_step(&self) -> usize {
-        let h = self.chat_messages_rect.height.saturating_sub(2) as usize;
+        let h = self.chat_messages_rect.height as usize;
         if h > 0 {
             h
         } else {
@@ -429,6 +432,7 @@ impl TuiApp {
             CurrentView::Chat => vec![
                 ("←/→", "agent"),
                 ("Enter", "send"),
+                ("Shift+Enter", "newline"),
                 ("↑↓", "scroll"),
                 ("PgUp/PgDn", "fast scroll"),
                 ("Tab", "next view"),
@@ -924,7 +928,11 @@ impl TuiApp {
                                     }
                                 }
                                 KeyCode::Enter => {
-                                    if !self.chat_loading.load(Ordering::SeqCst) {
+                                    // The input is one row, so Shift+Enter is how
+                                    // a newline gets in. Plain Enter still sends.
+                                    if matches!(key.modifiers, event::KeyModifiers::SHIFT) {
+                                        self.chat_input.push('\n');
+                                    } else if !self.chat_loading.load(Ordering::SeqCst) {
                                         self.send_chat_message();
                                     }
                                 }
