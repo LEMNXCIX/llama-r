@@ -404,8 +404,9 @@ impl TuiApp {
     /// The key hints the shared footer shows for `view`.
     ///
     /// This is the single place hint text lives: the per-view footers that
-    /// used to repeat it are on their way out.
-    fn hints_for(&self, view: CurrentView) -> Vec<(&'static str, &'static str)> {
+    /// used to repeat it are on their way out. No `self`: the text does not
+    /// depend on app state, which keeps it reachable from a test.
+    fn hints_for(view: CurrentView) -> Vec<(&'static str, &'static str)> {
         match view {
             CurrentView::Dashboard => {
                 vec![("Tab", "next view"), ("↑/↓", "scroll logs"), ("q", "quit")]
@@ -429,13 +430,16 @@ impl TuiApp {
             ],
             CurrentView::Analysis => vec![("Esc", "back"), ("r", "re-analyze")],
             CurrentView::ContextView => vec![("Esc", "back"), ("↑/↓", "scroll")],
+            // One row, and a hint that does not fit is clipped from the right, which
+            // takes `Esc: back` first. Sized to fit 80 columns: `PgUp/PgDn`
+            // still scrolls, it is just not advertised — six hints fit, seven
+            // do not.
             CurrentView::Chat => vec![
                 ("←/→", "agent"),
                 ("Enter", "send"),
                 ("Shift+Enter", "newline"),
                 ("↑↓", "scroll"),
-                ("PgUp/PgDn", "fast scroll"),
-                ("Tab", "next view"),
+                ("Tab", "view"),
                 ("Esc", "back"),
             ],
         }
@@ -689,7 +693,7 @@ impl TuiApp {
                 if let Some((ref confirm_type, ref confirm_id)) = self.confirm_delete {
                     render_confirm_delete(f, c.body, confirm_type, confirm_id);
                 }
-                chrome::render_footer(f, c.footer, &self.hints_for(self.current_view.clone()));
+                chrome::render_footer(f, c.footer, &TuiApp::hints_for(self.current_view.clone()));
             })?;
 
             if event::poll(std::time::Duration::from_millis(50))? {
@@ -900,6 +904,21 @@ impl TuiApp {
 
                         // Chat view handling
                         if self.current_view == CurrentView::Chat {
+                            // Composing the message comes first, and it is
+                            // routed by `chat_input_action` so the Enter vs
+                            // Shift+Enter rule is testable without a terminal.
+                            match chat_input_action(key, self.chat_loading.load(Ordering::SeqCst)) {
+                                ChatAction::Edit(c) => self.chat_input.push(c),
+                                ChatAction::Backspace => {
+                                    self.chat_input.pop();
+                                }
+                                ChatAction::Newline => self.chat_input.push('\n'),
+                                ChatAction::Send => self.send_chat_message(),
+                                ChatAction::Other => {}
+                            }
+
+                            // Everything below needs app state: navigation,
+                            // agent cycling, and scrolling the messages.
                             match key.code {
                                 KeyCode::Esc => {
                                     self.current_view = CurrentView::Projects;
@@ -926,18 +945,6 @@ impl TuiApp {
                                         self.chat_agent_index = (self.chat_agent_index + 1) % count;
                                         self.update_chat_selected_agent();
                                     }
-                                }
-                                KeyCode::Enter => {
-                                    // The input is one row, so Shift+Enter is how
-                                    // a newline gets in. Plain Enter still sends.
-                                    if matches!(key.modifiers, event::KeyModifiers::SHIFT) {
-                                        self.chat_input.push('\n');
-                                    } else if !self.chat_loading.load(Ordering::SeqCst) {
-                                        self.send_chat_message();
-                                    }
-                                }
-                                KeyCode::Backspace => {
-                                    self.chat_input.pop();
                                 }
                                 KeyCode::Up => {
                                     if self.chat_auto_scroll {
@@ -984,11 +991,6 @@ impl TuiApp {
                                 KeyCode::End => {
                                     self.chat_auto_scroll = true;
                                     self.chat_scroll = usize::MAX;
-                                }
-                                KeyCode::Char(c) => {
-                                    if !self.chat_loading.load(Ordering::SeqCst) {
-                                        self.chat_input.push(c);
-                                    }
                                 }
                                 _ => {}
                             }
@@ -1261,6 +1263,47 @@ impl TuiApp {
     }
 }
 
+/// What a key press means in the chat input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatAction {
+    /// Append this character to the buffer.
+    Edit(char),
+    /// Take the last character off the buffer.
+    Backspace,
+    /// Append a newline to the buffer.
+    Newline,
+    /// Send the buffer.
+    Send,
+    /// Nothing for the input to do: either the key belongs to navigation and
+    /// scrolling, or the input is frozen because a reply is in flight.
+    Other,
+}
+
+/// Routes a key press to what it means in the chat input.
+///
+/// `Enter` sends and `Shift+Enter` inserts a newline instead. That
+/// distinction is the whole commitment behind the one-line input — without it
+/// a multi-line prompt cannot be composed at all — so it lives here, in one
+/// testable place, instead of buried in the event loop's match. The caller
+/// applies the result and nothing else.
+///
+/// While `loading` the buffer cannot grow or be sent. `Shift+Enter` is refused
+/// with them: a newline in a buffer that cannot otherwise change is not
+/// composing anything. Backspace is the exception — it stays available so a
+/// typo can still be taken back out of the draft.
+pub fn chat_input_action(key: event::KeyEvent, loading: bool) -> ChatAction {
+    match key.code {
+        KeyCode::Backspace => ChatAction::Backspace,
+        _ if loading => ChatAction::Other,
+        KeyCode::Char(c) => ChatAction::Edit(c),
+        KeyCode::Enter if matches!(key.modifiers, event::KeyModifiers::SHIFT) => {
+            ChatAction::Newline
+        }
+        KeyCode::Enter => ChatAction::Send,
+        _ => ChatAction::Other,
+    }
+}
+
 /// The old tab bar, superseded by [`chrome::render_bar`].
 ///
 /// No longer called. Kept until the remaining per-view chrome is deleted, so
@@ -1301,6 +1344,7 @@ fn render_tab_bar(f: &mut ratatui::Frame, current: &CurrentView) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyEventKind, KeyModifiers};
     use ratatui::backend::TestBackend;
 
     fn all_views() -> [CurrentView; 6] {
@@ -1312,6 +1356,115 @@ mod tests {
             CurrentView::ContextView,
             CurrentView::Chat,
         ]
+    }
+
+    /// The chat footer is one row, and a hint that does not fit is clipped away
+    /// from the right — which takes `Esc: back` first. An escape key nobody can
+    /// see is a real loss, so the row is pinned at the default terminal width.
+    #[test]
+    fn the_chat_hints_fit_one_row() {
+        let hints = TuiApp::hints_for(CurrentView::Chat);
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|f| chrome::render_footer(f, f.area(), &hints))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            row.contains("Esc: back"),
+            "the escape hint must survive the 80-column row: {row:?}"
+        );
+        assert!(
+            row.contains("Shift+Enter: newline"),
+            "the newline hint is the point of the one-line input: {row:?}"
+        );
+        let width = Line::from(row.trim_end()).width();
+        assert!(
+            width <= 80,
+            "the chat hints are {width} columns wide and get clipped: {row:?}"
+        );
+        println!("chat hints render {width} columns of the 80 available");
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> event::KeyEvent {
+        event::KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        }
+    }
+
+    /// The commitment behind the one-line input: `Enter` sends, `Shift+Enter`
+    /// inserts a newline. If this regresses a multi-line prompt becomes
+    /// impossible to compose and the shorter input stops being a fair trade.
+    #[test]
+    fn enter_sends_and_shift_enter_starts_a_new_line() {
+        assert_eq!(
+            chat_input_action(key(KeyCode::Enter, KeyModifiers::NONE), false),
+            ChatAction::Send
+        );
+        assert_eq!(
+            chat_input_action(key(KeyCode::Enter, KeyModifiers::SHIFT), false),
+            ChatAction::Newline,
+            "Shift+Enter must never send"
+        );
+        assert_ne!(
+            chat_input_action(key(KeyCode::Enter, KeyModifiers::SHIFT), false),
+            ChatAction::Send
+        );
+    }
+
+    #[test]
+    fn an_ordinary_character_edits_the_buffer() {
+        assert_eq!(
+            chat_input_action(key(KeyCode::Char('a'), KeyModifiers::NONE), false),
+            ChatAction::Edit('a')
+        );
+    }
+
+    /// While a reply is in flight the buffer is frozen: nothing is typed and
+    /// nothing is sent, so a newline has nothing to compose into either.
+    /// Backspace stays available so a typo can still be taken back out.
+    #[test]
+    fn a_frozen_input_refuses_to_grow_or_send() {
+        for code in [KeyCode::Enter, KeyCode::Char('a')] {
+            for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                assert_eq!(
+                    chat_input_action(key(code, modifiers), true),
+                    ChatAction::Other,
+                    "{code:?} with {modifiers:?} must do nothing while loading"
+                );
+            }
+        }
+        assert_eq!(
+            chat_input_action(key(KeyCode::Backspace, KeyModifiers::NONE), true),
+            ChatAction::Backspace,
+            "a typo in the draft can still be removed while loading"
+        );
+    }
+
+    #[test]
+    fn keys_that_are_not_input_composition_are_left_alone() {
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            assert_eq!(
+                chat_input_action(key(code, KeyModifiers::NONE), false),
+                ChatAction::Other,
+                "{code:?} is navigation, not the input's business"
+            );
+        }
     }
 
     /// Declaration order is the contract between `index()` and `VIEW_NAMES`:

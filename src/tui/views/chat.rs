@@ -65,6 +65,12 @@ const ELLIPSIS: char = '…';
 /// The row is one line, so the last line is what shows: it is the one being
 /// typed. `Shift+Enter` puts the earlier lines in the buffer, and they go out
 /// with the message, so nothing is lost by not drawing them here.
+///
+/// When even that line is wider than the row, its **tail** is what shows. The
+/// user is typing at the end and the cursor sits there, so cutting from the
+/// left keeps the text being written visible and reviewable — cutting from the
+/// right would leave the row frozen on a prefix that never changes again. A
+/// leading `…` says something was cut.
 pub fn input_display(buffer: &str, width: u16) -> String {
     let last = buffer.rsplit('\n').next().unwrap_or_default();
     let budget = width as usize;
@@ -75,17 +81,21 @@ pub fn input_display(buffer: &str, width: u16) -> String {
         return String::new();
     }
 
-    // The ellipsis takes the last column, and no character is ever split.
+    // Walk back from the end, whole characters only, until one more would not
+    // fit beside the ellipsis. Measuring each candidate suffix from the left
+    // would be quadratic in the line's length; this is bounded by the budget.
     let keep = budget - 1;
-    let mut end = 0;
-    for (index, ch) in last.char_indices() {
-        let next = index + ch.len_utf8();
-        if Line::from(&last[..next]).width() > keep {
+    let mut used = 0;
+    let mut start = last.len();
+    for (index, ch) in last.char_indices().rev() {
+        let w = Line::from(&last[index..index + ch.len_utf8()]).width();
+        if used + w > keep {
             break;
         }
-        end = next;
+        used += w;
+        start = index;
     }
-    format!("{}{ELLIPSIS}", &last[..end])
+    format!("{ELLIPSIS}{}", &last[start..])
 }
 
 /// Returns `(scroll_max, messages_rect)` so the caller can drive scroll
@@ -189,8 +199,9 @@ pub fn render_chat(
     f.render_widget(input_widget, chunks[2]);
 
     // ── Cursor ────────────────────────────────────────────────────────────
-    // Measured from the text the row actually shows, not the whole buffer, so
-    // a multi-line buffer leaves the cursor at the end of its last line.
+    // Measured from the text the row actually shows, not the whole buffer, so a
+    // multi-line buffer leaves the cursor at the end of its last line, and a
+    // line too long for the row leaves it where the typing is.
     let x = chunks[2].x + prompt_width + Line::from(shown.as_str()).width() as u16;
     let last_column = chunks[2].x + chunks[2].width.saturating_sub(1);
     f.set_cursor_position((x.min(last_column), chunks[2].y));
@@ -232,6 +243,72 @@ mod tests {
         assert!(shown.chars().count() <= 5, "{shown:?}");
     }
 
+    /// The end of the line is the text being typed, so that is what must
+    /// survive. Cutting from the left instead would freeze the row on a prefix
+    /// the user can no longer read or correct.
+    #[test]
+    fn input_display_keeps_the_end_of_a_line_that_does_not_fit() {
+        assert_eq!(input_display("abcdefghij", 5), "…ghij");
+        assert_eq!(input_display("abcdefghij", 2), "…j");
+        assert_eq!(input_display("abc", 3), "abc", "an exact fit needs no cut");
+    }
+
+    #[test]
+    fn input_display_never_splits_a_wide_character() {
+        // Each glyph is two columns, so only one fits beside the ellipsis, and
+        // with no room at all the ellipsis is all that is left.
+        assert_eq!(input_display("你好世界", 4), "…界");
+        assert_eq!(input_display("你好世界", 3), "…界");
+        assert_eq!(input_display("你好世界", 2), "…");
+        for width in 0..8 {
+            let shown = input_display("你好世界", width);
+            assert!(
+                Line::from(shown.as_str()).width() <= width as usize,
+                "{shown:?} is wider than {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_display_returns_nothing_when_there_is_no_room() {
+        assert_eq!(input_display("texto", 0), "");
+        assert_eq!(input_display("", 0), "");
+    }
+
+    /// The regression guard for tail truncation, at the level the user sees
+    /// it: a long draft must keep showing what was just typed.
+    #[test]
+    fn a_long_input_row_shows_its_tail_not_its_head() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        terminal
+            .draw(|f| {
+                render_chat(
+                    f,
+                    Rect::new(0, 0, 20, 6),
+                    &[],
+                    "abcdefghijklmnopqrstuvwxyz",
+                    false,
+                    None,
+                    &None,
+                    &None,
+                    &[],
+                    0,
+                    0,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let row = row_text(&buffer, 5);
+        assert!(
+            row.contains('…'),
+            "the row must say it was cut from the left: {row:?}"
+        );
+        assert!(
+            row.ends_with("yz"),
+            "the text being typed must stay visible: {row:?}"
+        );
+    }
+
     #[test]
     fn chat_renders_without_any_bordered_block() {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -258,6 +335,17 @@ mod tests {
             assert!(!text.contains(ch), "chat must not draw box char {ch:?}");
         }
         assert!(text.contains("hola"), "the message must render");
+        // Absence of borders alone would also pass a view that drew nothing but
+        // whitespace, so pin the two things that must be there: the thin rule
+        // that separates the conversation from the input, and the input row.
+        assert!(
+            text.contains('─'),
+            "the thin separator must render: {text:?}"
+        );
+        assert!(
+            text.contains("> "),
+            "the input row and its prompt must render: {text:?}"
+        );
     }
 
     /// Renders chat into `body` and returns the messages rect it reports back
