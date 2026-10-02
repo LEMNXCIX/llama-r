@@ -4,7 +4,9 @@
 //! Same port contract → swapping the adapter does not change services.
 
 use crate::domain::scope::AgentScope;
-use crate::ports::rag::{EmbeddingProvider, RagChunk, RagReplaceBatch, RagStore, RagUpsert};
+use crate::ports::rag::{
+    write_denied, EmbeddingProvider, RagChunk, RagReplaceBatch, RagStore, RagUpsert,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -120,10 +122,7 @@ impl RagStore for InMemoryRagStore {
         // Deny before embed (defense in depth + saves CPU).
         for doc in &docs {
             if !scope.allows_rag_write(&doc.source_id) {
-                return Err(format!(
-                    "RAG write denied for source '{}' on agent '{}'",
-                    doc.source_id, scope.agent_id
-                ));
+                return Err(write_denied(&doc.source_id, &scope.agent_id));
             }
         }
 
@@ -138,10 +137,7 @@ impl RagStore for InMemoryRagStore {
 
         for (doc, embedding) in docs.into_iter().zip(vectors.into_iter()) {
             if !scope.allows_rag_write(&doc.source_id) {
-                return Err(format!(
-                    "RAG write denied for source '{}' on agent '{}'",
-                    doc.source_id, scope.agent_id
-                ));
+                return Err(write_denied(&doc.source_id, &scope.agent_id));
             }
             let entry = collections.entry(doc.source_id).or_default();
             if let Some(existing) = entry.iter_mut().find(|item| item.id == doc.id) {
@@ -188,10 +184,7 @@ impl RagStore for InMemoryRagStore {
         }
         // Deny before embed (defense in depth + saves CPU).
         if !scope.allows_rag_write(source_id) {
-            return Err(format!(
-                "RAG write denied for source '{source_id}' on agent '{}'",
-                scope.agent_id
-            ));
+            return Err(write_denied(source_id, &scope.agent_id));
         }
         for (id_prefix, docs) in &batch {
             for doc in docs {
@@ -248,16 +241,34 @@ impl RagStore for InMemoryRagStore {
         Ok(written)
     }
 
+    async fn delete_document_scoped(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+        id_prefix: &str,
+    ) -> Result<usize, String> {
+        if id_prefix.is_empty() {
+            return Err("delete_document_scoped requires a non-empty id_prefix".into());
+        }
+        if !scope.allows_rag_write(source_id) {
+            return Err(write_denied(source_id, &scope.agent_id));
+        }
+        let mut collections = self.collections.write().await;
+        let Some(entry) = collections.get_mut(source_id) else {
+            return Ok(0);
+        };
+        let before = entry.len();
+        entry.retain(|item| !item.id.starts_with(id_prefix));
+        Ok(before - entry.len())
+    }
+
     async fn delete_collection_scoped(
         &self,
         scope: &AgentScope,
         source_id: &str,
     ) -> Result<(), String> {
         if !scope.allows_rag_write(source_id) {
-            return Err(format!(
-                "RAG write denied for source '{source_id}' on agent '{}'",
-                scope.agent_id
-            ));
+            return Err(write_denied(source_id, &scope.agent_id));
         }
         self.collections.write().await.remove(source_id);
         Ok(())

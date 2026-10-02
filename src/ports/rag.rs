@@ -9,6 +9,22 @@ use crate::domain::scope::AgentScope;
 use async_trait::async_trait;
 use serde_json::Value;
 
+/// Prefix every store uses for a scope write-policy denial.
+///
+/// Callers classify errors by this prefix rather than by the bare word "denied",
+/// so an I/O fault like "Permission denied (os error 13)" stays a server-side
+/// error instead of being reported to the client as a bad request.
+///
+/// Always build these with [`write_denied`], never by hand: a hand-written
+/// literal that drifts from this prefix would silently turn a policy denial
+/// into a 500.
+pub const RAG_WRITE_DENIED: &str = "RAG write denied";
+
+/// Build a write-policy denial error carrying [`RAG_WRITE_DENIED`].
+pub fn write_denied(source_id: &str, agent_id: &str) -> String {
+    format!("{RAG_WRITE_DENIED} for source '{source_id}' on agent '{agent_id}'")
+}
+
 #[derive(Debug, Clone)]
 pub struct RagChunk {
     pub id: String,
@@ -89,10 +105,25 @@ pub trait RagStore: Send + Sync {
         docs: Vec<RagUpsert>,
     ) -> Result<usize, String>;
 
+    /// Delete every chunk in `source_id` whose id starts with `id_prefix`.
+    ///
+    /// The scoped way to retract a single document. Returns the number of chunks
+    /// removed. An empty `id_prefix` is refused: it would match every id and
+    /// destroy the whole collection.
+    async fn delete_document_scoped(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+        id_prefix: &str,
+    ) -> Result<usize, String>;
+
     /// Delete a collection only if the scope's write policy allows it.
     ///
     /// Scoped counterpart to [`RagStore::delete_collection`], which is unscoped and
     /// therefore must never be reachable from a request handler.
+    ///
+    /// A policy denial must be returned via [`write_denied`] so callers can tell
+    /// it apart from an I/O failure (see [`RAG_WRITE_DENIED`]).
     async fn delete_collection_scoped(
         &self,
         scope: &AgentScope,

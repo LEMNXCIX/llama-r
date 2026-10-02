@@ -8,13 +8,15 @@
 
 use super::namespace::{encode_source_id_for_path, validate_source_id};
 use crate::domain::scope::AgentScope;
-use crate::ports::rag::{EmbeddingProvider, RagChunk, RagReplaceBatch, RagStore, RagUpsert};
+use crate::ports::rag::{
+    write_denied, EmbeddingProvider, RagChunk, RagReplaceBatch, RagStore, RagUpsert,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredDoc {
@@ -29,7 +31,18 @@ pub struct FileRagStore {
     base_dir: PathBuf,
     embeddings: Arc<dyn EmbeddingProvider>,
     /// In-process cache; reloaded from disk on first access per source.
-    cache: RwLock<HashMap<String, Vec<StoredDoc>>>,
+    ///
+    /// Values are `Arc` so a reader can take a cheap snapshot and release the
+    /// lock, letting a large rewrite run without blocking queries.
+    cache: RwLock<HashMap<String, Arc<Vec<StoredDoc>>>>,
+    /// One exclusive lock per collection, held across snapshot → write → publish.
+    ///
+    /// Without it, two concurrent writers each snapshot the same state and the
+    /// last publish silently discards the other's write. Holding a `tokio::sync`
+    /// lock across `spawn_blocking` does not block the runtime, so this
+    /// serializes writers without reintroducing the blocking-I/O problem.
+    /// Writers to *different* collections stay fully parallel.
+    collection_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl FileRagStore {
@@ -46,7 +59,17 @@ impl FileRagStore {
             base_dir,
             embeddings,
             cache: RwLock::new(HashMap::new()),
+            collection_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The exclusive lock guarding writes to `source_id`.
+    async fn collection_lock(&self, source_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.collection_locks.lock().await;
+        locks
+            .entry(source_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     fn collection_dir(&self, source_id: &str) -> PathBuf {
@@ -57,46 +80,6 @@ impl FileRagStore {
         dir.join("docs.jsonl")
     }
 
-    fn load_from_disk(path: &Path) -> Result<Vec<StoredDoc>, String> {
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let content = std::fs::read_to_string(path)
-            .map_err(|err| format!("rag read '{}': {err}", path.display()))?;
-        let mut docs = Vec::new();
-        for (line_no, line) in content.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let doc: StoredDoc = serde_json::from_str(line)
-                .map_err(|err| format!("rag parse '{}':{}: {err}", path.display(), line_no + 1))?;
-            docs.push(doc);
-        }
-        Ok(docs)
-    }
-
-    fn write_to_disk(path: &Path, docs: &[StoredDoc]) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("rag mkdir '{}': {err}", parent.display()))?;
-        }
-        let mut body = String::new();
-        for doc in docs {
-            let line = serde_json::to_string(doc)
-                .map_err(|err| format!("rag serialize doc '{}': {err}", doc.id))?;
-            body.push_str(&line);
-            body.push('\n');
-        }
-        // Atomic-ish write via temp file in same directory.
-        let tmp = path.with_extension("jsonl.tmp");
-        std::fs::write(&tmp, &body)
-            .map_err(|err| format!("rag write '{}': {err}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .map_err(|err| format!("rag rename to '{}': {err}", path.display()))?;
-        Ok(())
-    }
-
     async fn ensure_loaded(&self, source_id: &str) -> Result<(), String> {
         {
             let cache = self.cache.read().await;
@@ -105,11 +88,102 @@ impl FileRagStore {
             }
         }
         let path = Self::docs_path(&self.collection_dir(source_id));
-        let docs = Self::load_from_disk(&path)?;
+        let docs = load_from_disk_blocking(path).await?;
         let mut cache = self.cache.write().await;
-        cache.entry(source_id.to_string()).or_insert(docs);
+        cache
+            .entry(source_id.to_string())
+            .or_insert_with(|| Arc::new(docs));
         Ok(())
     }
+}
+
+/// Blocking disk read, offloaded to the blocking pool.
+///
+/// Reading a large collection synchronously inside an async fn would stall the
+/// runtime, and with it every other task on that worker thread.
+async fn load_from_disk_blocking(path: PathBuf) -> Result<Vec<StoredDoc>, String> {
+    tokio::task::spawn_blocking(move || load_from_disk(&path))
+        .await
+        .map_err(|err| format!("rag read task failed: {err}"))?
+}
+
+fn load_from_disk(path: &Path) -> Result<Vec<StoredDoc>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|err| format!("rag read '{}': {err}", path.display()))?;
+    let mut docs = Vec::new();
+    for (line_no, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let doc: StoredDoc = serde_json::from_str(line)
+            .map_err(|err| format!("rag parse '{}':{}: {err}", path.display(), line_no + 1))?;
+        docs.push(doc);
+    }
+    Ok(docs)
+}
+
+/// Apply `edits` to a snapshot of `current` and persist the result.
+///
+/// The clone, the prefix filtering and the serialization all happen on the
+/// blocking pool: doing them on the async thread would block the runtime for as
+/// long as the collection takes to rewrite. Returns the new collection so the
+/// caller can publish it once the write succeeded.
+async fn apply_and_write(
+    path: PathBuf,
+    current: Arc<Vec<StoredDoc>>,
+    edits: Vec<(String, Vec<RagUpsert>, Vec<Vec<f32>>)>,
+) -> Result<Vec<StoredDoc>, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut updated: Vec<StoredDoc> = (*current).clone();
+        for (id_prefix, docs, vectors) in edits {
+            // Drop chunks from a previous, longer version of this same document.
+            updated.retain(|item| !item.id.starts_with(id_prefix.as_str()));
+            for (doc, embedding) in docs.into_iter().zip(vectors.into_iter()) {
+                updated.push(StoredDoc {
+                    id: doc.id,
+                    text: doc.text,
+                    embedding,
+                    metadata: doc.metadata,
+                });
+            }
+        }
+        write_to_disk(&path, &updated)?;
+        Ok(updated)
+    })
+    .await
+    .map_err(|err| format!("rag write task failed: {err}"))?
+}
+
+fn write_to_disk(path: &Path, docs: &[StoredDoc]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("rag mkdir '{}': {err}", parent.display()))?;
+    }
+    let mut body = String::new();
+    for doc in docs {
+        let line = serde_json::to_string(doc)
+            .map_err(|err| format!("rag serialize doc '{}': {err}", doc.id))?;
+        body.push_str(&line);
+        body.push('\n');
+    }
+    // Atomic-ish write via a temp file in the same directory. The name is unique
+    // per write: a shared temp path would let two writers (or two processes)
+    // clobber each other's bytes and publish the wrong content.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("{unique}.tmp"));
+    std::fs::write(&tmp, &body).map_err(|err| format!("rag write '{}': {err}", tmp.display()))?;
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("rag rename to '{}': {err}", path.display()));
+    }
+    Ok(())
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -169,11 +243,16 @@ impl RagStore for FileRagStore {
             }
 
             self.ensure_loaded(source_id).await?;
-            let cache = self.cache.read().await;
-            let Some(docs) = cache.get(source_id) else {
-                continue;
+            // Cheap Arc snapshot: the read lock is released before scoring, so a
+            // concurrent rewrite never blocks the query.
+            let docs = {
+                let cache = self.cache.read().await;
+                match cache.get(source_id) {
+                    Some(docs) => docs.clone(),
+                    None => continue,
+                }
             };
-            for doc in docs {
+            for doc in docs.iter() {
                 let score = cosine_similarity(&query_vec, &doc.embedding);
                 hits.push(RagChunk {
                     id: doc.id.clone(),
@@ -208,10 +287,7 @@ impl RagStore for FileRagStore {
         for doc in &docs {
             validate_source_id(&doc.source_id)?;
             if !scope.allows_rag_write(&doc.source_id) {
-                return Err(format!(
-                    "RAG write denied for source '{}' on agent '{}'",
-                    doc.source_id, scope.agent_id
-                ));
+                return Err(write_denied(&doc.source_id, &scope.agent_id));
             }
         }
 
@@ -246,28 +322,51 @@ impl RagStore for FileRagStore {
 
         let mut written = 0usize;
         for (source_id, items) in by_source {
+            written += items.len();
+            let collection_lock = self.collection_lock(&source_id).await;
+            let _guard = collection_lock.lock().await;
             self.ensure_loaded(&source_id).await?;
-            let mut cache = self.cache.write().await;
-            let entry = cache.entry(source_id.clone()).or_default();
+            let current = {
+                let cache = self.cache.read().await;
+                cache
+                    .get(&source_id)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(Vec::new()))
+            };
 
-            for (doc, embedding) in items {
-                if let Some(existing) = entry.iter_mut().find(|item| item.id == doc.id) {
-                    existing.text = doc.text;
-                    existing.embedding = embedding;
-                    existing.metadata = doc.metadata;
-                } else {
-                    entry.push(StoredDoc {
-                        id: doc.id,
-                        text: doc.text,
-                        embedding,
-                        metadata: doc.metadata,
-                    });
+            // Merge-and-write on the blocking pool.
+            let (docs, vectors): (Vec<RagUpsert>, Vec<Vec<f32>>) = items.into_iter().unzip();
+            let merge = |mut existing: Vec<StoredDoc>| -> Result<Vec<StoredDoc>, String> {
+                for (doc, embedding) in docs.into_iter().zip(vectors) {
+                    if let Some(slot) = existing.iter_mut().find(|item| item.id == doc.id) {
+                        slot.text = doc.text;
+                        slot.embedding = embedding;
+                        slot.metadata = doc.metadata;
+                    } else {
+                        existing.push(StoredDoc {
+                            id: doc.id,
+                            text: doc.text,
+                            embedding,
+                            metadata: doc.metadata,
+                        });
+                    }
                 }
-                written += 1;
-            }
+                Ok(existing)
+            };
 
             let path = Self::docs_path(&self.collection_dir(&source_id));
-            Self::write_to_disk(&path, entry)?;
+            let updated = tokio::task::spawn_blocking(move || -> Result<Vec<StoredDoc>, String> {
+                let merged = merge((*current).clone())?;
+                write_to_disk(&path, &merged)?;
+                Ok(merged)
+            })
+            .await
+            .map_err(|err| format!("rag write task failed: {err}"))??;
+
+            self.cache
+                .write()
+                .await
+                .insert(source_id, Arc::new(updated));
         }
 
         Ok(written)
@@ -300,10 +399,7 @@ impl RagStore for FileRagStore {
         validate_source_id(source_id)?;
         // Deny before embed (defense in depth + saves CPU).
         if !scope.allows_rag_write(source_id) {
-            return Err(format!(
-                "RAG write denied for source '{source_id}' on agent '{}'",
-                scope.agent_id
-            ));
+            return Err(write_denied(source_id, &scope.agent_id));
         }
         for (id_prefix, docs) in &batch {
             for doc in docs {
@@ -348,36 +444,109 @@ impl RagStore for FileRagStore {
             }
         }
 
-        self.ensure_loaded(source_id).await?;
-        let mut cache = self.cache.write().await;
+        // Serialize writers to this collection so a concurrent write cannot be
+        // discarded by a stale snapshot.
+        let collection_lock = self.collection_lock(source_id).await;
+        let _guard = collection_lock.lock().await;
 
-        // Build the new collection without mutating the cache, so a failed disk
-        // write cannot leave the cache permanently missing the old chunks (which
-        // a later successful write would then persist, making the loss permanent).
-        let mut updated: Vec<StoredDoc> = cache.get(source_id).cloned().unwrap_or_default();
+        self.ensure_loaded(source_id).await?;
+        let current = self
+            .cache
+            .read()
+            .await
+            .get(source_id)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Vec::new()));
+
+        // Pair each document with its vector, grouped by the prefix being replaced.
+        let mut edits: Vec<(String, Vec<RagUpsert>, Vec<Vec<f32>>)> = Vec::new();
         let mut cursor = 0usize;
         for (id_prefix, docs) in batch {
-            // Drop chunks from a previous, longer version of this same document.
-            updated.retain(|item| !item.id.starts_with(id_prefix.as_str()));
+            let mut group_docs = Vec::with_capacity(docs.len());
+            let mut group_vectors = Vec::with_capacity(docs.len());
             for doc in docs {
-                let embedding = vectors[cursor].clone();
+                group_docs.push(doc);
+                group_vectors.push(vectors[cursor].clone());
                 cursor += 1;
-                updated.push(StoredDoc {
-                    id: doc.id,
-                    text: doc.text,
-                    embedding,
-                    metadata: doc.metadata,
-                });
             }
+            edits.push((id_prefix, group_docs, group_vectors));
         }
 
+        // The snapshot keeps readers consistent while the rewrite runs, and the
+        // cache is only updated once the write is durable.
         let path = Self::docs_path(&self.collection_dir(source_id));
-        Self::write_to_disk(&path, &updated)?;
+        let updated = apply_and_write(path, current, edits).await?;
 
-        // Disk is authoritative: publish the new state only after it is durable.
         let written = all_docs.len();
-        cache.insert(source_id.to_string(), updated);
+        self.cache
+            .write()
+            .await
+            .insert(source_id.to_string(), Arc::new(updated));
         Ok(written)
+    }
+
+    async fn delete_document_scoped(
+        &self,
+        scope: &AgentScope,
+        source_id: &str,
+        id_prefix: &str,
+    ) -> Result<usize, String> {
+        if id_prefix.is_empty() {
+            return Err("delete_document_scoped requires a non-empty id_prefix".into());
+        }
+        validate_source_id(source_id)?;
+        if !scope.allows_rag_write(source_id) {
+            return Err(write_denied(source_id, &scope.agent_id));
+        }
+
+        let collection_lock = self.collection_lock(source_id).await;
+        let _guard = collection_lock.lock().await;
+
+        let dir = self.collection_dir(source_id);
+        // Nothing on disk to retract: do not load or create anything, so a
+        // typo'd source_id cannot materialize a phantom empty collection.
+        if !dir.exists() {
+            return Ok(0);
+        }
+
+        self.ensure_loaded(source_id).await?;
+        let current = {
+            let cache = self.cache.read().await;
+            cache
+                .get(source_id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Vec::new()))
+        };
+        // Nothing matched: avoid rewriting the file for no reason.
+        if !current.iter().any(|item| item.id.starts_with(id_prefix)) {
+            return Ok(0);
+        }
+
+        let path = Self::docs_path(&dir);
+        let id_prefix = id_prefix.to_string();
+        // Filter and persist on the blocking pool, then publish.
+        let (updated, removed) = tokio::task::spawn_blocking(move || {
+            let updated: Vec<StoredDoc> = (*current)
+                .iter()
+                .filter(|item| !item.id.starts_with(id_prefix.as_str()))
+                .cloned()
+                .collect();
+            let removed = current.len() - updated.len();
+            if removed > 0 {
+                write_to_disk(&path, &updated)?;
+            }
+            Ok::<_, String>((updated, removed))
+        })
+        .await
+        .map_err(|err| format!("rag write task failed: {err}"))??;
+
+        if removed > 0 {
+            self.cache
+                .write()
+                .await
+                .insert(source_id.to_string(), Arc::new(updated));
+        }
+        Ok(removed)
     }
 
     async fn delete_collection_scoped(
@@ -386,10 +555,7 @@ impl RagStore for FileRagStore {
         source_id: &str,
     ) -> Result<(), String> {
         if !scope.allows_rag_write(source_id) {
-            return Err(format!(
-                "RAG write denied for source '{source_id}' on agent '{}'",
-                scope.agent_id
-            ));
+            return Err(write_denied(source_id, &scope.agent_id));
         }
         self.delete_collection(source_id).await
     }
@@ -711,6 +877,253 @@ mod tests {
             total += written;
         }
         assert_eq!(total, 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disk_writes_do_not_block_the_async_runtime() {
+        // On a current-thread runtime every task shares one thread, so any
+        // blocking std::fs work inside an async fn stalls the whole runtime,
+        // including timers. With the write moved to spawn_blocking, the timer
+        // keeps firing while a large collection is serialized.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileRagStore::new(
+            dir.path(),
+            Arc::new(HashEmbeddingProvider::new(64)),
+        ));
+        let scope = scope_for("a", &["agent:a/memory"], RagWritePolicy::OwnMemoryOnly);
+
+        // Pre-load a large collection. This happens outside the measured window,
+        // so the only remaining work is the rewrite the replace triggers.
+        {
+            let docs: Vec<RagUpsert> = (0..30_000)
+                .map(|index| RagUpsert {
+                    source_id: "agent:a/memory".into(),
+                    id: format!("doc-{index}#chunk-0"),
+                    text: format!("chunk {index} with some filler text to serialize"),
+                    metadata: serde_json::json!({"k": index}),
+                })
+                .collect();
+            store
+                .replace_batch_scoped(&scope, "agent:a/memory", vec![("doc-".to_string(), docs)])
+                .await
+                .expect("preload");
+        }
+
+        // Replacing one document rewrites the whole collection to disk.
+        let replacement = vec![RagUpsert {
+            source_id: "agent:a/memory".into(),
+            id: "fresh#chunk-0".into(),
+            text: "one small replacement document".into(),
+            metadata: serde_json::json!({}),
+        }];
+        let write = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .replace_batch_scoped(
+                        &scope,
+                        "agent:a/memory",
+                        vec![("fresh#chunk-".to_string(), replacement)],
+                    )
+                    .await
+            }
+        });
+
+        // A timer that must keep ticking while the write is in flight.
+        let mut ticks = 0u32;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            ticks += 1;
+        }
+
+        write.await.unwrap().expect("write should succeed");
+        assert!(
+            ticks >= 5,
+            "runtime was starved by blocking disk I/O: only {ticks} timer ticks in 250ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_writers_do_not_lose_updates() {
+        // The history summarizer upserts on every agent turn, so two concurrent
+        // writes to the same collection are normal. Both documents must survive.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileRagStore::new(
+            dir.path(),
+            Arc::new(HashEmbeddingProvider::new(16)),
+        ));
+        let scope = scope_for("a", &["agent:a/memory"], RagWritePolicy::OwnMemoryOnly);
+
+        // Seed the collection so a lost update is detectable.
+        store
+            .upsert_scoped(
+                &scope,
+                vec![RagUpsert {
+                    source_id: "agent:a/memory".into(),
+                    id: "seed#chunk-0".into(),
+                    text: "seed document".into(),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+
+        for trial in 0..25 {
+            let a = {
+                let store = store.clone();
+                let scope = scope.clone();
+                tokio::spawn(async move {
+                    store
+                        .upsert_scoped(
+                            &scope,
+                            vec![RagUpsert {
+                                source_id: "agent:a/memory".into(),
+                                id: "d0#chunk-0".into(),
+                                text: "first concurrent document".into(),
+                                metadata: serde_json::json!({}),
+                            }],
+                        )
+                        .await
+                })
+            };
+            let b = {
+                let store = store.clone();
+                let scope = scope.clone();
+                tokio::spawn(async move {
+                    store
+                        .upsert_scoped(
+                            &scope,
+                            vec![RagUpsert {
+                                source_id: "agent:a/memory".into(),
+                                id: "d1#chunk-0".into(),
+                                text: "second concurrent document".into(),
+                                metadata: serde_json::json!({}),
+                            }],
+                        )
+                        .await
+                })
+            };
+            a.await.unwrap().expect("writer a");
+            b.await.unwrap().expect("writer b");
+
+            let ids: HashSet<String> = store
+                .query_scoped(&scope, "document", 50)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.id)
+                .collect();
+            assert!(
+                ids.contains("d0#chunk-0") && ids.contains("d1#chunk-0"),
+                "trial {trial}: concurrent writes lost an update, have {:?}",
+                ids.iter().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn file_store_delete_document_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let emb: Arc<dyn EmbeddingProvider> = Arc::new(HashEmbeddingProvider::new(16));
+        let scope = scope_for("a", &["agent:a/memory"], RagWritePolicy::OwnMemoryOnly);
+
+        {
+            let store = FileRagStore::new(dir.path(), emb.clone());
+            store
+                .upsert_scoped(
+                    &scope,
+                    vec![
+                        RagUpsert {
+                            source_id: "agent:a/memory".into(),
+                            id: "keep#chunk-0".into(),
+                            text: "knowledge that must survive".into(),
+                            metadata: serde_json::json!({}),
+                        },
+                        RagUpsert {
+                            source_id: "agent:a/memory".into(),
+                            id: "obsolete#chunk-0".into(),
+                            text: "knowledge that must be retracted".into(),
+                            metadata: serde_json::json!({}),
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+
+            let removed = store
+                .delete_document_scoped(&scope, "agent:a/memory", "obsolete#chunk-")
+                .await
+                .unwrap();
+            assert_eq!(removed, 1);
+        }
+
+        // A fresh instance must see the retraction persisted, not resurrect it.
+        let store = FileRagStore::new(dir.path(), emb);
+        let hits = store.query_scoped(&scope, "knowledge", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "retraction must survive a reload");
+        assert!(hits[0].id.contains("keep"));
+    }
+
+    #[tokio::test]
+    async fn file_store_delete_document_noop_does_not_create_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileRagStore::new(dir.path(), Arc::new(HashEmbeddingProvider::new(16)));
+        // The collection is the agent's own memory, but nothing was ever written
+        // to it, so a retract must be a no-op rather than create it.
+        let scope = scope_for("a", &["agent:a/memory"], RagWritePolicy::OwnMemoryOnly);
+
+        let removed = store
+            .delete_document_scoped(&scope, "agent:a/memory", "anything#chunk-")
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+        assert!(
+            !store.collection_dir("agent:a/memory").exists(),
+            "a no-op delete must not create the collection directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_store_delete_document_respects_write_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileRagStore::new(dir.path(), Arc::new(HashEmbeddingProvider::new(16)));
+        let scope = scope_for("a", &["agent:a/memory"], RagWritePolicy::None);
+        let err = store
+            .delete_document_scoped(&scope, "agent:a/memory", "doc#chunk-")
+            .await
+            .unwrap_err();
+        assert!(
+            err == write_denied("agent:a/memory", "a"),
+            "denial must carry the shared prefix, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_store_delete_document_rejects_empty_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileRagStore::new(dir.path(), Arc::new(HashEmbeddingProvider::new(16)));
+        let scope = scope_for("a", &["agent:a/memory"], RagWritePolicy::OwnMemoryOnly);
+        store
+            .upsert_scoped(
+                &scope,
+                vec![RagUpsert {
+                    source_id: "agent:a/memory".into(),
+                    id: "doc#chunk-0".into(),
+                    text: "must not be wiped".into(),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .delete_document_scoped(&scope, "agent:a/memory", "")
+            .await
+            .unwrap_err();
+        assert!(err.contains("non-empty"), "got: {err}");
+        let hits = store.query_scoped(&scope, "must not", 5).await.unwrap();
+        assert_eq!(hits.len(), 1, "collection must be untouched");
     }
 
     #[tokio::test]
