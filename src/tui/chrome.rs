@@ -315,6 +315,47 @@ mod tests {
         );
     }
 
+    // The regression guard for the bug this layout exists to fix: a view that
+    // honours `body` cannot write over the bar's row, so the bar survives.
+    #[test]
+    fn a_view_drawn_into_body_leaves_the_bar_intact() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let c = layout(f.area());
+                let ctx = Context {
+                    project: Some("fudi".into()),
+                    agent: Some("ops".into()),
+                };
+                render_bar(f, c.bar, &["Dashboard", "Projects", "Chat"], 0, &ctx, true);
+                // Stand-in for a view: fill the body region only.
+                f.render_widget(ratatui::widgets::Paragraph::new("body content"), c.body);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        assert!(
+            row_text(&buffer, 0).contains("Dashboard"),
+            "bar row must survive"
+        );
+        assert!(
+            (0..buffer.area.width).any(|x| buffer[(x, 1)].symbol() != " "),
+            "the body must start on the row after the bar"
+        );
+    }
+
+    #[test]
+    fn body_does_not_overlap_the_bar_or_the_footer() {
+        let c = layout(Rect::new(0, 0, 80, 24));
+        assert!(
+            c.body.y >= c.bar.y + c.bar.height,
+            "body must start below the bar"
+        );
+        assert!(
+            c.body.y + c.body.height <= c.footer.y,
+            "body must end above the footer"
+        );
+    }
+
     #[tokio::test]
     async fn tiny_terminal_renders_without_panicking() {
         for (w, h) in [(1u16, 1u16), (3, 2), (10, 1), (2, 40)] {

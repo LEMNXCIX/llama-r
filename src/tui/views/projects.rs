@@ -9,8 +9,11 @@ use ratatui::{
     Frame,
 };
 
+/// Draws the projects view inside `body`, the part of the screen the shared
+/// chrome left over.
 pub fn render_projects(
     f: &mut Frame,
+    body: Rect,
     state: &AppState,
     project_index: usize,
     agent_index: usize,
@@ -27,7 +30,7 @@ pub fn render_projects(
             ]
             .as_ref(),
         )
-        .split(f.area());
+        .split(body);
 
     // Title
     let title = Paragraph::new(Line::from(vec![
@@ -153,16 +156,15 @@ pub fn render_projects(
         f.render_widget(empty, main_chunks[1]);
     }
 
-    // Footer
-    let footer = Paragraph::new(
-        " [Tab] Switch List | [Arrows] Navigate | [a] Analyze | [n] New Agent | [e] Edit | [d] Delete | [q] Quit"
-    )
-    .block(Block::default().borders(Borders::ALL));
+    // Footer. The hints come from `TuiApp::hints_for` now; this bordered row
+    // stays until the old chrome is deleted.
+    let footer = Paragraph::new("").block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
 }
 
 pub fn render_agent_form(
     f: &mut Frame,
+    body: Rect,
     id: &str,
     name: &str,
     model: &str,
@@ -173,7 +175,7 @@ pub fn render_agent_form(
     prompt: &str,
     field_index: usize,
 ) {
-    let area = f.area();
+    let area = body;
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Create/Edit Agent ")
@@ -317,10 +319,9 @@ pub fn render_agent_form(
         chunks[7],
     );
 
-    let help = Paragraph::new(
-        " [Tab] Next | [Shift+Tab] Prev | [Enter] in Prompt: Newline | [Arrows in Project] Cycle | [Ctrl+S] Save | [Esc] Cancel "
-    )
-    .block(Block::default().borders(Borders::ALL));
+    // Hints come from `TuiApp::hints_for`; this row stays until the old chrome
+    // is deleted.
+    let help = Paragraph::new("").block(Block::default().borders(Borders::ALL));
     f.render_widget(help, chunks[8]);
 
     // Set cursor position based on active field
@@ -375,7 +376,7 @@ pub fn render_agent_form(
     }
 }
 
-pub fn render_analysis(f: &mut Frame, analysis_state: &AnalysisState) {
+pub fn render_analysis(f: &mut Frame, body: Rect, analysis_state: &AnalysisState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -387,7 +388,7 @@ pub fn render_analysis(f: &mut Frame, analysis_state: &AnalysisState) {
             ]
             .as_ref(),
         )
-        .split(f.area());
+        .split(body);
 
     // Title
     let title = Paragraph::new(Line::from(vec![
@@ -436,7 +437,7 @@ pub fn render_analysis(f: &mut Frame, analysis_state: &AnalysisState) {
             results,
             ..
         } => {
-            render_skill_proposals(f, f.area(), proposals, *selected, results);
+            render_skill_proposals(f, body, proposals, *selected, results);
         }
         AnalysisState::Loaded(content_md) => {
             let content = Paragraph::new(content_md.as_str())
@@ -467,13 +468,19 @@ pub fn render_analysis(f: &mut Frame, analysis_state: &AnalysisState) {
         }
     }
 
-    // Footer
-    let footer = Paragraph::new(" [Esc] Return to Projects | [r] Re-analyze")
-        .block(Block::default().borders(Borders::ALL));
+    // Footer. The hints come from `TuiApp::hints_for` now; this bordered row
+    // stays until the old chrome is deleted.
+    let footer = Paragraph::new("").block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
 }
 
-pub fn render_context(f: &mut Frame, state: &AppState, project_index: usize, scroll: usize) {
+pub fn render_context(
+    f: &mut Frame,
+    body: Rect,
+    state: &AppState,
+    project_index: usize,
+    scroll: usize,
+) {
     let projects = state.context_store.list_all_projects();
     let project = projects.get(project_index);
 
@@ -499,7 +506,7 @@ pub fn render_context(f: &mut Frame, state: &AppState, project_index: usize, scr
             ]
             .as_ref(),
         )
-        .split(f.area());
+        .split(body);
 
     // Title
     let title = Paragraph::new(Line::from(vec![
@@ -525,14 +532,15 @@ pub fn render_context(f: &mut Frame, state: &AppState, project_index: usize, scr
         .scroll((scroll as u16, 0));
     f.render_widget(content, chunks[1]);
 
-    // Footer
-    let footer = Paragraph::new(" [Esc] Return to Projects | [↑/↓] Scroll")
-        .block(Block::default().borders(Borders::ALL));
+    // Footer. The hints come from `TuiApp::hints_for` now; this bordered row
+    // stays until the old chrome is deleted.
+    let footer = Paragraph::new("").block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
 }
 
-pub fn render_confirm_delete(f: &mut Frame, confirm_type: &str, confirm_id: &str) {
-    let area = f.area();
+/// Draws the delete confirmation over `body`. The bar and footer stay
+/// readable above and below it.
+pub fn render_confirm_delete(f: &mut Frame, body: Rect, confirm_type: &str, confirm_id: &str) {
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
@@ -543,7 +551,7 @@ pub fn render_confirm_delete(f: &mut Frame, confirm_type: &str, confirm_id: &str
             ]
             .as_ref(),
         )
-        .split(area);
+        .split(body);
     let horiz = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(
@@ -648,4 +656,51 @@ pub fn render_skill_proposals(
     let footer = Paragraph::new("[Enter] approve  [a] approve all  [d] discard  [Esc] back")
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::chrome::{self, Context};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// The bug this whole refactor exists to fix: a view laid out over
+    /// `f.area()` covers the bar's row, and the bar disappears.
+    #[test]
+    fn the_agent_form_leaves_the_bar_row_alone() {
+        let body = Rect::new(0, 1, 80, 22);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let c = chrome::layout(f.area());
+                chrome::render_bar(
+                    f,
+                    c.bar,
+                    &["Dashboard", "Projects", "Agent"],
+                    2,
+                    &Context::default(),
+                    true,
+                );
+                render_agent_form(f, body, "ops", "ops", "llama3", "fudi", "", "", "", "", 0);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let bar_row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        // Only the bar writes these names; the form's own border title is
+        // " Create/Edit Agent ", so matching on "Agent" would pass by accident.
+        assert!(
+            bar_row.contains("Dashboard") && bar_row.contains("Projects"),
+            "the bar's row must survive the view: {bar_row:?}"
+        );
+        let first_body_row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 1)].symbol().to_string())
+            .collect();
+        assert!(
+            first_body_row.contains('┌'),
+            "the form must start on the body's first row: {first_body_row:?}"
+        );
+    }
 }

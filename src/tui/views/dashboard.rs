@@ -1,6 +1,6 @@
 use crate::api::handlers::AppState;
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
@@ -8,7 +8,9 @@ use ratatui::{
 };
 use std::sync::atomic::Ordering;
 
-pub fn render_dashboard(f: &mut Frame, state: &AppState, log_scroll: usize) {
+/// Draws the dashboard inside `body`, the part of the screen the shared chrome
+/// left over.
+pub fn render_dashboard(f: &mut Frame, body: Rect, state: &AppState, log_scroll: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -21,7 +23,7 @@ pub fn render_dashboard(f: &mut Frame, state: &AppState, log_scroll: usize) {
             ]
             .as_ref(),
         )
-        .split(f.area());
+        .split(body);
 
     let title = Paragraph::new(vec![Line::from(vec![
         Span::styled(
@@ -112,8 +114,10 @@ pub fn render_dashboard(f: &mut Frame, state: &AppState, log_scroll: usize) {
 
     f.render_widget(logs_panel, chunks[2]);
 
-    let footer = Paragraph::new(" [Tab] Next View  [↑/↓] Scroll Logs  [q] Quit")
-        .block(Block::default().borders(Borders::ALL));
+    // The hints themselves now come from the shared footer via
+    // `TuiApp::hints_for`. This bordered row stays until the old chrome is
+    // deleted; keeping it empty avoids showing the same hints twice.
+    let footer = Paragraph::new("").block(Block::default().borders(Borders::ALL));
 
     f.render_widget(footer, chunks[3]);
 }

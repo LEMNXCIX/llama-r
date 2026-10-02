@@ -49,8 +49,12 @@ use ratatui::{
 
 /// Returns `(scroll_max, messages_rect)` so the caller can drive scroll
 /// state and hit-test mouse events on the messages region.
+///
+/// `body` is the region the shared chrome left over; `messages_rect` is
+/// therefore relative to it, and callers hit-test against the same rect.
 pub fn render_chat(
     f: &mut Frame,
+    body: Rect,
     messages: &[(String, String)],
     input: &str,
     loading: bool,
@@ -73,7 +77,7 @@ pub fn render_chat(
             ]
             .as_ref(),
         )
-        .split(f.area());
+        .split(body);
 
     // ── Header ────────────────────────────────────────────────────────────
     let agent_label = agent_header_label(selected_agent.as_deref(), selected_project.as_deref());
@@ -85,10 +89,6 @@ pub fn render_chat(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(agent_label, Style::default().fg(Color::Cyan)),
-        Span::styled(
-            "  [←/→] Agent  [Tab] Next View  [Esc] Back",
-            Style::default().fg(Color::Gray),
-        ),
     ]))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -187,11 +187,9 @@ pub fn render_chat(
     f.render_widget(input_widget, chunks[2]);
 
     // ── Footer ────────────────────────────────────────────────────────────
-    let footer = Paragraph::new(
-        " [←/→] Switch Agent  [Enter] Send  [↑↓] Scroll  [PgUp/PgDn] Fast Scroll  [Tab] Next View",
-    )
-    .block(Block::default().borders(Borders::ALL))
-    .style(Style::default().fg(Color::DarkGray));
+    // Hints come from `TuiApp::hints_for` now; this bordered row stays until
+    // the old chrome is deleted.
+    let footer = Paragraph::new("").block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[3]);
 
     // ── Cursor ────────────────────────────────────────────────────────────
@@ -205,7 +203,80 @@ pub fn render_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::chrome;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
     use std::time::Duration;
+
+    /// Renders chat into `body` and returns the messages rect it reports back
+    /// for scroll and mouse handling.
+    fn messages_rect_in(body: Rect) -> Rect {
+        let messages = vec![("user".to_string(), "hola".to_string())];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut reported = Rect::default();
+        terminal
+            .draw(|f| {
+                reported =
+                    render_chat(f, body, &messages, "", false, None, &None, &None, &[], 0, 0).1;
+            })
+            .unwrap();
+        reported
+    }
+
+    /// The bar's row must survive the chat view drawn after it.
+    #[test]
+    fn chat_leaves_the_bar_row_alone() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let c = chrome::layout(f.area());
+                chrome::render_bar(
+                    f,
+                    c.bar,
+                    &["Dashboard", "Projects", "Chat"],
+                    2,
+                    &chrome::Context::default(),
+                    true,
+                );
+                render_chat(
+                    f,
+                    c.body,
+                    &[("user".to_string(), "hola".to_string())],
+                    "",
+                    false,
+                    None,
+                    &None,
+                    &None,
+                    &[],
+                    0,
+                    0,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let bar_row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            bar_row.contains("Dashboard") && bar_row.contains("Chat"),
+            "the bar's row must survive the chat view: {bar_row:?}"
+        );
+    }
+
+    /// The rect chat reports back must follow `body`. A view laying out the
+    /// whole screen instead leaves it pinned to the screen, and the mouse wheel
+    /// then scrolls rows that belong to the bar.
+    #[test]
+    fn the_reported_messages_rect_follows_the_body() {
+        let at_top = messages_rect_in(Rect::new(0, 1, 80, 22));
+        let lower = messages_rect_in(Rect::new(0, 4, 80, 14));
+        assert_eq!(
+            lower.y - at_top.y,
+            3,
+            "moving the body down 3 rows must move the messages rect down 3: \
+             {at_top:?} then {lower:?}"
+        );
+    }
 
     #[test]
     fn header_shows_project_next_to_agent() {

@@ -1,6 +1,7 @@
 use crate::api::handlers::AppState;
 use crate::domain::models::ChatMessage;
 use crate::services::agent_runtime::RuntimeChatRequest;
+use crate::tui::chrome;
 use crate::tui::views::chat::render_chat;
 use crate::tui::views::dashboard::render_dashboard;
 use crate::tui::views::projects::render_confirm_delete;
@@ -31,6 +32,31 @@ pub enum CurrentView {
     ContextView,
     Chat,
 }
+
+impl CurrentView {
+    /// Position of this view in the context bar's view list, in declaration
+    /// order. Must stay within `VIEW_NAMES`.
+    fn index(&self) -> usize {
+        match self {
+            CurrentView::Dashboard => 0,
+            CurrentView::Projects => 1,
+            CurrentView::AgentForm => 2,
+            CurrentView::Analysis => 3,
+            CurrentView::ContextView => 4,
+            CurrentView::Chat => 5,
+        }
+    }
+}
+
+/// Names the context bar shows, in the same order as [`CurrentView::index`].
+const VIEW_NAMES: [&str; 6] = [
+    "Dashboard",
+    "Projects",
+    "Agent",
+    "Analysis",
+    "Context",
+    "Chat",
+];
 
 #[derive(Clone)]
 pub enum AnalysisState {
@@ -372,6 +398,45 @@ impl TuiApp {
         self.available_agents = agents;
     }
 
+    /// The key hints the shared footer shows for `view`.
+    ///
+    /// This is the single place hint text lives: the per-view footers that
+    /// used to repeat it are on their way out.
+    fn hints_for(&self, view: CurrentView) -> Vec<(&'static str, &'static str)> {
+        match view {
+            CurrentView::Dashboard => {
+                vec![("Tab", "next view"), ("↑/↓", "scroll logs"), ("q", "quit")]
+            }
+            CurrentView::Projects => vec![
+                ("Tab", "switch list"),
+                ("←/→", "navigate"),
+                ("a", "analyze"),
+                ("n", "new agent"),
+                ("e", "edit"),
+                ("d", "delete"),
+                ("q", "quit"),
+            ],
+            CurrentView::AgentForm => vec![
+                ("Tab", "next field"),
+                ("Shift+Tab", "prev field"),
+                ("Enter", "newline in prompt"),
+                ("←/→", "cycle project"),
+                ("Ctrl+S", "save"),
+                ("Esc", "cancel"),
+            ],
+            CurrentView::Analysis => vec![("Esc", "back"), ("r", "re-analyze")],
+            CurrentView::ContextView => vec![("Esc", "back"), ("↑/↓", "scroll")],
+            CurrentView::Chat => vec![
+                ("←/→", "agent"),
+                ("Enter", "send"),
+                ("↑↓", "scroll"),
+                ("PgUp/PgDn", "fast scroll"),
+                ("Tab", "next view"),
+                ("Esc", "back"),
+            ],
+        }
+    }
+
     /// Returns only agents belonging to the currently selected project.
     fn project_agents(&self) -> Vec<crate::domain::agent::Agent> {
         let projects = self.state.context_store.list_all_projects();
@@ -522,12 +587,34 @@ impl TuiApp {
             }
 
             terminal.draw(|f| {
-                render_tab_bar(f, &self.current_view);
+                // The chrome owns the layout: the bar and footer come off the
+                // top and bottom, and views only ever see what is left.
+                let chrome = chrome::layout(f.area());
+                let ctx = chrome::Context {
+                    project: self
+                        .state
+                        .context_store
+                        .list_all_projects()
+                        .get(self.project_index)
+                        .map(|p| p.project_id.clone()),
+                    agent: self.chat_selected_agent.clone(),
+                };
+                chrome::render_bar(
+                    f,
+                    chrome.bar,
+                    &VIEW_NAMES,
+                    self.current_view.index(),
+                    &ctx,
+                    self.state.api_running.load(Ordering::SeqCst),
+                );
                 match self.current_view {
-                    CurrentView::Dashboard => render_dashboard(f, &self.state, self.log_scroll),
+                    CurrentView::Dashboard => {
+                        render_dashboard(f, chrome.body, &self.state, self.log_scroll)
+                    }
                     CurrentView::Projects => {
                         crate::tui::views::projects::render_projects(
                             f,
+                            chrome.body,
                             &self.state,
                             self.project_index,
                             self.agent_index,
@@ -537,6 +624,7 @@ impl TuiApp {
                     CurrentView::AgentForm => {
                         crate::tui::views::projects::render_agent_form(
                             f,
+                            chrome.body,
                             &self.form_id,
                             &self.form_name,
                             &self.form_model,
@@ -554,11 +642,16 @@ impl TuiApp {
                             .try_lock()
                             .map(|g| g.clone())
                             .unwrap_or(AnalysisState::Idle);
-                        crate::tui::views::projects::render_analysis(f, &analysis_state);
+                        crate::tui::views::projects::render_analysis(
+                            f,
+                            chrome.body,
+                            &analysis_state,
+                        );
                     }
                     CurrentView::ContextView => {
                         crate::tui::views::projects::render_context(
                             f,
+                            chrome.body,
                             &self.state,
                             self.project_index,
                             self.context_scroll,
@@ -578,6 +671,7 @@ impl TuiApp {
                         };
                         let (scroll_max, msg_rect) = render_chat(
                             f,
+                            chrome.body,
                             &messages,
                             &self.chat_input,
                             loading,
@@ -593,8 +687,9 @@ impl TuiApp {
                     }
                 }
                 if let Some((ref confirm_type, ref confirm_id)) = self.confirm_delete {
-                    render_confirm_delete(f, confirm_type, confirm_id);
+                    render_confirm_delete(f, chrome.body, confirm_type, confirm_id);
                 }
+                chrome::render_footer(f, chrome.footer, &self.hints_for(self.current_view.clone()));
             })?;
 
             if event::poll(std::time::Duration::from_millis(50))? {
@@ -1162,6 +1257,11 @@ impl TuiApp {
     }
 }
 
+/// The old tab bar, superseded by [`chrome::render_bar`].
+///
+/// No longer called. Kept until the remaining per-view chrome is deleted, so
+/// the old chrome goes away in one sweep rather than half a step at a time.
+#[allow(dead_code)]
 fn render_tab_bar(f: &mut ratatui::Frame, current: &CurrentView) {
     let area = f.area();
     let bar_rect = Rect {
@@ -1192,4 +1292,86 @@ fn render_tab_bar(f: &mut ratatui::Frame, current: &CurrentView) {
     ]))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(bar, bar_rect);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn all_views() -> [CurrentView; 6] {
+        [
+            CurrentView::Dashboard,
+            CurrentView::Projects,
+            CurrentView::AgentForm,
+            CurrentView::Analysis,
+            CurrentView::ContextView,
+            CurrentView::Chat,
+        ]
+    }
+
+    /// Declaration order is the contract between `index()` and `VIEW_NAMES`:
+    /// the active view must land on a real name, and on the one the enum
+    /// declares it at.
+    #[test]
+    fn every_view_index_addresses_a_name_on_the_bar() {
+        let indices: Vec<usize> = all_views().iter().map(|v| v.index()).collect();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5]);
+        for view in all_views() {
+            assert!(
+                view.index() < VIEW_NAMES.len(),
+                "index {} is past the {} names on the bar",
+                view.index(),
+                VIEW_NAMES.len()
+            );
+        }
+        assert_eq!(
+            VIEW_NAMES.len(),
+            all_views().len(),
+            "every view needs a name of its own on the bar"
+        );
+    }
+
+    /// Whichever view is active, its name must be on the bar *and* styled as
+    /// active. A view missing from `VIEW_NAMES` leaves a bar with no active
+    /// view — which is how the broken tab bar read.
+    #[test]
+    fn the_bar_marks_whichever_view_is_active() {
+        let active = crate::tui::theme::active();
+        for view in all_views() {
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            let name = VIEW_NAMES[view.index()];
+            terminal
+                .draw(|f| {
+                    let c = chrome::layout(f.area());
+                    chrome::render_bar(
+                        f,
+                        c.bar,
+                        &VIEW_NAMES,
+                        view.index(),
+                        &chrome::Context::default(),
+                        true,
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, 0)].symbol().to_string())
+                .collect();
+            // `find` gives a byte offset and the bar holds multi-byte separators,
+            // so count characters to get the column.
+            let start = row
+                .find(name)
+                .map(|byte| row[..byte].chars().count())
+                .unwrap_or_else(|| panic!("the bar must show {name:?}: {row:?}"));
+            // Compare the fields that mean "active" rather than the whole
+            // style: the buffer's cells carry defaults the token does not.
+            let style = buffer[(start as u16, 0)].style();
+            assert_eq!(
+                (style.fg, style.add_modifier),
+                (active.fg, active.add_modifier),
+                "{name:?} must be the styled-active view on the bar"
+            );
+        }
+    }
 }
