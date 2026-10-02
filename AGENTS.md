@@ -188,9 +188,10 @@ POST /api/mcp
 ```text
 POST /api/rag/ingest
 POST /api/rag/query
+POST /api/rag/delete-document
 ```
 
-Returns `403` without the header, and `501` when RAG is disabled (`RAG_ENABLED=false`).
+Returns `403` without the header (checked before the body is parsed), and `501` when RAG is disabled (`RAG_ENABLED=false`).
 
 ## Developer Commands
 ```powershell
@@ -237,10 +238,13 @@ cargo test --target-dir target-tests
 - Re-ingest replaces a document's chunks (ids are `{doc_key}#chunk-{index}`), so a shorter document does not leave stale chunks behind. An empty/whitespace document is skipped and reported in `skipped`, never treated as a deletion.
 - Document keys may not contain `#` (reserved for chunk ids), and must be unique within one ingest request.
 - One ingest is atomic per collection: it goes through `replace_batch_scoped`, so a failure partway through leaves nothing behind. To drop a single document, re-ingest it shorter — an empty document is a no-op, not a deletion.
+- Retracting a document is an explicit operation (`delete_document` / `POST /api/rag/delete-document`); it must never be inferred from empty content.
+- `FileRagStore` holds a per-collection lock across snapshot → write → publish, so concurrent writers to one collection cannot lose each other's updates, while disk I/O runs on `spawn_blocking` so it never stalls the runtime.
 - Chat path: when an agent has `rag_sources`, Rig `prepare()` queries the store and injects `## Retrieved knowledge` into the system prompt.
 - Debug API (requires header `X-Debug: true`):
   - `POST /api/rag/ingest` — body: `project_id?`, `agent_id?`, `source_id`, `texts[]`, optional `files[]` under base dir. Response reports `chunks_written`, `files_read`, and `skipped[]` (paths not indexed, with a reason)
   - `POST /api/rag/query` — body: `project_id?`, `agent_id?`, `query`, `top_k?`
+  - `POST /api/rag/delete-document` — body: `project_id?`, `agent_id?`, `source_id`, `doc_key`. Retracts one document (distinct from re-ingesting it empty, which is a no-op)
 - Example agent: `examples/agents/rag-demo.toml`
 - Modules: `src/adapters/rag/` (`file_store`, `embeddings`, `chunker`, `namespace`, `store`), `src/services/rag_ingest.rs`, `src/api/rag_api.rs`
 
