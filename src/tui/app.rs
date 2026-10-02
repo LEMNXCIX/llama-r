@@ -76,6 +76,9 @@ pub struct TuiApp {
     chat_auto_scroll: bool,
     chat_agent_index: usize,
     chat_selected_agent: Option<String>,
+    /// Project of the selected chat agent, so the header can disambiguate
+    /// agents that share an id across projects.
+    chat_selected_project: Option<String>,
     available_agents: Vec<String>,
     chat_scroll: usize,
     // Render-time feedback so key/mouse handlers can drive real bounds.
@@ -114,6 +117,7 @@ impl TuiApp {
             chat_auto_scroll: true,
             chat_agent_index: 0,
             chat_selected_agent: None,
+            chat_selected_project: None,
             available_agents: Vec::new(),
             chat_scroll: 0,
             chat_scroll_max: 0,
@@ -242,9 +246,22 @@ impl TuiApp {
     fn update_chat_selected_agent(&mut self) {
         if self.available_agents.is_empty() || self.chat_agent_index == 0 {
             self.chat_selected_agent = None;
+            self.chat_selected_project = None;
         } else {
             self.chat_selected_agent = Some(self.available_agents[self.chat_agent_index].clone());
+            self.chat_selected_project = self.project_of(&self.chat_selected_agent.clone());
         }
+    }
+
+    /// The project an agent belongs to, if any (global agents have none).
+    fn project_of(&self, agent_id: &Option<String>) -> Option<String> {
+        let id = agent_id.as_ref()?;
+        self.state
+            .agent_registry
+            .list_agents()
+            .into_iter()
+            .find(|a| &a.id == id)
+            .and_then(|a| a.project_id)
     }
 
     fn send_chat_message(&mut self) {
@@ -420,6 +437,7 @@ impl TuiApp {
                             loading,
                             loading_since,
                             &self.chat_selected_agent,
+                            &self.chat_selected_project,
                             &self.available_agents,
                             self.chat_agent_index,
                             self.chat_scroll,

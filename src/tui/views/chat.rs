@@ -1,3 +1,15 @@
+/// Build the chat header's agent label.
+///
+/// Two projects can register an agent with the same id, so showing the project
+/// is what makes the selection unambiguous.
+pub fn agent_header_label(agent: Option<&str>, project: Option<&str>) -> String {
+    match (agent, project) {
+        (None, _) => " Direct (no agent) ".to_string(),
+        (Some(id), None) => format!(" Agent: {id} · Project: — "),
+        (Some(id), Some(project)) => format!(" Agent: {id} · Project: {project} "),
+    }
+}
+
 /// Braille spinner frames, shared by the chat and analysis loaders.
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -44,6 +56,7 @@ pub fn render_chat(
     loading: bool,
     loading_since: Option<std::time::Instant>,
     selected_agent: &Option<String>,
+    selected_project: &Option<String>,
     _available_agents: &[String],
     _agent_index: usize,
     scroll: usize,
@@ -63,10 +76,7 @@ pub fn render_chat(
         .split(f.area());
 
     // ── Header ────────────────────────────────────────────────────────────
-    let agent_label = match selected_agent {
-        Some(id) => format!(" Agent: {id} "),
-        None => " Direct (no agent) ".to_string(),
-    };
+    let agent_label = agent_header_label(selected_agent.as_deref(), selected_project.as_deref());
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
             "Chat ",
@@ -196,6 +206,41 @@ pub fn render_chat(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn header_shows_project_next_to_agent() {
+        let label = agent_header_label(Some("soporte"), Some("fudi"));
+        assert!(label.contains("soporte"), "{label}");
+        assert!(
+            label.contains("fudi"),
+            "the project must be shown so same-named agents are distinguishable: {label}"
+        );
+    }
+
+    #[test]
+    fn header_marks_global_agents() {
+        let label = agent_header_label(Some("notificador"), None);
+        assert!(label.contains("notificador"), "{label}");
+        assert!(
+            label.contains("Project"),
+            "a global agent still needs a project slot, marked as none: {label}"
+        );
+    }
+
+    #[test]
+    fn header_without_agent_says_so() {
+        assert!(agent_header_label(None, Some("fudi")).contains("no agent"));
+    }
+
+    #[test]
+    fn header_distinguishes_same_named_agents_from_different_projects() {
+        let a = agent_header_label(Some("soporte"), Some("fudi"));
+        let b = agent_header_label(Some("soporte"), Some("clinica"));
+        assert_ne!(
+            a, b,
+            "two projects with an agent of the same id must render differently"
+        );
+    }
 
     fn ms(total: u128) -> Duration {
         Duration::from_millis(total as u64)
