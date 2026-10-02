@@ -1,3 +1,32 @@
+/// Braille spinner frames, shared by the chat and analysis loaders.
+pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Spinner frame for a given elapsed duration.
+///
+/// `frame_interval` controls the animation speed. The frame is derived from
+/// elapsed time rather than a counter so the animation stays smooth regardless
+/// of how often the view is redrawn.
+pub fn spinner_frame(
+    elapsed: std::time::Duration,
+    frame_interval: std::time::Duration,
+) -> &'static str {
+    let interval = frame_interval.as_millis().max(1) as u128;
+    let index = (elapsed.as_millis() / interval) as usize % SPINNER_FRAMES.len();
+    SPINNER_FRAMES[index]
+}
+
+/// The "thinking" status line.
+///
+/// The braille glyph is the animation; a trailing "..." would be redundant and
+/// looks broken next to a moving spinner, so it is not used.
+pub fn thinking_line(elapsed: std::time::Duration) -> String {
+    format!("  {} Thinking", spinner_frame(elapsed, SPINNER_INTERVAL))
+}
+
+/// Animation speed for both loaders: one frame every 120ms (~8 fps), fast
+/// enough to read as motion, slow enough not to be distracting.
+pub const SPINNER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -13,6 +42,7 @@ pub fn render_chat(
     messages: &[(String, String)],
     input: &str,
     loading: bool,
+    loading_since: Option<std::time::Instant>,
     selected_agent: &Option<String>,
     _available_agents: &[String],
     _agent_index: usize,
@@ -75,8 +105,11 @@ pub fn render_chat(
     }
 
     if loading {
+        let elapsed = loading_since
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
         lines.push(Line::from(Span::styled(
-            "  ⠋ Thinking...",
+            thinking_line(elapsed),
             Style::default().fg(Color::Gray),
         )));
     }
@@ -157,4 +190,75 @@ pub fn render_chat(
     f.set_cursor_position((x.min(chunks[2].x + chunks[2].width.saturating_sub(2)), y));
 
     (scroll_max, chunks[1])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn ms(total: u128) -> Duration {
+        Duration::from_millis(total as u64)
+    }
+
+    #[test]
+    fn spinner_advances_over_time() {
+        let first = spinner_frame(ms(0), SPINNER_INTERVAL);
+        let later = spinner_frame(ms(400), SPINNER_INTERVAL);
+        assert_ne!(first, later, "the spinner must actually move");
+    }
+
+    #[test]
+    fn spinner_cycles_through_every_frame() {
+        let interval = SPINNER_INTERVAL.as_millis() as u64;
+        let mut seen = std::collections::HashSet::new();
+        for step in 0..SPINNER_FRAMES.len() {
+            seen.insert(spinner_frame(
+                ms(interval as u128 * step as u128),
+                SPINNER_INTERVAL,
+            ));
+        }
+        assert_eq!(
+            seen.len(),
+            SPINNER_FRAMES.len(),
+            "frames must not repeat early"
+        );
+    }
+
+    #[test]
+    fn spinner_is_stable_within_a_frame_interval() {
+        // The redraw loop runs every 50ms; several redraws inside one 120ms
+        // frame must not jitter the glyph.
+        let a = spinner_frame(ms(100), SPINNER_INTERVAL);
+        let b = spinner_frame(ms(110), SPINNER_INTERVAL);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn thinking_line_animates_and_has_no_trailing_dots() {
+        let first = thinking_line(ms(0));
+        let later = thinking_line(ms(400));
+        assert_ne!(first, later, "the thinking dots must move");
+        assert!(
+            !first.contains("..."),
+            "redundant dots must be gone: {first}"
+        );
+        assert!(first.contains("Thinking"), "label must remain: {first}");
+    }
+
+    #[test]
+    fn thinking_line_only_uses_spinner_glyphs() {
+        for step in 0..40 {
+            let line = thinking_line(ms(SPINNER_INTERVAL.as_millis() as u128 * step));
+            let glyph = line
+                .trim_start()
+                .chars()
+                .next()
+                .expect("line must start with the spinner glyph");
+            assert!(
+                SPINNER_FRAMES.contains(&glyph.to_string().as_str()),
+                "unexpected glyph {glyph:?} in {line:?}"
+            );
+        }
+    }
 }

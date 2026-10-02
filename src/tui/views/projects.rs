@@ -411,13 +411,20 @@ pub fn render_analysis(f: &mut Frame, analysis_state: &AnalysisState) {
             f.render_widget(content, chunks[1]);
         }
         AnalysisState::Loading { started_at } => {
-            let elapsed = started_at.elapsed().as_secs();
-            let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let frame = spinner[(elapsed as usize) % spinner.len()];
+            let elapsed_secs = started_at.elapsed().as_secs();
+            // The braille glyph is the animation; a trailing "..." would sit
+            // frozen next to a moving spinner and read as a glitch.
+            let frame = crate::tui::views::chat::spinner_frame(
+                started_at.elapsed(),
+                crate::tui::views::chat::SPINNER_INTERVAL,
+            );
             let content = Paragraph::new(Line::from(vec![
                 Span::styled(frame, Style::default().fg(Color::Cyan)),
-                Span::raw(" Analyzing project... "),
-                Span::styled(format!("({}s)", elapsed), Style::default().fg(Color::Gray)),
+                Span::raw(" Analyzing project "),
+                Span::styled(
+                    format!("({elapsed_secs}s)"),
+                    Style::default().fg(Color::Gray),
+                ),
             ]))
             .block(Block::default().borders(Borders::ALL).title(" Analysis "))
             .wrap(Wrap { trim: true });

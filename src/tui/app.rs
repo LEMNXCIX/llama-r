@@ -71,6 +71,8 @@ pub struct TuiApp {
     chat_messages: Arc<Mutex<Vec<(String, String)>>>,
     chat_input: String,
     chat_loading: Arc<AtomicBool>,
+    /// When the in-flight chat request started, used to drive the spinner.
+    chat_loading_since: Arc<Mutex<Option<Instant>>>,
     chat_auto_scroll: bool,
     chat_agent_index: usize,
     chat_selected_agent: Option<String>,
@@ -108,6 +110,7 @@ impl TuiApp {
             chat_messages: Arc::new(Mutex::new(Vec::new())),
             chat_input: String::new(),
             chat_loading: Arc::new(AtomicBool::new(false)),
+            chat_loading_since: Arc::new(Mutex::new(None)),
             chat_auto_scroll: true,
             chat_agent_index: 0,
             chat_selected_agent: None,
@@ -255,11 +258,13 @@ impl TuiApp {
             .unwrap()
             .push(("user".to_string(), input.clone()));
         self.chat_loading.store(true, Ordering::SeqCst);
+        *self.chat_loading_since.lock().unwrap() = Some(Instant::now());
         self.chat_auto_scroll = true;
 
         let state = self.state.clone();
         let messages = self.chat_messages.clone();
         let loading = self.chat_loading.clone();
+        let loading_since = self.chat_loading_since.clone();
         let agent_id = self.chat_selected_agent.clone();
         let agent_project_id = agent_id.as_ref().and_then(|aid| {
             self.state
@@ -334,6 +339,7 @@ impl TuiApp {
                 }
             }
             loading.store(false, Ordering::SeqCst);
+            *loading_since.lock().unwrap() = None;
         });
     }
 
@@ -402,11 +408,17 @@ impl TuiApp {
                             .map(|g| g.clone())
                             .unwrap_or_default();
                         let loading = self.chat_loading.load(Ordering::SeqCst);
+                        let loading_since = if loading {
+                            *self.chat_loading_since.lock().unwrap()
+                        } else {
+                            None
+                        };
                         let (scroll_max, msg_rect) = render_chat(
                             f,
                             &messages,
                             &self.chat_input,
                             loading,
+                            loading_since,
                             &self.chat_selected_agent,
                             &self.available_agents,
                             self.chat_agent_index,
