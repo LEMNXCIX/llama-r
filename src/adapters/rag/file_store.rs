@@ -186,7 +186,11 @@ fn write_to_disk(path: &Path, docs: &[StoredDoc]) -> Result<(), String> {
     Ok(())
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+/// Cosine similarity, 0.0 when the vectors are empty or of different length.
+///
+/// Shared with the skill index so both rank with identical semantics. A length
+/// mismatch scoring 0.0 is why embedding dimensions must be validated on write.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.is_empty() || b.is_empty() || a.len() != b.len() {
         return 0.0;
     }

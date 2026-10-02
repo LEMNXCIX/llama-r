@@ -66,13 +66,29 @@ pub fn build_app_state(
     rag_store: Option<Arc<dyn RagStore>>,
     rag_ingest: Option<Arc<RagIngestService>>,
     history_store: Option<Arc<dyn ConversationStore>>,
+    // Embedding settings for semantic skill ranking: (url, model, dims).
+    embeddings: Option<(String, String, usize)>,
 ) -> Arc<AppState> {
     let metrics = Arc::new(TokenMetrics::new());
-    let context_enricher = Arc::new(ContextEnricher::new(
-        context_store.clone(),
-        skill_manager.clone(),
-        default_model.clone(),
-    ));
+    let context_enricher = Arc::new(
+        ContextEnricher::new(
+            context_store.clone(),
+            skill_manager.clone(),
+            default_model.clone(),
+        )
+        // Semantic skill ranking. Without embeddings every declared skill is used,
+        // so this is an improvement and never a requirement.
+        .with_embeddings(embeddings.as_ref().map_or_else(
+            || {
+                Arc::new(OllamaEmbeddings::new(
+                    "http://localhost:11434",
+                    "nomic-embed-text",
+                    768,
+                ))
+            },
+            |(url, model, dims)| Arc::new(OllamaEmbeddings::new(url, model, *dims)) as Arc<_>,
+        )),
+    );
 
     Arc::new(AppState {
         provider,
@@ -348,6 +364,11 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         rag_store,
         rag_ingest,
         history_store,
+        Some((
+            config.ollama_url.clone(),
+            config.embedding_model.clone(),
+            config.embedding_dimensions,
+        )),
     );
     let router = build_router(state.clone());
 

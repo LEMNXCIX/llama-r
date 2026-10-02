@@ -72,12 +72,36 @@ pub struct SkillMetadata {
     pub tags: Option<Vec<String>>,
 }
 
+/// Where a skill came from, which decides precedence when ids collide.
+///
+/// Discovered by *how* it was found rather than by a path table: the loader
+/// knows whether it was reading a project's own directory or a shared one.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SkillScope {
+    /// Installed by another harness (Claude, Cursor, Windsurf, ...).
+    Harness,
+    /// Shared Llama-R skills, available to any project.
+    LlamaR,
+    /// Dedicated to one project; wins over the others.
+    Project,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Skill {
     pub id: String,
     pub path: String,
     pub metadata: SkillMetadata,
     pub content: String,
+    /// Provenance, used to resolve ids that exist in more than one scope.
+    #[serde(default = "default_skill_scope")]
+    pub scope: SkillScope,
+}
+
+/// Skills loaded before scopes existed are treated as shared, which keeps the
+/// previous behaviour (a global scan could see them) instead of silently
+/// demoting them to Harness and changing resolution.
+fn default_skill_scope() -> SkillScope {
+    SkillScope::LlamaR
 }
 
 #[derive(Debug, Serialize, Deserialize)]

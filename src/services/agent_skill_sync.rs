@@ -393,6 +393,7 @@ mod tests {
                 tags: None,
             },
             content: String::new(),
+            scope: crate::domain::models::SkillScope::LlamaR,
         }
     }
 

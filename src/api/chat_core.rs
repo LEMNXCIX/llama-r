@@ -163,7 +163,7 @@ fn engine_events_to_chat_stream(
     })
 }
 
-fn prepare_request(
+async fn prepare_request(
     state: &AppState,
     mut payload: ChatRequest,
     selection: AgentSelection<'_>,
@@ -194,7 +194,7 @@ fn prepare_request(
     if let Some(agent) = selected_agent {
         let optimizer = TokenOptimizer::new(agent.config.optimize.clone());
         let mut optimized_messages = Vec::with_capacity(payload.messages.len() + 1);
-        let sys_prompt_raw = state.context_enricher.build_system_prompt(&agent);
+        let sys_prompt_raw = state.context_enricher.build_system_prompt(&agent).await;
         let sys_prompt = optimizer.optimize(&sys_prompt_raw);
         state
             .metrics
@@ -326,7 +326,7 @@ pub async fn execute_chat(
     let requested_model = selection.requested_target(&payload.model);
     let original_model = payload.model.clone();
     let engine_ids = engine_target(state, selection, &original_model);
-    let prepared = prepare_request(state, payload, selection)?;
+    let prepared = prepare_request(state, payload, selection).await?;
 
     let debug_prompt = if selection.debug {
         Some(
@@ -401,7 +401,7 @@ pub async fn execute_chat_stream(
     let requested_model = selection.requested_target(&payload.model);
     let original_model = payload.model.clone();
     let engine_ids = engine_target(state, selection, &original_model);
-    let prepared = prepare_request(state, payload, selection)?;
+    let prepared = prepare_request(state, payload, selection).await?;
     let started_at = Instant::now();
 
     if let Some((project_id, agent_id)) = engine_ids {

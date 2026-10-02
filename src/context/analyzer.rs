@@ -1,6 +1,8 @@
 use crate::context::store::{ContextStore, ProjectContext};
 use crate::domain::agent::Agent;
+use crate::ports::rag::EmbeddingProvider;
 use crate::services::agent_skill_sync::merge_skill_ids;
+use crate::services::skill_index::{apply_ranking, SkillIndex};
 use crate::services::skill_manager::SkillManager;
 use crate::services::validation::canonicalize_project_path;
 use std::fs;
@@ -240,6 +242,9 @@ pub struct ContextEnricher {
     context_store: Arc<ContextStore>,
     skill_manager: Arc<SkillManager>,
     default_model: String,
+    /// Embeddings for ranking skills semantically. `None` disables ranking, in
+    /// which case every declared skill is used — the previous behaviour.
+    embeddings: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl ContextEnricher {
@@ -252,7 +257,14 @@ impl ContextEnricher {
             context_store,
             skill_manager,
             default_model,
+            embeddings: None,
         }
+    }
+
+    /// Enable semantic skill ranking.
+    pub fn with_embeddings(mut self, embeddings: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embeddings = Some(embeddings);
+        self
     }
 
     pub fn resolve_model(&self, agent: &Agent) -> String {
@@ -263,7 +275,7 @@ impl ContextEnricher {
         }
     }
 
-    pub fn build_system_prompt(&self, agent: &Agent) -> String {
+    pub async fn build_system_prompt(&self, agent: &Agent) -> String {
         let budget = agent.config.max_context_tokens;
         let mut sections = Vec::new();
 
@@ -298,8 +310,8 @@ impl ContextEnricher {
         }
 
         // 4. Agent Skills
-        let selected_skill_ids = merge_skill_ids(&agent.config.skills, &agent.config.auto_skills);
-        if !selected_skill_ids.is_empty() {
+        let candidate_skill_ids = merge_skill_ids(&agent.config.skills, &agent.config.auto_skills);
+        if !candidate_skill_ids.is_empty() {
             let project_path = agent
                 .config
                 .context_project
@@ -307,12 +319,31 @@ impl ContextEnricher {
                 .and_then(|project_id| self.context_store.get_context(project_id))
                 .map(|context| context.path);
 
-            let selected_skills = selected_skill_ids
+            // Ranking narrows the candidates; without embeddings (or on an
+            // embedding failure) every candidate is used, so retrieval can never
+            // cost an agent its declared skills.
+            let kept_ids: Vec<String> = match self
+                .rank_skills(
+                    agent,
+                    &candidate_skill_ids,
+                    agent.config.skills.as_slice(),
+                    project_path.as_deref(),
+                )
+                .await
+            {
+                Ok(kept) => kept,
+                Err(err) => {
+                    tracing::warn!(error = %err, "skill ranking failed; using all candidates");
+                    candidate_skill_ids.clone()
+                }
+            };
+
+            let selected_skills = kept_ids
                 .iter()
                 .filter_map(|skill_id| {
                     if let Some(project_path) = &project_path {
                         self.skill_manager
-                            .get_skill_for_project(skill_id, Path::new(project_path))
+                            .resolve_for_project(skill_id, Path::new(project_path))
                     } else {
                         self.skill_manager.get_skill(skill_id)
                     }
@@ -334,12 +365,11 @@ impl ContextEnricher {
                     60,
                 ));
             }
-        }
-
-        // 5. Context Files (Lowest priority)
-        for file_path in &agent.config.context_files {
-            if let Ok(content) = std::fs::read_to_string(file_path) {
-                sections.push((format!("\n## Context: {}\n{}", file_path, content), 50));
+            // 5. Context Files (Lowest priority)
+            for file_path in &agent.config.context_files {
+                if let Ok(content) = std::fs::read_to_string(file_path) {
+                    sections.push((format!("\n## Context: {}\n{}", file_path, content), 50));
+                }
             }
         }
 
@@ -366,6 +396,65 @@ impl ContextEnricher {
 
         final_prompt
     }
+
+    /// Narrow candidate skills to the ones relevant to this agent and project.
+    ///
+    /// Returns the kept ids. Candidates that ranking dropped are logged with their
+    /// score rather than dropped silently.
+    async fn rank_skills(
+        &self,
+        agent: &Agent,
+        candidate_ids: &[String],
+        manual_ids: &[String],
+        project_path: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let Some(embeddings) = &self.embeddings else {
+            return Ok(candidate_ids.to_vec());
+        };
+
+        let catalog = match project_path {
+            Some(path) => self.skill_manager.list_skills_for_project(Path::new(path)),
+            None => self.skill_manager.list_skills(),
+        };
+        let catalog: Vec<crate::domain::models::Skill> = catalog
+            .into_iter()
+            .filter(|skill| candidate_ids.iter().any(|id| id == &skill.id))
+            .collect();
+        if catalog.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut index = SkillIndex::new(embeddings.clone());
+        index.build(&catalog, manual_ids).await?;
+
+        // Query text: what this agent is for, plus what the project is.
+        let profile = agent
+            .config
+            .context_project
+            .as_deref()
+            .map(|id| self.context_store.get_context_md(id))
+            .unwrap_or_default();
+        let query_text = format!("{}\n{}", agent.config.system_prompt, profile);
+        let query_text: String = query_text.chars().take(2000).collect();
+
+        // Ask for every candidate so ranking decides, not the cut.
+        let ranked = index.query(&query_text, candidate_ids.len().max(1)).await?;
+        let selection = apply_ranking(candidate_ids, &ranked, candidate_ids.len());
+
+        for dropped in &selection.dropped {
+            let score = ranked
+                .iter()
+                .find(|m| &m.id == &dropped.id)
+                .map(|m| m.score)
+                .unwrap_or(f32::NAN);
+            tracing::info!(
+                skill = %dropped.id,
+                score = %score,
+                "skill dropped by relevance ranking"
+            );
+        }
+        Ok(selection.selected)
+    }
 }
 
 #[cfg(test)]
@@ -380,8 +469,8 @@ mod tests {
         crate::core::paths::lock_env_for_tests()
     }
 
-    #[test]
-    fn build_system_prompt_should_include_agent_rules_and_selected_skills_only() {
+    #[tokio::test]
+    async fn build_system_prompt_should_include_agent_rules_and_selected_skills_only() {
         let _guard = lock_env();
         let temp_dir = tempfile::tempdir().unwrap();
         let previous_dir = std::env::current_dir().unwrap();
@@ -438,7 +527,7 @@ mod tests {
             },
         };
 
-        let prompt = enricher.build_system_prompt(&agent);
+        let prompt = enricher.build_system_prompt(&agent).await;
 
         assert!(prompt.contains("## Agent Rules"));
         assert!(prompt.contains("Always explain the risk"));

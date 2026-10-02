@@ -422,7 +422,7 @@ fn validate_agent_request(
             .and_then(|path| {
                 state
                     .skill_manager
-                    .get_skill_for_project(skill_id, FsPath::new(path))
+                    .resolve_for_project(skill_id, FsPath::new(path))
             })
             .or_else(|| state.skill_manager.get_skill(skill_id));
         if exists.is_none() {

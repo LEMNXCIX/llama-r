@@ -182,6 +182,7 @@ fn setup_app() -> TestApp {
         None,
         None,
         None,
+        None,
     );
     let router = build_router(state.clone());
     let grpc_service = GrpcService::new(state);
