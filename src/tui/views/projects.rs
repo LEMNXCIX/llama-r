@@ -33,15 +33,12 @@ pub fn render_projects(
         .split(body);
 
     // Title
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "Projects Management ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("(Tab to switch view)", Style::default().fg(Color::Gray)),
-    ]))
+    let title = Paragraph::new(Line::from(Span::styled(
+        "Projects Management ",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
@@ -367,8 +364,8 @@ pub fn render_agent_form(
                     }
                 }
 
-                let final_y =
-                    (chunks[7].y + 1 + y_offset as u16).min(chunks[7].y + chunks[7].height - 2);
+                let final_y = (chunks[7].y + 1 + y_offset as u16)
+                    .min(chunks[7].y + chunks[7].height.saturating_sub(2));
                 f.set_cursor_position((chunks[7].x + 1 + x_pos as u16, final_y));
             }
         }
@@ -391,15 +388,12 @@ pub fn render_analysis(f: &mut Frame, body: Rect, analysis_state: &AnalysisState
         .split(body);
 
     // Title
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "Project Analysis ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("(Esc to return)", Style::default().fg(Color::Gray)),
-    ]))
+    let title = Paragraph::new(Line::from(Span::styled(
+        "Project Analysis ",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
@@ -509,15 +503,12 @@ pub fn render_context(
         .split(body);
 
     // Title
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!(" Context: {project_id} "),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("(Esc to return)", Style::default().fg(Color::Gray)),
-    ]))
+    let title = Paragraph::new(Line::from(Span::styled(
+        format!(" Context: {project_id} "),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
@@ -653,8 +644,9 @@ pub fn render_skill_proposals(
         chunks[1],
     );
 
-    let footer = Paragraph::new("[Enter] approve  [a] approve all  [d] discard  [Esc] back")
-        .block(Block::default().borders(Borders::ALL));
+    // The approve/discard keys are in `TuiApp::hints_for` for the analysis
+    // view; this bordered row stays until the old chrome is deleted.
+    let footer = Paragraph::new("").block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
 }
 
@@ -669,11 +661,13 @@ mod tests {
     /// `f.area()` covers the bar's row, and the bar disappears.
     #[test]
     fn the_agent_form_leaves_the_bar_row_alone() {
-        let body = Rect::new(0, 1, 80, 22);
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        // Derived from the chrome rather than restated, so a change to `layout`
+        // is caught here too.
+        let area = Rect::new(0, 0, 80, 24);
+        let c = chrome::layout(area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         terminal
             .draw(|f| {
-                let c = chrome::layout(f.area());
                 chrome::render_bar(
                     f,
                     c.bar,
@@ -682,12 +676,12 @@ mod tests {
                     &Context::default(),
                     true,
                 );
-                render_agent_form(f, body, "ops", "ops", "llama3", "fudi", "", "", "", "", 0);
+                render_agent_form(f, c.body, "ops", "ops", "llama3", "fudi", "", "", "", "", 0);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let bar_row: String = (0..buffer.area.width)
-            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .map(|x| buffer[(x, c.bar.y)].symbol().to_string())
             .collect();
         // Only the bar writes these names; the form's own border title is
         // " Create/Edit Agent ", so matching on "Agent" would pass by accident.
@@ -696,7 +690,7 @@ mod tests {
             "the bar's row must survive the view: {bar_row:?}"
         );
         let first_body_row: String = (0..buffer.area.width)
-            .map(|x| buffer[(x, 1)].symbol().to_string())
+            .map(|x| buffer[(x, c.body.y)].symbol().to_string())
             .collect();
         assert!(
             first_body_row.contains('┌'),

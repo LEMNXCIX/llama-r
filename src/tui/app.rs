@@ -589,7 +589,7 @@ impl TuiApp {
             terminal.draw(|f| {
                 // The chrome owns the layout: the bar and footer come off the
                 // top and bottom, and views only ever see what is left.
-                let chrome = chrome::layout(f.area());
+                let c = chrome::layout(f.area());
                 let ctx = chrome::Context {
                     project: self
                         .state
@@ -601,7 +601,7 @@ impl TuiApp {
                 };
                 chrome::render_bar(
                     f,
-                    chrome.bar,
+                    c.bar,
                     &VIEW_NAMES,
                     self.current_view.index(),
                     &ctx,
@@ -609,12 +609,12 @@ impl TuiApp {
                 );
                 match self.current_view {
                     CurrentView::Dashboard => {
-                        render_dashboard(f, chrome.body, &self.state, self.log_scroll)
+                        render_dashboard(f, c.body, &self.state, self.log_scroll)
                     }
                     CurrentView::Projects => {
                         crate::tui::views::projects::render_projects(
                             f,
-                            chrome.body,
+                            c.body,
                             &self.state,
                             self.project_index,
                             self.agent_index,
@@ -624,7 +624,7 @@ impl TuiApp {
                     CurrentView::AgentForm => {
                         crate::tui::views::projects::render_agent_form(
                             f,
-                            chrome.body,
+                            c.body,
                             &self.form_id,
                             &self.form_name,
                             &self.form_model,
@@ -642,16 +642,12 @@ impl TuiApp {
                             .try_lock()
                             .map(|g| g.clone())
                             .unwrap_or(AnalysisState::Idle);
-                        crate::tui::views::projects::render_analysis(
-                            f,
-                            chrome.body,
-                            &analysis_state,
-                        );
+                        crate::tui::views::projects::render_analysis(f, c.body, &analysis_state);
                     }
                     CurrentView::ContextView => {
                         crate::tui::views::projects::render_context(
                             f,
-                            chrome.body,
+                            c.body,
                             &self.state,
                             self.project_index,
                             self.context_scroll,
@@ -671,7 +667,7 @@ impl TuiApp {
                         };
                         let (scroll_max, msg_rect) = render_chat(
                             f,
-                            chrome.body,
+                            c.body,
                             &messages,
                             &self.chat_input,
                             loading,
@@ -687,9 +683,9 @@ impl TuiApp {
                     }
                 }
                 if let Some((ref confirm_type, ref confirm_id)) = self.confirm_delete {
-                    render_confirm_delete(f, chrome.body, confirm_type, confirm_id);
+                    render_confirm_delete(f, c.body, confirm_type, confirm_id);
                 }
-                chrome::render_footer(f, chrome.footer, &self.hints_for(self.current_view.clone()));
+                chrome::render_footer(f, c.footer, &self.hints_for(self.current_view.clone()));
             })?;
 
             if event::poll(std::time::Duration::from_millis(50))? {
