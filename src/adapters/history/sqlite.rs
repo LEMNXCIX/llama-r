@@ -407,6 +407,11 @@ impl ConversationStore for SqliteConversationStore {
     }
 
     async fn purge_old_conversations(&self, retention_days: u32) -> Result<u64, String> {
+        // 0 means "never purge" (documented in .env.example / AGENTS.md).
+        // Without this guard the cutoff would be `now`, deleting every conversation.
+        if retention_days == 0 {
+            return Ok(0);
+        }
         let cutoff = chrono::Utc::now().timestamp() - (retention_days as i64 * 86_400);
         let conn = self
             .conn
@@ -612,6 +617,75 @@ mod tests {
                 ..AgentConfig::default()
             },
         }
+    }
+
+    #[tokio::test]
+    async fn purge_with_zero_retention_keeps_history() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("retention_zero.db");
+        let store = SqliteConversationStore::open(&db_path, "http://localhost:11434", "llama3.2")
+            .expect("Failed to open db");
+        let agent = make_test_agent("agent1", Some("projA"));
+
+        let conv = store
+            .append_user(None, &agent, "hello")
+            .await
+            .expect("append");
+        store
+            .append_assistant(Some(&conv), &agent, "hi")
+            .await
+            .expect("append");
+
+        // Age the row by 100 days so "never purge" is actually exercised:
+        // a zero-retention purge must not touch it.
+        let old_time = chrono::Utc::now().timestamp() - (100 * 86_400);
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+                params![old_time, conv],
+            )
+            .unwrap();
+        }
+
+        // retention_days = 0 must mean "never purge", not "delete everything".
+        let deleted = store.purge_old_conversations(0).await.expect("purge");
+        assert_eq!(deleted, 0, "retention 0 must not delete any conversation");
+
+        let after = store.get_conversation(&conv).await.expect("get");
+        assert!(
+            after.is_some(),
+            "conversation must survive a zero-retention purge"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_with_positive_retention_still_deletes_old() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("retention_positive.db");
+        let store = SqliteConversationStore::open(&db_path, "http://localhost:11434", "llama3.2")
+            .expect("Failed to open db");
+        let agent = make_test_agent("agent1", Some("projA"));
+
+        let old = store
+            .append_user(None, &agent, "hello")
+            .await
+            .expect("append");
+
+        // Age the row by 2 days so it is genuinely older than the 1-day cutoff.
+        let old_time = chrono::Utc::now().timestamp() - (2 * 86_400);
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+                params![old_time, old],
+            )
+            .unwrap();
+        }
+
+        let deleted = store.purge_old_conversations(1).await.expect("purge");
+        assert_eq!(deleted, 1, "a conversation older than 1 day must be purged");
+        assert!(store.get_conversation(&old).await.expect("get").is_none());
     }
 
     #[tokio::test]
