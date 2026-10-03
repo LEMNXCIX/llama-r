@@ -465,12 +465,18 @@ impl TuiApp {
                 ("d", "delete"),
                 ("q", "quit"),
             ],
+            // The form. `←/→` cycles the two fields that are not typed into (the model
+            // and the project) — the only way to change them. `Enter` says
+            // "newline in prompt" rather than "next field" because the prompt is
+            // the one field that can hold more than a line, and a user who
+            // believed it always advanced would never write a second line. Tab
+            // and Shift+Tab share a hint since they are one key's two directions.
             KeyTarget::View(CurrentView::AgentForm) => vec![
-                ("Tab", "field"),
-                ("Shift+Tab", "prev"),
-                ("Enter", "newline"),
+                ("Tab/⇧Tab", "field"),
+                ("←/→", "cycle"),
+                ("Enter", "newline in prompt"),
                 ("Ctrl+S", "save"),
-                ("Esc", "cancel"),
+                ("Esc", "back"),
             ],
             KeyTarget::View(CurrentView::Analysis) => {
                 vec![("Esc", "back"), ("r", "re-analyze")]
@@ -1423,7 +1429,9 @@ mod tests {
                 .map(|x| buffer[(x, 0)].symbol().to_string())
                 .collect();
 
-            // Measured from the hints, not from the row.
+            // Measured from the hints, not from the row: the row is 80 columns
+            // wide whatever was written into it, so measuring it there proves
+            // nothing.
             let width = hints
                 .iter()
                 .map(|(key, hint)| Line::from(format!("{key}: {hint}")).width() + 2)
@@ -1446,28 +1454,56 @@ mod tests {
         }
     }
 
-    /// The chat row has to keep the two hints the one-line input depends on:
-    /// `Shift+Enter: newline` is the only reason a multi-line prompt is still
-    /// composable, and `Esc: back` is the first thing the clip takes.
-    #[test]
-    fn the_chat_hints_keep_what_the_one_line_input_needs() {
-        let hints = TuiApp::hints_for(KeyTarget::View(CurrentView::Chat));
+    /// Rendered `target`'s footer row at 80 columns.
+    fn footer_row(target: KeyTarget) -> String {
+        let hints = TuiApp::hints_for(target);
         let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
         terminal
             .draw(|f| chrome::render_footer(f, f.area(), &hints))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let row: String = (0..buffer.area.width)
+        (0..buffer.area.width)
             .map(|x| buffer[(x, 0)].symbol().to_string())
-            .collect();
-        assert!(
-            row.contains("Esc: back"),
-            "the escape hint must survive the 80-column row: {row:?}"
-        );
-        assert!(
-            row.contains("Shift+Enter: newline"),
-            "the newline hint is the point of the one-line input: {row:?}"
-        );
+            .collect()
+    }
+
+    /// The rows that have to keep a specific hint, and what it costs to keep it.
+    ///
+    /// The general fit test above proves each row is complete; this says which
+    /// hints are load-bearing enough that losing one to a future trim is a bug
+    /// rather than a shortened row. Each pair is (screen, the hint it needs).
+    #[test]
+    fn the_rows_keep_the_hints_they_owe_the_user() {
+        for (target, key) in [
+            // Without this the one-line input's multi-line path is undiscoverable,
+            // which is what the design traded the input's rows for.
+            (KeyTarget::View(CurrentView::Chat), "Shift+Enter: newline"),
+            // `Esc` is the first thing a clip takes, and on these two rows it is
+            // the only way out of a screen you entered by a key.
+            (KeyTarget::View(CurrentView::Chat), "Esc: back"),
+            (KeyTarget::View(CurrentView::Analysis), "Esc: back"),
+            (KeyTarget::View(CurrentView::ContextView), "Esc: back"),
+            (KeyTarget::View(CurrentView::AgentForm), "Esc: back"),
+            // Without this, the multi-line prompt is undiscoverable in the form
+            // the same way it would be in the chat.
+            (
+                KeyTarget::View(CurrentView::AgentForm),
+                "Enter: newline in prompt",
+            ),
+            // The two screens whose keys belong to no view: the only place the
+            // user is told approve and discard exist, and the only place the
+            // agent list is reachable.
+            (KeyTarget::Proposals, "a: approve all"),
+            (KeyTarget::Proposals, "d: discard"),
+            (KeyTarget::ProjectAgents, "e: edit"),
+            (KeyTarget::ProjectAgents, "←/→: projects"),
+        ] {
+            let row = footer_row(target.clone());
+            assert!(
+                row.contains(key),
+                "{target:?} must still show {key:?}: {row:?}"
+            );
+        }
     }
 
     /// `AnalysisState::Proposals` is the only screen whose keys belong to no
