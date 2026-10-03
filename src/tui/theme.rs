@@ -33,8 +33,10 @@ pub fn action() -> Style {
     Style::default().fg(Color::Cyan)
 }
 
-/// The current selection. Bold is the only bold in the interface, so "bold"
-/// and "selected" mean the same thing everywhere.
+/// The current selection. The only bold *token*, so a bold row means "selected".
+/// A view may still add bold on top of one for a label — the analysis view does
+/// it for the `Error: ` prefix — which is a label the user has to read, not a row
+/// they can act on.
 pub fn active() -> Style {
     Style::default()
         .fg(Color::Yellow)

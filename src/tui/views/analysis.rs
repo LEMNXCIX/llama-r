@@ -60,6 +60,10 @@ pub fn render_analysis(f: &mut Frame, body: Rect, analysis_state: &AnalysisState
         }
         AnalysisState::Error(err) => {
             let failure = Paragraph::new(Line::from(vec![
+                // The one place a view adds bold on top of a `theme` token: the
+                // prefix labels a failure the user has to read, and `active`'s
+                // bold means "selected" everywhere else, so it cannot be reused
+                // for that. `theme::active()` is still the only bold *token*.
                 Span::styled("Error: ", theme::error().add_modifier(Modifier::BOLD)),
                 Span::styled(err.as_str(), theme::content()),
             ]))
