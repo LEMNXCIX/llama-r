@@ -29,13 +29,13 @@ const DOWN: &str = "○";
 /// is left answers the three questions a user lands here with: are the servers
 /// up, how much is configured, and what has happened since.
 ///
-/// Two things the bar does *not* carry, which a reader of this file would
-/// otherwise assume it does. Its dot is the HTTP listener's liveness
-/// (`api_running`, set just before `axum::serve` and cleared when it errors) —
-/// nothing in the TUI reports whether the provider answers. And the product's
-/// name is nowhere: `Llama-R` appears in no view. Restoring it belongs to the
-/// bar, not to a view that would otherwise repeat the banner this function
-/// deleted.
+/// One thing the bar does *not* carry, which a reader of this file would
+/// otherwise assume it does: its dot is the HTTP **listener's** liveness
+/// (`api_running`, set just before `axum::serve` and cleared when that call
+/// errors). Nothing in the TUI reports whether the provider answers. The bar
+/// does carry the product's name — as the answer to *what this is*, which the
+/// rest of the row cannot give — but that is `chrome`'s wording, not a title
+/// this view repeats.
 pub fn render_dashboard(f: &mut Frame, body: Rect, state: &AppState, log_scroll: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -219,6 +219,11 @@ mod tests {
     /// box are gone. `─` is deliberately left legal — it is the rule the
     /// redesign puts in their place — but a `Block` with borders draws the
     /// corners and the verticals, which nothing here may draw.
+    ///
+    /// The two rows are drawn separately, because "this view must not carry the
+    /// product's name" and "the product's name must appear somewhere in the
+    /// interface" are both true and only hold at different scopes: the bar's
+    /// row owns the name, and this view's body must not repeat it.
     #[test]
     fn dashboard_drops_the_title_banner_and_the_boxes() {
         let _env = crate::core::paths::lock_env_for_tests();
@@ -236,7 +241,7 @@ mod tests {
         );
         assert!(
             !text.contains("Llama-R"),
-            "the product banner must be gone: {text}"
+            "the product name belongs to the bar's row, not to this view's body: {text}"
         );
         // A view that draws nothing passes every absence check above, so the
         // status content and the rule that replaces the boxes are pinned too.

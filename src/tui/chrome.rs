@@ -22,8 +22,15 @@ pub const FOOTER_HEIGHT: u16 = 1;
 /// Blank columns between neighbouring parts of a line.
 const GAP: &str = "  ";
 
-/// Punctuation between view names. Not a border: it is the bar's own wording.
+/// Punctuation between the bar's groups. Not a border: it is the bar's own
+/// wording, and the spec's mockup shows it.
 const VIEW_JOIN: &str = " │ ";
+
+/// What this interface is called. It leads the bar because it answers the one
+/// question the rest of the row cannot: not *where you are* — the view names
+/// say that — but *what this is*. No view carries it, so the bar is where it
+/// lives.
+const PRODUCT: &str = "Llama-R";
 
 /// Marks text that did not fit.
 const ELLIPSIS: char = '…';
@@ -79,29 +86,33 @@ pub fn layout(area: Rect) -> Chrome {
     }
 }
 
-/// Draws the context bar: view names on the left with the active one bold, the
-/// context and the provider's health pushed to the right edge.
+/// Draws the context bar: the product's name, then the view names with the
+/// active one bold, then the context and the health dot at the right edge.
 ///
-/// The context group — label, gap, health dot — is what gives way when the row
-/// is too narrow: the label truncates from the right and ends in `…`. View
-/// names are never dropped.
+/// `api_running` is the HTTP **listener's** liveness, not the provider's: it is
+/// set immediately before `axum::serve` and cleared only when that call errors
+/// (`runtime.rs`). Nothing in the TUI reports whether the provider answers — the
+/// dashboard says so where a reader would otherwise assume the bar does.
+///
+/// The context group — label, gap, dot — is what gives way when the row is too
+/// narrow: the label truncates from the right and ends in `…`. Neither the view
+/// names nor the product's name is ever dropped.
 pub fn render_bar(
     f: &mut Frame,
     rect: Rect,
     views: &[&str],
     active: usize,
     ctx: &Context,
-    healthy: bool,
+    api_running: bool,
 ) {
     if rect.is_empty() {
         return;
     }
 
     let mut line = Line::default();
+    line.push_span(Span::styled(PRODUCT, theme::content()));
     for (index, name) in views.iter().enumerate() {
-        if index > 0 {
-            line.push_span(Span::styled(VIEW_JOIN, theme::chrome()));
-        }
+        line.push_span(Span::styled(VIEW_JOIN, theme::chrome()));
         let style = if index == active {
             theme::active()
         } else {
@@ -110,7 +121,7 @@ pub fn render_bar(
         line.push_span(Span::styled(*name, style));
     }
 
-    let health = if healthy {
+    let health = if api_running {
         Span::styled("●", theme::ok())
     } else {
         Span::styled("○", theme::error())
@@ -258,6 +269,92 @@ mod tests {
             !row.contains('┌') && !row.contains('┐') && !row.contains('└') && !row.contains('┘'),
             "the bar must not draw a border: {row:?}"
         );
+    }
+
+    /// The bar's job is *where you are*; the product's name answers the question
+    /// none of the rest of the row can — *what this is*. It used to come from the
+    /// dashboard's deleted banner, and with that gone the name was in no view at
+    /// all, which is a screen that never says what it is.
+    #[tokio::test]
+    async fn the_bar_leads_with_the_product_name() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                render_bar(
+                    f,
+                    f.area(),
+                    &["Dashboard", "Projects", "Chat"],
+                    0,
+                    &Context::default(),
+                    true,
+                )
+            })
+            .unwrap();
+        let row = row_text(&terminal.backend().buffer().clone(), 0);
+        assert!(
+            row.starts_with("Llama-R "),
+            "the name leads the bar: {row:?}"
+        );
+        // Ahead of the view names, not after them: a name at the end of a row
+        // that ends in the health dot is the first thing to be truncated, and it
+        // is the one thing that must never be.
+        assert!(
+            row.find("Llama-R") < row.find("Dashboard"),
+            "the name comes before the view names: {row:?}"
+        );
+    }
+
+    /// The name is part of what the bar never drops, so it survives a context too
+    /// long to fit — the same rule the view names are under.
+    #[tokio::test]
+    async fn the_product_name_survives_a_context_that_does_not_fit() {
+        let mut terminal = Terminal::new(TestBackend::new(50, 10)).unwrap();
+        let ctx = Context {
+            project: Some("un-proyecto-con-nombre-realmente-larguísimo".into()),
+            agent: Some("un-agente-igual-de-largo-y-que-no-cabe".into()),
+        };
+        terminal
+            .draw(|f| {
+                render_bar(
+                    f,
+                    f.area(),
+                    &["Dashboard", "Projects", "Chat"],
+                    0,
+                    &ctx,
+                    true,
+                )
+            })
+            .unwrap();
+        let row = row_text(&terminal.backend().buffer().clone(), 0);
+        assert!(row.contains("Llama-R"), "the name must survive: {row:?}");
+        assert!(row.contains('…'), "the context must give way: {row:?}");
+    }
+
+    /// The dot is the HTTP listener's liveness, and the doc comment above
+    /// `render_bar` says so. This pins the claim that it tracks the flag it is
+    /// given rather than anything the TUI works out for itself.
+    #[tokio::test]
+    async fn the_dot_follows_the_flag_it_is_given() {
+        for (api_running, expected) in [(true, "●"), (false, "○")] {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|f| {
+                    render_bar(
+                        f,
+                        f.area(),
+                        &["Dashboard", "Projects", "Chat"],
+                        0,
+                        &Context::default(),
+                        api_running,
+                    )
+                })
+                .unwrap();
+            let row = row_text(&terminal.backend().buffer().clone(), 0);
+            assert!(
+                row.contains(expected),
+                "api_running={api_running} must show {expected:?}: {row:?}"
+            );
+        }
     }
 
     #[test]

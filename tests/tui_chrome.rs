@@ -186,3 +186,32 @@ fn the_context_bar_never_draws_a_border() {
         );
     }
 }
+
+/// The product's name is in the bar and in no view. It went when the dashboard's
+/// banner went, and the spec's claim that the bar "does that job" is false: the
+/// bar draws view names, a context label and a health dot, which say where you
+/// are, not what this is.
+#[test]
+fn the_context_bar_names_the_product() {
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| {
+            llama_r::tui::chrome::render_bar(
+                f,
+                f.area(),
+                &["Dashboard", "Projects", "Chat"],
+                0,
+                &llama_r::tui::chrome::Context::default(),
+                true,
+            );
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let row: String = (0..buffer.area.width)
+        .map(|x| buffer[(x, 0)].symbol().to_string())
+        .collect();
+    assert!(
+        row.starts_with("Llama-R "),
+        "the bar must say what interface this is: {row:?}"
+    );
+}
