@@ -171,13 +171,19 @@ fn prompt_cursor(prompt: &str, area: Rect) -> (u16, u16) {
         // CJK one is two, and counting characters puts the caret in the wrong
         // place on exactly the prompts that have them.
         let line_width = Line::from(*line).width();
-        let wrapped = line_width.div_ceil(width);
         if index < lines.len() - 1 {
-            rows += wrapped + 1;
+            // Every row this line occupies, and nothing more: the hard newline
+            // does not spend a row of its own, it only puts the next line on the
+            // row after this one's last. Adding one here detaches the caret by a
+            // row for every newline already typed.
+            rows += line_width.div_ceil(width);
         } else {
-            // The last line's own final row is where the caret is, so only the
-            // rows *above* it are counted.
-            rows += wrapped.saturating_sub(1);
+            // The caret goes *after* the last character, and floor is what puts
+            // it there: `ceil - 1` is only the same when the line does not end
+            // exactly on a row boundary, and one that does — an 80-column system
+            // prompt on an 80-column terminal — would leave the caret sitting on
+            // the last character instead of past it.
+            rows += line_width / width;
             column = line_width % width;
         }
     }
@@ -290,8 +296,22 @@ mod tests {
         );
     }
 
+    /// `CYCLED_FIELD` is a bare index, and `app.rs` hardcodes the same numbering
+    /// against `PROMPT_INDEX` and `% 8`, so this is the pin that keeps the two
+    /// sides describing the same form. Reordering `FIELDS` without it would put
+    /// the caret in the wrong row, which nothing else here would notice.
+    #[test]
+    fn the_cycled_field_is_the_project_one() {
+        assert_eq!(FIELDS[CYCLED_FIELD], "Project Context");
+    }
+
     /// The values are a column: the eye reads them down, so they all have to
     /// start in the same place whatever the label above them is.
+    ///
+    /// The column is pinned against the widest label and the gap rather than
+    /// against `value_column`, so a helper that returned something else — a
+    /// column at 40, clipping every value — fails here instead of agreeing with
+    /// itself.
     #[test]
     fn the_field_values_line_up_in_a_column() {
         let buffer = render(0);
@@ -300,10 +320,11 @@ mod tests {
             .enumerate()
             .map(|(index, value)| column_of_or_panic(&buffer, row_of(index), value))
             .collect();
+        let expected = Line::from("Optimization Rules").width() + 2;
         assert_eq!(
             columns,
-            vec![value_column() as usize; FIELDS.len()],
-            "every value must start in the value column: {columns:?}"
+            vec![expected; FIELDS.len()],
+            "every value must start at the widest label plus the gap, column {expected}: {columns:?}"
         );
     }
 
@@ -398,17 +419,56 @@ mod tests {
         }
     }
 
-    /// A prompt with hard newlines counts them, so a caret on the fourth line
-    /// does not drift back towards the top as the prompt grows.
+    /// Each hard newline puts the next line on the row after the previous one, so
+    /// the caret follows the text down one row per newline and not one more.
+    ///
+    /// The rendered rows are read back as well: without them the caret could be
+    /// asserted against arithmetic that is wrong in the same direction as the
+    /// implementation and the test would agree with the bug.
     #[test]
     fn the_cursor_follows_the_newlines_in_the_prompt() {
-        let (_, caret) = draw_form("uno\ndos\ntres\ncuatro", PROMPT_INDEX);
+        let (buffer, caret) = draw_form("uno\ndos\ntres\ncuatro", PROMPT_INDEX);
         let prompt_row = row_of(PROMPT_INDEX + 2);
+        for (offset, line) in ["uno", "dos", "tres", "cuatro"].iter().enumerate() {
+            let row = row_text(&buffer, prompt_row + offset as u16);
+            assert_eq!(
+                row.trim_end(),
+                *line,
+                "`{line}` must be on row {offset} of the prompt: {row:?}"
+            );
+        }
         assert_eq!(
             caret,
-            (6, prompt_row + 6),
-            "the caret must sit after `cuatro`, on the seventh row: three hard \
-             newlines plus the row each of the three lines before it took"
+            (6, prompt_row + 3),
+            "the caret must sit after `cuatro`, on the row it rendered on"
+        );
+    }
+
+    /// A final line that exactly fills the row leaves the caret on the next row
+    /// at column 0: "after the last character" is the start of the row below, and
+    /// that is where a terminal puts it too.
+    ///
+    /// The rows are read back first so the `+1` means something: the prompt
+    /// occupies exactly one row, and the caret is the row past it.
+    #[test]
+    fn the_cursor_sits_after_a_final_line_that_exactly_fills_the_row() {
+        let full_row = "x".repeat(80);
+        let (buffer, caret) = draw_form(&full_row, PROMPT_INDEX);
+        let prompt_row = row_of(PROMPT_INDEX + 2);
+        assert_eq!(
+            row_text(&buffer, prompt_row).trim_end(),
+            full_row,
+            "the prompt must fill the row exactly"
+        );
+        assert_eq!(
+            row_text(&buffer, prompt_row + 1).trim_end(),
+            "",
+            "and stop there: nothing wrapped onto the next row"
+        );
+        assert_eq!(
+            caret,
+            (0, prompt_row + 1),
+            "the caret must sit past the last character, not on it"
         );
     }
 
