@@ -87,28 +87,38 @@ fn names_a_key(line: &str) -> bool {
         return true;
     }
 
-    // `[key]` counts only when a hint follows it, so indexing (`chunks[2]`,
-    // `values[index]`) and array types (`[&str; 7]`) are not mistaken for one.
+    bracket_hint(line)
+}
+
+/// `[key] what it does`, the second spelling this codebase has used.
+///
+/// Deliberately narrow: a hint is a bracketed token of at most twelve characters
+/// followed by words. That keeps indexing (`chunks[2]`, `values[index]`), array
+/// types (`[&str; 7]`) and empty brackets (`vec![]`) out of it, so the check
+/// fires on a hint and not on Rust's punctuation.
+fn bracket_hint(line: &str) -> bool {
     let chars: Vec<char> = line.chars().collect();
     chars.iter().enumerate().any(|(start, ch)| {
         if *ch != '[' {
             return false;
         }
-        let inner: String = chars
+        let close = match chars[start + 1..]
             .iter()
-            .skip(start + 1)
-            .take_while(|c| **c != ']')
-            .take(8)
-            .collect();
-        !inner.is_empty()
-            && inner.chars().all(|c| !c.is_whitespace())
-            && inner.chars().any(|c| c.is_alphanumeric())
+            .position(|c| *c == ']')
+            .filter(|offset| *offset <= 12)
+        {
+            Some(offset) => start + 1 + offset,
+            None => return false,
+        };
+        let key: String = chars[start + 1..close].iter().collect();
+        !key.is_empty()
+            && key.chars().all(|c| !c.is_whitespace())
+            && key.chars().any(|c| c.is_alphanumeric())
+            // A word follows: `[Esc] Cancel` is a hint, `chunks[2],` is not.
             && chars
-                .get(start + 2 + inner.chars().count())
+                .get(close + 1)
                 .is_some_and(|after| after.is_whitespace())
-            && chars
-                .get(start + 4 + inner.chars().count())
-                .is_some_and(|hint| *hint != ' ')
+            && chars[close + 2..].iter().any(|c| !c.is_whitespace())
     })
 }
 
@@ -192,6 +202,28 @@ fn every_view_renders_inside_the_body_without_a_box() {
                     &llama_r::tui::app::AnalysisState::Loading {
                         started_at: std::time::Instant::now(),
                     },
+                )
+            }),
+        ),
+        (
+            "analysis · loaded",
+            Box::new(|f: &mut Frame, body: Rect| {
+                render_analysis(
+                    f,
+                    body,
+                    &llama_r::tui::app::AnalysisState::Loaded(
+                        "# Reglas\n- hablar en español\n- no inventar".to_string(),
+                    ),
+                )
+            }),
+        ),
+        (
+            "analysis · error",
+            Box::new(|f: &mut Frame, body: Rect| {
+                render_analysis(
+                    f,
+                    body,
+                    &llama_r::tui::app::AnalysisState::Error("se rompió el análisis".to_string()),
                 )
             }),
         ),
@@ -345,6 +377,78 @@ fn no_view_hard_codes_a_key_hint() {
             );
         }
     }
+}
+
+/// The key-hint check has to fire on the two strings it was written for, and on
+/// nothing the views legitimately contain. Without this, a detector that matched
+/// no hint at all would leave `no_view_hard_codes_a_key_hint` passing for the
+/// wrong reason — a guard that cannot fail is not a guard.
+#[test]
+fn the_key_hint_check_spots_a_hint_and_spares_the_rest() {
+    // The two spellings that shipped in views before this file existed.
+    assert!(
+        names_a_key("\"Press 'a' on a project to start analysis\","),
+        "the prose form must be caught"
+    );
+    assert!(
+        names_a_key(" \" [y] Yes   [n] No   [Esc] Cancel\","),
+        "the bracketed form must be caught"
+    );
+    assert!(
+        names_a_key(" \"[Enter] approve  [a] approve all  [d] discard\","),
+        "the old proposals footer must be caught"
+    );
+
+    // What the views actually contain: Rust's punctuation and doc prose. Each of
+    // these appears in a view file today.
+    for innocent in [
+        "chunks[2],",
+        "    let values = [id, name, model, project_id];",
+        "const FIELDS: [&str; 7] = [",
+        "    f.render_widget(List::new(items), chunks[0]);",
+        "/// The subscriber writes `[12:00:02] ERROR message`, so the level comes first —",
+        "/// [`theme::action`], so where the user is typing is a colour rather than a",
+        "    _available_agents: &[String],",
+    ] {
+        assert!(
+            !names_a_key(innocent),
+            "{innocent:?} is not a key hint and must not be reported as one"
+        );
+    }
+
+    // A doc comment is not shipped code: a view may name the hint it used to
+    // have in a comment explaining why it does not.
+    assert!(
+        !names_a_key("    // no longer says Press 'a' to analyze"),
+        "a comment is not the interface"
+    );
+}
+
+/// The border check fires on each spelling of asking ratatui for one, and on the
+/// whole-source case: a view that draws its own corners does not have to write
+/// `Borders::` to violate the rule the buffer checks enforce.
+#[test]
+fn the_border_check_spots_every_spelling() {
+    for ask in [
+        "    .block(Block::default().borders(Borders::ALL))",
+        "    let block = Block::default().bordered();",
+        "    .border_type(BorderType::Plain)",
+    ] {
+        assert_eq!(
+            border_ask(ask),
+            Some(
+                ["Borders::", ".borders(", ".bordered(", ".border_type("]
+                    .into_iter()
+                    .find(|needle| ask.contains(needle))
+                    .unwrap()
+            ),
+            "{ask:?} asks for a border and must be reported"
+        );
+    }
+    assert_eq!(
+        border_ask("    f.render_widget(Paragraph::new(line), rect);"),
+        None
+    );
 }
 
 /// Borders are for the two modals. Everything else frames content with type and
