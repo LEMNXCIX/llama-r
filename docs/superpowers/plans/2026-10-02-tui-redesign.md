@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Visual direction is **C — dZen minimal**: one-line context bar, thin `─` separators, **no boxes** except the chat input area and modal dialogs.
+- Visual direction is **C — dZen minimal**: one-line context bar, thin `─` separators, **no boxes** except the modal dialogs. (An earlier revision of this line also allowed the chat input area. Task 4 replaces the 3-row bordered input box with a prompt marker, and nothing else in the interface is permitted a border — so the allowance went with the box.)
 - The context bar is exactly **1 row**, with **no border**.
 - The context bar always shows the active view and the current project/agent; this is the fix for context loss between views.
 - Each view declares its own key hints; the chrome renders the footer. No view may hard-code hint text.
@@ -129,7 +129,7 @@ git commit -m "feat(tui): add theme tokens with fixed semantic meaning"
   - `pub struct Context { pub project: Option<String>, pub agent: Option<String> }`
   - `pub const BAR_HEIGHT: u16 = 1;` and `pub const FOOTER_HEIGHT: u16 = 1;`
   - `pub fn layout(area: Rect) -> Chrome`
-  - `pub fn render_bar(f: &mut Frame, rect: Rect, views: &[&str], active: usize, ctx: &Context, healthy: bool)`
+  - `pub fn render_bar(f: &mut Frame, rect: Rect, views: &[&str], active: usize, ctx: &Context, api_running: bool)` — `api_running`, not `healthy`: the dot is the HTTP *listener's* liveness, and a parameter called `healthy` is how a reader comes to believe it reports the provider.
   - `pub fn render_footer(f: &mut Frame, rect: Rect, hints: &[(&str, &str)])`
   - `pub fn separator(f: &mut Frame, rect: Rect)`
   - `pub fn context_label(ctx: &Context) -> String` — `"fudi/ops"`, `"fudi"`, `"ops"`, or `"direct"`.
@@ -209,7 +209,15 @@ And Review Focus 1 and 2:
         let row = row_text(&buffer, 0);
         assert!(row.contains("Dashboard"), "view names must survive: {row:?}");
         assert!(row.contains('…'), "the long context must be truncated: {row:?}");
-        assert_eq!(row.chars().count(), 50, "the bar must stay on one row");
+        // Not `row.chars().count() == 50`: `row_text` returns one symbol per column
+        // and the buffer is 50 wide, so that holds for every implementation. What
+        // the one-row rule actually forbids is the bar spilling onto row 1.
+        assert_eq!(
+            row_text(&buffer, 1).trim(),
+            "",
+            "the bar must stay on one row: {:?}",
+            row_text(&buffer, 1)
+        );
     }
 
     #[tokio::test]
@@ -241,7 +249,7 @@ Implement, in order:
 - `BAR_HEIGHT`/`FOOTER_HEIGHT` as `u16 = 1`.
 - `Chrome` with three `Rect` fields, and `layout(area)` returning bar at `(area.x, area.y, area.width, BAR_HEIGHT)`, footer pinned to the last row, and body as the rows between. Use `saturating_sub` on every subtraction so a short terminal clamps to zero rather than wrapping.
 - `Context` deriving `Default`, plus `context_label`.
-- `render_bar` — one `Line` of spans: view names joined by `" │ "` in `chrome()`, the active one in `active()`; a spacer; the context label in `chrome()`; `●`/`○` in `ok()`/`error()`. **Truncation rule:** build the full line; if its width exceeds `rect.width`, drop trailing context characters until it fits, appending `…`. View names are never dropped. Compute widths with `Line::width()`, never `chars().count()` (Review Focus 3).
+- `render_bar` — one `Line` of spans: view names joined by `" │ "` in `chrome()`, the active one in `active()`; a spacer; the context label in `chrome()`; `●`/`○` in `ok()`/`error()`. **Truncation rule:** fit *the context label only*, shortening it from the right and ending it in `…`; hand the assembled line to a `Paragraph`, which does not wrap and clips at `rect.width`. Nothing is dropped selectively — past the cut, the gap, then the dot, then the last view names go, and the product's name is the last thing the cut reaches rather than a thing it never reaches. (An earlier revision of this rule said "view names are never dropped", which the clip falsifies: the six shipped names need 66 columns and the group needs three more, so the dot needs 69 before the label has a column of its own. Pin that width — `the_dot_needs_sixty_nine_columns_before_the_label_gets_one` in `src/tui/chrome.rs` does.) Compute widths with `Line::width()`, never `chars().count()` (Review Focus 3).
 - `render_footer` — a `Line` of `key: hint` pairs, keys in `action()`, hints in `chrome()`.
 - `separator` — a `Line` of `─` filling `rect.width`, in `chrome()`.
 
@@ -360,7 +368,7 @@ git commit -m "refactor(tui): give views a body rect so the shared bar survives"
 
 **Interfaces:**
 - Consumes: `chrome::{render_footer, separator}`, `theme`, `body: Rect` from Task 3.
-- Produces: `chat::input_display(buffer: &str, width: u16) -> String` — the last line of a possibly multi-line buffer, truncated to `width` (Review Focus 4). Chat renders no bordered block except the input area.
+- Produces: `chat::input_display(buffer: &str, width: u16) -> String` — the last line of a possibly multi-line buffer, truncated to `width` (Review Focus 4). Chat renders no bordered block at all, the input area included.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -380,7 +388,9 @@ mod tests {
     #[test]
     fn input_display_truncates_to_the_available_width() {
         let shown = input_display("abcdefghij", 5);
-        assert!(shown.chars().count() <= 5, "{shown:?}");
+        // Display width, not `chars().count()`: the two differ on any name with an
+        // accent or a wide glyph, and only the first one is what a column is.
+        assert!(ratatui::text::Line::from(shown.as_str()).width() <= 5, "{shown:?}");
     }
 
     #[test]
@@ -405,7 +415,8 @@ mod tests {
         }).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let text = all_text(&buffer);
-        // The only permitted box characters are the input area's.
+        // No box characters anywhere: the input area has none either, so there is
+        // nothing to except.
         for ch in ['┌', '┐', '└', '┘', '│'] {
             assert!(!text.contains(ch), "chat must not draw box char {ch:?}");
         }
@@ -493,7 +504,11 @@ fn projects_renders_an_empty_state_instead_of_a_bare_divider() {
 
 And the alignment guard (Review Focus 3). This is the test that fails if the padding
 uses `chars().count()` instead of display width — `clinica` has 8 cells, `日本語` has 6
-cells but 3 chars:
+cells but 3 chars. `str::find` answers in *bytes*, and a CJK glyph is three of them, so
+the offset is converted to a character index and read back as a terminal column; a byte
+offset would travel with the glyph and report the column that glyph is in, which is
+the opposite of the question being asked. The scan stops at the separator, or the
+agent list's own ` agentes de fudi` label answers the needle instead:
 
 ```rust
 #[test]
@@ -504,8 +519,13 @@ fn the_agent_count_column_aligns_with_multibyte_names() {
     let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|f| render_projects(f, Rect::new(0, 1, 80, 22), &state, 0, 0, true)).unwrap();
     let buffer = terminal.backend().buffer().clone();
-    let columns: Vec<usize> = (0..buffer.area.height)
-        .filter_map(|y| row_text(&buffer, y).find("agentes"))
+    // `column_of(buffer, y, needle)` — the terminal column `needle` starts on
+    // row `y`, in display columns rather than byte offsets.
+    let projects_end = (0..buffer.area.height)
+        .find(|y| row_text(&buffer, *y).contains('─'))
+        .unwrap();
+    let columns: Vec<usize> = (0..projects_end)
+        .filter_map(|y| column_of(&buffer, y, "agente"))
         .collect();
     assert_eq!(columns.len(), 3, "each project row must show a count: {columns:?}");
     assert!(
@@ -514,6 +534,10 @@ fn the_agent_count_column_aligns_with_multibyte_names() {
     );
 }
 ```
+
+`column_of` belongs in the shared test helpers (`src/tui/views/test_helpers.rs`), not
+copied per module: it is the only place the byte-offset-to-column conversion lives, and
+two copies of it would be two places to get wrong.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -579,7 +603,7 @@ fn analysis_proposals_render_without_borders() {
 }
 ```
 
-`│` is permitted here only on the separator line.
+Separator rules are `─`, not `│`: `│` is the context bar's own joiner between view names and belongs to no view.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
