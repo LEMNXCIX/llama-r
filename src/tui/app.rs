@@ -224,6 +224,43 @@ fn focus_after_agent_delete() -> bool {
     true
 }
 
+/// The project and agent the context bar names.
+///
+/// **The agent's own project, not the projects view's selection.** They are
+/// unrelated state — the chat's agent selector walks every agent in the
+/// registry, the projects view walks its own projects — so reading one half from
+/// each produced `clinica/nutricion`: an agent belonging to a different project,
+/// which is the one pair [`crate::tui::chrome::context_label`] exists to rule out.
+/// Two projects can register an agent with the same id, so showing the project is
+/// what makes a selection unambiguous, and a bar that pairs halves from two
+/// sources makes it ambiguous again.
+///
+/// The fallback is the projects view's own selection, because with no agent in
+/// scope there is nothing to disambiguate. A *global* agent has no project at
+/// all, so the bar names it alone rather than pairing it with whichever project
+/// happened to be selected.
+///
+/// A free function for the reason the rest are: the pair is a decision about
+/// state, and a decision reached inside the draw closure cannot be checked by
+/// anything but a terminal.
+fn bar_context(
+    projects_selection: Option<String>,
+    agent_selection: Option<String>,
+    agent_project: Option<String>,
+) -> chrome::Context {
+    let project = match (agent_selection.is_some(), agent_project) {
+        (true, Some(project)) => Some(project),
+        // A global agent belongs to no project, so the project's half is absent
+        // rather than borrowed from an unrelated selection.
+        (true, None) => None,
+        (false, _) => projects_selection,
+    };
+    chrome::Context {
+        project,
+        agent: agent_selection,
+    }
+}
+
 pub struct TuiApp {
     state: Arc<AppState>,
     current_view: CurrentView,
@@ -792,15 +829,17 @@ impl TuiApp {
                 // The chrome owns the layout: the bar and footer come off the
                 // top and bottom, and views only ever see what is left.
                 let c = chrome::layout(f.area());
-                let ctx = chrome::Context {
-                    project: self
-                        .state
+                // The two halves come from one decision, not from two screens'
+                // state: see `bar_context`.
+                let ctx = bar_context(
+                    self.state
                         .context_store
                         .list_all_projects()
                         .get(self.project_index)
                         .map(|p| p.project_id.clone()),
-                    agent: self.chat_selected_agent.clone(),
-                };
+                    self.chat_selected_agent.clone(),
+                    self.chat_selected_project.clone(),
+                );
                 // Read once, for the view and for the footer: the footer has to
                 // answer for the analysis state as well as the view, or the
                 // proposal modal's keys are on no row at all.
@@ -1643,6 +1682,80 @@ mod tests {
         (0..buffer.area.width)
             .map(|x| buffer[(x, 0)].symbol().to_string())
             .collect()
+    }
+
+    /// The scope the bar renders for these three selections.
+    fn bar_label(
+        projects_selection: Option<&str>,
+        agent: Option<&str>,
+        agent_project: Option<&str>,
+    ) -> String {
+        chrome::context_label(&bar_context(
+            projects_selection.map(str::to_string),
+            agent.map(str::to_string),
+            agent_project.map(str::to_string),
+        ))
+    }
+
+    /// **The bar may not name a pair that does not exist.** An agent in scope
+    /// brings its own project with it, whatever the projects view happens to have
+    /// selected — the two are unrelated state, and reading one half from each
+    /// produced `clinica/nutricion`: an agent of one project under another's
+    /// name. Two projects can register an agent with the same id, which is why
+    /// the project half is there at all, so a bar that gets it wrong is worse
+    /// than the ambiguity it exists to remove.
+    #[test]
+    fn the_bar_pairs_an_agent_with_its_own_project() {
+        // The repro: chat, `→` to `fudi`'s `nutricion`, then Tab to the projects
+        // view and move its selection to `clinica`. Nothing about the agent
+        // changes, so nothing about its project may change either.
+        assert_eq!(
+            bar_label(Some("clinica"), Some("nutricion"), Some("fudi")),
+            "fudi/nutricion",
+            "the agent's own project is the one that names it, not the projects view's selection"
+        );
+        // And the move in the other direction, which is the same pair.
+        assert_eq!(
+            bar_label(Some("fudi"), Some("nutricion"), Some("fudi")),
+            "fudi/nutricion",
+            "a selection that agrees changes nothing about the reading"
+        );
+        // Two projects, two agents with the same id: the pair is what tells them
+        // apart, so the labels must differ.
+        assert_ne!(
+            bar_label(Some("clinica"), Some("soporte"), Some("fudi")),
+            bar_label(Some("clinica"), Some("soporte"), Some("clinica")),
+            "two projects with an agent of the same id must not render the same"
+        );
+    }
+
+    /// The other three readings, so the pairing rule above is not a rule that
+    /// happens to hold for one case: a global agent has no project to name, and
+    /// with no agent in scope the projects view's own selection is the scope.
+    #[test]
+    fn the_bar_names_a_global_agent_without_borrowing_a_project() {
+        assert_eq!(
+            bar_label(Some("clinica"), Some("notificador"), None),
+            "notificador",
+            "a global agent belongs to no project, so the project's half is absent"
+        );
+        assert_eq!(
+            bar_label(Some("clinica"), None, None),
+            "clinica",
+            "with no agent in scope the selected project is the scope"
+        );
+        assert_eq!(
+            bar_label(None, None, None),
+            "direct",
+            "with neither, the scope says so"
+        );
+        // The stale half is ignored rather than believed: a project left over from
+        // an agent that no longer exists must not resurface under nothing.
+        assert_eq!(
+            bar_label(Some("clinica"), None, Some("fudi")),
+            "clinica",
+            "with no agent in scope there is no agent project to prefer"
+        );
     }
 
     /// The rows that have to keep a specific hint, and what it costs to keep it.

@@ -1,21 +1,3 @@
-/// Build the chat header's agent label.
-///
-/// Two projects can register an agent with the same id, so showing the project
-/// is what makes the selection unambiguous.
-///
-/// The chat no longer draws its own header: [`crate::tui::chrome`]'s context
-/// bar carries project and agent now. Kept because the wording is the
-/// reference for how a scope reads, and the bar's context label is tested
-/// against the same ambiguity.
-#[allow(dead_code)]
-pub fn agent_header_label(agent: Option<&str>, project: Option<&str>) -> String {
-    match (agent, project) {
-        (None, _) => " Direct (no agent) ".to_string(),
-        (Some(id), None) => format!(" Agent: {id} · Project: — "),
-        (Some(id), Some(project)) => format!(" Agent: {id} · Project: {project} "),
-    }
-}
-
 /// Braille spinner frames, shared by the chat and analysis loaders.
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -415,41 +397,6 @@ mod tests {
             3,
             "moving the body down 3 rows must move the messages rect down 3: \
              {at_top:?} then {lower:?}"
-        );
-    }
-
-    #[test]
-    fn header_shows_project_next_to_agent() {
-        let label = agent_header_label(Some("soporte"), Some("fudi"));
-        assert!(label.contains("soporte"), "{label}");
-        assert!(
-            label.contains("fudi"),
-            "the project must be shown so same-named agents are distinguishable: {label}"
-        );
-    }
-
-    #[test]
-    fn header_marks_global_agents() {
-        let label = agent_header_label(Some("notificador"), None);
-        assert!(label.contains("notificador"), "{label}");
-        assert!(
-            label.contains("Project"),
-            "a global agent still needs a project slot, marked as none: {label}"
-        );
-    }
-
-    #[test]
-    fn header_without_agent_says_so() {
-        assert!(agent_header_label(None, Some("fudi")).contains("no agent"));
-    }
-
-    #[test]
-    fn header_distinguishes_same_named_agents_from_different_projects() {
-        let a = agent_header_label(Some("soporte"), Some("fudi"));
-        let b = agent_header_label(Some("soporte"), Some("clinica"));
-        assert_ne!(
-            a, b,
-            "two projects with an agent of the same id must render differently"
         );
     }
 
