@@ -220,10 +220,11 @@ mod tests {
     /// redesign puts in their place — but a `Block` with borders draws the
     /// corners and the verticals, which nothing here may draw.
     ///
-    /// The two rows are drawn separately, because "this view must not carry the
-    /// product's name" and "the product's name must appear somewhere in the
-    /// interface" are both true and only hold at different scopes: the bar's
-    /// row owns the name, and this view's body must not repeat it.
+    /// The absence check and the name being back on the bar are both true, at
+    /// different scopes: `render` draws this view into a body starting at row 1,
+    /// so the name the bar now carries is not in this buffer, and the banner must
+    /// stay gone from the body. `chrome::tests::the_bar_leads_with_the_product_name`
+    /// is where the name is pinned.
     #[test]
     fn dashboard_drops_the_title_banner_and_the_boxes() {
         let _env = crate::core::paths::lock_env_for_tests();

@@ -350,9 +350,17 @@ mod tests {
                 })
                 .unwrap();
             let row = row_text(&terminal.backend().buffer().clone(), 0);
+            // Both marks, and only the right one: a row showing both would mean
+            // something on the screen is contributing a mark the flag does not
+            // account for, which is the whole claim this test exists to pin.
             assert!(
                 row.contains(expected),
                 "api_running={api_running} must show {expected:?}: {row:?}"
+            );
+            let absent = if api_running { '○' } else { '●' };
+            assert!(
+                !row.contains(absent),
+                "api_running={api_running} must not show {absent:?}: {row:?}"
             );
         }
     }
