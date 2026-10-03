@@ -18,6 +18,12 @@
 //! hard-coded hint (`Press 'a'` and `[Enter] approve`) and for any request to
 //! ratatui for a border. A new spelling slips through, which is why the doc
 //! comment on each check says what it covers.
+//!
+//! Rule 2 has a second detector, because the prose heuristic misses the shape it
+//! was written for: the idiomatic way to draw a hint is a `chrome::render_footer`
+//! call with the hints as data, and `&[("a", "analyze")]` matches neither
+//! spelling. So `only_the_dispatch_draws_the_footer` asserts the property the
+//! heuristic cannot reach — there is exactly one footer in the TUI.
 
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -423,6 +429,119 @@ fn fixture_state(dir: &std::path::Path) -> std::sync::Arc<llama_r::api::handlers
         None,
         None,
     )
+}
+
+/// Every `.rs` file under `src/tui`, with the path it was read from, trimmed to
+/// its shipped code.
+///
+/// Recursive, and not the `views/` list plus `app.rs`, because the thing being
+/// guarded here is *one call site in the whole TUI*: a second footer anywhere
+/// under `src/tui` is the violation, wherever it lives.
+fn tui_modules() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui");
+    let mut found = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in
+            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.extension().is_some_and(|ext| ext == "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let name = path
+                .strip_prefix(&root)
+                .expect("a file under the root")
+                .display()
+                .to_string();
+            found.push((name, source));
+        }
+    }
+    found.sort();
+    assert!(
+        !found.is_empty(),
+        "no modules found under {} — the walk found nothing, so this check would \
+         pass for the wrong reason",
+        root.display()
+    );
+    found
+}
+
+/// Whether `line` *calls* `render_footer` rather than declaring it.
+fn footer_call(line: &str) -> bool {
+    if !line.contains("render_footer(") {
+        return false;
+    }
+    let trimmed = line.trim_start();
+    !(trimmed.starts_with("fn ")
+        || trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("pub(crate) fn "))
+}
+
+/// One footer, drawn once, by the dispatch.
+///
+/// `names_a_key` cannot see a second one, and the bypass is the idiomatic
+/// spelling: `chrome::render_footer(f, rect, &[("a", "analyze")])` matches
+/// neither `press '` nor a `[key] word`, because the hints arrive as data. So a
+/// view can draw its own footer beside the shared one, advertise a key its own
+/// handler never answers, and pass every other check in this file — which is the
+/// violation that produced Task 3's Important finding.
+///
+/// The count is asserted rather than the set, so the message names the second
+/// site instead of only failing on a number.
+#[test]
+fn only_the_dispatch_draws_the_footer() {
+    let mut calls: Vec<String> = Vec::new();
+    for (name, source) in tui_modules() {
+        for (number, line) in shipped(&source).lines().enumerate() {
+            if footer_call(line) {
+                calls.push(format!("src/tui/{name}:{}", number + 1));
+            }
+        }
+    }
+    assert_eq!(
+        calls.len(),
+        1,
+        "the key hints are drawn once, by `TuiApp::run`, and every other call \
+         site is a second footer naming keys nothing answers: {calls:?}"
+    );
+    assert!(
+        calls[0].starts_with("src/tui/app.rs:"),
+        "the shared footer belongs to the dispatch, which is the only place \
+         `hints_for` is reachable from: {calls:?}"
+    );
+}
+
+/// The footer check fires on the call it was written for and not on the
+/// declaration. Without this, `only_the_dispatch_draws_the_footer` would pass
+/// for a reason nobody chose.
+#[test]
+fn the_footer_check_spots_a_call_and_spares_the_declaration() {
+    assert!(
+        footer_call("                chrome::render_footer(f, c.footer, &hints);"),
+        "the dispatch's own call must be counted"
+    );
+    assert!(
+        footer_call("        f.render_widget(chrome::render_footer(f, r, &[(\"a\", \"x\")]), r);"),
+        "so must the one-liner a view would write"
+    );
+    assert!(
+        !footer_call("pub fn render_footer(f: &mut Frame, rect: Rect, hints: &[(&str, &str)]) {"),
+        "the declaration is not a second footer"
+    );
+    assert!(
+        !footer_call("    /// The row `render_footer` draws is one line, truncated."),
+        "nor is naming it in a doc comment"
+    );
+    assert!(!footer_call(
+        "    chrome::render_bar(f, c.bar, &names, 0, &context, true);"
+    ));
 }
 
 /// Key hints live in `hints_for` and nowhere else — including in `app.rs`, which
