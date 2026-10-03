@@ -26,11 +26,26 @@ const FIELDS: [&str; 7] = [
 
 /// The prompt is the only field that is more than a line, so it is not in
 /// `FIELDS`; it is the field after them.
-const PROMPT_INDEX: usize = FIELDS.len();
+///
+/// `pub` because the footer's hints follow it: `hints_for` reads the same number
+/// the handler compares against, so the two cannot disagree about which field
+/// `Enter` inserts a newline in.
+pub const PROMPT_INDEX: usize = FIELDS.len();
 
 /// The project field is cycled with the arrow keys instead of being typed into,
 /// so it never holds the caret. Its index is the one `app.rs` cycles on.
 const CYCLED_FIELD: usize = 3;
+
+/// The fields the arrow keys cycle, in order: the model and the project.
+///
+/// The model is both cyclable *and* typeable — a caret there is right, since the
+/// arrows are only the quick way through a long list. The project is cyclable and
+/// nothing else, because `app.rs` drops the character it is given. Both are the
+/// fields whose value cannot be reached any other way.
+///
+/// `pub` for the same reason as [`PROMPT_INDEX`]: these are the fields
+/// `←/→: cycle` is true on, and the row that says so is built elsewhere.
+pub const CYCLES_WITH_ARROWS: [usize; 2] = [2, CYCLED_FIELD];
 
 /// Label of the prompt's own row.
 const PROMPT_LABEL: &str = "System Prompt";
@@ -215,6 +230,24 @@ mod tests {
     /// fields come before the rule and the prompt.
     fn row_of(index: usize) -> u16 {
         1 + index as u16
+    }
+
+    /// `CYCLES_WITH_ARROWS` and `PROMPT_INDEX` are read by the footer's hints in
+    /// `app.rs`, and both name fields *by index* — so a reordered `FIELDS` would
+    /// put `←/→: cycle` on two fields that do not cycle and take the newline hint
+    /// off the prompt, with nothing in this file to notice. Pinned by name: the
+    /// two are the model, cycled through the provider's list, and the project
+    /// context, not typed into at all, because those are the two whose value the
+    /// arrows are the only way to change.
+    #[test]
+    fn the_fields_the_arrows_cycle_are_the_model_and_the_project() {
+        assert_eq!(FIELDS[CYCLES_WITH_ARROWS[0]], "Model");
+        assert_eq!(FIELDS[CYCLES_WITH_ARROWS[1]], "Project Context");
+        assert_eq!(
+            PROMPT_INDEX,
+            FIELDS.len(),
+            "the prompt is the field after them, and only there does Enter insert a newline"
+        );
     }
 
     /// A distinguishable value per one-line field, so a test can tell one row's

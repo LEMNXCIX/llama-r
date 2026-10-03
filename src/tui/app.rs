@@ -71,6 +71,9 @@ enum KeyTarget {
     Proposals,
     /// The delete confirmation, drawn over whichever view opened it.
     DeleteConfirm,
+    /// The agent form, at a given field. Two of its keys mean different things
+    /// field by field, so the field index is part of what the row says.
+    AgentForm(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +116,7 @@ fn key_target(
     active_in_project_list: bool,
     analysis: &AnalysisState,
     projects_bounds: ListBounds,
+    form_field_index: usize,
     confirm_delete: bool,
 ) -> KeyTarget {
     // Checked first because it is the outermost interception in the event loop:
@@ -136,6 +140,12 @@ fn key_target(
         && projects_bounds.agent_rows > 0
     {
         return KeyTarget::ProjectAgents;
+    }
+    // The form's own keys are not one set: `Enter` and the arrows mean different
+    // things on different fields, so the field index is part of the target rather
+    // than a detail the handler keeps to itself.
+    if matches!(view, CurrentView::AgentForm) {
+        return KeyTarget::AgentForm(form_field_index);
     }
     KeyTarget::View(view.clone())
 }
@@ -627,19 +637,37 @@ impl TuiApp {
                 ("n", "new"),
                 ("q", "quit"),
             ],
-            // The form. `←/→` cycles the two fields that are not typed into (the model
-            // and the project) — the only way to change them. `Enter` says
-            // "newline in prompt" rather than "next field" because the prompt is
-            // the one field that can hold more than a line, and a user who
-            // believed it always advanced would never write a second line. Tab
-            // and Shift+Tab share a hint since they are one key's two directions.
-            KeyTarget::View(CurrentView::AgentForm) => vec![
-                ("Tab/⇧Tab", "field"),
-                ("←/→", "cycle"),
-                ("Enter", "newline in prompt"),
-                ("Ctrl+S", "save"),
-                ("Esc", "back"),
-            ],
+            // The form. Two of its keys change meaning field by field, so the row
+            // follows `form_field_index` rather than describing one field and
+            // hoping: `Enter` is "next field" on the seven one-line fields and a
+            // newline only in the prompt — the one field that can hold more than a
+            // line, where a user who believed it always advanced would never write
+            // a second one. The arrows only cycle the two fields that are not typed
+            // into (the model and the project), which is the only way to change
+            // them; anywhere else they are consumed by the form's own handler and
+            // do nothing. Tab and Shift+Tab share a hint since they are one key's
+            // two directions.
+            KeyTarget::AgentForm(field) => {
+                let prompt = field == crate::tui::views::agent_form::PROMPT_INDEX;
+                let cycled = crate::tui::views::agent_form::CYCLES_WITH_ARROWS.contains(&field);
+                vec![
+                    ("Tab/⇧Tab", "field"),
+                    ("←/→", "cycle"),
+                    (
+                        "Enter",
+                        if prompt {
+                            "newline in prompt"
+                        } else {
+                            "next field"
+                        },
+                    ),
+                    ("Ctrl+S", "save"),
+                    ("Esc", "back"),
+                ]
+                .into_iter()
+                .filter(|(key, _)| cycled || *key != "←/→")
+                .collect()
+            }
             KeyTarget::View(CurrentView::Analysis) => {
                 vec![("Esc", "back"), ("r", "re-analyze")]
             }
@@ -675,6 +703,11 @@ impl TuiApp {
             // interception is before the quit binding too. Naming what answers
             // the question is what makes the footer and the behaviour agree.
             KeyTarget::DeleteConfirm => vec![("y", "delete"), ("n", "cancel"), ("Esc", "cancel")],
+            // Unreachable through `key_target`, which resolves the form to
+            // `AgentForm(field)` above. Kept honest rather than merged into one of
+            // the other arms: this is the row that would name a false `Enter` on
+            // seven of the eight fields.
+            KeyTarget::View(CurrentView::AgentForm) => Self::hints_for(KeyTarget::AgentForm(0)),
         }
     }
 
@@ -853,6 +886,7 @@ impl TuiApp {
                     self.active_in_project_list,
                     &analysis,
                     self.project_list_bounds,
+                    self.form_field_index,
                     self.confirm_delete.is_some(),
                 ));
                 chrome::render_bar(
@@ -1590,11 +1624,13 @@ mod tests {
         ]
     }
 
-    /// `key_target` with the delete confirmation down.
+    /// `key_target` with the delete confirmation down and the form's caret at
+    /// field 0.
     ///
-    /// Every screen below is one with no dialog over it, and naming the fifth
-    /// axis here rather than at eight call sites is what keeps the argument list
-    /// honest: a test that wants the confirmation up calls `key_target`.
+    /// Every screen below is one with no dialog over it, and naming the two extra
+    /// axes here rather than at eight call sites is what keeps the argument list
+    /// honest: a test that wants the confirmation up, or a field, calls
+    /// `key_target`.
     fn keys_for(
         view: &CurrentView,
         active_in_project_list: bool,
@@ -1606,6 +1642,7 @@ mod tests {
             active_in_project_list,
             analysis,
             projects_bounds,
+            0,
             false,
         )
     }
@@ -1624,17 +1661,22 @@ mod tests {
     /// it.
     #[test]
     fn every_footer_fits_one_row_at_eighty_columns() {
-        let targets = [
+        // Every `KeyTarget` there is, and the form is listed at both of its field
+        // shapes — the two rows are different lengths, and a list that only had
+        // the longer one would leave the shorter untested.
+        let mut targets = vec![
             KeyTarget::View(CurrentView::Dashboard),
             KeyTarget::View(CurrentView::Projects),
             KeyTarget::ProjectAgents,
-            KeyTarget::View(CurrentView::AgentForm),
             KeyTarget::View(CurrentView::Analysis),
             KeyTarget::Proposals,
             KeyTarget::View(CurrentView::ContextView),
             KeyTarget::View(CurrentView::Chat),
             KeyTarget::DeleteConfirm,
         ];
+        for field in 0..=crate::tui::views::agent_form::PROMPT_INDEX {
+            targets.push(KeyTarget::AgentForm(field));
+        }
         for target in targets {
             let hints = TuiApp::hints_for(target.clone());
             let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
@@ -1774,13 +1816,17 @@ mod tests {
             (KeyTarget::View(CurrentView::Chat), "Esc: back"),
             (KeyTarget::View(CurrentView::Analysis), "Esc: back"),
             (KeyTarget::View(CurrentView::ContextView), "Esc: back"),
-            (KeyTarget::View(CurrentView::AgentForm), "Esc: back"),
-            // Without this, the multi-line prompt is undiscoverable in the form
-            // the same way it would be in the chat.
+            (KeyTarget::AgentForm(0), "Esc: back"),
+            // Without this the multi-line prompt is undiscoverable in the form
+            // the same way it would be in the chat — and it is named on the
+            // prompt field *only*, which is the field `Enter` inserts into.
             (
-                KeyTarget::View(CurrentView::AgentForm),
+                KeyTarget::AgentForm(crate::tui::views::agent_form::PROMPT_INDEX),
                 "Enter: newline in prompt",
             ),
+            // The arrows are the only way to change the two fields that are not
+            // typed into, so they have to be named on those.
+            (KeyTarget::AgentForm(2), "←/→: cycle"),
             // The two screens whose keys belong to no view: the only place the
             // user is told approve and discard exist, and the only place the
             // agent list is reachable.
@@ -1864,6 +1910,74 @@ mod tests {
         }
     }
 
+    /// **The form's two conditional keys follow the field.** `Enter` is "next
+    /// field" on the seven one-line fields and a newline only in the prompt, and
+    /// the arrows cycle only the two fields that are not typed into — anywhere
+    /// else the form's handler consumes them and nothing happens. One row for the
+    /// whole form described one field and hoped, and a test pinned the false label
+    /// as required.
+    #[test]
+    fn the_form_hints_follow_the_field_the_caret_is_in() {
+        use crate::tui::views::agent_form::{CYCLES_WITH_ARROWS, PROMPT_INDEX};
+
+        // `Enter`, field by field: every field gets exactly one of the two, and
+        // the prompt is the only field that gets the newline.
+        for field in 0..=PROMPT_INDEX {
+            let row = footer_row(KeyTarget::AgentForm(field));
+            let newline = field == PROMPT_INDEX;
+            assert_eq!(
+                row.contains("Enter: newline in prompt"),
+                newline,
+                "field {field}: only the prompt can hold a second line: {row:?}"
+            );
+            assert_eq!(
+                row.contains("Enter: next field"),
+                !newline,
+                "field {field}: every other field advances: {row:?}"
+            );
+            // Never both, so a row cannot claim two meanings for one key.
+            assert!(
+                !(row.contains("Enter: newline in prompt") && row.contains("Enter: next field")),
+                "field {field} names one meaning for Enter: {row:?}"
+            );
+            // And the arrows, on the two fields and nowhere else.
+            assert_eq!(
+                row.contains("←/→: cycle"),
+                CYCLES_WITH_ARROWS.contains(&field),
+                "field {field}: the arrows only cycle {CYCLES_WITH_ARROWS:?}: {row:?}"
+            );
+        }
+
+        // The field index reaches the target, so this is a decision `key_target`
+        // makes rather than one the test supplies directly.
+        for field in 0..=PROMPT_INDEX {
+            assert_eq!(
+                key_target(
+                    &CurrentView::AgentForm,
+                    true,
+                    &AnalysisState::Idle,
+                    ListBounds::default(),
+                    field,
+                    false
+                ),
+                KeyTarget::AgentForm(field),
+                "the form's target carries the field it is on"
+            );
+        }
+
+        // The keys that do not vary are on every field, so the rows above are not
+        // merely short.
+        for field in 0..=PROMPT_INDEX {
+            let row = footer_row(KeyTarget::AgentForm(field));
+            for constant in ["Tab/⇧Tab: field", "Ctrl+S: save", "Esc: back"] {
+                assert!(
+                    row.contains(constant),
+                    "field {field} must still name {constant:?}: {row:?}"
+                );
+            }
+        }
+    }
+
     /// **The view axis of the same rule.** `Esc` out of the modal sets
     /// `current_view = Projects` and touches nothing else, so `analysis_state` is
     /// still `Proposals` on the next frame. A check on the state alone would put
@@ -1901,12 +2015,19 @@ mod tests {
             CurrentView::ContextView,
             CurrentView::AgentForm,
         ] {
+            let left = keys_for(&view, true, &pending, ListBounds::default());
+            // The form is the one view whose target carries its field, so the
+            // "back to the view's own row" claim is spelled out for it.
             assert_eq!(
-                keys_for(&view, true, &pending, ListBounds::default()),
-                KeyTarget::View(view.clone()),
+                left,
+                if view == CurrentView::AgentForm {
+                    KeyTarget::AgentForm(0)
+                } else {
+                    KeyTarget::View(view.clone())
+                },
                 "{view:?} is not the proposal modal, whatever the analysis state says"
             );
-            let row = footer_row(KeyTarget::View(view.clone()));
+            let row = footer_row(left);
             for modal_key in ["Enter: approve", "a: approve all", "d: discard"] {
                 assert!(
                     !row.contains(modal_key),
@@ -1951,7 +2072,7 @@ mod tests {
             (CurrentView::AgentForm, true),
         ] {
             assert_eq!(
-                key_target(&view, focus, &idle, drawn, true),
+                key_target(&view, focus, &idle, drawn, 0, true),
                 KeyTarget::DeleteConfirm,
                 "{view:?} with the confirmation up is not {view:?}"
             );
@@ -2009,8 +2130,7 @@ mod tests {
     }
 
     /// Deleting the selected agent puts the focus back on the projects, so every
-    /// label on the row that follows is true.
-    ///
+    /// label on the row that follows is true.    ///
     /// The repro is a project with one agent: `→` `d` `y`. `agent_index` resets
     /// and the agent list is empty, so `key_target` falls through to
     /// `View(Projects)` — while the focus was still on the agent list. Three of
