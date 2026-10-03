@@ -21,6 +21,8 @@
 
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::Frame;
 use ratatui::Terminal;
 
 /// Every row of `buffer`, joined by newlines.
@@ -64,12 +66,8 @@ fn shipped(source: &str) -> &str {
 
 /// Any spelling of "ask ratatui for a border" this codebase has used.
 fn border_ask(source: &str) -> Option<&'static str> {
-    for ask in ["Borders::", ".borders(", ".bordered(", ".border_type("] {
-        if source.contains(ask) {
-            return Some(ask);
-        }
-    }
-    None
+    const ASKS: [&str; 4] = ["Borders::", ".borders(", ".bordered(", ".border_type("];
+    ASKS.into_iter().find(|ask| source.contains(ask))
 }
 
 /// Whether `line` names a key and what it does.
@@ -117,6 +115,225 @@ fn names_a_key(line: &str) -> bool {
 /// The key hint the footer shows for a screen may only be written in
 /// `hints_for`. A view that repeats one has two places to update and one of
 /// them will be stale.
+fn env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// One screen, as a closure over whatever fixture it needs.
+type Screen<'a> = (&'a str, Box<dyn Fn(&mut Frame, Rect) + 'a>);
+
+/// Every screen that can be reached — the six views plus the two states whose
+/// keys belong to no view of their own — has to render, and render box-free,
+/// inside the chrome's body. This is the whole style in one test: a view that
+/// grew a block back, or one whose keys nothing reaches, both fail here.
+#[test]
+fn every_view_renders_inside_the_body_without_a_box() {
+    use llama_r::tui::chrome::{self, Context};
+    use llama_r::tui::views::{
+        agent_form::render_agent_form, analysis::render_analysis, chat::render_chat,
+        context::render_context, dashboard::render_dashboard, projects::render_projects,
+    };
+    // `LLAMA_R_DIR` is process-wide, so this screen walk holds a lock of its own.
+    // `core::paths::lock_env_for_tests` is `#[cfg(test)]` and so is not visible from
+    // an integration test — this is the same trick `api_integration.rs` uses.
+    let _env = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LLAMA_R_DIR", dir.path());
+    let state = fixture_state(dir.path());
+
+    // Each arm is one screen. `body` is the rect the chrome leaves over, which
+    // is what a view is allowed to draw on — a view that reached for `f.area()`
+    // instead would draw over the bar, and the bar is drawn first here, so the
+    // bar surviving at the end is checked per screen below.
+    let screens: Vec<Screen<'_>> = vec![
+        (
+            "dashboard",
+            Box::new(|f: &mut Frame, body: Rect| render_dashboard(f, body, &state, 0)),
+        ),
+        (
+            "projects",
+            Box::new(|f: &mut Frame, body: Rect| render_projects(f, body, &state, 0, 0, true)),
+        ),
+        (
+            "projects · agent list",
+            Box::new(|f: &mut Frame, body: Rect| render_projects(f, body, &state, 0, 0, false)),
+        ),
+        (
+            "agent form",
+            Box::new(|f: &mut Frame, body: Rect| {
+                render_agent_form(
+                    f,
+                    body,
+                    "ops",
+                    "Nutrición",
+                    "llama3",
+                    "fudi",
+                    "habla español",
+                    "sé breve",
+                    "demo",
+                    "eres un asistente",
+                    0,
+                )
+            }),
+        ),
+        (
+            "analysis · idle",
+            Box::new(|f: &mut Frame, body: Rect| {
+                render_analysis(f, body, &llama_r::tui::app::AnalysisState::Idle)
+            }),
+        ),
+        (
+            "analysis · loading",
+            Box::new(|f: &mut Frame, body: Rect| {
+                render_analysis(
+                    f,
+                    body,
+                    &llama_r::tui::app::AnalysisState::Loading {
+                        started_at: std::time::Instant::now(),
+                    },
+                )
+            }),
+        ),
+        (
+            "context",
+            Box::new(|f: &mut Frame, body: Rect| render_context(f, body, &state, 0, 0)),
+        ),
+        (
+            "chat",
+            Box::new(|f: &mut Frame, body: Rect| {
+                render_chat(
+                    f,
+                    body,
+                    &[("user".to_string(), "hola".to_string())],
+                    "una pregunta",
+                    false,
+                    None,
+                    &None,
+                    &None,
+                    &[],
+                    0,
+                    0,
+                );
+            }),
+        ),
+    ];
+
+    for (label, render) in screens {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                // The real dispatch order: bar, then the view into the body.
+                let c = chrome::layout(f.area());
+                chrome::render_bar(
+                    f,
+                    c.bar,
+                    &["Dashboard", "Projects", "Chat"],
+                    0,
+                    &Context::default(),
+                    true,
+                );
+                render(f, c.body);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        // Corners across the whole screen: no view may frame anything, and the
+        // bar is already pinned to be border-free by its own test.
+        for ch in ['┌', '┐', '└', '┘'] {
+            assert!(
+                !all_text(&buffer).contains(ch),
+                "the {label} screen drew box char {ch:?}"
+            );
+        }
+        // The vertical checked over the body alone: `│` is the bar's own
+        // punctuation between view names, which the spec's mockup shows, so a
+        // whole-screen check would blame the view for the bar.
+        let body = chrome::layout(Rect::new(0, 0, 80, 24)).body;
+        let body_text: String = (body.y..body.y + body.height)
+            .map(|y| {
+                (body.x..body.x + body.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body_text.contains('│'),
+            "the {label} screen drew a vertical in its body: {body_text}"
+        );
+        // A screen that drew nothing passes every check above, so the bar is
+        // asserted too: it is the one thing this test can know every screen
+        // must contain, and its survival is what the shared layout exists for.
+        let bar: String = (0..80)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            bar.contains("Llama-R"),
+            "the bar must survive the {label} screen: {bar:?}"
+        );
+    }
+}
+
+/// An `AppState` over `dir`, with one project and two agents in it.
+///
+/// `build_app_state` is what the runtime calls; the pieces are the ones the TUI
+/// actually reads — a context store, an agent registry and a log buffer.
+fn fixture_state(dir: &std::path::Path) -> std::sync::Arc<llama_r::api::handlers::AppState> {
+    use llama_r::adapters::mcp::StaticMcpRegistry;
+    use llama_r::context::store::{ContextStore, ProjectContext};
+    use llama_r::providers::ollama::OllamaProvider;
+    use llama_r::runtime::build_app_state;
+    use llama_r::services::agent_registry::AgentRegistry;
+    use llama_r::services::skill_manager::SkillManager;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    let context_store = Arc::new(ContextStore::new());
+    context_store
+        .save_context(ProjectContext {
+            project_id: "fudi".to_string(),
+            path: dir.join("fudi").display().to_string(),
+            context_md: "# Reglas\n- hablar en español".to_string(),
+            project_type: "rust".to_string(),
+            skills_injected: Vec::new(),
+            last_analyzed: chrono::Utc::now(),
+            custom_rules: String::new(),
+        })
+        .unwrap();
+
+    let agent_registry = Arc::new(AgentRegistry::new());
+    let agents_dir = dir
+        .join("contextos")
+        .join("projects")
+        .join("fudi")
+        .join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    for name in ["nutricion", "pediatra"] {
+        std::fs::write(
+            agents_dir.join(format!("{name}.toml")),
+            "name = \"Agente\"\nmodel = \"llama3\"\nsystem_prompt = \"hola\"\n",
+        )
+        .unwrap();
+    }
+    agent_registry.reload_all(&[]).unwrap();
+
+    build_app_state(
+        Arc::new(OllamaProvider::new("http://localhost:11434".to_string())),
+        agent_registry,
+        Arc::new(SkillManager::new()),
+        context_store,
+        "llama3".to_string(),
+        Arc::new(Mutex::new(VecDeque::new())),
+        Vec::new(),
+        Arc::new(StaticMcpRegistry::new()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
 #[test]
 fn no_view_hard_codes_a_key_hint() {
     for (name, source) in VIEWS {
