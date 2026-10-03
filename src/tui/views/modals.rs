@@ -8,9 +8,9 @@
 //! as a file list: a `Borders::` anywhere else is a mistake, and there is no
 //! exemption to hide behind.
 
+use crate::tui::theme;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
@@ -49,14 +49,15 @@ pub fn render_confirm_delete(f: &mut Frame, body: Rect, confirm_type: &str, conf
     let dialog = Paragraph::new(vec![
         Line::from(Span::styled(
             format!(" Delete {confirm_type}: \"{confirm_id}\"?"),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            theme::active(),
         )),
         Line::from(""),
+        // A dialog's answer set, not a view's key hints: this is not a
+        // `CurrentView`, so it has no row on the bar and no footer of its own to
+        // put them in. The keys are spelled out where the question is.
         Line::from(Span::styled(
             " [y] Yes   [n] No   [Esc] Cancel",
-            Style::default().fg(Color::Gray),
+            theme::chrome(),
         )),
     ])
     .block(
@@ -74,9 +75,9 @@ pub fn render_confirm_delete(f: &mut Frame, body: Rect, confirm_type: &str, conf
 /// to let the model write instructions that will shape future behaviour, and
 /// approving without reading would make the approval meaningless.
 ///
-/// The approve and discard keys are in `TuiApp::hints_for`'s `Proposals` scope:
-/// they are live while this is on screen, so the shared footer has to name them,
-/// which is why the bordered row below the list is empty.
+/// This used to end in a bordered row three rows deep that drew nothing — the
+/// per-view footer the shared one replaced. Those rows go to the proposals
+/// instead, which is what the user is reading before they decide.
 pub fn render_skill_proposals(
     f: &mut Frame,
     area: Rect,
@@ -86,18 +87,12 @@ pub fn render_skill_proposals(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(3),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(area);
 
     let title = Paragraph::new(Line::from(Span::styled(
         " Skill proposals — nothing is written until you approve ",
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
+        theme::active(),
     )))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -109,17 +104,19 @@ pub fn render_skill_proposals(
     for (index, proposal) in proposals.iter().enumerate() {
         let marker = if index == selected { ">" } else { " " };
         lines.push(Line::from(vec![
-            Span::styled(format!("{marker} "), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{marker} "), theme::action()),
+            // The selected proposal wears `active`, the same one bold token the
+            // rest of the interface uses for "this is what the next key acts
+            // on". The marker alone could not carry that: it is one character.
             Span::styled(
                 proposal.id.clone(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                if index == selected {
+                    theme::active()
+                } else {
+                    theme::content()
+                },
             ),
-            Span::styled(
-                format!(" — {}", proposal.description),
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled(format!(" — {}", proposal.description), theme::chrome()),
         ]));
         for line in proposal.content.lines().take(6) {
             lines.push(Line::from(format!("    {line}")));
@@ -127,10 +124,7 @@ pub fn render_skill_proposals(
         lines.push(Line::from(""));
     }
     for result in results {
-        lines.push(Line::from(Span::styled(
-            result.clone(),
-            Style::default().fg(Color::Green),
-        )));
+        lines.push(Line::from(Span::styled(result.clone(), theme::ok())));
     }
     f.render_widget(
         Paragraph::new(lines)
@@ -138,9 +132,6 @@ pub fn render_skill_proposals(
             .wrap(Wrap { trim: true }),
         chunks[1],
     );
-
-    let footer = Paragraph::new("").block(Block::default().borders(Borders::ALL));
-    f.render_widget(footer, chunks[2]);
 }
 
 #[cfg(test)]
@@ -208,23 +199,99 @@ mod tests {
         );
     }
 
-    /// The selected proposal wears `>`, and it is the row the approve key acts
-    /// on, so the marker has to move with `selected`.
+    /// The selected proposal is the one `Enter` acts on, so it has to be marked by
+    /// more than the `>` glyph: it wears the same bold-and-yellow `active` token
+    /// the rest of the interface uses for "the next keystroke lands here", and
+    /// nothing else wears it. An unselected proposal wears `content`, so the two
+    /// cannot be confused.
     #[test]
-    fn the_selected_proposal_is_the_only_one_marked() {
+    fn the_selected_proposal_is_the_only_one_wearing_active() {
         let buffer = render_proposals(&["uno", "dos", "tres"], 1);
-        let marked: Vec<String> = (0..buffer.area.height)
-            .filter(|y| row_text(&buffer, *y).contains('>'))
+        // Scoped to the proposal rows: the banner above them is bold too, and a
+        // screen-wide count would be counting the banner.
+        let first = row_of(&buffer, "nothing is written until you approve") + TITLE_ROWS;
+        let wearing: Vec<String> = (first..buffer.area.height)
+            .filter(|y| wears(&buffer, *y, theme::active()))
             .map(|y| row_text(&buffer, y))
             .collect();
         assert_eq!(
-            marked.len(),
+            wearing.len(),
             1,
-            "exactly one proposal is marked: {marked:?}"
+            "exactly one proposal wears active: {wearing:?}"
         );
         assert!(
-            marked[0].contains("dos"),
-            "the marked proposal is the selected one: {marked:?}"
+            wearing[0].contains("dos"),
+            "the active proposal is the selected one: {wearing:?}"
+        );
+        assert!(
+            wearing[0].contains('>'),
+            "the marker must still agree with it: {wearing:?}"
+        );
+
+        for id in ["uno", "tres"] {
+            assert!(
+                wears(&buffer, row_of(&buffer, id), theme::content()),
+                "{id} is not selected and must wear content: {:?}",
+                row_text(&buffer, row_of(&buffer, id))
+            );
+        }
+    }
+
+    /// The row `needle` is on.
+    /// Rows the bordered title takes: the text plus the rule above and below it.
+    const TITLE_ROWS: u16 = 3;
+
+    /// Bordered boxes this panel draws: the banner and the proposal list.
+    const BOXES: usize = 2;
+
+    /// The row `needle` is on.
+    fn row_of(buffer: &Buffer, needle: &str) -> u16 {
+        (0..buffer.area.height)
+            .find(|y| row_text(&buffer, *y).contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is not on screen: {}", all_text(buffer)))
+    }
+
+    /// Does row `y` wear `token` anywhere? A proposal's name starts after the
+    /// `>` and its spaces, so the token is read off the row's first non-blank
+    /// cell rather than a hardcoded column.
+    fn wears(buffer: &Buffer, y: u16, token: ratatui::style::Style) -> bool {
+        (0..buffer.area.width)
+            .filter(|x| buffer[(*x, y)].symbol() != " ")
+            .any(|x| {
+                let cell = &buffer[(x, y)];
+                Some(cell.fg) == token.fg && cell.modifier == token.add_modifier
+            })
+    }
+
+    /// Every row the panel spends below the title goes to the proposals. The
+    /// empty bordered footer this used to end in drew nothing and took three
+    /// rows of a body that is already short — on the one screen where the user is
+    /// reading a generated skill before approving it.
+    #[test]
+    fn the_proposals_get_every_row_but_the_title() {
+        let buffer = render_proposals(&["uno", "dos", "tres"], 0);
+        let rules: Vec<String> = (0..buffer.area.height)
+            .filter(|y| row_text(&buffer, *y).contains('─'))
+            .map(|y| row_text(&buffer, y))
+            .collect();
+        // Two bordered boxes, so four rules: the banner's and the panel's. The old
+        // layout drew a third, empty box for its footer, which made six — three
+        // rows of the body spent on nothing, on the one screen where the user is
+        // reading a generated skill before approving it.
+        assert_eq!(
+            rules.len(),
+            2 * BOXES,
+            "the banner and the panel are the only two bordered boxes: {rules:?}"
+        );
+        // …and those rows go to the proposals. Three at six content lines each is
+        // more than fits, which is the point: the empty footer used to eat into
+        // the one that did.
+        let held = all_text(&buffer).matches("body").count();
+        assert_eq!(
+            held,
+            3,
+            "every proposal's body must be readable in the panel: {}",
+            all_text(&buffer)
         );
     }
 
