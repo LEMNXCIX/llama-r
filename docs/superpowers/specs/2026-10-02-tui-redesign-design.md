@@ -1,8 +1,14 @@
 # TUI redesign — design
 
 **Date:** 2026-10-02
-**Status:** draft for review
+**Status:** implemented, and amended in place to describe what shipped.
 **Scope:** visual redesign of the Llama-R terminal UI. No behaviour changes to the API, runtime, or agent semantics.
+
+> **Cite this document by section, not by line.** It was amended twice after it
+> was written — once when the implementation diverged from it, once when a fix
+> wave corrected its own claims — and in the meantime every line-number citation
+> into it rotted: three of them, in one sentence about the project rows. A
+> section heading survives an edit; a line number does not.
 
 ## Problem
 
@@ -27,12 +33,18 @@ Two concrete defects fall out of this structure:
 ```
 src/tui/
   theme.rs        colour tokens and semantic styles
-  chrome.rs       context bar, key-hint footer, separators
-  app.rs          state, input handling, render dispatch
+  chrome.rs       layout, context bar, key-hint footer, separators
+  app.rs          state, input handling, render dispatch, key hints
   views/
     chat.rs       dashboard.rs      projects.rs
     agent_form.rs analysis.rs       context.rs
+    modals.rs     test_helpers.rs
 ```
+
+`modals.rs` is where the two bordered dialogs live — the only boxes in the
+interface, and the reason the border guard can name one file and mean it.
+`test_helpers.rs` holds the fixtures the view tests share; it is not a view and
+renders nothing.
 
 `projects.rs` is split: the project list, the agent form, the analysis view, and the modal dialogs become separate files. `AgentForm`, `Analysis`, and `ContextView` are all rendered from `projects.rs` today despite being distinct `CurrentView` variants, so they become `agent_form.rs`, `analysis.rs`, and `context.rs` respectively. This is a consequence of the redesign, not a separate refactor — the shared chrome only makes sense with per-view bodies.
 
@@ -52,27 +64,45 @@ Colour and style tokens with fixed meaning, so views stop choosing colours ad ho
 
 ### `chrome.rs`
 
-Three public pieces, consumed by every view:
+Five functions, consumed by every view, over two types (`Chrome`, `Context`) and
+two row constants (`BAR_HEIGHT`, `FOOTER_HEIGHT`, both `1`):
 
-1. **`context_bar(current, context, api_running)`** — one row, no border:
+1. **`layout(area) -> Chrome { bar, body, footer }`** — the split the dispatch
+   hands every view as `body`. Every subtraction saturates, so a terminal too
+   small for the two fixed rows gets an empty body rather than a wrapped-around
+   one. This is the piece the redesign turns on: a view that lays out
+   `f.area()` includes the bar's row in its own layout and writes over it.
+
+2. **`render_bar(f, rect, views, active, ctx, api_running)`** — one row, no border:
    ```
-   Llama-R │ Dashboard │ Projects │ Chat             fudi/ops  ● q
+   Llama-R │ Dashboard │ Projects │ Agent │ Analysis │ Context │ Chat   fudi/ops  ●
    ```
-   The product's name leads, then the view names, then the context (project + agent) right-aligned and always visible. Replaces the broken tab bar and every per-view title block.
+   Drawn to scale at 80 columns, which is where the mockup above sits: the fixed
+   part is 66 columns and the group needs three more for its gap and dot, so the
+   dot needs 69 before the label has a column of its own. The product's name leads,
+   then the view names, then the context (project + agent) right-aligned. It
+   replaces the broken tab bar and every per-view title block.
 
    The name is the one thing the rest of the row cannot say: the view names and the context say *where you are*, not *what this is*. When the dashboard's banner went (below), this became the only place the product is named — which is why it belongs here rather than in a view.
 
-   The dot is the HTTP **listener's** liveness (`api_running`), not the provider's. Nothing in the TUI reports whether the provider answers; the dashboard says so where a reader would otherwise assume the bar does.
+   The dot is the HTTP **listener's** liveness (`api_running`), not the provider's. No view states whether the provider answers; the dashboard's own doc says so where a reader would otherwise assume the bar does.
 
-2. **`key_hints(&[(&str, &str)])`** — the footer. Each view declares its own shortcuts; the chrome renders them. Ends the duplicated hint text.
+   Only the context *label* is fitted, and only it is truncated — from the right, ending in `…`. The rest of the row is clipped, not chosen: the line is assembled left to right and cut at the row's width, so past the cut the gap goes first, then the dot, then the last view names. The product's name is the last thing that cut reaches, not a thing the cut never reaches.
 
-3. **`separator(width)`** — a thin `─` rule.
+3. **`render_footer(f, rect, hints)`** — the footer. Each screen declares its own shortcuts and the chrome renders them; the text lives in one function, `TuiApp::hints_for`, which is keyed on a `KeyTarget` rather than on the view. Ends the duplicated hint text.
+
+4. **`separator(f, rect)`** — a thin `─` rule across `rect.width`.
+
+5. **`context_label(ctx) -> String`** — how the scope reads: `fudi/ops`, `fudi`, `ops`, or `direct`.
 
 ## Visual language
 
 Hard rules, so the style does not erode:
 
-- **No boxes.** Borders only where grouping earns its keep: the chat input area and modal dialogs.
+- **No boxes.** Borders only where grouping earns its keep: the modal dialogs, and
+  nowhere else. (An earlier revision of this line also permitted the chat input
+  area. The prompt marker that replaced the 3-row input box below leaves nothing
+  to frame, so the permission was dropped rather than kept as an allowance.)
 - **No decorative titles.** The context bar carries identity; view bodies start straight into content.
 - **Typography is the hierarchy.** Bold for labels and keys, `chrome` for furniture, `content` for text.
 - **One-row bar, actually one row.** No border.
@@ -83,7 +113,7 @@ Hard rules, so the style does not erode:
 ### Chat
 
 ```
-Llama-R │ Dashboard │ Projects │ Chat             fudi/ops  ● q
+Llama-R │ Dashboard │ Projects │ Agent │ Analysis │ Context │ Chat   fudi/ops  ●
 
   You  ¿plazo de reembolso?
 
@@ -93,22 +123,24 @@ Llama-R │ Dashboard │ Projects │ Chat             fudi/ops  ● q
 
 ─────────────────────────────────────────────────────────
 > _
- Enter enviar  Shift+Enter nueva línea  ↑↓ scroll  ←→ agente
 ```
 
-`Enter` sends; `Shift+Enter` inserts a newline. The prompt marker replaces the 3-row bordered input box.
+`Enter` sends; `Shift+Enter` inserts a newline. The prompt marker replaces the 3-row bordered input box. The hint row is not drawn here: the key hints are the chrome footer's, on the last row of the screen, in one row shared by every view. Six fit at 80 columns; a seventh would be clipped from the right, which takes `Esc: back` first, so `PgUp`/`PgDn` still scroll the chat without being advertised.
 
 ### Projects
 
 ```
-  fudi              3 agentes   ● analizado
+  fudi              3 agentes   ● analizado   ✗
   clinica           1 agente
 ─────────────────────────────────────────────────────────
  agentes de fudi
   nutricion         llama3
   pediatra          llama3
- Tab vista  ←→ agentes  ↑↓ seleccionar  a analizar  n nuevo  d borrar  q salir
 ```
+
+The hint row is likewise the shared footer's, and here it changes with the focus:
+`←→` names the list the next `←→` moves *onto*, so the row reads `agentes` while
+the project list has focus and `projects` while the agent list has it.
 
 Two lists of plain rows separated by a thin rule — no box, no title on either. One rule, between the two lists; nothing closes the agent list, exactly as nothing closes the chat input above its rule.
 
@@ -141,11 +173,16 @@ The TUI is testable without a terminal by rendering into `ratatui::backend::Test
 
 Assertions that encode the design, not just "it compiles":
 
-- **No stray borders.** Rendering a view produces no box-drawing characters outside the input and dialogs. This is the regression guard for "no boxes".
-- **The bar renders.** Its row contains the active view name and the current context. Guards the bug being fixed.
-- **Context survives navigation.** The context bar shows the same project/agent before and after a view switch.
-- **Key hints match the view.** The footer row contains exactly the shortcuts that view declares.
-- **Chat layout.** Message area grows when the terminal grows; `Shift+Enter` adds a line instead of sending.
+- **No stray borders.** Every screen is rendered into the chrome's body and the whole buffer must be free of `┌┐└┘` and, over the body alone, of `│`; the bar row must survive. The sources are checked as well, so the rule holds for a view added tomorrow: no module under `src/tui/views/` may ask ratatui for a border but `modals`, and `modals` must still use it, so the one exemption cannot go vacuous. `tests/tui_chrome.rs`.
+- **The bar renders.** Its row leads with the product's name, carries the active view name and the current context, and survives a view drawn after it. `src/tui/chrome.rs`.
+- **The footer names what the screen answers to**, resolved per screen *state* rather than per view: the agent list inside the projects view, the skill-proposal modal, the delete confirmation and the agent form's caret each get their own row, and a row leaves when its state does. No view may hard-code hint text, and the TUI contains exactly one footer. `src/tui/app.rs` and `tests/tui_chrome.rs`.
+- **Nothing drives a row that was not drawn.** The two lists in the projects view report the rows they got, and the four keys that act on the agent list consult that report — so a footer cannot advertise a list with nothing in it. `src/tui/views/projects.rs` and `src/tui/app.rs`.
+
+Specified here and **not** implemented, recorded so the gap reads as a decision
+rather than an oversight:
+
+- *Context survives navigation* — the bar shows the same project/agent before and after a view switch. No test exercises a view switch, because `Tab` is handled in an event loop that no test drives.
+- *Message area grows when the terminal grows* — the chat's message region is sized by its own `Min(0)`, so it does, but nothing asserts it. The `Shift+Enter` half of that line is covered.
 
 ## Scope
 
