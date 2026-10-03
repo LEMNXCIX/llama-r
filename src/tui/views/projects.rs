@@ -114,8 +114,9 @@ pub fn render_projects(
 
     // The number is right-aligned in its own field, so the word after it is a
     // column: ` 2 agentes` beside `12 agentes`, not `2 agentes` beside
-    // `12 agentes` with the words a column apart. `1 agente`, `3 agentes`
-    // (`design.md:100-101`).
+    // `12 agentes` with the words a column apart. `1 agente`, `3 agentes` — the
+    // spec's own mockup, `docs/superpowers/specs/2026-10-02-tui-redesign-design.md`
+    // § Per-view layout.
     let digits = totals
         .iter()
         .map(|total| total.to_string().len())
@@ -145,40 +146,6 @@ pub fn render_projects(
     // One leading space on every row, then the counts.
     let count_column = 1 + widest_name + FIELD_GAP;
 
-    let items: Vec<ListItem> = projects
-        .iter()
-        .zip(&counts)
-        .enumerate()
-        .map(|(index, (project, count))| {
-            // In a list, bold marks the row the next keystroke acts on, and
-            // only while this list has focus. Bold is not exclusive to that: the
-            // bar's current view and two rows in `modals.rs` wear it too.
-            let name_style = if active_in_project_list && index == project_index {
-                theme::active()
-            } else {
-                theme::content()
-            };
-            let name = format!(" {}", project.project_id);
-            let pad = " ".repeat(count_column.saturating_sub(Line::from(name.as_str()).width()));
-
-            // The count starts in its column, which is what `design.md:100-101`
-            // draws: `3 agentes` and `1 agente` begin at the same column.
-            let mut spans = vec![
-                Span::styled(name, name_style),
-                Span::styled(format!("{pad}{count}"), theme::chrome()),
-            ];
-            if project.project_type != UNANALYZED {
-                // Pad the count out so the marker below it is a column too.
-                let tail =
-                    " ".repeat(widest_count.saturating_sub(Line::from(count.as_str()).width()));
-                spans.push(Span::styled(format!("{tail}  "), theme::chrome()));
-                spans.push(Span::styled("●", theme::ok()));
-                spans.push(Span::styled(" analizado", theme::chrome()));
-            }
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
-
     let selected = projects.get(project_index);
     let agents = agents_of_project(state, selected.map(|p| p.project_id.as_str()));
 
@@ -206,32 +173,25 @@ pub fn render_projects(
     } else {
         available
     });
-    let project_rows = (items.len() as u16).min(available.saturating_sub(agent_rows));
+    let project_rows = (projects.len() as u16).min(available.saturating_sub(agent_rows));
 
+    // Each window is read twice: once to walk the rows it names, once for its
+    // length in the bounds reported back. `Range` is two `usize`s, so the copy
+    // costs nothing — and it is the copy that lets the window, rather than a
+    // count of the rows built from it, be what both sides read.
     let project_window = window(projects.len(), project_index, project_rows as usize);
     let visible_items: Vec<ListItem> = project_window
         .clone()
         .map(|index| {
-            let (project, count) = (&projects[index], &counts[index]);
-            let name_style = if active_in_project_list && index == project_index {
-                theme::active()
-            } else {
-                theme::content()
-            };
-            let name = format!(" {}", project.project_id);
-            let pad = " ".repeat(count_column.saturating_sub(Line::from(name.as_str()).width()));
-            let mut spans = vec![
-                Span::styled(name, name_style),
-                Span::styled(format!("{pad}{count}"), theme::chrome()),
-            ];
-            if project.project_type != UNANALYZED {
-                let tail =
-                    " ".repeat(widest_count.saturating_sub(Line::from(count.as_str()).width()));
-                spans.push(Span::styled(format!("{tail}  "), theme::chrome()));
-                spans.push(Span::styled("●", theme::ok()));
-                spans.push(Span::styled(" analizado", theme::chrome()));
-            }
-            ListItem::new(Line::from(spans))
+            let project = &projects[index];
+            project_row(
+                &project.project_id,
+                &counts[index],
+                count_column,
+                widest_count,
+                project.project_type != UNANALYZED,
+                active_in_project_list && index == project_index,
+            )
         })
         .collect();
 
@@ -284,6 +244,55 @@ pub fn render_projects(
     }
 }
 
+/// One project row: its name, how many agents it has, whether it has been
+/// analysed.
+///
+/// Built once per project per frame. Two copies of this existed — one over every
+/// project to measure the list, one over the window that is drawn — and they had
+/// to stay byte-identical or the rows would change as the selection moved, so
+/// the padding, the marker and the singular/plural all lived twice.
+///
+/// The count starts in the same column on every row: the name is padded to
+/// `count_column`, and `count` arrives already right-aligned in a field as wide
+/// as the widest one, so ` 2 agentes` sits beside `12 agentes` with the words in
+/// one column. The analysed marker is padded to `widest_count` for the same
+/// reason. Widths are display widths throughout (`Line::width`): a name with
+/// accents or CJK in it takes more columns than it has characters, and counting
+/// characters would push that row's count off the column every other row lines
+/// up on.
+///
+/// `selected` is not read from any state: in a list, bold marks the row the next
+/// keystroke acts on, and only while this list has focus — and bold is not
+/// exclusive to that, since the bar's current view and two rows in `modals.rs`
+/// wear it too.
+fn project_row<'a>(
+    project_id: &'a str,
+    count: &'a str,
+    count_column: usize,
+    widest_count: usize,
+    analysed: bool,
+    selected: bool,
+) -> ListItem<'a> {
+    let name_style = if selected {
+        theme::active()
+    } else {
+        theme::content()
+    };
+    let name = format!(" {project_id}");
+    let pad = " ".repeat(count_column.saturating_sub(Line::from(name.as_str()).width()));
+    let mut spans = vec![
+        Span::styled(name, name_style),
+        Span::styled(format!("{pad}{count}"), theme::chrome()),
+    ];
+    if analysed {
+        let tail = " ".repeat(widest_count.saturating_sub(Line::from(count).width()));
+        spans.push(Span::styled(format!("{tail}  "), theme::chrome()));
+        spans.push(Span::styled("●", theme::ok()));
+        spans.push(Span::styled(" analizado", theme::chrome()));
+    }
+    ListItem::new(Line::from(spans))
+}
+
 /// The agents of `project_id`, in the order the projects view lists them.
 ///
 /// Both sides of `agent_index` must agree on that order: the view draws this
@@ -292,8 +301,10 @@ pub fn render_projects(
 /// [`crate::api::handlers::AppState::agent_registry`] is a `HashMap` walk, so the
 /// order is not stable on its own.
 ///
-/// Sorted by id, which is also what the user reads the list as. Both call sites go
-/// through here rather than filtering the registry themselves.
+/// Sorted by id, which is also what the user reads the list as, and the rows come
+/// from here rather than from a filter of the view's own so the two cannot
+/// disagree. The per-project counts above filter the registry directly instead:
+/// a count does not depend on the order, and `e`/`d` never read it.
 pub fn agents_of_project(
     state: &AppState,
     project_id: Option<&str>,
@@ -998,6 +1009,95 @@ mod tests {
     fn wears(buffer: &Buffer, y: u16, token: Style) -> bool {
         let cell = &buffer[(1, y)];
         Some(cell.fg) == token.fg && cell.modifier == token.add_modifier
+    }
+
+    /// Project rows drawn the way [`render_projects`] draws them: the text of
+    /// each row with the trailing blanks trimmed, and whether its name wears
+    /// `active`.
+    ///
+    /// Drawn through a `List` rather than read off the spans, because the row a
+    /// user sees is the one the widget lays out — and a `List` is what turns a
+    /// `ListItem` into columns.
+    fn draw_rows(rows: Vec<ListItem<'_>>) -> (Vec<String>, Vec<bool>, Buffer) {
+        let height = rows.len() as u16;
+        let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+        terminal
+            .draw(|f| f.render_widget(List::new(rows), f.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text = (0..buffer.area.height)
+            .map(|y| row_text(&buffer, y).trim_end().to_string())
+            .collect();
+        let bold = (0..buffer.area.height)
+            .map(|y| wears(&buffer, y, theme::active()))
+            .collect();
+        (text, bold, buffer)
+    }
+
+    /// **The guard for [`project_row`] being the only place a project row is
+    /// built.** It used to be written twice — once over every project to measure
+    /// the list, once over the window that is drawn — so the padding, the marker
+    /// and the selection all had to stay byte-identical across two copies and
+    /// nothing held them there.
+    ///
+    /// Asserted as exact text because the weaker forms pass for a broken row:
+    /// `contains` finds the marker wherever it lands, and a padding computed
+    /// from `chars().count()` lines up perfectly on ASCII names and only drifts
+    /// once a name is multibyte — which is the third row below, and the one that
+    /// fails if the width rule goes back to counting characters.
+    #[test]
+    fn a_project_row_is_the_name_the_count_and_the_marker_in_those_columns() {
+        // Two names, four and eight columns wide, so the short one is the row
+        // whose padding has to absorb the difference. `count_column` is
+        // `1 + widest_name + FIELD_GAP`; `widest_count` is the width of the
+        // counts, which `render_projects` right-aligns to the widest total so
+        // they are all the same width.
+        let count_column = 1 + 8 + FIELD_GAP;
+        let (text, bold, _) = draw_rows(vec![
+            project_row("fudi", "3 agentes", count_column, 9, true, false),
+            project_row("clinica", "1 agente", count_column, 9, false, true),
+        ]);
+
+        assert_eq!(
+            text[0], " fudi      3 agentes  ● analizado",
+            "an analysed row is name, count, marker and its label"
+        );
+        assert_eq!(
+            text[1], " clinica   1 agente",
+            "a row with no analysis stops after its count"
+        );
+        // The words `agentes` and `agente` are the column the eye compares down
+        // the list, so they have to end in the same place.
+        assert_eq!(
+            text[0].find("agentes"),
+            text[1].find("agente"),
+            "the count's word is a column: {text:?}"
+        );
+        assert!(
+            !bold[0] && bold[1],
+            "bold follows `selected`, not the row's position: {bold:?}"
+        );
+
+        // `日本語` is three characters and six columns. Padded by characters
+        // instead of by columns it would sit at column 7, and its count with it —
+        // three columns right of every other row's, which is the mistake
+        // `Line::width` is here to prevent. Read back as a column rather than as
+        // a string: `row_text` writes one symbol per terminal column, so a wide
+        // glyph comes back interleaved with the blank cell behind it and is not
+        // the row's text.
+        let (_, _, buffer) = draw_rows(vec![project_row(
+            "日本語",
+            "3 agentes",
+            count_column,
+            9,
+            true,
+            false,
+        )]);
+        assert_eq!(
+            column_of(&buffer, 0, "3 agentes"),
+            Some(count_column),
+            "a multibyte name must not push its own row's count off the column"
+        );
     }
 
     /// The layout subtracts one row for the rule and clamps against
