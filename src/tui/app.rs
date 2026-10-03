@@ -167,13 +167,30 @@ fn move_agent_selection(bounds: ListBounds, current: usize, count: usize, delta:
     next as usize
 }
 
-/// Whether `←`/`→` may move focus onto the agent list.
+/// Whether `←`/`→` may move focus, given which list the focus is on now.
 ///
-/// Only onto a list with rows. Focus that lands on an empty list is the state where
-/// the footer would have to relabel itself and `d` would silently do nothing
-/// instead of deleting the selected project — so it does not land there.
-fn may_move_list_focus(bounds: ListBounds) -> bool {
-    agent_list_is_drawn(bounds)
+/// The parameter is the focus's *current* state rather than the direction of the
+/// move, so the call site passes `self.active_in_project_list` and reads as the
+/// fact it is — no negation for the reader to get wrong.
+///
+/// **Direction matters, and refusing the wrong direction is a trap.** Moving onto
+/// the agent list needs a row in it: a selection with nothing selected is how the
+/// footer ends up relabelling itself for a list that is not there. Moving *off* it
+/// never needs anything, because that is the only way back.
+///
+/// The agent list empties while the focus is on it — deleting its last agent drops
+/// `agent_rows` to zero and leaves the focus where it was. An undirected
+/// `agent_rows > 0` would then refuse the exit, and since this key is the only
+/// writer of the focus flag and no view switch resets it, project selection,
+/// project delete and the way back would be gone for the life of the process.
+/// That is strictly worse than landing on an empty project row, which is a
+/// selection the user can still see and act on with `a`, `n` and `d`.
+fn may_move_list_focus(bounds: ListBounds, focus_is_on_the_project_list: bool) -> bool {
+    if focus_is_on_the_project_list {
+        agent_list_is_drawn(bounds)
+    } else {
+        true
+    }
 }
 
 pub struct TuiApp {
@@ -1217,18 +1234,18 @@ impl TuiApp {
                                 }
                             }
                             // Focus moves between the two lists the projects view draws: the project
-                            // rows and the agent rows below them. Both are on screen, so
-                            // both sets of keys act on something the user can see.
-                            //
-                            // Unless the last frame drew neither, which a body three
-                            // rows tall cannot do: focus would then be a selection
-                            // with nothing selected.
+                            // rows and the agent rows below them. Which way it may go depends on
+                            // where the focus is now — see `may_move_list_focus`, which is the
+                            // whole of the rule.
                             KeyCode::Char('l')
                             | KeyCode::Right
                             | KeyCode::Char('h')
                             | KeyCode::Left => {
                                 if self.current_view == CurrentView::Projects
-                                    && may_move_list_focus(self.project_list_bounds)
+                                    && may_move_list_focus(
+                                        self.project_list_bounds,
+                                        self.active_in_project_list,
+                                    )
                                 {
                                     self.active_in_project_list = !self.active_in_project_list;
                                 }
@@ -1878,28 +1895,68 @@ mod tests {
         );
     }
 
-    /// Focus does not move onto a list with no rows — which is what keeps
-    /// `d` meaning "delete the selected agent" once it gets there, rather than
-    /// silently doing nothing because the focus is on nothing.
+    /// **Focus may not move *onto* a list with no rows** — which is what keeps `d`
+    /// meaning "delete the selected agent" once it gets there, rather than silently
+    /// doing nothing because the focus is on nothing.
     #[test]
     fn focus_does_not_move_onto_a_list_with_no_rows() {
+        // Entering the agent list: gated on it having a row.
         assert!(
-            may_move_list_focus(drawn_bounds()),
+            may_move_list_focus(drawn_bounds(), true),
             "the agent list has rows, so focus may move onto it"
         );
         assert!(
-            !may_move_list_focus(undrawn_bounds()),
+            !may_move_list_focus(undrawn_bounds(), true),
             "the agent list has none, so focus must not move onto it"
         );
         assert!(
-            !may_move_list_focus(ListBounds::default()),
+            !may_move_list_focus(ListBounds::default(), true),
             "nor when neither list has a row"
         );
-        // …but a project row alone is still focusable: the projects list is where
-        // `a`, `n` and `d` are bound.
         assert!(
             !agent_list_is_drawn(undrawn_bounds()),
-            "the predicate the other two are built on says the same"
+            "the predicate the entering direction is built on says the same"
+        );
+    }
+
+    /// **…but it may always move *off* one.** Deleting the selected project's last
+    /// agent drops `agent_rows` to zero while the focus stays where it was, and
+    /// this key is the only writer of the focus flag — no view switch resets it.
+    /// So refusing the exit would take project selection, project delete and the
+    /// way back away for the life of the process, in exchange for avoiding an
+    /// empty project row the user can still see.
+    #[test]
+    fn focus_can_leave_the_agent_list_after_its_last_agent_is_deleted() {
+        // Before the delete: both directions open.
+        let before = ListBounds {
+            project_rows: 3,
+            agent_rows: 1,
+        };
+        assert!(may_move_list_focus(before, true), "onto a list with a row");
+        assert!(may_move_list_focus(before, false), "and off it");
+
+        // `d` on the only agent, confirmed. `agent_index` resets to 0, the focus
+        // stays on the agent list, and the next frame reports it empty.
+        let after = ListBounds {
+            project_rows: 3,
+            agent_rows: 0,
+        };
+        assert!(
+            !may_move_list_focus(after, true),
+            "the now-empty agent list must not be entered"
+        );
+        assert!(
+            may_move_list_focus(after, false),
+            "but focus must be able to leave it, or the project list is unreachable"
+        );
+
+        // The worst form of the same trap: a body where the project list is empty
+        // too. Refusing the exit here would strand the user on a screen with
+        // nothing selectable and no way to leave it.
+        let neither = ListBounds::default();
+        assert!(
+            may_move_list_focus(neither, false),
+            "leaving is never refused, even with nothing to land on"
         );
     }
 
