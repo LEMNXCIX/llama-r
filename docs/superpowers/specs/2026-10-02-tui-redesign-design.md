@@ -130,12 +130,12 @@ Llama-R │ Dashboard │ Projects │ Agent │ Analysis │ Context │ Chat  
 ### Projects
 
 ```
-  fudi              3 agentes   ● analizado   ✗
-  clinica           1 agente
+  fudi      3 agentes  ● analizado
+ clinica   1 agente
 ─────────────────────────────────────────────────────────
  agentes de fudi
-  nutricion         llama3
-  pediatra          llama3
+  nutricion  llama3
+  pediatra  llama3
 ```
 
 The hint row is likewise the shared footer's, and here it changes with the focus:

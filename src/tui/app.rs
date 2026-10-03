@@ -69,7 +69,7 @@ enum KeyTarget {
     ProjectAgents,
     /// Skill proposals awaiting a decision, inside the analysis view.
     Proposals,
-    /// The delete confirmation, drawn over whichever view opened it.
+    /// The delete confirmation, drawn over the projects view.
     DeleteConfirm,
     /// The agent form, at a given field. Two of its keys mean different things
     /// field by field, so the field index is part of what the row says.
@@ -119,9 +119,9 @@ fn key_target(
     form_field_index: usize,
     confirm_delete: bool,
 ) -> KeyTarget {
-    // Checked first because it is the outermost interception in the event loop:
-    // `confirm_delete` is consulted before the agent form, before the chat, and
-    // before the view's own keys, and every branch below it `continue`s.
+    // Checked first because it outranks every axis below it: the handler in the
+    // event loop takes every key while the confirmation is up and `continue`s, so
+    // no keypress reaches the screen any other target here describes.
     if confirm_delete {
         return KeyTarget::DeleteConfirm;
     }
@@ -2059,18 +2059,18 @@ mod tests {
     }
 
     /// **The delete confirmation is the same defect, on the sibling modal.** Its
-    /// handler takes *every* key while it is up — it is consulted before the
-    /// agent form, before the chat, before `q`, and every branch `continue`s — so
-    /// the projects row underneath named seven keys that did nothing, `q: quit`
-    /// most visibly of all. There is no view to fall back to either: the modal is
-    /// drawn over whichever view opened it, so `key_target` has to be told it is
-    /// up.
+    /// handler takes *every* key while it is up — it is consulted before the chat
+    /// and before `q`, and every branch `continue`s — so the projects row
+    /// underneath named seven keys that did nothing, `q: quit` most visibly of
+    /// all. Nothing in the view says it is up: only the projects view opens it, and
+    /// the projects view stays current underneath, so `key_target` has to be told.
     #[test]
     fn the_delete_confirmation_owns_the_footer_while_it_is_up() {
         let idle = AnalysisState::Idle;
         let drawn = drawn_bounds();
-        // Every view the confirmation can be opened over, and the state that puts
-        // an agent list under it.
+        // Only the projects view opens it, but the check cannot know that: it has to
+        // answer `DeleteConfirm` whichever view it is asked about, and over both
+        // projects states, since the confirmation and the focus are separate inputs.
         for (view, focus) in [
             (CurrentView::Projects, true),
             (CurrentView::Projects, false),
