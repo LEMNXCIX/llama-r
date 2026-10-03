@@ -16,21 +16,31 @@ const UNANALYZED: &str = "unanalyzed";
 /// Draws the projects view inside `body`, the part of the screen the shared
 /// chrome left over.
 ///
-/// One row per project: the name, how many agents it has, and whether it has
-/// been analysed. The counts are a column the eye compares down the list, so
-/// every row's count ends in the same place.
+/// Two lists, stacked and separated by one rule, both of them plain rows:
 ///
-/// The key hints are the chrome footer's job, not this function's.
+/// - one row per project — its name, how many agents it has, whether it has
+///   been analysed. The counts are a column the eye compares down the list, so
+///   every row's count ends in the same place.
+/// - the selected project's agents, one row each, under a label saying whose
+///   they are.
 ///
-/// `agent_index` stays in the signature so the call site does not change. This
-/// view no longer draws the agent list — the count on each row is what it is
-/// reduced to, and the context bar already carries the agent in force.
+/// The agent list is here because four key bindings act on it. `←/→` moves
+/// focus between the two, `↑/↓` moves within whichever has it, `e` edits the
+/// selected agent and `d` deletes it. A previous revision of this view dropped
+/// the agent rows and kept the keys, so pressing any of them deselected the
+/// screen with nothing left to navigate to: the keys drove a list that was not
+/// drawn. Two lists of rows with a rule between is still the minimal shape —
+/// it is boxes and titles this view gives up, not its content.
+///
+/// The key hints are the chrome footer's job, not this function's; they follow
+/// the focus, so they are asked for with the same two flags that pick the active
+/// row.
 pub fn render_projects(
     f: &mut Frame,
     body: Rect,
     state: &AppState,
     project_index: usize,
-    _agent_index: usize,
+    agent_index: usize,
     active_in_project_list: bool,
 ) {
     let projects = state.context_store.list_all_projects();
@@ -124,17 +134,68 @@ pub fn render_projects(
         })
         .collect();
 
-    // The rule gets the last row, so a list that fills the body loses its last
-    // project rather than the separator under it.
+    // The agents of the selected project, which the lower list shows. Filtered
+    // the same way the counts above are, so the two cannot disagree about which
+    // project is selected.
+    let selected = projects.get(project_index);
+    let agents: Vec<&crate::domain::agent::Agent> = agents
+        .iter()
+        .filter(|agent| match (agent.project_id.as_deref(), selected) {
+            (Some(agent_project), Some(project)) => agent_project == project.project_id.as_str(),
+            _ => false,
+        })
+        .collect();
+
+    // Three regions: the project rows, the rule, then the agent rows. The rule
+    // and the label come off the top first, so a body too short for the agents
+    // loses agent rows rather than the project list or the rule between them.
+    let project_rows = items.len() as u16;
+    let reserved = 1 + 1; // the rule, and the agent list's label
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length((items.len() as u16).min(body.height.saturating_sub(1))),
+            Constraint::Length(project_rows.min(body.height.saturating_sub(reserved))),
             Constraint::Length(1),
+            Constraint::Min(0),
         ])
         .split(body);
     f.render_widget(List::new(items), chunks[0]);
     chrome::separator(f, chunks[1]);
+
+    let agents_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(chunks[2]);
+    // The label says whose agents these are. Without it the lower rows are a
+    // second list of short names directly under a list of projects, and the eye
+    // has no way to tell the two apart.
+    let label = Paragraph::new(Line::from(Span::styled(
+        match selected {
+            Some(project) => format!(" agentes de {}", project.project_id),
+            None => " agentes".to_string(),
+        },
+        theme::chrome(),
+    )));
+    f.render_widget(label, agents_chunks[0]);
+
+    let agent_items: Vec<ListItem> = agents
+        .iter()
+        .enumerate()
+        .map(|(index, agent)| {
+            // Bold marks the row the next keystroke acts on, and only while
+            // this list has the focus — the same rule the project rows follow.
+            let style = if !active_in_project_list && index == agent_index {
+                theme::active()
+            } else {
+                theme::content()
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("  {}", agent.id), style),
+                Span::styled(format!("  {}", agent.config.model), theme::chrome()),
+            ]))
+        })
+        .collect();
+    f.render_widget(List::new(agent_items), agents_chunks[1]);
 }
 
 #[cfg(test)]
@@ -157,6 +218,16 @@ mod tests {
     /// The projects view on an 80x24 terminal, inside the body the chrome
     /// leaves under the bar.
     fn render(state: &AppState, project_index: usize, active_in_project_list: bool) -> Buffer {
+        render_with(state, project_index, 0, active_in_project_list)
+    }
+
+    /// The same, with the agent list's own selection.
+    fn render_with(
+        state: &AppState,
+        project_index: usize,
+        agent_index: usize,
+        active_in_project_list: bool,
+    ) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|f| {
@@ -165,7 +236,7 @@ mod tests {
                     Rect::new(0, 1, 80, 22),
                     state,
                     project_index,
-                    0,
+                    agent_index,
                     active_in_project_list,
                 );
             })
@@ -240,8 +311,13 @@ mod tests {
         let buffer = render(&state, 0, true);
         // `agente`, not `agentes`: one of the three projects has exactly one
         // agent and correctly reads `1 agente`, so the plural needle would find
-        // two rows and the test would pass on a broken column.
-        let columns: Vec<usize> = (0..buffer.area.height)
+        // two rows and the test would pass on a broken column. Scoped to the
+        // rows above the rule, because the agent list below it is labelled
+        // `agentes de <project>` and would match too.
+        let projects_end = (0..buffer.area.height)
+            .find(|y| row_text(&buffer, *y).contains('─'))
+            .unwrap();
+        let columns: Vec<usize> = (0..projects_end)
             .filter_map(|y| column_of(&buffer, y, "agente"))
             .collect();
         assert_eq!(
@@ -328,6 +404,173 @@ mod tests {
                 project.project_id
             );
         }
+    }
+
+    /// Four keys act on the agent list: `←/→` moves focus onto it, `↑/↓` moves
+    /// within it, `e` edits the selected agent and `d` deletes it. This is the
+    /// regression guard for the state that made all four of them useless — the
+    /// list was dropped from the view while the keys stayed, so pressing one
+    /// deselected the screen with nothing to navigate to.
+    #[test]
+    fn the_selected_projects_agents_are_listed_under_it() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(
+            &[("fudi", "rust"), ("clinica", "rust")],
+            &[("fudi", 2), ("clinica", 1)],
+        );
+        let projects = state.context_store.list_all_projects();
+        let fudi = projects
+            .iter()
+            .position(|p| p.project_id == "fudi")
+            .expect("the fixture must have a project named fudi");
+        let text = all_text(&render(&state, fudi, true));
+        assert!(
+            text.contains("agentes de fudi"),
+            "the agent list must say whose agents it is: {text}"
+        );
+        for id in ["agent-0", "agent-1"] {
+            assert!(
+                text.contains(id),
+                "the selected project's agent {id} must be listed: {text}"
+            );
+        }
+        // The other project's single agent belongs to the other project, and a
+        // list that showed it would be showing an agent `↑/↓` cannot reach:
+        // `agent_index` only ever walks the selected project's agents.
+        assert_eq!(
+            text.matches("agent-0").count(),
+            1,
+            "an agent must appear once, under its own project: {text}"
+        );
+    }
+
+    /// The count on the project row and the rows below it must agree. They are
+    /// computed from the same filter, so a change to one without the other
+    /// would show `3 agentes` above an empty list.
+    #[test]
+    fn the_agent_rows_match_the_count_on_the_project_row() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(&[("fudi", "rust")], &[("fudi", 3)]);
+        let buffer = render(&state, 0, true);
+        let text = all_text(&buffer);
+        assert!(
+            text.contains("3 agentes"),
+            "the row must count them: {text}"
+        );
+        for id in ["agent-0", "agent-1", "agent-2"] {
+            assert!(
+                text.contains(id),
+                "every counted agent must be listed: {text}"
+            );
+        }
+    }
+
+    /// A project with no agents says so instead of showing a bare label over
+    /// nothing — the same rule the empty project list follows.
+    #[test]
+    fn a_project_with_no_agents_says_so() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(&[("clinica", "rust")], &[]);
+        let text = all_text(&render(&state, 0, true));
+        assert!(
+            text.contains("agentes de clinica"),
+            "the label is still the header of the list: {text}"
+        );
+        assert!(
+            text.contains("0 agentes"),
+            "the row already says there are none: {text}"
+        );
+        assert!(
+            !text.contains("agent-"),
+            "no agent rows may be drawn for a project with no agents: {text}"
+        );
+    }
+
+    /// `agent_index` selects a row in the lower list, and it is a `usize` the
+    /// caller clamps rather than a promise. An index past the end must select
+    /// nothing rather than panic or mark a row that is not there.
+    #[test]
+    fn an_out_of_range_agent_index_selects_nothing() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(&[("fudi", "rust")], &[("fudi", 2)]);
+        let buffer = render(&state, 0, false);
+        let text = all_text(&buffer);
+        assert!(
+            text.contains("agent-0"),
+            "the agents must still be listed: {text}"
+        );
+        assert!(
+            !text.contains('>'),
+            "no row may claim the selection: {text}"
+        );
+    }
+
+    /// Which list holds the bold row is what tells the user where `e` and `d`
+    /// will act, and it has to follow `active_in_project_list` in both
+    /// directions: one row active at a time, and always in the focused list.
+    #[test]
+    fn the_focused_list_is_the_only_one_with_an_active_row() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(&[("fudi", "rust")], &[("fudi", 2)]);
+
+        // The registry does not promise an order, so the index under test is read
+        // back off it rather than assumed: `list_agents` walks a HashMap, and
+        // `agent-1` is not reliably the second row.
+        let second = state
+            .agent_registry
+            .list_agents()
+            .iter()
+            .position(|agent| agent.id == "agent-1")
+            .expect("the fixture must have an agent named agent-1");
+
+        let agents_focused = render_with(&state, 0, second, false);
+        let agent_row = row_of(&agents_focused, "agent-1");
+        assert!(
+            wears_at(&agents_focused, agent_row, 2, theme::active()),
+            "agent-1 is the selected agent and must wear active: {:?}",
+            row_text(&agents_focused, agent_row)
+        );
+        assert!(
+            !wears(
+                &agents_focused,
+                row_of(&agents_focused, "fudi"),
+                theme::active()
+            ),
+            "the project row must not look selected while the agent list has focus"
+        );
+        // And the row that is *not* selected says so.
+        let other = row_of(&agents_focused, "agent-0");
+        assert!(
+            wears_at(&agents_focused, other, 2, theme::content()),
+            "an unselected agent is ordinary text: {:?}",
+            row_text(&agents_focused, other)
+        );
+
+        let projects_focused = render_with(&state, 0, second, true);
+        assert!(
+            wears(
+                &projects_focused,
+                row_of(&projects_focused, "fudi"),
+                theme::active()
+            ),
+            "the project row must look selected while it has the focus"
+        );
+        assert!(
+            !wears_at(
+                &projects_focused,
+                row_of(&projects_focused, "agent-1"),
+                2,
+                theme::active()
+            ),
+            "no agent row may look selected while the agent list does not have focus"
+        );
+    }
+
+    /// Does the cell at column `x` on row `y` wear `token`? Agent rows are
+    /// indented two columns, so their name does not start at 1.
+    fn wears_at(buffer: &Buffer, y: u16, x: u16, token: Style) -> bool {
+        let cell = &buffer[(x, y)];
+        Some(cell.fg) == token.fg && cell.modifier == token.add_modifier
     }
 
     /// Does the project's name on row `y` wear `token`?

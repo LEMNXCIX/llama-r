@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-#[derive(PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum CurrentView {
     Dashboard,
     Projects,
@@ -52,7 +52,24 @@ const VIEW_NAMES: [&str; 6] = [
     "Chat",
 ];
 
-#[derive(Clone)]
+/// Which keys the shared footer describes.
+///
+/// The `CurrentView` alone is not enough: two screens answer to keys that belong
+/// to no view of their own — the agent list inside the projects view, and the
+/// proposal modal inside the analysis view. `hints_for` is keyed on `CurrentView`,
+/// so without these two it cannot see either, which is how the modal lost the
+/// only mention of its approve and discard keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyTarget {
+    /// The view's own body.
+    View(CurrentView),
+    /// The selected project's agent list, inside the projects view.
+    ProjectAgents,
+    /// Skill proposals awaiting a decision, inside the analysis view.
+    Proposals,
+}
+
+#[derive(Debug, Clone)]
 pub enum AnalysisState {
     Idle,
     Loading {
@@ -70,6 +87,25 @@ pub enum AnalysisState {
         /// One line per proposal: what was written, or why it was refused.
         results: Vec<String>,
     },
+}
+
+/// Which keys the footer shows for the screen about to be drawn.
+///
+/// A free function rather than a method so its three inputs can be named and
+/// tested without an `AppState`: nothing here reads app state beyond the view,
+/// the list focus and the analysis state.
+fn key_target(
+    view: &CurrentView,
+    active_in_project_list: bool,
+    analysis: &AnalysisState,
+) -> KeyTarget {
+    if matches!(analysis, AnalysisState::Proposals { .. }) {
+        return KeyTarget::Proposals;
+    }
+    if matches!(view, CurrentView::Projects) && !active_in_project_list {
+        return KeyTarget::ProjectAgents;
+    }
+    KeyTarget::View(view.clone())
 }
 
 pub struct TuiApp {
@@ -395,53 +431,71 @@ impl TuiApp {
         self.available_agents = agents;
     }
 
-    /// The key hints the shared footer shows for `view`.
+    /// The key hints the shared footer shows.
     ///
-    /// This is the single place hint text lives: the per-view footers that
-    /// used to repeat it are on their way out. No `self`: the text does not
-    /// depend on app state, which keeps it reachable from a test.
-    fn hints_for(view: CurrentView) -> Vec<(&'static str, &'static str)> {
-        match view {
-            CurrentView::Dashboard => {
+    /// This is the single place hint text lives. No `self`: the text depends
+    /// only on which keys the screen answers to, which keeps it reachable from a
+    /// test without a terminal or an `AppState`.
+    fn hints_for(target: KeyTarget) -> Vec<(&'static str, &'static str)> {
+        match target {
+            KeyTarget::View(CurrentView::Dashboard) => {
                 vec![("Tab", "next view"), ("↑/↓", "scroll logs"), ("q", "quit")]
             }
-            // One row, and a hint that does not fit is clipped from the right,
-            // which takes `q: quit` first — the one key nobody can do without.
-            // Sized to fit 80 columns. Two hints are absent because what they
-            // act on is not drawn here: `e` edits an agent and `←/→` toggles
-            // focus to the agent list (`app.rs:1066`), neither of which this
-            // view shows. `design.md:103` advertises `n`, `a` and `d` for this
-            // screen. Both keys still work in the app; they are just not
-            // advertised. `↑/↓` is advertised instead, because it moves the
-            // selection in the one list that *is* drawn.
-            CurrentView::Projects => vec![
-                ("Tab", "switch list"),
+            // The project list. `Tab` switches *views*, not lists — it is `←/→`
+            // that moves between this list and the agent list below it — so the
+            // row says so where the key is named. Seven hints fill the row
+            // exactly, which is also why `n` is the only one named by one word.
+            KeyTarget::View(CurrentView::Projects) => vec![
+                ("Tab", "view"),
+                ("←/→", "agents"),
                 ("↑/↓", "select"),
                 ("a", "analyze"),
-                ("n", "new agent"),
+                ("n", "new"),
                 ("d", "delete"),
                 ("q", "quit"),
             ],
-            CurrentView::AgentForm => vec![
-                ("Tab", "next field"),
-                ("Shift+Tab", "prev field"),
-                ("Enter", "newline in prompt"),
-                ("←/→", "cycle project"),
+            // The agent list, which `e` only edits while this one has focus —
+            // so the hint moves with the focus rather than being on the screen
+            // either way.
+            KeyTarget::ProjectAgents => vec![
+                ("Tab", "view"),
+                ("←/→", "projects"),
+                ("↑/↓", "select"),
+                ("e", "edit"),
+                ("d", "delete"),
+                ("q", "quit"),
+            ],
+            KeyTarget::View(CurrentView::AgentForm) => vec![
+                ("Tab", "field"),
+                ("Shift+Tab", "prev"),
+                ("Enter", "newline"),
                 ("Ctrl+S", "save"),
                 ("Esc", "cancel"),
             ],
-            CurrentView::Analysis => vec![("Esc", "back"), ("r", "re-analyze")],
-            CurrentView::ContextView => vec![("Esc", "back"), ("↑/↓", "scroll")],
-            // One row, and a hint that does not fit is clipped from the right, which
-            // takes `Esc: back` first. Sized to fit 80 columns: `PgUp/PgDn`
+            KeyTarget::View(CurrentView::Analysis) => {
+                vec![("Esc", "back"), ("r", "re-analyze")]
+            }
+            KeyTarget::View(CurrentView::ContextView) => vec![("Esc", "back"), ("↑/↓", "scroll")],
+            // One row, and a hint that does not fit is clipped from the right,
+            // which takes `Esc: back` first. Sized to fit 80 columns: `PgUp/PgDn`
             // still scrolls, it is just not advertised — six hints fit, seven
             // do not.
-            CurrentView::Chat => vec![
+            KeyTarget::View(CurrentView::Chat) => vec![
                 ("←/→", "agent"),
                 ("Enter", "send"),
                 ("Shift+Enter", "newline"),
                 ("↑↓", "scroll"),
                 ("Tab", "view"),
+                ("Esc", "back"),
+            ],
+            // The modal's own keys. Nothing else on this screen answers while a
+            // proposal is pending, so nothing else is advertised: the analysis
+            // view's `r` and `Esc` are the modal's `Esc` and nothing more, and
+            // `AnalysisState::Proposals` is what the modal draws.
+            KeyTarget::Proposals => vec![
+                ("Enter", "approve"),
+                ("a", "approve all"),
+                ("d", "discard"),
                 ("Esc", "back"),
             ],
         }
@@ -609,6 +663,19 @@ impl TuiApp {
                         .map(|p| p.project_id.clone()),
                     agent: self.chat_selected_agent.clone(),
                 };
+                // Read once, for the view and for the footer: the footer has to
+                // answer for the analysis state as well as the view, or the
+                // proposal modal's keys are on no row at all.
+                let analysis = self
+                    .analysis_state
+                    .try_lock()
+                    .map(|g| g.clone())
+                    .unwrap_or(AnalysisState::Idle);
+                let hints = Self::hints_for(key_target(
+                    &self.current_view,
+                    self.active_in_project_list,
+                    &analysis,
+                ));
                 chrome::render_bar(
                     f,
                     c.bar,
@@ -647,12 +714,7 @@ impl TuiApp {
                         );
                     }
                     CurrentView::Analysis => {
-                        let analysis_state = self
-                            .analysis_state
-                            .try_lock()
-                            .map(|g| g.clone())
-                            .unwrap_or(AnalysisState::Idle);
-                        crate::tui::views::analysis::render_analysis(f, c.body, &analysis_state);
+                        crate::tui::views::analysis::render_analysis(f, c.body, &analysis);
                     }
                     CurrentView::ContextView => {
                         crate::tui::views::context::render_context(
@@ -695,7 +757,7 @@ impl TuiApp {
                 if let Some((ref confirm_type, ref confirm_id)) = self.confirm_delete {
                     render_confirm_delete(f, c.body, confirm_type, confirm_id);
                 }
-                chrome::render_footer(f, c.footer, &TuiApp::hints_for(self.current_view.clone()));
+                chrome::render_footer(f, c.footer, &hints);
             })?;
 
             if event::poll(std::time::Duration::from_millis(50))? {
@@ -1065,6 +1127,9 @@ impl TuiApp {
                                     self.context_scroll = self.context_scroll.saturating_sub(1);
                                 }
                             }
+                            // Focus moves between the two lists the projects view draws: the project
+                            // rows and the agent rows below them. Both are on screen, so
+                            // both sets of keys act on something the user can see.
                             KeyCode::Char('l')
                             | KeyCode::Right
                             | KeyCode::Char('h')
@@ -1073,7 +1138,6 @@ impl TuiApp {
                                     self.active_in_project_list = !self.active_in_project_list;
                                 }
                             }
-                            // Placeholder for actions
                             KeyCode::Char('a') => {
                                 if self.current_view == CurrentView::Projects {
                                     let projects = self.state.context_store.list_all_projects();
@@ -1324,12 +1388,70 @@ mod tests {
         ]
     }
 
-    /// The chat footer is one row, and a hint that does not fit is clipped away
-    /// from the right — which takes `Esc: back` first. An escape key nobody can
-    /// see is a real loss, so the row is pinned at the default terminal width.
+    /// Every footer fits one row and loses nothing to the clip.
+    ///
+    /// `render_footer` has no truncation logic: it hands the line to `Paragraph`,
+    /// which clips at the area width with no ellipsis, so a hint pushed past 80
+    /// columns simply stops being drawn — no marker, no second line. The
+    /// consequence is that a row which overflows loses its *tail*, which on every
+    /// one of these screens is `q: quit` or `Esc: back`: the keys nobody can do
+    /// without. So the pin is the rendered row compared against the hint text,
+    /// which fails the moment one hint is cut. A `width <= 80` check alone is
+    /// necessary but not sufficient, and measuring the row's own width proves
+    /// nothing at all — the buffer is 80 columns wide whatever was written into
+    /// it.
     #[test]
-    fn the_chat_hints_fit_one_row() {
-        let hints = TuiApp::hints_for(CurrentView::Chat);
+    fn every_footer_fits_one_row_at_eighty_columns() {
+        let targets = [
+            KeyTarget::View(CurrentView::Dashboard),
+            KeyTarget::View(CurrentView::Projects),
+            KeyTarget::ProjectAgents,
+            KeyTarget::View(CurrentView::AgentForm),
+            KeyTarget::View(CurrentView::Analysis),
+            KeyTarget::Proposals,
+            KeyTarget::View(CurrentView::ContextView),
+            KeyTarget::View(CurrentView::Chat),
+        ];
+        for target in targets {
+            let hints = TuiApp::hints_for(target.clone());
+            let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
+            terminal
+                .draw(|f| chrome::render_footer(f, f.area(), &hints))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, 0)].symbol().to_string())
+                .collect();
+
+            // Measured from the hints, not from the row.
+            let width = hints
+                .iter()
+                .map(|(key, hint)| Line::from(format!("{key}: {hint}")).width() + 2)
+                .sum::<usize>()
+                - 2;
+            assert!(
+                width <= 80,
+                "the {target:?} hints are {width} columns wide and get clipped"
+            );
+            assert_eq!(
+                row.trim_end(),
+                hints
+                    .iter()
+                    .map(|(key, hint)| format!("{key}: {hint}"))
+                    .collect::<Vec<_>>()
+                    .join("  "),
+                "every {target:?} hint must survive the 80-column row"
+            );
+            println!("{target:?} hints render {width} columns of the 80 available");
+        }
+    }
+
+    /// The chat row has to keep the two hints the one-line input depends on:
+    /// `Shift+Enter: newline` is the only reason a multi-line prompt is still
+    /// composable, and `Esc: back` is the first thing the clip takes.
+    #[test]
+    fn the_chat_hints_keep_what_the_one_line_input_needs() {
+        let hints = TuiApp::hints_for(KeyTarget::View(CurrentView::Chat));
         let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
         terminal
             .draw(|f| chrome::render_footer(f, f.area(), &hints))
@@ -1346,33 +1468,29 @@ mod tests {
             row.contains("Shift+Enter: newline"),
             "the newline hint is the point of the one-line input: {row:?}"
         );
-        // Measured from the hints, not from the row: the row is 80 columns
-        // wide whatever was written into it, so measuring it there proves
-        // nothing.
-        let width = hints
-            .iter()
-            .map(|(key, hint)| Line::from(format!("{key}: {hint}")).width() + 2)
-            .sum::<usize>()
-            - 2;
-        assert!(
-            width <= 80,
-            "the chat hints are {width} columns wide and get clipped: {row:?}"
-        );
-        println!("chat hints render {width} columns of the 80 available");
     }
 
-    /// The same pin for the projects row, which was 86 columns wide and lost
-    /// `q: quit` to the clip.
-    ///
-    /// The pin is the rendered row, not the hint list: `render_footer` clips at
-    /// the area width with no ellipsis, so a hint pushed past 80 columns simply
-    /// stops being drawn. Comparing the row against the text the hints describe
-    /// fails the moment one of them is cut, which a `width <= 80` check cannot
-    /// do — the buffer is 80 columns wide whatever was written into it.
+    /// `AnalysisState::Proposals` is the only screen whose keys belong to no
+    /// `CurrentView`, and its approve/discard keys were the ones the deleted
+    /// hard-coded footer used to be the only mention of. `key_target` is what
+    /// puts them back: the check goes through `key_target` rather than through
+    /// `hints_for` directly, because a footer that can name those keys but is
+    /// never asked to is still a feature the user cannot find.
     #[test]
-    fn the_projects_hints_fit_one_row() {
-        let hints = TuiApp::hints_for(CurrentView::Projects);
+    fn the_proposal_modals_keys_are_on_the_footer() {
+        let pending = AnalysisState::Proposals {
+            project_path: "/tmp/p".into(),
+            proposals: vec![],
+            selected: 0,
+            results: Vec::new(),
+        };
+        assert_eq!(
+            key_target(&CurrentView::Analysis, true, &pending),
+            KeyTarget::Proposals
+        );
+
         let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        let hints = TuiApp::hints_for(KeyTarget::Proposals);
         terminal
             .draw(|f| chrome::render_footer(f, f.area(), &hints))
             .unwrap();
@@ -1380,28 +1498,74 @@ mod tests {
         let row: String = (0..buffer.area.width)
             .map(|x| buffer[(x, 0)].symbol().to_string())
             .collect();
+        for key in [
+            "Enter: approve",
+            "a: approve all",
+            "d: discard",
+            "Esc: back",
+        ] {
+            assert!(
+                row.contains(key),
+                "the proposal modal's {key:?} must be on screen: {row:?}"
+            );
+        }
+    }
 
-        // Measured from the hints, not from the row: the row is 80 columns wide
-        // whatever was written into it, so measuring it there proves nothing.
-        let width = hints
-            .iter()
-            .map(|(key, hint)| Line::from(format!("{key}: {hint}")).width() + 2)
-            .sum::<usize>()
-            - 2;
-        assert!(
-            width <= 80,
-            "the projects hints are {width} columns wide and get clipped: {row:?}"
-        );
+    /// …and only while proposals are pending. The other analysis states answer
+    /// to the analysis view's own keys, so a footer that kept the modal's would
+    /// be advertising `a` and `d` for a screen where neither does anything.
+    #[test]
+    fn the_proposal_keys_leave_the_footer_when_the_decision_is_over() {
+        for state in [
+            AnalysisState::Idle,
+            AnalysisState::Loading {
+                started_at: Instant::now(),
+            },
+            AnalysisState::Loaded("done".into()),
+            AnalysisState::Error("boom".into()),
+        ] {
+            assert_eq!(
+                key_target(&CurrentView::Analysis, true, &state),
+                KeyTarget::View(CurrentView::Analysis),
+                "{state:?} is not the proposal modal"
+            );
+        }
+    }
+
+    /// The projects view draws two lists and four keys move between and within
+    /// them. The footer has to follow the focus, because `e` only edits an agent
+    /// while the agent list is selected: an `e: edit` hint on the project list
+    /// would be a key that does nothing.
+    #[test]
+    fn the_projects_footer_follows_the_list_that_has_focus() {
+        let idle = AnalysisState::Idle;
+
         assert_eq!(
-            row.trim_end(),
-            hints
-                .iter()
-                .map(|(key, hint)| format!("{key}: {hint}"))
-                .collect::<Vec<_>>()
-                .join("  "),
-            "every hint must survive the 80-column row"
+            key_target(&CurrentView::Projects, true, &idle),
+            KeyTarget::View(CurrentView::Projects)
         );
-        println!("projects hints render {width} columns of the 80 available");
+        assert!(
+            !TuiApp::hints_for(KeyTarget::View(CurrentView::Projects))
+                .iter()
+                .any(|(key, _)| *key == "e"),
+            "`e` edits an agent and must not be advertised while the agent list is not selected"
+        );
+
+        assert_eq!(
+            key_target(&CurrentView::Projects, false, &idle),
+            KeyTarget::ProjectAgents
+        );
+        let agents = TuiApp::hints_for(KeyTarget::ProjectAgents);
+        assert!(
+            agents.iter().any(|(key, _)| *key == "e"),
+            "the agent list is selected, so its edit key must be advertised: {agents:?}"
+        );
+        assert!(
+            agents
+                .iter()
+                .any(|(key, hint)| *key == "←/→" && *hint == "projects"),
+            "the agent list needs a way back to the projects: {agents:?}"
+        );
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> event::KeyEvent {

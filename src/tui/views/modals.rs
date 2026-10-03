@@ -217,7 +217,11 @@ mod tests {
             .filter(|y| row_text(&buffer, *y).contains('>'))
             .map(|y| row_text(&buffer, y))
             .collect();
-        assert_eq!(marked.len(), 1, "exactly one proposal is marked: {marked:?}");
+        assert_eq!(
+            marked.len(),
+            1,
+            "exactly one proposal is marked: {marked:?}"
+        );
         assert!(
             marked[0].contains("dos"),
             "the marked proposal is the selected one: {marked:?}"
