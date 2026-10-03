@@ -454,15 +454,19 @@ impl TuiApp {
                 ("d", "delete"),
                 ("q", "quit"),
             ],
-            // The agent list, which `e` only edits while this one has focus —
-            // so the hint moves with the focus rather than being on the screen
-            // either way.
+            // The agent list. `e` and `d` only target an agent while this one has
+            // focus, so the hints move with the focus rather than being on the
+            // screen either way. `n` is here and `a` is not: `n` creates an agent
+            // in the project this row is showing, so it belongs to it, while `a`
+            // analyses that project and the user has moved off the projects they
+            // would be analysing.
             KeyTarget::ProjectAgents => vec![
                 ("Tab", "view"),
                 ("←/→", "projects"),
                 ("↑/↓", "select"),
                 ("e", "edit"),
                 ("d", "delete"),
+                ("n", "new"),
                 ("q", "quit"),
             ],
             // The form. `←/→` cycles the two fields that are not typed into (the model
@@ -1603,6 +1607,13 @@ mod tests {
                 .iter()
                 .any(|(key, hint)| *key == "←/→" && *hint == "projects"),
             "the agent list needs a way back to the projects: {agents:?}"
+        );
+        // Every hint on this row acts on an agent. `a` analyses the project, and
+        // the user is looking at agents: naming it here would say the two rows
+        // are the same selection.
+        assert!(
+            !agents.iter().any(|(key, _)| *key == "a"),
+            "analysing a project is the project row's key, not the agent list's: {agents:?}"
         );
     }
 
