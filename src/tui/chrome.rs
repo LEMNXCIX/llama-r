@@ -98,13 +98,13 @@ pub fn layout(area: Rect) -> Chrome {
 /// narrow, and within the group only the label is *fitted*: [`fit`] shortens it
 /// from the right and ends it in `…`.
 ///
-/// The rest of the row is not fitted, it is clipped. The line is assembled left
-/// to right and handed to a `Paragraph`, which does not wrap and cuts at the
-/// row's width, so past the cut nothing is chosen — the gap goes first, then the
-/// dot, then the last view names, and on a row narrower than the fixed part the
-/// product's name goes with them. Which is not the same as the fixed part being
-/// safe: it is only ever at the left, so it is the *last* thing the cut reaches,
-/// not a thing that is never reached.
+/// The rest of the row is not fitted, it is clipped, and nothing in it is exempt
+/// from that. The line is assembled left to right and handed to a `Paragraph`,
+/// which does not wrap and cuts at the row's width, so past the cut the gap goes
+/// first, then the dot, then the last view names, and on a row narrower than the
+/// fixed part the product's name goes with them. Which is not the same as the
+/// fixed part being safe: it is only ever at the left, so it is the *last* thing
+/// the cut reaches, not a thing the cut never reaches.
 ///
 /// The six shipped view names make the fixed part 66 columns, and the group needs
 /// three more for its gap and dot — 69 before the label has a column of its own

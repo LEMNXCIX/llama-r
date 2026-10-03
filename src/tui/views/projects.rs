@@ -115,7 +115,7 @@ pub fn render_projects(
     // The number is right-aligned in its own field, so the word after it is a
     // column: ` 2 agentes` beside `12 agentes`, not `2 agentes` beside
     // `12 agentes` with the words a column apart. `1 agente`, `3 agentes` — the
-    // spec's own mockup, `docs/superpowers/specs/2026-10-02-tui-redesign-design.md`
+    // spec's own mockup, in `docs/superpowers/specs/2026-10-02-tui-redesign-design.md`
     // § Per-view layout.
     let digits = totals
         .iter()
@@ -748,9 +748,11 @@ mod tests {
             "the one row left goes to the project list, and the agent keys then defer: {bounds:?}"
         );
 
-        // Four rows is the threshold the spec names: rule, label, one project row
-        // and one agent row. Pinned from both sides so the sentence in
-        // `design.md` has a test behind it rather than a number that could drift.
+        // Four rows is the threshold the spec's Per-view layout section names:
+        // rule, label, one project row and one agent row. Pinned from both sides
+        // so that sentence has a test behind it rather than a number that could
+        // drift — cited by section, not by line: the document is amended by this
+        // branch, and a number into it is stale the moment it grows.
         let mut four = Terminal::new(TestBackend::new(80, 4)).unwrap();
         let reported = std::cell::Cell::new(ListBounds::default());
         four.draw(|f| {

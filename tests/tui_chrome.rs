@@ -95,6 +95,9 @@ const MODAL_MODULE: &str = "modals";
 /// The dispatch that owns the chrome and `hints_for`.
 const APP: &str = include_str!("../src/tui/app.rs");
 
+/// The module that draws the bar.
+const CHROME: &str = include_str!("../src/tui/chrome.rs");
+
 /// `app.rs` with `hints_for`'s body removed — the one place hint text is allowed
 /// to live, and the reason `app.rs` is otherwise in scope for the hint check.
 ///
@@ -721,10 +724,228 @@ fn the_context_bar_never_draws_a_border() {
     }
 }
 
+/// Design spec and implementation plan, for the citation sweep below.
+const SPEC: &str = include_str!("../docs/superpowers/specs/2026-10-02-tui-redesign-design.md");
+const PLAN: &str = include_str!("../docs/superpowers/plans/2026-10-02-tui-redesign.md");
+
+/// The spec by the path the code names it by, so "the spec does not exist" is a
+/// message this guard can produce rather than one a reader has to discover.
+const SPEC_PATH: &str = "docs/superpowers/specs/2026-10-02-tui-redesign-design.md";
+
+/// The heading each piece of the spec is cited from. What these are for is the
+/// sentence, not the function: a citation says *where the rule is written*, and
+/// a heading still names that after the document grows a paragraph.
+const SPEC_SECTIONS: [&str; 7] = [
+    "### `theme.rs`",
+    "### `chrome.rs`",
+    "## Visual language",
+    "Per-view layout",
+    "### Chat",
+    "### Projects",
+    "## Testing",
+];
+
+/// The doc comment on `render_bar` used to say neither the product's name nor a
+/// view name is ever dropped — which `Paragraph`'s clip falsifies, and which sat
+/// for two revisions because a neighbouring `AGENTS.md` bullet had been corrected
+/// and this one had not. A module's own doc comment has to survive its neighbours
+/// being fixed, and nothing here checked that.
+#[test]
+fn the_bar_says_it_clips_its_right_edge_rather_than_choosing_what_to_drop() {
+    let doc = between(&CHROME, "/// Draws the context bar", "pub fn render_bar(");
+    assert!(
+        doc.contains("clipped") && doc.contains("`Paragraph`"),
+        "the bar's own doc must say the row is clipped at its width and never say \
+         the names cannot be dropped: {doc}"
+    );
+    assert!(
+        !doc.contains("never dropped") && !doc.contains("never truncated"),
+        "the bar drops whatever falls past the cut, including the dot: {doc}"
+    );
+}
+
+/// The text between `from` and `to` in `source`, or the whole source with a note
+/// when either marker is gone — a moved item should say so, not return nothing.
+fn between(source: &str, from: &str, to: &str) -> String {
+    let (Some(start), Some(end)) = (source.find(from), source.find(to)) else {
+        panic!("`{from}` .. `{to}` is not where this test looks any more");
+    };
+    source[start..end].to_string()
+}
+
+/// One call to `chrome::render_bar`, in `app.rs` — the only place the bar is
+/// drawn, and the reason a view cannot draw a second one over the dispatch's.
+#[test]
+fn only_the_dispatch_draws_the_bar() {
+    let mut calls: Vec<String> = Vec::new();
+    for (name, source) in tui_modules() {
+        for (number, line) in shipped(&source).lines().enumerate() {
+            if footer_call(line) || bar_call(line) {
+                calls.push(format!("src/tui/{name}:{}", number + 1));
+            }
+        }
+    }
+    assert_eq!(
+        calls.len(),
+        2,
+        "one call to `render_footer` and one to `render_bar`, both in the dispatch: {calls:?}"
+    );
+    for call in &calls {
+        assert!(
+            call.starts_with("src/tui/app.rs:"),
+            "the bar and the footer are the chrome's two rows and are drawn once, \
+             by the dispatch: {calls:?}"
+        );
+    }
+}
+
+/// Whether `line` *calls* `render_bar` rather than declaring it.
+fn bar_call(line: &str) -> bool {
+    if !line.contains("render_bar(") {
+        return false;
+    }
+    let trimmed = line.trim_start();
+    !(trimmed.starts_with("fn ")
+        || trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("pub(crate) fn "))
+}
+
+/// **Every citation of the spec names a section that is still a heading.** Two
+/// halves, because either alone passes for the wrong reason: a line number that
+/// is still in range says nothing about whether it still points at the rule it
+/// was cited for, and a section name that has drifted away says nothing about
+/// the sentences around it.
+///
+/// Not "the citation is in range" — that is what the three rotted citations in
+/// `projects.rs` looked like. `design.md:100-101` was correct when it was written
+/// and pointed at `### Projects` and a blank line after the spec grew by fifteen
+/// rows. What the code meant was *the project rows' mockup*, so that is what it
+/// has to say, and a heading survives an edit.
+#[test]
+fn every_citation_of_the_spec_names_a_section_that_still_exists() {
+    let citations = cited_sections();
+    assert!(
+        !citations.is_empty(),
+        "no citation of the design spec found under src/tui — either the sources \
+         stopped citing it or the scan has stopped finding them, and a sweep that \
+         finds nothing has checked nothing"
+    );
+    for (where_, section) in &citations {
+        assert!(
+            SPEC_SECTIONS.contains(&section.as_str()),
+            "{where_} cites the spec's {section:?}, which is not one of the headings \
+             it has: {SPEC_SECTIONS:?}"
+        );
+        assert!(
+            SPEC.lines().any(|line| {
+                let heading = line.trim();
+                heading == format!("### {section}")
+                    || heading == format!("## {section}")
+                    || heading.ends_with(&format!(" {section}"))
+            }),
+            "{SPEC_PATH} has no heading {section:?}, so the citation is a name with \
+             nothing behind it"
+        );
+    }
+}
+
+/// A line number is the form that rotted, three times, over one document this
+/// branch edits in the same commit that changes the code it describes. So none is
+/// used: the rule is asserted instead of pointed at (`render_bar`'s doc, the
+/// project-row comment), and where the *sentences* matter the citation names the
+/// section they are in.
+#[test]
+fn no_source_cites_a_line_number_in_the_spec() {
+    let mut checked = 0usize;
+    for (name, source) in tui_modules() {
+        for (number, line) in shipped(&source).lines().enumerate() {
+            if line.contains("design.md") {
+                checked += 1;
+            }
+            assert!(
+                !line_number_citation(line),
+                "src/tui/{name}:{} cites the spec by line number: {line:?} — cite the \
+                 section, or the number goes stale the next time the document grows",
+                number + 1
+            );
+        }
+    }
+    assert!(
+        checked > 0,
+        "no source under src/tui mentions the spec at all, so this found nothing to \
+         check — the scan is broken, not the code"
+    );
+}
+
+/// Whether `line` cites the spec by line number: the path, or its own short name,
+/// followed by a colon and a digit.
+fn line_number_citation(line: &str) -> bool {
+    [SPEC_PATH, "design.md"].iter().any(|needle| {
+        let Some(index) = line.find(needle) else {
+            return false;
+        };
+        let mut rest = line[index + needle.len()..].trim_start();
+        if let Some(stripped) = rest.strip_prefix(':') {
+            rest = stripped.trim_start().trim_start_matches('`').trim_start();
+        }
+        rest.starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
+/// The `(file:line, section)` pairs every source under `src/tui` cites.
+///
+/// A citation is one sentence and may wrap, and the `§` marker landed on the line
+/// after the path in the citation this was written for — so each line is read
+/// together with the one after it.
+fn cited_sections() -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for (name, source) in tui_modules() {
+        let lines: Vec<&str> = shipped(&source).lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let window = lines
+                .get(index + 1)
+                .map_or_else(|| (*line).to_string(), |next| format!("{line} {next}"));
+            if !window.contains("design.md") {
+                continue;
+            }
+            let Some((_, after)) = window.split_once('§') else {
+                continue;
+            };
+            let section: String = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == ' ')
+                .collect();
+            found.push((
+                format!("src/tui/{name}:{}", index + 1),
+                section.trim().to_string(),
+            ));
+        }
+    }
+    found
+}
+
+/// The plan's two anchors into the spec: it points at the file, and it does not
+/// re-decide what the spec decides. A copy of a decision in the plan is how the
+/// two drift — the plan said the chat input area may be boxed, the spec's
+/// per-view layout says the prompt marker replaced that box, and the code has
+/// neither.
+#[test]
+fn the_plan_points_at_the_spec_without_re_deciding_it() {
+    assert!(
+        PLAN.contains(SPEC_PATH),
+        "the plan must name the spec it implements"
+    );
+    assert!(
+        PLAN.contains("no boxes** except the modal dialogs"),
+        "the plan still permits a chat input box that the spec replaced with a \
+         prompt marker — the premise that put a false claim in two views"
+    );
+}
+
 /// The product's name is in the bar and in no view. It went when the dashboard's
-/// banner went, and the spec's claim that the bar "does that job" is false: the
-/// bar draws view names, a context label and a health dot, which say where you
-/// are, not what this is.
+/// banner went, and the spec's claim that the bar "does that job" was half
+/// false: the bar draws view names, a context label and a liveness dot, which
+/// say where you are, not what this is — the product's name is the part it added.
 #[test]
 fn the_context_bar_names_the_product() {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
