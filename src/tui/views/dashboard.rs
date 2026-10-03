@@ -23,11 +23,11 @@ const DOWN: &str = "○";
 ///
 /// A row of status, a rule, then the log list: the three-row product banner and
 /// the four bordered blocks it used to spend 13 rows on are now two. The banner
-/// went because the shared bar already carries the interface's identity — which
-/// view you are in, under which context, and whether the HTTP server is up — and
-/// the status row below names this gateway's two servers without a title. What
-/// is left answers the three questions a user lands here with: are the servers
-/// up, how much is configured, and what has happened since.
+/// went because the bar carries the product's name, which was the one part of it
+/// with nowhere else to go, and the status row below names this gateway's two
+/// servers without a title. What is left answers the three questions a user lands
+/// here with: are the servers up, how much is configured, and what has happened
+/// since.
 ///
 /// One thing the bar does *not* carry, which a reader of this file would
 /// otherwise assume it does: its dot is the HTTP **listener's** liveness

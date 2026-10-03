@@ -33,12 +33,16 @@ pub fn action() -> Style {
     Style::default().fg(Color::Cyan)
 }
 
-/// The current selection. The only bold *token*: in a list it marks the row the
-/// next keystroke acts on. Bold is not exclusive to that — the current view's name
-/// on the bar (`chrome::render_bar`) and two rows in `views/modals.rs`, the delete
-/// question and the warning before approval, wear it because the user has to read
-/// them. A view may also add bold on top of another token for a label
-/// (`views/analysis.rs` does it for `Error: `).
+/// The row the next keystroke acts on, and the only bold *token. In a list it
+/// marks the selection; it is not the token for *every* selection — the agent
+/// form marks its current field with `action()` instead, which is why that view
+/// costs a colour rather than a bold weight.
+///
+/// Bold is not exclusive to this token either: the current view's name on the bar
+/// (`chrome::render_bar`) and two rows in `views/modals.rs`, the delete question
+/// and the warning before approval, wear it because the user has to read them. A
+/// view may also add bold on top of another token for a label (`views/analysis.rs`
+/// does it for `Error: `).
 pub fn active() -> Style {
     Style::default()
         .fg(Color::Yellow)

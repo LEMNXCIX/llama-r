@@ -43,7 +43,7 @@ fn all_text(buffer: &Buffer) -> String {
         .join("\n")
 }
 
-/// The view modules, read from disk at test time.
+/// Every module under `src/tui/views/`, read from disk at test time.
 ///
 /// Deliberately not a list: a hand-maintained one goes stale the moment a module
 /// is added, and the module that goes unguarded is then the new one — which is
@@ -51,8 +51,10 @@ fn all_text(buffer: &Buffer) -> String {
 /// directory means a file cannot be added without also being guarded, and
 /// `include_str!` cannot silently fall back to nothing.
 ///
-/// `modals.rs` is exempt and named by [`MODAL_MODULE`], because borders are
-/// permitted there and nowhere else.
+/// No exemption here. [`MODAL_MODULE`] is applied by the one check that needs it
+/// — the border one — and left in the hint scan, which the delete confirmation
+/// used to be excluded from and no longer needs to be: its answers moved to
+/// `hints_for` with `KeyTarget::DeleteConfirm`.
 fn view_modules() -> Vec<(String, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/views");
     let mut found: Vec<(String, String)> = std::fs::read_dir(&dir)
@@ -69,7 +71,6 @@ fn view_modules() -> Vec<(String, String)> {
                 .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
             (name, source)
         })
-        .filter(|(name, _)| name != MODAL_MODULE)
         .collect();
     found.sort();
     assert!(
@@ -81,9 +82,14 @@ fn view_modules() -> Vec<(String, String)> {
     found
 }
 
-/// The one module under `src/tui/views/` permitted to draw a border. A dialog is
-/// the one thing on this screen that has to read as separate from the page behind
-/// it, and `design.md` permits a box nowhere else.
+/// The one module under `src/tui/views/` permitted to draw a border.
+///
+/// A dialog is the one thing on this screen that has to read as separate from the
+/// page behind it. That is the whole of the exemption and it is about borders:
+/// `only_the_modals_draw_borders` is the only check that skips this module, so
+/// the rule stays narrow enough that a box here cannot become invisible — a
+/// *second* check skipping it would quietly widen it to whatever that check
+/// looks for, and the guard would stop being a statement about boxes.
 const MODAL_MODULE: &str = "modals";
 
 /// The dispatch that owns the chrome and `hints_for`.
@@ -655,6 +661,9 @@ fn the_border_check_spots_every_spelling() {
 #[test]
 fn only_the_modals_draw_borders() {
     for (name, source) in view_modules() {
+        if name == MODAL_MODULE {
+            continue;
+        }
         assert_eq!(
             border_ask(shipped(&source)),
             None,

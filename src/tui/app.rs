@@ -196,18 +196,27 @@ fn move_agent_selection(bounds: ListBounds, current: usize, count: usize, delta:
 /// move, so the call site passes `self.active_in_project_list` and reads as the
 /// fact it is — no negation for the reader to get wrong.
 ///
-/// **Direction matters, and refusing the wrong direction is a trap.** Moving onto
-/// the agent list needs a row in it: a selection with nothing selected is how the
-/// footer ends up relabelling itself for a list that is not there. Moving *off* it
-/// never needs anything, because that is the only way back.
+/// **Direction matters, and the two directions are not symmetric.**
 ///
-/// The agent list empties while the focus is on it — deleting its last agent drops
-/// `agent_rows` to zero and leaves the focus where it was. An undirected
-/// `agent_rows > 0` would then refuse the exit, and since this key is the only
-/// writer of the focus flag and no view switch resets it, project selection,
-/// project delete and the way back would be gone for the life of the process.
-/// That is strictly worse than landing on an empty project row, which is a
-/// selection the user can still see and act on with `a`, `n` and `d`.
+/// Moving *onto* the agent list needs a row in it — **not because of the footer.**
+/// `key_target` re-checks `agent_rows > 0` when it resolves the target, so the
+/// row would not relabel itself for a list that is not there even without this
+/// gate. What the gate is for is the state: focus can only land on a list that
+/// has a row, which is what makes "a row wears `active` wherever the focus is"
+/// true. Move onto an empty list and `↑/↓` reaches [`move_agent_selection`],
+/// which refuses for the same reason — so the footer would read `↑/↓: select`
+/// over a list that selects nothing, and no row anywhere would wear `active`.
+///
+/// Moving *off* it never needs anything, because that is the only way back.
+/// The agent list can still empty while the focus is on it: the focus flag
+/// survives a view switch and a resize, and the rows are recomputed every frame,
+/// so a body too short for the list after the rule and the label — or an agent
+/// removed underneath the user — leaves the focus on a list with nothing in it.
+/// An undirected `agent_rows > 0` would then refuse the exit, and since this key
+/// is the only writer of the focus flag and no view switch resets it, project
+/// selection, project delete and the way back would be gone for the life of the
+/// process. Landing on the project list instead costs the user nothing: it is a
+/// selection they can still see and act on with `a`, `n` and `d`.
 fn may_move_list_focus(bounds: ListBounds, focus_is_on_the_project_list: bool) -> bool {
     if focus_is_on_the_project_list {
         agent_list_is_drawn(bounds)

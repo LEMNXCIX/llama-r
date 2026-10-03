@@ -95,8 +95,20 @@ pub fn layout(area: Rect) -> Chrome {
 /// dashboard says so where a reader would otherwise assume the bar does.
 ///
 /// The context group — label, gap, dot — is what gives way when the row is too
-/// narrow: the label truncates from the right and ends in `…`. Neither the view
-/// names nor the product's name is ever dropped.
+/// narrow, and within the group only the label is *fitted*: [`fit`] shortens it
+/// from the right and ends it in `…`.
+///
+/// The rest of the row is not fitted, it is clipped. The line is assembled left
+/// to right and handed to a `Paragraph`, which does not wrap and cuts at the
+/// row's width, so past the cut nothing is chosen — the gap goes first, then the
+/// dot, then the last view names, and on a row narrower than the fixed part the
+/// product's name goes with them. Which is not the same as the fixed part being
+/// safe: it is only ever at the left, so it is the *last* thing the cut reaches,
+/// not a thing that is never reached.
+///
+/// The six shipped view names make the fixed part 66 columns, and the group needs
+/// three more for its gap and dot — 69 before the label has a column of its own
+/// (`the_dot_needs_sixty_nine_columns_before_the_label_gets_one`).
 pub fn render_bar(
     f: &mut Frame,
     rect: Rect,
@@ -363,6 +375,62 @@ mod tests {
                 "api_running={api_running} must not show {absent:?}: {row:?}"
             );
         }
+    }
+
+    /// The bar clips its right edge; it does not choose what to drop.
+    ///
+    /// The doc comment on `render_bar` says only the label is fitted and the rest
+    /// is cut at the row's width, which makes 69 columns a number in a comment
+    /// rather than a consequence of the layout. This pins it, with the six view
+    /// names that actually ship — every other bar test here passes three, which is
+    /// 29 columns narrower than the real row and lets every "the view names
+    /// survive" claim look true.
+    ///
+    /// Found by measurement, not by counting the name, the joins and the names in
+    /// a comment: the width at which the dot stops being on screen is the width
+    /// the fixed part and the group together come to.
+    #[tokio::test]
+    async fn the_dot_needs_sixty_nine_columns_before_the_label_gets_one() {
+        const VIEWS: [&str; 6] = [
+            "Dashboard",
+            "Projects",
+            "Agent",
+            "Analysis",
+            "Context",
+            "Chat",
+        ];
+        /// The row with the group given no room at all, which is what the search
+        /// below measures against.
+        fn bar(width: u16) -> String {
+            let mut terminal = Terminal::new(TestBackend::new(width, 3)).unwrap();
+            terminal
+                .draw(|f| render_bar(f, f.area(), &VIEWS, 0, &Context::default(), true))
+                .unwrap();
+            row_text(&terminal.backend().buffer().clone(), 0)
+                .trim_end()
+                .to_string()
+        }
+
+        let narrowest = (1..=120u16).find(|width| bar(*width).contains('●'));
+        assert_eq!(
+            narrowest,
+            Some(69),
+            "the dot is the rightmost thing on the row, so the width it first \
+             fits at is the whole fixed part plus the gap and the dot"
+        );
+        // One column short of it the row is the fixed part and nothing else: no
+        // dot, and not even the gap in front of it.
+        assert_eq!(
+            bar(68),
+            "Llama-R │ Dashboard │ Projects │ Agent │ Analysis │ Context │ Chat",
+            "at 68 the group has no column left and the row is cut after the names"
+        );
+        // And wide enough to land it, with the label fitted into what is left.
+        assert_eq!(
+            bar(80),
+            "Llama-R │ Dashboard │ Projects │ Agent │ Analysis │ Context │ Chat     direct  ●",
+            "at 80 the whole label fits and the dot is the last column"
+        );
     }
 
     #[test]
