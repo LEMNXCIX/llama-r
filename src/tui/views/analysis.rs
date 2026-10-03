@@ -1,7 +1,7 @@
 use crate::tui::app::AnalysisState;
 use crate::tui::theme;
 use crate::tui::views::chat::{spinner_frame, SPINNER_INTERVAL};
-use crate::tui::views::projects::render_skill_proposals;
+use crate::tui::views::modals::render_skill_proposals;
 use ratatui::{
     layout::Rect,
     style::Modifier,
@@ -21,12 +21,16 @@ use ratatui::{
 /// generated skill is a modal, and [`render_skill_proposals`] keeps its border.
 pub fn render_analysis(f: &mut Frame, body: Rect, analysis_state: &AnalysisState) {
     match analysis_state {
+        // Idle is the state before anything has been triggered, and the key that
+        // triggers it lives on the projects list. Naming it here would be
+        // naming a key that does nothing on this screen; `hints_for` already
+        // carries the one that does (`r`).
         AnalysisState::Idle => {
-            let hint = Paragraph::new(Line::from(Span::styled(
-                "Press 'a' on a project to start analysis",
+            let idle = Paragraph::new(Line::from(Span::styled(
+                "No analysis running.",
                 theme::chrome(),
             )));
-            f.render_widget(hint, body);
+            f.render_widget(idle, body);
         }
         AnalysisState::Loading { started_at } => {
             let elapsed = started_at.elapsed();
@@ -106,7 +110,7 @@ mod tests {
     #[test]
     fn the_analysis_view_draws_no_box_characters() {
         let states = [
-            ("idle", AnalysisState::Idle, vec!["Press 'a' on a project"]),
+            ("idle", AnalysisState::Idle, vec!["No analysis running"]),
             (
                 "loading",
                 AnalysisState::Loading {

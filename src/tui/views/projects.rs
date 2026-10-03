@@ -2,9 +2,8 @@ use crate::api::handlers::AppState;
 use crate::tui::{chrome, theme};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{List, ListItem, Paragraph},
     Frame,
 };
 
@@ -138,127 +137,6 @@ pub fn render_projects(
     chrome::separator(f, chunks[1]);
 }
 
-/// Draws the delete confirmation over `body`. The bar and footer stay
-/// readable above and below it.
-pub fn render_confirm_delete(f: &mut Frame, body: Rect, confirm_type: &str, confirm_id: &str) {
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Percentage(40),
-                Constraint::Length(5),
-                Constraint::Percentage(40),
-            ]
-            .as_ref(),
-        )
-        .split(body);
-    let horiz = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(
-            [
-                Constraint::Percentage(25),
-                Constraint::Length(50),
-                Constraint::Percentage(25),
-            ]
-            .as_ref(),
-        )
-        .split(vert[1]);
-
-    let dialog = Paragraph::new(vec![
-        Line::from(Span::styled(
-            format!(" Delete {confirm_type}: \"{confirm_id}\"?"),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            " [y] Yes   [n] No   [Esc] Cancel",
-            Style::default().fg(Color::Gray),
-        )),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Confirm Delete "),
-    )
-    .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(dialog, horiz[1]);
-}
-
-/// Render the skill proposals awaiting approval.
-///
-/// The generated bodies are shown, not just the names: the user is being asked
-/// to let the model write instructions that will shape future behaviour, and
-/// approving without reading would make the approval meaningless.
-pub fn render_skill_proposals(
-    f: &mut Frame,
-    area: Rect,
-    proposals: &[crate::services::skill_generation::SkillProposal],
-    selected: usize,
-    results: &[String],
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    let title = Paragraph::new(Line::from(Span::styled(
-        " Skill proposals — nothing is written until you approve ",
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )))
-    .block(Block::default().borders(Borders::ALL));
-    f.render_widget(title, chunks[0]);
-
-    let mut lines: Vec<Line> = Vec::new();
-    if proposals.is_empty() {
-        lines.push(Line::from("No skill proposals."));
-    }
-    for (index, proposal) in proposals.iter().enumerate() {
-        let marker = if index == selected { ">" } else { " " };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{marker} "), Style::default().fg(Color::Cyan)),
-            Span::styled(
-                proposal.id.clone(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" — {}", proposal.description),
-                Style::default().fg(Color::Gray),
-            ),
-        ]));
-        for line in proposal.content.lines().take(6) {
-            lines.push(Line::from(format!("    {line}")));
-        }
-        lines.push(Line::from(""));
-    }
-    for result in results {
-        lines.push(Line::from(Span::styled(
-            result.clone(),
-            Style::default().fg(Color::Green),
-        )));
-    }
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" Proposals "))
-            .wrap(Wrap { trim: true }),
-        chunks[1],
-    );
-
-    // The approve/discard keys are in `TuiApp::hints_for` for the analysis
-    // view; this bordered row stays until the old chrome is deleted.
-    let footer = Paragraph::new("").block(Block::default().borders(Borders::ALL));
-    f.render_widget(footer, chunks[2]);
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{all_text, column_of, row_text, state_with};
@@ -266,6 +144,7 @@ mod tests {
     use crate::tui::chrome;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::style::Style;
     use ratatui::Terminal;
 
     /// The row `needle` was drawn on.

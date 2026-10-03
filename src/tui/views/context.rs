@@ -7,7 +7,11 @@ use ratatui::{
 };
 
 /// Shown for a project that has never been analysed.
-const NO_CONTEXT: &str = "No context analyzed yet. Press 'a' to analyze.";
+///
+/// The state, not the key: `hints_for` owns the keys, and this view has none of
+/// its own — the analysis key works on the projects list, so naming it here
+/// would be naming a key that does nothing on this screen.
+const NO_CONTEXT: &str = "No context analyzed yet.";
 
 /// Shown when `project_index` points past the end of the project list.
 const NO_PROJECT: &str = "No project selected";

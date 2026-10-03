@@ -4,20 +4,14 @@ use crate::services::agent_runtime::RuntimeChatRequest;
 use crate::tui::chrome;
 use crate::tui::views::chat::render_chat;
 use crate::tui::views::dashboard::render_dashboard;
-use crate::tui::views::projects::render_confirm_delete;
+use crate::tui::views::modals::render_confirm_delete;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::{
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
-    Terminal,
-};
+use ratatui::Terminal;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1312,48 +1306,12 @@ pub fn chat_input_action(key: event::KeyEvent, loading: bool) -> ChatAction {
     }
 }
 
-/// The old tab bar, superseded by [`chrome::render_bar`].
-///
-/// No longer called. Kept until the remaining per-view chrome is deleted, so
-/// the old chrome goes away in one sweep rather than half a step at a time.
-#[allow(dead_code)]
-fn render_tab_bar(f: &mut ratatui::Frame, current: &CurrentView) {
-    let area = f.area();
-    let bar_rect = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: 1,
-    };
-    let active_style = |active: bool| {
-        if active {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        }
-    };
-    let bar = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "  [Dashboard]",
-            active_style(*current == CurrentView::Dashboard),
-        ),
-        Span::styled(
-            "  [Projects]",
-            active_style(*current == CurrentView::Projects),
-        ),
-        Span::styled("  [Chat]", active_style(*current == CurrentView::Chat)),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
-    f.render_widget(bar, bar_rect);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyModifiers};
     use ratatui::backend::TestBackend;
+    use ratatui::text::Line;
 
     fn all_views() -> [CurrentView; 6] {
         [
