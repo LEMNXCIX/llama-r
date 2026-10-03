@@ -55,11 +55,12 @@ const VIEW_NAMES: [&str; 6] = [
 
 /// Which keys the shared footer describes.
 ///
-/// The `CurrentView` alone is not enough: two screens answer to keys that belong
-/// to no view of their own — the agent list inside the projects view, and the
-/// proposal modal inside the analysis view. `hints_for` is keyed on `CurrentView`,
-/// so without these two it cannot see either, which is how the modal lost the
-/// only mention of its approve and discard keys.
+/// The `CurrentView` alone is not enough: three screens answer to keys that
+/// belong to no view of their own — the agent list inside the projects view, the
+/// proposal modal inside the analysis view, and the delete confirmation, which is
+/// not a view at all. `hints_for` is keyed on `CurrentView`, so without these it
+/// cannot see any of them, which is how the modals lost the only mention of the
+/// keys that answer them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum KeyTarget {
     /// The view's own body.
@@ -68,6 +69,8 @@ enum KeyTarget {
     ProjectAgents,
     /// Skill proposals awaiting a decision, inside the analysis view.
     Proposals,
+    /// The delete confirmation, drawn over whichever view opened it.
+    DeleteConfirm,
 }
 
 #[derive(Debug, Clone)]
@@ -92,22 +95,32 @@ pub enum AnalysisState {
 
 /// Which keys the footer shows for the screen about to be drawn.
 ///
-/// A free function rather than a method so its three inputs can be named and
-/// tested without an `AppState`: nothing here reads app state beyond the view,
-/// the list focus and the analysis state.
+/// A free function rather than a method so its inputs can be named and tested
+/// without an `AppState`: nothing here reads app state beyond the view and the
+/// three facts about it the view alone cannot supply.
 ///
-/// **Both** axes, never either. `Esc` out of the proposal modal returns to the
-/// projects list and leaves `analysis_state` on `Proposals` — nothing else writes
-/// it — so a check on the state alone would keep the modal's `Enter: approve  a:
-/// approve all  d: discard` on the projects footer, where `a` re-triggers an
-/// analysis and `d` opens the delete confirmation. The two labels would name keys
-/// that do something else entirely.
+/// **Every axis, never a subset.** Each one is a screen whose keys belong to no
+/// `CurrentView`, and each was added after the footer was found naming keys
+/// that did something else entirely. `Esc` out of the proposal modal returns to
+/// the projects list and leaves `analysis_state` on `Proposals` — nothing else
+/// writes it — so a check on the state alone would keep the modal's `Enter:
+/// approve  a: approve all  d: discard` on the projects footer, where `a`
+/// re-triggers an analysis and `d` opens the delete confirmation. The delete
+/// confirmation is the same story with no view to go back to: it takes *every*
+/// key while it is up, so the row underneath names keys that do nothing.
 fn key_target(
     view: &CurrentView,
     active_in_project_list: bool,
     analysis: &AnalysisState,
     projects_bounds: ListBounds,
+    confirm_delete: bool,
 ) -> KeyTarget {
+    // Checked first because it is the outermost interception in the event loop:
+    // `confirm_delete` is consulted before the agent form, before the chat, and
+    // before the view's own keys, and every branch below it `continue`s.
+    if confirm_delete {
+        return KeyTarget::DeleteConfirm;
+    }
     if matches!(view, CurrentView::Analysis) && matches!(analysis, AnalysisState::Proposals { .. })
     {
         return KeyTarget::Proposals;
@@ -191,6 +204,24 @@ fn may_move_list_focus(bounds: ListBounds, focus_is_on_the_project_list: bool) -
     } else {
         true
     }
+}
+
+/// Where the projects view's focus goes after its selected agent is deleted.
+///
+/// Back on the project list, always. The agent list has just lost a row and, at
+/// one agent, has none — and the focus flag is what both the highlighted row and
+/// the footer's labels follow. Left on the agent list, `key_target` falls through
+/// to the projects row because `agent_rows == 0`, so the footer names
+/// `←/→: agents` while the focus is on the projects, `↑/↓` drives a selection
+/// nobody can see, `d` falls through to the project branch and is refused by
+/// [`selected_agent`], and no row wears `active` at all: three of seven labels
+/// wrong and nothing highlighted. Going back to the projects makes every label on
+/// the row true at once.
+///
+/// A free function for the reason the three above it are: the event loop is not
+/// reachable from a test, so a decision made inside it is a decision with no test.
+fn focus_after_agent_delete() -> bool {
+    true
 }
 
 pub struct TuiApp {
@@ -600,6 +631,13 @@ impl TuiApp {
                 ("d", "discard"),
                 ("Esc", "back"),
             ],
+            // The confirmation's own answer set, which is the whole of what it
+            // accepts. It is drawn over the projects view and its handler takes
+            // *every* key while it is up, so the row underneath was naming seven
+            // keys that did nothing — `q: quit` most of all, since the
+            // interception is before the quit binding too. Naming what answers
+            // the question is what makes the footer and the behaviour agree.
+            KeyTarget::DeleteConfirm => vec![("y", "delete"), ("n", "cancel"), ("Esc", "cancel")],
         }
     }
 
@@ -776,6 +814,7 @@ impl TuiApp {
                     self.active_in_project_list,
                     &analysis,
                     self.project_list_bounds,
+                    self.confirm_delete.is_some(),
                 ));
                 chrome::render_bar(
                     f,
@@ -1059,6 +1098,13 @@ impl TuiApp {
                                                         self.state.agent_registry.reload_all(&[]);
                                                 }
                                                 self.agent_index = 0;
+                                                // Not just the index: the focus has
+                                                // to leave a list that may now be
+                                                // empty, or the footer keeps
+                                                // naming the agent keys over rows
+                                                // that are gone.
+                                                self.active_in_project_list =
+                                                    focus_after_agent_delete();
                                             }
                                             _ => {}
                                         }
@@ -1505,6 +1551,26 @@ mod tests {
         ]
     }
 
+    /// `key_target` with the delete confirmation down.
+    ///
+    /// Every screen below is one with no dialog over it, and naming the fifth
+    /// axis here rather than at eight call sites is what keeps the argument list
+    /// honest: a test that wants the confirmation up calls `key_target`.
+    fn keys_for(
+        view: &CurrentView,
+        active_in_project_list: bool,
+        analysis: &AnalysisState,
+        projects_bounds: ListBounds,
+    ) -> KeyTarget {
+        key_target(
+            view,
+            active_in_project_list,
+            analysis,
+            projects_bounds,
+            false,
+        )
+    }
+
     /// Every footer fits one row and loses nothing to the clip.
     ///
     /// `render_footer` has no truncation logic: it hands the line to `Paragraph`,
@@ -1528,6 +1594,7 @@ mod tests {
             KeyTarget::Proposals,
             KeyTarget::View(CurrentView::ContextView),
             KeyTarget::View(CurrentView::Chat),
+            KeyTarget::DeleteConfirm,
         ];
         for target in targets {
             let hints = TuiApp::hints_for(target.clone());
@@ -1632,7 +1699,7 @@ mod tests {
             results: Vec::new(),
         };
         assert_eq!(
-            key_target(
+            keys_for(
                 &CurrentView::Analysis,
                 true,
                 &pending,
@@ -1677,7 +1744,7 @@ mod tests {
             AnalysisState::Error("boom".into()),
         ] {
             assert_eq!(
-                key_target(&CurrentView::Analysis, true, &state, ListBounds::default()),
+                keys_for(&CurrentView::Analysis, true, &state, ListBounds::default()),
                 KeyTarget::View(CurrentView::Analysis),
                 "{state:?} is not the proposal modal"
             );
@@ -1703,7 +1770,7 @@ mod tests {
         };
         // Inside the modal: the modal's keys.
         assert_eq!(
-            key_target(
+            keys_for(
                 &CurrentView::Analysis,
                 true,
                 &pending,
@@ -1722,7 +1789,7 @@ mod tests {
             CurrentView::AgentForm,
         ] {
             assert_eq!(
-                key_target(&view, true, &pending, ListBounds::default()),
+                keys_for(&view, true, &pending, ListBounds::default()),
                 KeyTarget::View(view.clone()),
                 "{view:?} is not the proposal modal, whatever the analysis state says"
             );
@@ -1748,6 +1815,144 @@ mod tests {
         );
     }
 
+    /// **The delete confirmation is the same defect, on the sibling modal.** Its
+    /// handler takes *every* key while it is up — it is consulted before the
+    /// agent form, before the chat, before `q`, and every branch `continue`s — so
+    /// the projects row underneath named seven keys that did nothing, `q: quit`
+    /// most visibly of all. There is no view to fall back to either: the modal is
+    /// drawn over whichever view opened it, so `key_target` has to be told it is
+    /// up.
+    #[test]
+    fn the_delete_confirmation_owns_the_footer_while_it_is_up() {
+        let idle = AnalysisState::Idle;
+        let drawn = drawn_bounds();
+        // Every view the confirmation can be opened over, and the state that puts
+        // an agent list under it.
+        for (view, focus) in [
+            (CurrentView::Projects, true),
+            (CurrentView::Projects, false),
+            (CurrentView::Dashboard, true),
+            (CurrentView::Chat, true),
+            (CurrentView::Analysis, true),
+            (CurrentView::ContextView, true),
+            (CurrentView::AgentForm, true),
+        ] {
+            assert_eq!(
+                key_target(&view, focus, &idle, drawn, true),
+                KeyTarget::DeleteConfirm,
+                "{view:?} with the confirmation up is not {view:?}"
+            );
+        }
+
+        let row = footer_row(KeyTarget::DeleteConfirm);
+        for answer in ["y: delete", "n: cancel", "Esc: cancel"] {
+            assert!(
+                row.contains(answer),
+                "the confirmation's {answer:?} must be on screen: {row:?}"
+            );
+        }
+        // …and nothing of the view underneath, which is the whole point: every one
+        // of those keys is swallowed before it reaches the view.
+        for inert in [
+            "a: analyze",
+            "n: new",
+            "d: delete",
+            "e: edit",
+            "←/→: agents",
+            "←/→: projects",
+            "q: quit",
+            "Enter: approve",
+        ] {
+            assert!(
+                !row.contains(inert),
+                "nothing underneath answers while the confirmation is up, so {inert:?} \
+                 must not be named: {row:?}"
+            );
+        }
+    }
+
+    /// **…and it leaves with it.** `y`/`n`/`Esc` all clear `confirm_delete`, so
+    /// the very next frame's footer must be the view's own again. A flag that
+    /// outlives its dialog is the same trap as the analysis state outliving the
+    /// proposal modal, one screen over.
+    #[test]
+    fn the_confirmation_keys_leave_the_footer_when_it_is_dismissed() {
+        let idle = AnalysisState::Idle;
+        let drawn = drawn_bounds();
+        // Up, then dismissed: the second frame is the first frame's target again.
+        assert_eq!(
+            keys_for(&CurrentView::Projects, false, &idle, drawn),
+            KeyTarget::ProjectAgents
+        );
+        let row = footer_row(KeyTarget::ProjectAgents);
+        assert!(
+            row.contains("e: edit"),
+            "the agent list's own keys come back: {row:?}"
+        );
+        assert!(
+            !row.contains("y: delete"),
+            "and nothing of the confirmation stays: {row:?}"
+        );
+    }
+
+    /// Deleting the selected agent puts the focus back on the projects, so every
+    /// label on the row that follows is true.
+    ///
+    /// The repro is a project with one agent: `→` `d` `y`. `agent_index` resets
+    /// and the agent list is empty, so `key_target` falls through to
+    /// `View(Projects)` — while the focus was still on the agent list. Three of
+    /// that row's seven labels were then wrong (`↑/↓` drove a selection nobody
+    /// could see, `d` fell through to the project branch and was refused,
+    /// `←/→: agents` was the wrong way round) and *no* row wore `active`, because
+    /// the project rows' marker follows this very flag.
+    #[test]
+    fn deleting_an_agent_puts_the_focus_back_where_the_labels_are_true() {
+        // The value the delete handler writes into `active_in_project_list`.
+        let focus_on_projects = focus_after_agent_delete();
+        assert!(
+            focus_on_projects,
+            "the focus goes back to the project list, not to an agent list that may be empty"
+        );
+
+        // The state the next frame sees: project rows, no agent rows.
+        let after = undrawn_bounds();
+        let idle = AnalysisState::Idle;
+
+        // The footer names the projects, which is where the focus now is.
+        assert_eq!(
+            keys_for(&CurrentView::Projects, focus_on_projects, &idle, after),
+            KeyTarget::View(CurrentView::Projects),
+            "the projects row is the one whose labels this focus makes true"
+        );
+        // The agent keys refuse, so the projects row's keys are the only honest set.
+        assert!(
+            selected_agent(after, &agents_named(&[]), 0).is_none(),
+            "`e` and the agent arm of `d` have nothing to aim at"
+        );
+        assert_eq!(
+            move_agent_selection(after, 0, 0, 1),
+            0,
+            "`↑/↓` must not move a selection with no row under it"
+        );
+        // Focus is already where the user can see it, so nothing needs `←/→` to
+        // put it there — and the empty agent list must still never be entered.
+        assert!(
+            !may_move_list_focus(after, focus_on_projects),
+            "an empty agent list must not be entered from the projects"
+        );
+        assert!(
+            may_move_list_focus(after, !focus_on_projects),
+            "and leaving one is never refused, or the project list is unreachable"
+        );
+        // The row the footer says the next keystroke acts on is a project row, so
+        // it exists: this is the half that is a rendering claim, pinned by
+        // `views/projects.rs::the_focused_list_is_the_only_one_with_an_active_row`.
+        assert!(
+            after.project_rows > 0,
+            "the focus has to land somewhere: {after:?}"
+        );
+    }
+
     /// The projects view draws two lists and four keys move between and within
     /// them. The footer has to follow the focus, because `e` only edits an agent
     /// while the agent list is selected: an `e: edit` hint on the project list
@@ -1763,7 +1968,7 @@ mod tests {
         };
 
         assert_eq!(
-            key_target(&CurrentView::Projects, true, &idle, drawn),
+            keys_for(&CurrentView::Projects, true, &idle, drawn),
             KeyTarget::View(CurrentView::Projects)
         );
         assert!(
@@ -1774,7 +1979,7 @@ mod tests {
         );
 
         assert_eq!(
-            key_target(&CurrentView::Projects, false, &idle, drawn),
+            keys_for(&CurrentView::Projects, false, &idle, drawn),
             KeyTarget::ProjectAgents
         );
         let agents = TuiApp::hints_for(KeyTarget::ProjectAgents);
@@ -1971,7 +2176,7 @@ mod tests {
         // Focus is on the agent list and it is empty: this is the state `→` reaches
         // on a project with no agents.
         assert_eq!(
-            key_target(&CurrentView::Projects, false, &idle, undrawn_bounds()),
+            keys_for(&CurrentView::Projects, false, &idle, undrawn_bounds()),
             KeyTarget::View(CurrentView::Projects),
             "an empty agent list must not get the agent row's labels"
         );
@@ -1995,7 +2200,7 @@ mod tests {
         // With rows drawn, the agent labels are back — so the gate is not simply
         // deleting them.
         assert_eq!(
-            key_target(&CurrentView::Projects, false, &idle, drawn_bounds()),
+            keys_for(&CurrentView::Projects, false, &idle, drawn_bounds()),
             KeyTarget::ProjectAgents
         );
         assert!(footer_row(KeyTarget::ProjectAgents).contains("e: edit"));

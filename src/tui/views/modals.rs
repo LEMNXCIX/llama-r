@@ -19,9 +19,11 @@ use ratatui::{
 /// Draws the delete confirmation over `body`. The bar and footer stay
 /// readable above and below it.
 ///
-/// The keys are a modal's answer set rather than a hint list: this is not a
-/// `CurrentView`, so it has no row on the bar and no footer of its own to put
-/// them in.
+/// The keys that answer it are the shared footer's job (`hints_for`, reached
+/// through `KeyTarget::DeleteConfirm`): a dialog is not a `CurrentView`, so
+/// before that target existed the answer set was spelled inside the box — which
+/// is why this module is, and was, exempt from the hint scan as well as the
+/// border one.
 pub fn render_confirm_delete(f: &mut Frame, body: Rect, confirm_type: &str, confirm_id: &str) {
     let vert = Layout::default()
         .direction(Direction::Vertical)
@@ -52,13 +54,6 @@ pub fn render_confirm_delete(f: &mut Frame, body: Rect, confirm_type: &str, conf
             theme::active(),
         )),
         Line::from(""),
-        // A dialog's answer set, not a view's key hints: this is not a
-        // `CurrentView`, so it has no row on the bar and no footer of its own to
-        // put them in. The keys are spelled out where the question is.
-        Line::from(Span::styled(
-            " [y] Yes   [n] No   [Esc] Cancel",
-            theme::chrome(),
-        )),
     ])
     .block(
         Block::default()
@@ -69,7 +64,7 @@ pub fn render_confirm_delete(f: &mut Frame, body: Rect, confirm_type: &str, conf
     f.render_widget(dialog, horiz[1]);
 }
 
-/// Render the skill proposals awaiting approval.
+/// Render the skill proposals awaiting approval, into `body`.
 ///
 /// The generated bodies are shown, not just the names: the user is being asked
 /// to let the model write instructions that will shape future behaviour, and
@@ -78,9 +73,13 @@ pub fn render_confirm_delete(f: &mut Frame, body: Rect, confirm_type: &str, conf
 /// This used to end in a bordered row three rows deep that drew nothing — the
 /// per-view footer the shared one replaced. Those rows go to the proposals
 /// instead, which is what the user is reading before they decide.
+///
+/// `body`, like every other view's second parameter: the chrome took the bar's
+/// and the footer's rows for itself, and a view that lays out the whole screen
+/// writes over the bar.
 pub fn render_skill_proposals(
     f: &mut Frame,
-    area: Rect,
+    body: Rect,
     proposals: &[crate::services::skill_generation::SkillProposal],
     selected: usize,
     results: &[String],
@@ -88,7 +87,7 @@ pub fn render_skill_proposals(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)])
-        .split(area);
+        .split(body);
 
     let title = Paragraph::new(Line::from(Span::styled(
         " Skill proposals — nothing is written until you approve ",
@@ -177,19 +176,17 @@ mod tests {
     /// `tests/tui_chrome.rs` exempts from the no-boxes rule, so if a box here
     /// stopped meaning "this is a dialog", that test's exemption would be
     /// pointing at nothing.
+    ///
+    /// The answer set is *not* asserted here: it lives in `hints_for`, and
+    /// `tests/tui_chrome.rs` scans this module for it like any other. A copy here
+    /// would be a second place to update and a second thing to go stale.
     #[test]
-    fn the_modals_draw_their_border_and_their_keys() {
+    fn the_modals_draw_their_border_and_say_what_they_are() {
         let text = all_text(&render_delete("project", "fudi"));
         assert!(text.contains('┌'), "a dialog is framed: {text}");
         assert!(
             text.contains("Delete project: \"fudi\"?"),
             "the dialog names what it deletes: {text}"
-        );
-        // Its answer set is the one key list a view may not own: there is no
-        // `CurrentView` for a dialog, so it has no row on the bar and no footer.
-        assert!(
-            text.contains("[y] Yes") && text.contains("[n] No"),
-            "a dialog states the keys that answer it: {text}"
         );
 
         let proposals = all_text(&render_proposals(&["demo"], 0));
@@ -204,10 +201,10 @@ mod tests {
     /// more than the `>` glyph: it wears the bold-and-yellow `active` token the
     /// list rows use for "the next keystroke lands here". An unselected proposal
     /// wears `content`, so the two cannot be confused. Not "the only one wearing
-    /// `active`": the banner above and the delete question wear it too, which is
+    /// `active`" — the banner above and the delete question wear it too, which is
     /// why the count below is scoped to the proposal rows.
     #[test]
-    fn the_selected_proposal_is_the_only_one_wearing_active() {
+    fn the_selected_proposal_is_the_active_one_among_the_proposal_rows() {
         let buffer = render_proposals(&["uno", "dos", "tres"], 1);
         // Scoped to the proposal rows: the banner above them is bold too, and a
         // screen-wide count would be counting the banner.

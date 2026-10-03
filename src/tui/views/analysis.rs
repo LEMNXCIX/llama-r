@@ -107,8 +107,12 @@ mod tests {
     }
 
     /// The regression guard for "no boxes", over every state this view draws
-    /// itself. `─` is left alone: the context bar draws it and this view must
-    /// not be blamed for it, but nothing here draws a rule either.
+    /// itself. `│` is in the list as well as the four corners: the bar's own
+    /// joiner is the one vertical the interface has, and `chrome` draws it into
+    /// the bar's row, so a vertical in this view's body is this view's. `─` is
+    /// not listed because the only state that draws rules is `Proposals`, which
+    /// delegates to `render_skill_proposals` — the rules belong to
+    /// `views/modals.rs`.
     ///
     /// The border assertion alone would also pass a view that drew nothing, so
     /// each state is checked for its own text as well.
