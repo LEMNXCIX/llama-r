@@ -752,7 +752,7 @@ const SPEC_SECTIONS: [&str; 7] = [
 /// being fixed, and nothing here checked that.
 #[test]
 fn the_bar_says_it_clips_its_right_edge_rather_than_choosing_what_to_drop() {
-    let doc = between(&CHROME, "/// Draws the context bar", "pub fn render_bar(");
+    let doc = between(CHROME, "/// Draws the context bar", "pub fn render_bar(");
     assert!(
         doc.contains("clipped") && doc.contains("`Paragraph`"),
         "the bar's own doc must say the row is clipped at its width and never say \
