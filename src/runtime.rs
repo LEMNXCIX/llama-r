@@ -16,6 +16,7 @@ use crate::api::history_api::{
 };
 use crate::api::observability::AppObservability;
 use crate::api::rag_api::{rag_delete_document, rag_ingest, rag_query};
+use crate::api::skill_api::list_skills_api;
 use crate::config::Config;
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::ContextStore;
@@ -157,6 +158,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/rag/ingest", post(rag_ingest))
         .route("/api/rag/query", post(rag_query))
         .route("/api/rag/delete-document", post(rag_delete_document))
+        .route("/api/skills", get(list_skills_api))
         .route("/api/conversations", get(list_conversations_handler))
         .route(
             "/api/conversations/:id",

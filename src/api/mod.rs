@@ -9,4 +9,5 @@ pub mod history_api;
 pub mod mcp_api;
 pub mod observability;
 pub mod rag_api;
+pub mod skill_api;
 pub mod sse;
