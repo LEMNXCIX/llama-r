@@ -638,7 +638,7 @@ impl TuiApp {
                         );
                     }
                     CurrentView::AgentForm => {
-                        crate::tui::views::projects::render_agent_form(
+                        crate::tui::views::agent_form::render_agent_form(
                             f,
                             c.body,
                             &self.form_id,
@@ -658,10 +658,10 @@ impl TuiApp {
                             .try_lock()
                             .map(|g| g.clone())
                             .unwrap_or(AnalysisState::Idle);
-                        crate::tui::views::projects::render_analysis(f, c.body, &analysis_state);
+                        crate::tui::views::analysis::render_analysis(f, c.body, &analysis_state);
                     }
                     CurrentView::ContextView => {
-                        crate::tui::views::projects::render_context(
+                        crate::tui::views::context::render_context(
                             f,
                             c.body,
                             &self.state,
