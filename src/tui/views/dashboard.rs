@@ -23,9 +23,15 @@ const DOWN: &str = "○";
 ///
 /// A row of status, a rule, then the log list: the three-row product banner and
 /// the four bordered blocks it used to spend 13 rows on are now two. The banner
-/// went because the bar above already carries the app's name. What is left
+/// went because the shared bar already carries the interface's identity — which
+/// view you are in, under which context, and whether the provider answers — and
+/// the status row below names this gateway without a title. What is left
 /// answers the three questions a user lands here with: are the servers up, how
 /// much is configured, and what has happened since.
+///
+/// What the bar does *not* carry is the product's name: `Llama-R` appears
+/// nowhere in the TUI now. Restoring it belongs to the bar itself, not to a
+/// view that would otherwise repeat the banner this function deleted.
 pub fn render_dashboard(f: &mut Frame, body: Rect, state: &AppState, log_scroll: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -269,6 +275,80 @@ mod tests {
             row_text(&buffer, FIRST_LOG_ROW).trim(),
             "",
             "the log list must start under the rule"
+        );
+    }
+
+    /// The counts have to carry the right *numbers* behind their words. Every
+    /// needle above is a stem, and two numbers side by side satisfy every stem
+    /// even when they are swapped — the fixture has one project and two agents,
+    /// so `1 agentes  2 proyectos` reads the same way through the list above.
+    /// The project count is also the only information this view adds, so it
+    /// gets a number of its own rather than a word.
+    ///
+    /// A fresh fixture's request counters are all zero, which would leave a
+    /// hardcoded `0` indistinguishable from the real figure, so they are moved
+    /// off zero first. Every number the row shows is then pinned to the state
+    /// field it comes from.
+    #[test]
+    fn the_status_numbers_come_from_the_state() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(&[("fudi", "rust")], &[("fudi", 2)]);
+        for _ in 0..3 {
+            state.observability.record_http_request();
+        }
+        state.observability.record_chat_request(800);
+        state.observability.record_fallback();
+        // 400 characters in, 200 out: the metric's own one-token-per-four-
+        // characters heuristic makes that 50 saved tokens.
+        state.metrics.record_optimization(400, 200);
+
+        let status = row_text(&render(&state, 0), STATUS_ROW);
+
+        let agents = state.agent_registry.list_agents().len();
+        assert!(
+            status.contains(&format!("{agents} agentes")),
+            "the agent count must be the number of agents, not the project's: {status:?}"
+        );
+        let projects = state.context_store.list_all_projects().len();
+        assert!(
+            status.contains(&format!("{projects} proyecto")),
+            "the project count must be the number of projects: {status:?}"
+        );
+
+        let metrics = state.observability.snapshot();
+        for number in [
+            format!("{} http", metrics.http_requests),
+            format!("{} chat", metrics.chat_requests),
+            format!("{} fallback", metrics.fallback_count),
+            format!("{} saved", state.metrics.get_saved_tokens()),
+        ] {
+            assert!(
+                status.contains(&number),
+                "{number:?} must be the state's own figure: {status:?}"
+            );
+        }
+    }
+
+    /// `count` inflects, and nothing above can see it happen: those needles are
+    /// stems on purpose. This view's first draft read `1 proyectos`, which no
+    /// stem-based assertion would have caught.
+    #[test]
+    fn the_counts_inflect_with_the_number() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, one) = state_with(&[("fudi", "rust")], &[]);
+        let one_project = row_text(&render(&one, 0), STATUS_ROW);
+        // The plural check is the one with teeth: `1 proyectos` contains
+        // `1 proyecto`, so only forbidding it tells the two apart.
+        assert!(
+            one_project.contains("1 proyecto") && !one_project.contains("1 proyectos"),
+            "one project is singular: {one_project:?}"
+        );
+
+        let (_dir, two) = state_with(&[("fudi", "rust"), ("clinica", "rust")], &[]);
+        let two_projects = row_text(&render(&two, 0), STATUS_ROW);
+        assert!(
+            two_projects.contains("2 proyectos"),
+            "two projects are plural: {two_projects:?}"
         );
     }
 
