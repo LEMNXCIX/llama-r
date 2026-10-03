@@ -6,12 +6,52 @@ use ratatui::{
     widgets::{List, ListItem, Paragraph},
     Frame,
 };
+use std::ops::Range;
 
 /// Blank columns between a project's name and the fields that follow it.
 const FIELD_GAP: usize = 2;
 
 /// `project_type` of a project that has never been analysed.
 const UNANALYZED: &str = "unanalyzed";
+
+/// The `rows` rows ending at `index`, extended forwards when `index` is near the
+/// top so the window is full.
+///
+/// A window, not a slice of the head: which rows a list shows is *derived* from
+/// which one is selected, so the two cannot disagree however the caller moves the
+/// index. That is the property the keys need — `↑/↓`, `e` and `d` all address
+/// `index`, and the row `index` names is in the window by construction.
+///
+/// Trailing rather than leading, so `↓` walks into the list without moving it and
+/// `↑` scrolls only once the selection reaches the top. That is the direction
+/// `less` and `vi` scroll in, and the one where the row you just moved onto is the
+/// row your eye was already following.
+fn window(len: usize, index: usize, rows: usize) -> Range<usize> {
+    if len == 0 || rows == 0 {
+        return 0..0;
+    }
+    let index = index.min(len - 1);
+    let start = (index + 1).saturating_sub(rows);
+    start..(start + rows).min(len)
+}
+
+/// How many rows of each list the projects view actually drew.
+///
+/// The two lists share one body, and the agent list is the one four keys act on,
+/// so it is given the rows first and the project list takes what is left. At some
+/// project counts that leaves a list with none — and a key that drives a row
+/// nobody can see is the defect this view exists to avoid — so the counts are
+/// reported back for the handlers to measure against.
+///
+/// This is the same render-time feedback [`crate::tui::views::chat::render_chat`]
+/// returns for its scroll bound, and for the same reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListBounds {
+    /// Rows drawn for the project list.
+    pub project_rows: usize,
+    /// Rows drawn for the agent list.
+    pub agent_rows: usize,
+}
 
 /// Draws the projects view inside `body`, the part of the screen the shared
 /// chrome left over.
@@ -35,6 +75,10 @@ const UNANALYZED: &str = "unanalyzed";
 /// The key hints are the chrome footer's job, not this function's; they follow
 /// the focus, so they are asked for with the same two flags that pick the active
 /// row.
+///
+/// Returns the rows each list got, for the reason given on [`ListBounds`]: the
+/// two share a body, so a list can end up with none of it and the keys that drive
+/// it have to know.
 pub fn render_projects(
     f: &mut Frame,
     body: Rect,
@@ -42,7 +86,7 @@ pub fn render_projects(
     project_index: usize,
     agent_index: usize,
     active_in_project_list: bool,
-) {
+) -> ListBounds {
     let projects = state.context_store.list_all_projects();
 
     if projects.is_empty() {
@@ -54,7 +98,7 @@ pub fn render_projects(
             theme::chrome(),
         )));
         f.render_widget(empty, body);
-        return;
+        return ListBounds::default();
     }
 
     let agents = state.agent_registry.list_agents();
@@ -134,38 +178,73 @@ pub fn render_projects(
         })
         .collect();
 
-    // The agents of the selected project, which the lower list shows. Filtered
-    // the same way the counts above are, so the two cannot disagree about which
-    // project is selected.
     let selected = projects.get(project_index);
-    let agents: Vec<&crate::domain::agent::Agent> = agents
-        .iter()
-        .filter(|agent| match (agent.project_id.as_deref(), selected) {
-            (Some(agent_project), Some(project)) => agent_project == project.project_id.as_str(),
-            _ => false,
+    let agents = agents_of_project(state, selected.map(|p| p.project_id.as_str()));
+
+    // Four regions: the project rows, the rule, the agent list's label, then the
+    // agent rows.
+    //
+    // The agent rows are sized first and the project rows take what is left,
+    // because four keys act on the agent list and one (`a`) acts on a project.
+    // But the agent list is not given *all* of them: a project list with no rows
+    // would point `a`, `d` and `n` at a project nobody can see, which is the same
+    // defect one list over. So each list keeps at least one row whenever the
+    // other has something to show, and when the body is too short even for that
+    // the counts reported back are zero and the keys consult them.
+    //
+    // Both lists are then drawn as a window on their own selection, so a list
+    // that did not get room for all of its rows still shows the selected one and
+    // every row stays reachable. That is what makes "no key drives invisible
+    // state" hold at every project count rather than only while the body
+    // outgrows both lists.
+    let fixed = 1 + 1; // the rule, and the label
+    let available = body.height.saturating_sub(fixed);
+    let both_have_rows = !agents.is_empty() && !projects.is_empty();
+    let agent_rows = (agents.len() as u16).min(if both_have_rows {
+        available.saturating_sub(1)
+    } else {
+        available
+    });
+    let project_rows = (items.len() as u16).min(available.saturating_sub(agent_rows));
+
+    let project_window = window(projects.len(), project_index, project_rows as usize);
+    let visible_items: Vec<ListItem> = project_window
+        .clone()
+        .map(|index| {
+            let (project, count) = (&projects[index], &counts[index]);
+            let name_style = if active_in_project_list && index == project_index {
+                theme::active()
+            } else {
+                theme::content()
+            };
+            let name = format!(" {}", project.project_id);
+            let pad = " ".repeat(count_column.saturating_sub(Line::from(name.as_str()).width()));
+            let mut spans = vec![
+                Span::styled(name, name_style),
+                Span::styled(format!("{pad}{count}"), theme::chrome()),
+            ];
+            if project.project_type != UNANALYZED {
+                let tail =
+                    " ".repeat(widest_count.saturating_sub(Line::from(count.as_str()).width()));
+                spans.push(Span::styled(format!("{tail}  "), theme::chrome()));
+                spans.push(Span::styled("●", theme::ok()));
+                spans.push(Span::styled(" analizado", theme::chrome()));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
-    // Three regions: the project rows, the rule, then the agent rows. The rule
-    // and the label come off the top first, so a body too short for the agents
-    // loses agent rows rather than the project list or the rule between them.
-    let project_rows = items.len() as u16;
-    let reserved = 1 + 1; // the rule, and the agent list's label
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(project_rows.min(body.height.saturating_sub(reserved))),
+            Constraint::Length(project_rows),
             Constraint::Length(1),
-            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(agent_rows),
         ])
         .split(body);
-    f.render_widget(List::new(items), chunks[0]);
+    f.render_widget(List::new(visible_items), chunks[0]);
     chrome::separator(f, chunks[1]);
-
-    let agents_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(chunks[2]);
     // The label says whose agents these are. Without it the lower rows are a
     // second list of short names directly under a list of projects, and the eye
     // has no way to tell the two apart.
@@ -176,12 +255,13 @@ pub fn render_projects(
         },
         theme::chrome(),
     )));
-    f.render_widget(label, agents_chunks[0]);
+    f.render_widget(label, chunks[2]);
 
-    let agent_items: Vec<ListItem> = agents
-        .iter()
-        .enumerate()
-        .map(|(index, agent)| {
+    let agent_window = window(agents.len(), agent_index, agent_rows as usize);
+    let agent_items: Vec<ListItem> = agent_window
+        .clone()
+        .map(|index| {
+            let agent = &agents[index];
             // Bold marks the row the next keystroke acts on, and only while
             // this list has the focus — the same rule the project rows follow.
             let style = if !active_in_project_list && index == agent_index {
@@ -195,7 +275,39 @@ pub fn render_projects(
             ]))
         })
         .collect();
-    f.render_widget(List::new(agent_items), agents_chunks[1]);
+    f.render_widget(List::new(agent_items), chunks[3]);
+
+    ListBounds {
+        project_rows: project_window.len(),
+        agent_rows: agent_window.len(),
+    }
+}
+
+/// The agents of `project_id`, in the order the projects view lists them.
+///
+/// Both sides of `agent_index` must agree on that order: the view draws this
+/// order and the key handlers index into it, so a second filter — or an unsorted
+/// one — would have `e` and `d` act on an agent other than the highlighted row.
+/// [`crate::api::handlers::AppState::agent_registry`] is a `HashMap` walk, so the
+/// order is not stable on its own.
+///
+/// Sorted by id, which is also what the user reads the list as. Both call sites go
+/// through here rather than filtering the registry themselves.
+pub fn agents_of_project(
+    state: &AppState,
+    project_id: Option<&str>,
+) -> Vec<crate::domain::agent::Agent> {
+    let Some(project_id) = project_id else {
+        return Vec::new();
+    };
+    let mut agents: Vec<crate::domain::agent::Agent> = state
+        .agent_registry
+        .list_agents()
+        .into_iter()
+        .filter(|agent| agent.project_id.as_deref() == Some(project_id))
+        .collect();
+    agents.sort_by(|a, b| a.id.cmp(&b.id));
+    agents
 }
 
 #[cfg(test)]
@@ -228,20 +340,36 @@ mod tests {
         agent_index: usize,
         active_in_project_list: bool,
     ) -> Buffer {
+        bounds_with(state, project_index, agent_index, active_in_project_list).1
+    }
+
+    /// The same render, returning both the buffer and the [`ListBounds`] it
+    /// reported — which is how a test reads the rows drawn rather than counting
+    /// them off the screen.
+    fn bounds_with(
+        state: &AppState,
+        project_index: usize,
+        agent_index: usize,
+        active_in_project_list: bool,
+    ) -> (ListBounds, Buffer) {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        // `Terminal::draw` returns a `CompletedFrame`, not the closure's value, so
+        // the bounds come back through a cell — the same shape `render_chat`'s
+        // caller uses.
+        let reported = std::cell::Cell::new(ListBounds::default());
         terminal
             .draw(|f| {
-                render_projects(
+                reported.set(render_projects(
                     f,
                     Rect::new(0, 1, 80, 22),
                     state,
                     project_index,
                     agent_index,
                     active_in_project_list,
-                );
+                ));
             })
             .unwrap();
-        terminal.backend().buffer().clone()
+        (reported.get(), terminal.backend().buffer().clone())
     }
 
     #[test]
@@ -406,6 +534,271 @@ mod tests {
         }
     }
 
+    /// The window a list shows always contains the selected row, whatever the
+    /// list's length, the selection, or how many rows it was given.
+    ///
+    /// Pinned as a table rather than through the renderer because the renderer's
+    /// own case — a list too long for the body — needs 20+ rows to reach, and this
+    /// says the same thing about every input at once.
+    #[test]
+    fn the_window_always_contains_the_selected_row() {
+        for len in 0..8usize {
+            for rows in 0..8usize {
+                for index in 0..12usize {
+                    let w = window(len, index, rows);
+                    assert!(
+                        w.start <= w.end && w.end <= len,
+                        "window {w:?} is not inside a list of {len} (index {index}, rows {rows})"
+                    );
+                    if len > 0 && rows > 0 {
+                        let selected = index.min(len - 1);
+                        assert!(
+                            w.contains(&selected),
+                            "index {selected} is outside its window {w:?} \
+                             (len {len}, rows {rows})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The window shows `rows` rows wherever the list has that many, so a short
+    /// list is not left showing one row because the selection sits at its head.
+    #[test]
+    fn the_window_is_full_wherever_the_list_has_the_rows() {
+        assert_eq!(window(2, 0, 19), 0..2, "a 2-item list in a 19-row body");
+        assert_eq!(window(20, 0, 3), 0..3, "at the top it fills forwards");
+        assert_eq!(
+            window(20, 19, 3),
+            17..20,
+            "at the bottom it fills backwards"
+        );
+        assert_eq!(
+            window(20, 5, 3),
+            3..6,
+            "in the middle it trails the selection"
+        );
+        assert_eq!(window(20, 5, 1), 5..6, "one row is the selection itself");
+        assert_eq!(window(20, 99, 3), 17..20, "a stale index shows the tail");
+        assert_eq!(window(0, 0, 3), 0..0, "an empty list shows nothing");
+        assert_eq!(window(20, 5, 0), 0..0, "no rows means no window");
+    }
+
+    /// **The guard for item 4's promise.** Twenty-five projects and twenty-four
+    /// agents in twenty-two body rows: neither list can be shown whole, and both
+    /// have keys aimed at them — four at the agent list, three at the project.
+    ///
+    /// So: each list keeps at least one row; the selected row of each is on
+    /// screen and is the row wearing `active`, at the head, the middle and the
+    /// tail; and the window is a window rather than a clip. The regression this
+    /// pins is the layout as it was, where `Min(0)` left the agent region
+    /// *empty* at this project count — a footer advertising `e: edit  d: delete`
+    /// over a list never drawn.
+    #[test]
+    fn a_body_too_short_for_both_lists_still_shows_the_selected_row() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let projects: Vec<(&str, &str)> = (0..25)
+            .map(|i| (leak(format!("p{i:02}")), "rust"))
+            .collect();
+        let (_dir, state) = state_with(&projects, &[("p00", 24)]);
+
+        // `list_all_projects` is a HashMap walk, so the index of the project that
+        // owns the twenty-four agents is looked up rather than assumed to be 0.
+        let p00 = state
+            .context_store
+            .list_all_projects()
+            .iter()
+            .position(|project| project.project_id == "p00")
+            .expect("the fixture must have a project named p00");
+
+        // Which agent sits at which index is the view's own order, read back from
+        // the function that defines it. Sorting is by id and `agent-10` sorts
+        // before `agent-2`, so a test that assumed `agent-19` was last would be
+        // reading an accident of the fixture rather than the list.
+        let ordered: Vec<String> = agents_of_project(&state, Some("p00"))
+            .iter()
+            .map(|agent| agent.id.clone())
+            .collect();
+        assert_eq!(ordered.len(), 24, "the fixture has twenty-four agents");
+
+        // The agent list is drawn at all, and it is a window rather than the whole
+        // list — otherwise this test would pass without exercising anything.
+        let head = render_with(&state, p00, 0, false);
+        let head_text = all_text(&head);
+        assert!(
+            head_text.contains("agentes de p00"),
+            "the agent list keeps its label: {head_text}"
+        );
+        assert!(
+            head_text.contains(&ordered[0]),
+            "the first agent is drawn: {head_text}"
+        );
+        assert!(
+            !head_text.contains(&ordered[23]),
+            "a list that showed all twenty-four would not prove the window: {head_text}"
+        );
+
+        // The last agent is reachable, and it is the row that wears `active` — so
+        // `e` and `d` act on a row the user can see.
+        let tail = render_with(&state, p00, 23, false);
+        let tail_text = all_text(&tail);
+        assert!(
+            tail_text.contains(&ordered[23]),
+            "the last agent must be reachable: {tail_text}"
+        );
+        assert!(
+            wears_at(&tail, row_of(&tail, &ordered[23]), 2, theme::active()),
+            "the selected agent is the active one: {:?}",
+            row_text(&tail, row_of(&tail, &ordered[23]))
+        );
+
+        // The middle too, so the window is not merely its two ends.
+        let middle = render_with(&state, p00, 12, false);
+        assert!(
+            wears_at(&middle, row_of(&middle, &ordered[12]), 2, theme::active()),
+            "the middle agent must be reachable and selected: {}",
+            all_text(&middle)
+        );
+
+        // The project list is a window as well, so its own keys — `a`, `d`, `n` —
+        // cannot be aimed at a row that scrolled off the top.
+        let all_projects = state.context_store.list_all_projects();
+        let last = all_projects.len() - 1;
+        let selected_id = all_projects[last].project_id.clone();
+        let projects_focused = render_with(&state, last, 0, true);
+        assert!(
+            wears(
+                &projects_focused,
+                row_of(&projects_focused, &selected_id),
+                theme::active()
+            ),
+            "{selected_id} is the selected project and must be drawn and active: {}",
+            all_text(&projects_focused)
+        );
+        // …and neither list was emptied by the other, which is the swap that
+        // "the agents get the rows first" would have caused.
+        let (bounds, _) = bounds_with(&state, p00, 23, false);
+        assert!(
+            bounds.project_rows > 0,
+            "the project list must not be emptied by the agent list: {bounds:?}"
+        );
+        assert!(
+            bounds.agent_rows > 0,
+            "nor the agent list by the projects: {bounds:?}"
+        );
+        assert!(
+            bounds.agent_rows < 24,
+            "and the agents are a window: {bounds:?}"
+        );
+        assert!(bounds.project_rows < 25, "as are the projects: {bounds:?}");
+    }
+
+    /// A body too short for either list — three rows, where the rule and the label
+    /// take two and one row is left — reports zero for the list that got none.
+    /// That zero is what the four agent keys consult to decide they may not act on
+    /// a row that was never drawn.
+    #[test]
+    fn a_body_with_no_room_reports_no_rows_rather_than_pretending() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let projects: Vec<(&str, &str)> = (0..25)
+            .map(|i| (leak(format!("p{i:02}")), "rust"))
+            .collect();
+        let (_dir, state) = state_with(&projects, &[("p00", 24)]);
+        let p00 = state
+            .context_store
+            .list_all_projects()
+            .iter()
+            .position(|project| project.project_id == "p00")
+            .expect("the fixture must have a project named p00");
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 3)).unwrap();
+        let reported = std::cell::Cell::new(ListBounds::default());
+        terminal
+            .draw(|f| {
+                reported.set(render_projects(
+                    f,
+                    Rect::new(0, 0, 80, 3),
+                    &state,
+                    p00,
+                    0,
+                    false,
+                ));
+            })
+            .unwrap();
+        let bounds = reported.get();
+        assert_eq!(
+            bounds.agent_rows, 0,
+            "three rows cannot hold a project row, a rule, a label and an agent: {bounds:?}"
+        );
+        assert_eq!(
+            bounds.project_rows, 1,
+            "the one row left goes to the project list, and the agent keys then defer: {bounds:?}"
+        );
+    }
+    /// The agent list's order is a guarantee, not an accident of the registry.
+    ///
+    /// `agent_index` addresses this list from the key handlers and points at a row in
+    /// the rendered one, so the two have to be the same list. They are one function —
+    /// [`agents_of_project`] is what both call — which is stronger than sorting twice
+    /// and hoping. What is left to pin is that it is *sorted*, since that is the part
+    /// the registry does not provide.
+    #[test]
+    fn the_agent_list_is_sorted_so_the_index_means_the_same_row_every_time() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(&[("fudi", "rust")], &[("fudi", 12)]);
+        let ids: Vec<String> = agents_of_project(&state, Some("fudi"))
+            .into_iter()
+            .map(|agent| agent.id)
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            ids, sorted,
+            "`agent_index` walks this order, so it must not be a HashMap's"
+        );
+        // Sorted by id as a string, which is not the numeric order a reader
+        // assumes: `agent-10` comes before `agent-2`. Worth saying out loud,
+        // because a test that assumed otherwise would be reading the fixture.
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "and strictly, so no index names two rows: {ids:?}"
+        );
+        assert!(ids.iter().any(|id| id == "agent-10"));
+        assert!(ids.iter().any(|id| id == "agent-2"));
+    }
+
+    /// A project with no agents, or an index naming no project, yields an empty
+    /// list rather than every agent: the filter is on the project's id and
+    /// nothing else.
+    #[test]
+    fn the_agent_list_is_empty_for_a_project_that_is_not_selected() {
+        let _env = crate::core::paths::lock_env_for_tests();
+        let (_dir, state) = state_with(
+            &[("fudi", "rust"), ("clinica", "rust")],
+            &[("fudi", 2), ("clinica", 1)],
+        );
+        assert_eq!(
+            agents_of_project(&state, Some("clinica")).len(),
+            1,
+            "another project's agents are not this project's"
+        );
+        assert!(
+            agents_of_project(&state, None).is_empty(),
+            "no project selected means no agents"
+        );
+        assert!(
+            agents_of_project(&state, Some("nope")).is_empty(),
+            "a project that does not exist has no agents"
+        );
+    }
+
+    /// A `&'static str` for a generated project name. `state_with` borrows its
+    /// names and a `Vec<(String, _)>`, which is the one way to name 25 projects
+    /// without 25 lines of fixture.
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
     /// Four keys act on the agent list: `←/→` moves focus onto it, `↑/↓` moves
     /// within it, `e` edits the selected agent and `d` deletes it. This is the
     /// regression guard for the state that made all four of them useless — the
@@ -488,21 +881,27 @@ mod tests {
 
     /// `agent_index` selects a row in the lower list, and it is a `usize` the
     /// caller clamps rather than a promise. An index past the end must select
-    /// nothing rather than panic or mark a row that is not there.
+    /// nothing — which is a claim about the *style*, so it is checked against the
+    /// style: no agent row may wear `active`. An earlier version of this test
+    /// looked for a `>` marker, which agent rows never draw, so it passed for
+    /// every implementation.
     #[test]
     fn an_out_of_range_agent_index_selects_nothing() {
         let _env = crate::core::paths::lock_env_for_tests();
         let (_dir, state) = state_with(&[("fudi", "rust")], &[("fudi", 2)]);
-        let buffer = render(&state, 0, false);
+        let buffer = render_with(&state, 0, 99, false);
         let text = all_text(&buffer);
         assert!(
             text.contains("agent-0"),
             "the agents must still be listed: {text}"
         );
-        assert!(
-            !text.contains('>'),
-            "no row may claim the selection: {text}"
-        );
+        for id in ["agent-0", "agent-1"] {
+            assert!(
+                !wears_at(&buffer, row_of(&buffer, id), 2, theme::active()),
+                "an index past the end must mark no row, and {id} is marked: {:?}",
+                row_text(&buffer, row_of(&buffer, id))
+            );
+        }
     }
 
     /// Which list holds the bold row is what tells the user where `e` and `d`
@@ -513,12 +912,10 @@ mod tests {
         let _env = crate::core::paths::lock_env_for_tests();
         let (_dir, state) = state_with(&[("fudi", "rust")], &[("fudi", 2)]);
 
-        // The registry does not promise an order, so the index under test is read
-        // back off it rather than assumed: `list_agents` walks a HashMap, and
-        // `agent-1` is not reliably the second row.
-        let second = state
-            .agent_registry
-            .list_agents()
+        // The index under test is read off the same list the view draws, which is the
+        // only order the assertion can be about: the registry itself is a HashMap
+        // walk and promises nothing.
+        let second = agents_of_project(&state, Some("fudi"))
             .iter()
             .position(|agent| agent.id == "agent-1")
             .expect("the fixture must have an agent named agent-1");
@@ -594,7 +991,9 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let c = chrome::layout(Rect::new(0, 0, width, height));
             terminal
-                .draw(|f| render_projects(f, c.body, &state, 99, 99, true))
+                .draw(|f| {
+                    render_projects(f, c.body, &state, 99, 99, true);
+                })
                 .unwrap();
         }
     }

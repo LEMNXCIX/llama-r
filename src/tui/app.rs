@@ -94,12 +94,20 @@ pub enum AnalysisState {
 /// A free function rather than a method so its three inputs can be named and
 /// tested without an `AppState`: nothing here reads app state beyond the view,
 /// the list focus and the analysis state.
+///
+/// **Both** axes, never either. `Esc` out of the proposal modal returns to the
+/// projects list and leaves `analysis_state` on `Proposals` — nothing else writes
+/// it — so a check on the state alone would keep the modal's `Enter: approve  a:
+/// approve all  d: discard` on the projects footer, where `a` re-triggers an
+/// analysis and `d` opens the delete confirmation. The two labels would name keys
+/// that do something else entirely.
 fn key_target(
     view: &CurrentView,
     active_in_project_list: bool,
     analysis: &AnalysisState,
 ) -> KeyTarget {
-    if matches!(analysis, AnalysisState::Proposals { .. }) {
+    if matches!(view, CurrentView::Analysis) && matches!(analysis, AnalysisState::Proposals { .. })
+    {
         return KeyTarget::Proposals;
     }
     if matches!(view, CurrentView::Projects) && !active_in_project_list {
@@ -114,6 +122,10 @@ pub struct TuiApp {
     project_index: usize,
     agent_index: usize,
     active_in_project_list: bool,
+    /// Rows the last frame actually drew for each of the projects view's two
+    /// lists. The agent list is smaller than the body at some project counts, so
+    /// the four keys that drive it read this rather than assuming it is there.
+    project_list_bounds: crate::tui::views::projects::ListBounds,
     // Form state
     form_id: String,
     form_name: String,
@@ -162,6 +174,7 @@ impl TuiApp {
             project_index: 0,
             agent_index: 0,
             active_in_project_list: true,
+            project_list_bounds: Default::default(),
             form_id: String::new(),
             form_name: String::new(),
             form_model: String::new(),
@@ -513,21 +526,29 @@ impl TuiApp {
         }
     }
 
-    /// Returns only agents belonging to the currently selected project.
+    /// Returns only agents belonging to the currently selected project, in the order
+    /// the projects view lists them.
+    ///
+    /// Routed through [`crate::tui::views::projects::agents_of_project`] rather
+    /// than filtered here: `agent_index` addresses this list *and* the view's, so
+    /// two filters would have to agree by luck. They used to be two filters, and
+    /// the registry they read is a `HashMap` walk, so nothing held them together.
     fn project_agents(&self) -> Vec<crate::domain::agent::Agent> {
         let projects = self.state.context_store.list_all_projects();
         let selected_project_id = projects
             .get(self.project_index)
             .map(|p| p.project_id.as_str());
+        crate::tui::views::projects::agents_of_project(&self.state, selected_project_id)
+    }
 
-        let all_agents = self.state.agent_registry.list_agents();
-        all_agents
-            .into_iter()
-            .filter(|a| match (&a.project_id, selected_project_id) {
-                (Some(pid), Some(sel)) => pid.as_str() == sel,
-                _ => false,
-            })
-            .collect()
+    /// Whether the projects view drew any agent row at all.
+    ///
+    /// The four bindings that drive the agent list consult this: with three body
+    /// rows the list gets none, and acting on `agent_index` then would mean
+    /// editing a row nobody can see. `false` makes them do nothing, which is the
+    /// honest answer — better than a footer advertising `e: edit` over nothing.
+    fn agent_list_is_drawn(&self) -> bool {
+        self.project_list_bounds.agent_rows > 0
     }
 
     fn update_chat_selected_agent(&mut self) {
@@ -701,7 +722,11 @@ impl TuiApp {
                         render_dashboard(f, c.body, &self.state, self.log_scroll)
                     }
                     CurrentView::Projects => {
-                        crate::tui::views::projects::render_projects(
+                        // Render-time feedback: the two lists share the body, so
+                        // at some project counts one of them gets no rows and the
+                        // keys that drive it have to know. Same reason
+                        // `chat_scroll_max` exists.
+                        let bounds = crate::tui::views::projects::render_projects(
                             f,
                             c.body,
                             &self.state,
@@ -709,6 +734,7 @@ impl TuiApp {
                             self.agent_index,
                             self.active_in_project_list,
                         );
+                        self.project_list_bounds = bounds;
                     }
                     CurrentView::AgentForm => {
                         crate::tui::views::agent_form::render_agent_form(
@@ -1098,7 +1124,7 @@ impl TuiApp {
                                             self.project_index = (self.project_index + 1) % count;
                                             self.agent_index = 0;
                                         }
-                                    } else {
+                                    } else if self.agent_list_is_drawn() {
                                         let agent_count = self.project_agents().len();
                                         if agent_count > 0 {
                                             self.agent_index = (self.agent_index + 1) % agent_count;
@@ -1123,7 +1149,7 @@ impl TuiApp {
                                             };
                                             self.agent_index = 0;
                                         }
-                                    } else {
+                                    } else if self.agent_list_is_drawn() {
                                         let agent_count = self.project_agents().len();
                                         if agent_count > 0 {
                                             self.agent_index = if self.agent_index == 0 {
@@ -1142,11 +1168,18 @@ impl TuiApp {
                             // Focus moves between the two lists the projects view draws: the project
                             // rows and the agent rows below them. Both are on screen, so
                             // both sets of keys act on something the user can see.
+                            //
+                            // Unless the last frame drew neither, which a body three
+                            // rows tall cannot do: focus would then be a selection
+                            // with nothing selected.
                             KeyCode::Char('l')
                             | KeyCode::Right
                             | KeyCode::Char('h')
                             | KeyCode::Left => {
-                                if self.current_view == CurrentView::Projects {
+                                if self.current_view == CurrentView::Projects
+                                    && (self.project_list_bounds.project_rows > 0
+                                        || self.project_list_bounds.agent_rows > 0)
+                                {
                                     self.active_in_project_list = !self.active_in_project_list;
                                 }
                             }
@@ -1176,7 +1209,7 @@ impl TuiApp {
                                                 project.project_id.clone(),
                                             ));
                                         }
-                                    } else {
+                                    } else if self.agent_list_is_drawn() {
                                         let agents = self.project_agents();
                                         if let Some(agent) = agents.get(self.agent_index) {
                                             self.confirm_delete =
@@ -1216,6 +1249,7 @@ impl TuiApp {
                             KeyCode::Char('e') => {
                                 if self.current_view == CurrentView::Projects
                                     && !self.active_in_project_list
+                                    && self.agent_list_is_drawn()
                                 {
                                     let agents = self.project_agents();
                                     if let Some(agent) = agents.get(self.agent_index) {
@@ -1572,6 +1606,65 @@ mod tests {
                 "{state:?} is not the proposal modal"
             );
         }
+    }
+
+    /// **The view axis of the same rule.** `Esc` out of the modal sets
+    /// `current_view = Projects` and touches nothing else, so `analysis_state` is
+    /// still `Proposals` on the next frame. A check on the state alone would put
+    /// the modal's keys on the projects footer — where `a` re-triggers a full
+    /// analysis and `d` opens the delete confirmation, so the row would name two
+    /// keys for something they do not do.
+    ///
+    /// This is the same defect item 3 was raised to fix, one layer up, and the
+    /// state-axis test above cannot see it: it never leaves the analysis view.
+    #[test]
+    fn the_proposal_keys_do_not_follow_the_user_out_of_the_modal() {
+        let pending = AnalysisState::Proposals {
+            project_path: "/tmp/p".into(),
+            proposals: vec![],
+            selected: 0,
+            results: Vec::new(),
+        };
+        // Inside the modal: the modal's keys.
+        assert_eq!(
+            key_target(&CurrentView::Analysis, true, &pending),
+            KeyTarget::Proposals
+        );
+
+        // Left the modal. `analysis_state` is untouched — this is what `Esc`
+        // does.
+        for view in [
+            CurrentView::Projects,
+            CurrentView::Dashboard,
+            CurrentView::Chat,
+            CurrentView::ContextView,
+            CurrentView::AgentForm,
+        ] {
+            assert_eq!(
+                key_target(&view, true, &pending),
+                KeyTarget::View(view.clone()),
+                "{view:?} is not the proposal modal, whatever the analysis state says"
+            );
+            let row = footer_row(KeyTarget::View(view.clone()));
+            for modal_key in ["Enter: approve", "a: approve all", "d: discard"] {
+                assert!(
+                    !row.contains(modal_key),
+                    "{view:?} must not show the modal's {modal_key:?}: {row:?}"
+                );
+            }
+        }
+
+        // …and the projects footer keeps its own keys, which is where `a` and `d`
+        // are actually bound.
+        let projects = footer_row(KeyTarget::View(CurrentView::Projects));
+        assert!(
+            projects.contains("a: analyze") && projects.contains("d: delete"),
+            "the projects footer must name its own keys: {projects:?}"
+        );
+        assert!(
+            !projects.contains("approve"),
+            "and nothing from the modal: {projects:?}"
+        );
     }
 
     /// The projects view draws two lists and four keys move between and within

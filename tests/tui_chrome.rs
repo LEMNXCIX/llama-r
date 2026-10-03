@@ -37,24 +37,79 @@ fn all_text(buffer: &Buffer) -> String {
         .join("\n")
 }
 
-/// The view modules. Every one of them draws inside `body` and takes its
-/// styling from `theme`; none of them may frame anything.
-const VIEWS: [(&str, &str); 6] = [
-    ("agent_form", include_str!("../src/tui/views/agent_form.rs")),
-    ("analysis", include_str!("../src/tui/views/analysis.rs")),
-    ("chat", include_str!("../src/tui/views/chat.rs")),
-    ("context", include_str!("../src/tui/views/context.rs")),
-    ("dashboard", include_str!("../src/tui/views/dashboard.rs")),
-    ("projects", include_str!("../src/tui/views/projects.rs")),
-];
+/// The view modules, read from disk at test time.
+///
+/// Deliberately not a list: a hand-maintained one goes stale the moment a module
+/// is added, and the module that goes unguarded is then the new one — which is
+/// exactly what happened when the modals moved into `views/`. Walking the
+/// directory means a file cannot be added without also being guarded, and
+/// `include_str!` cannot silently fall back to nothing.
+///
+/// `modals.rs` is exempt and named by [`MODAL_MODULE`], because borders are
+/// permitted there and nowhere else.
+fn view_modules() -> Vec<(String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/views");
+    let mut found: Vec<(String, String)> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("a readable directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .map(|path| {
+            let name = path
+                .file_stem()
+                .expect("a .rs file has a stem")
+                .to_string_lossy()
+                .into_owned();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            (name, source)
+        })
+        .filter(|(name, _)| name != MODAL_MODULE)
+        .collect();
+    found.sort();
+    assert!(
+        !found.is_empty(),
+        "no view modules found under {} — the walk found nothing, so every check below \
+         would pass for the wrong reason",
+        dir.display()
+    );
+    found
+}
 
-/// The two modal surfaces. Borders are permitted here and nowhere else, and the
-/// design keeps them: a dialog is the one thing on this screen that has to read
-/// as separate from the page behind it.
-const MODALS: &str = include_str!("../src/tui/views/modals.rs");
+/// The one module under `src/tui/views/` permitted to draw a border. A dialog is
+/// the one thing on this screen that has to read as separate from the page behind
+/// it, and `design.md` permits a box nowhere else.
+const MODAL_MODULE: &str = "modals";
 
-/// The dispatch that owns the chrome.
+/// The dispatch that owns the chrome and `hints_for`.
 const APP: &str = include_str!("../src/tui/app.rs");
+
+/// `app.rs` with `hints_for`'s body removed — the one place hint text is allowed
+/// to live, and the reason `app.rs` is otherwise in scope for the hint check.
+///
+/// Brace-balanced from the `fn` keyword, which is exact for a function whose
+/// strings contain no braces (this one does not) and keeps the doc comment above
+/// it, which may legitimately describe the hints.
+fn app_without_hint_text() -> String {
+    let Some(start) = APP.find("fn hints_for(") else {
+        panic!("app.rs no longer has hints_for — rename it and this exclusion with it");
+    };
+    let mut depth = 0usize;
+    let mut end = APP.len();
+    for (offset, ch) in APP[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    end = start + offset + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    format!("{}{}", &APP[..start], &APP[end..])
+}
 
 /// The shipped code of a module: everything before its test module.
 ///
@@ -163,11 +218,15 @@ fn every_view_renders_inside_the_body_without_a_box() {
         ),
         (
             "projects",
-            Box::new(|f: &mut Frame, body: Rect| render_projects(f, body, &state, 0, 0, true)),
+            Box::new(|f: &mut Frame, body: Rect| {
+                render_projects(f, body, &state, 0, 0, true);
+            }),
         ),
         (
             "projects · agent list",
-            Box::new(|f: &mut Frame, body: Rect| render_projects(f, body, &state, 0, 0, false)),
+            Box::new(|f: &mut Frame, body: Rect| {
+                render_projects(f, body, &state, 0, 0, false);
+            }),
         ),
         (
             "agent form",
@@ -366,17 +425,36 @@ fn fixture_state(dir: &std::path::Path) -> std::sync::Arc<llama_r::api::handlers
     )
 }
 
+/// Key hints live in `hints_for` and nowhere else — including in `app.rs`, which
+/// owns that function and could therefore grow a second copy of the text without
+/// any view being involved.
+///
+/// The file list is walked, not written down, so a module added tomorrow is
+/// guarded tomorrow; and `app.rs` is in scope with `hints_for`'s own body
+/// excluded, which is what makes the rule hold in the one file where a hint is
+/// legitimate.
 #[test]
 fn no_view_hard_codes_a_key_hint() {
-    for (name, source) in VIEWS {
-        for (number, line) in shipped(source).lines().enumerate() {
+    let mut checked: Vec<String> = Vec::new();
+    for (name, source) in view_modules() {
+        for (number, line) in shipped(&source).lines().enumerate() {
             assert!(
                 !names_a_key(line),
                 "src/tui/views/{name}.rs:{} names a key outside `hints_for`: {line:?}",
                 number + 1
             );
         }
+        checked.push(format!("src/tui/views/{name}.rs"));
     }
+    for (number, line) in shipped(&app_without_hint_text()).lines().enumerate() {
+        assert!(
+            !names_a_key(line),
+            "src/tui/app.rs:{} names a key outside `hints_for`: {line:?}",
+            number + 1
+        );
+    }
+    checked.push("src/tui/app.rs".to_string());
+    println!("hint guard covers: {}", checked.join(", "));
 }
 
 /// The key-hint check has to fire on the two strings it was written for, and on
@@ -453,12 +531,13 @@ fn the_border_check_spots_every_spelling() {
 
 /// Borders are for the two modals. Everything else frames content with type and
 /// rules, so a `Block` with borders anywhere else is a step back to the clutter
-/// this interface was redesigned to remove.
+/// this interface was redesigned to remove. The file list is walked, so a view
+/// module added tomorrow is in scope tomorrow.
 #[test]
 fn only_the_modals_draw_borders() {
-    for (name, source) in VIEWS {
+    for (name, source) in view_modules() {
         assert_eq!(
-            border_ask(shipped(source)),
+            border_ask(shipped(&source)),
             None,
             "src/tui/views/{name}.rs asks for a border; the chrome's separators \
              and `theme` carry structure instead"
@@ -469,8 +548,14 @@ fn only_the_modals_draw_borders() {
         None,
         "src/tui/app.rs asks for a border; the bar is `chrome::render_bar`"
     );
+    let modals = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/tui/views")
+            .join(format!("{MODAL_MODULE}.rs")),
+    )
+    .expect("the exempt module is named in MODAL_MODULE and must exist");
     assert!(
-        MODALS.contains("Borders::ALL"),
+        modals.contains("Borders::ALL"),
         "the modals are where borders belong — if this fails, the exemption has \
          been left with nothing to exempt"
     );

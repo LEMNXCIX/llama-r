@@ -54,11 +54,15 @@ Colour and style tokens with fixed meaning, so views stop choosing colours ad ho
 
 Three public pieces, consumed by every view:
 
-1. **`context_bar(current, context, healthy)`** — one row, no border:
+1. **`context_bar(current, context, api_running)`** — one row, no border:
    ```
-   Dashboard │ Projects │ Chat                    fudi/ops  ● q
+   Llama-R │ Dashboard │ Projects │ Chat             fudi/ops  ● q
    ```
-   Active view in `active`. Context (project + agent) right-aligned, always visible. Replaces the broken tab bar and every per-view title block.
+   The product's name leads, then the view names, then the context (project + agent) right-aligned and always visible. Replaces the broken tab bar and every per-view title block.
+
+   The name is the one thing the rest of the row cannot say: the view names and the context say *where you are*, not *what this is*. When the dashboard's banner went (below), this became the only place the product is named — which is why it belongs here rather than in a view.
+
+   The dot is the HTTP **listener's** liveness (`api_running`), not the provider's. Nothing in the TUI reports whether the provider answers; the dashboard says so where a reader would otherwise assume the bar does.
 
 2. **`key_hints(&[(&str, &str)])`** — the footer. Each view declares its own shortcuts; the chrome renders them. Ends the duplicated hint text.
 
@@ -79,7 +83,7 @@ Hard rules, so the style does not erode:
 ### Chat
 
 ```
-Dashboard │ Projects │ Chat                    fudi/ops  ● q
+Llama-R │ Dashboard │ Projects │ Chat             fudi/ops  ● q
 
   You  ¿plazo de reembolso?
 
@@ -100,14 +104,26 @@ Dashboard │ Projects │ Chat                    fudi/ops  ● q
   fudi              3 agentes   ● analizado
   clinica           1 agente
 ─────────────────────────────────────────────────────────
- n nuevo   a analizar   d borrar   Enter ver agentes
+ agentes de fudi
+  nutricion         llama3
+  pediatra          llama3
+─────────────────────────────────────────────────────────
+ Tab vista  ←→ agentes  ↑↓ seleccionar  a analizar  n nuevo  d borrar  q salir
 ```
 
-Selected project in `active`. Counts inline rather than only inside a sub-view. Actions permanently visible instead of hidden.
+Two lists of plain rows separated by a thin rule — no box, no title on either.
+
+The upper list is the projects, one row each: name, agent count, whether it has been analysed. The counts stay inline rather than only inside a sub-view.
+
+**The selected project's agents are listed underneath, and stay visible.** Four keys act on them — `←/→` moves focus between the two lists, `↑/↓` moves within whichever has it, `e` edits the selected agent and `d` deletes it — so a project row alone would leave all four driving state the user cannot see. Retargeting them at the project list is not available either: a project row carries a *count*, not an agent, so `e` would have to pick one invisibly. The agent list is what makes every one of those keys act on a row that is on screen.
+
+The mockup this replaces advertised `Enter ver agentes`, a key that was never bound to anything. There is no sub-view: the agents are on this screen.
+
+Both lists are windows on their own selection rather than the head of the list, and each keeps at least one row whenever the other has something to show. So on a body too short for both, the selected row of each is still drawn and every row stays reachable. Actions permanently visible instead of hidden.
 
 ### Dashboard
 
-The title block is removed. Status becomes one dense row; the log list follows with a single separator. The repeated "Llama-R / High-Performance AI Gateway" banner disappears — the bar does that job.
+The title block is removed. Status becomes one dense row; the log list follows with a single separator. The repeated "Llama-R / High-Performance AI Gateway" banner disappears — the context bar leads with the product's name, which is the one thing the rest of that row cannot say.
 
 ### Agent form, Analysis, Context
 
