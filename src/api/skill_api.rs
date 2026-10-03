@@ -47,6 +47,17 @@ pub struct SkillSummary {
 
 impl SkillSummary {
     fn of(skill: &Skill) -> Self {
+        skill.into()
+    }
+}
+
+/// `tags` is the one field a caller may not carry, and it has a sensible empty
+/// default; everything else is copied straight across. Implemented once, as
+/// `From`, so the picker (`InstalledSkill`) and this listing cannot drift: they
+/// showed the same four columns from the same struct and a hand-written mapping
+/// in each place is exactly how a fifth column ends up on one side only.
+impl From<&Skill> for SkillSummary {
+    fn from(skill: &Skill) -> Self {
         Self {
             id: skill.id.clone(),
             name: skill.metadata.name.clone(),

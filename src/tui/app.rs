@@ -37,15 +37,6 @@ fn available_skills(
         None => manager.list_skills(),
     }
 }
-
-fn scope_label(scope: crate::domain::models::SkillScope) -> &'static str {
-    use crate::domain::models::SkillScope;
-    match scope {
-        SkillScope::Harness => "Harness",
-        SkillScope::LlamaR => "LlamaR",
-        SkillScope::Project => "Project",
-    }
-}
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -668,12 +659,7 @@ impl TuiApp {
             project_id,
         )
         .iter()
-        .map(|skill| InstalledSkill {
-            id: skill.id.clone(),
-            name: skill.metadata.name.clone(),
-            description: skill.metadata.description.clone(),
-            scope: scope_label(skill.scope).to_string(),
-        })
+        .map(Into::into)
         .collect();
 
         let chosen: Vec<String> = self

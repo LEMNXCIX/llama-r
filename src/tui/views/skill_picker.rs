@@ -107,13 +107,11 @@ impl SkillPicker {
 }
 
 /// What the skill manager knows about a skill, without its body or its path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstalledSkill {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub scope: String,
-}
+///
+/// A thin alias of the API's `SkillSummary`: both answer "what is installed and
+/// what is it called", and they used to be hand-mapped from `Skill` separately,
+/// which is how one gains a column and the other does not.
+pub type InstalledSkill = crate::api::skill_api::SkillSummary;
 
 #[cfg(test)]
 mod tests {
@@ -124,6 +122,7 @@ mod tests {
             id: id.to_string(),
             name: id.to_string(),
             description: format!("{id} does something"),
+            tags: Vec::new(),
             scope: scope.to_string(),
         }
     }
