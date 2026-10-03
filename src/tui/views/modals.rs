@@ -1,14 +1,16 @@
-//! The two modal surfaces, and the only places in the interface that draw a
-//! border.
+//! The modal surfaces, and the only places in the interface that draw a border.
 //!
 //! A dialog is the one thing that has to read as separate from the page behind
-//! it, so the delete confirmation and the skill-proposal approval keep their
-//! boxes while every view gives them up. Keeping them here — rather than at the
-//! bottom of a view module — is what lets `tests/tui_chrome.rs` state the rule
-//! as a file list: a `Borders::` anywhere else is a mistake, and there is no
-//! exemption to hide behind.
+//! it, so the delete confirmation, the skill-proposal approval and the skill
+//! picker keep their boxes while every view gives them up. Keeping them here —
+//! rather than at the bottom of a view module — is what lets `tests/tui_chrome.rs`
+//! state the rule as a file list: a `Borders::` anywhere else is a mistake, and
+//! there is no exemption to hide behind. The picker's state lives in
+//! [`crate::tui::views::skill_picker`]; only its panel is here, because the
+//! border is what put it in this file and the border is the whole reason.
 
 use crate::tui::theme;
+use crate::tui::views::skill_picker::SkillPicker;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     text::{Line, Span},
@@ -132,6 +134,138 @@ pub fn render_skill_proposals(
             .wrap(Wrap { trim: true }),
         chunks[1],
     );
+}
+
+/// The check column. `✓` for a row the agent gets, `·` for one it does not, and
+/// `—` for one the analysis owns — so the three states are distinguishable in a
+/// single glyph rather than by reading the row.
+const PICKED: &str = "✓";
+const UNPICKED: &str = "·";
+const MANAGED: &str = "—";
+
+/// Draw the skill picker over `body`, with the bar and footer left readable.
+///
+/// A dialog, and so one of the three places in the interface that keep a border:
+/// the user is choosing from a list, and a box is what separates that list from
+/// the form still sitting behind it. The keys are the shared footer's job, through
+/// `KeyTarget::SkillPicker`.
+pub fn render_skill_picker(f: &mut Frame, body: Rect, picker: &SkillPicker) {
+    let area = centered(body, 60, body.height.saturating_sub(2).max(5));
+
+    // The block wraps the title as well as the rows, so the inner rect is computed
+    // from the border rather than from the panel. Splitting `area` instead would
+    // leave the title on the border's own row, where it is overwritten — and the
+    // window height one row too large, which puts the cursor's row off the bottom
+    // of a full list.
+    let block = Block::default().borders(Borders::ALL);
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)].as_ref())
+        .split(block.inner(area));
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Skills — space to toggle, enter to confirm ",
+            theme::chrome(),
+        ))),
+        inner[0],
+    );
+
+    // One row per skill, windowed to the panel: a catalogue longer than the screen
+    // has to scroll or the bottom of the list is unreachable.
+    let rows_height = inner[1].height as usize;
+    let first = picker
+        .cursor
+        .saturating_sub(rows_height.saturating_sub(1))
+        .min(picker.cursor);
+
+    let lines: Vec<Line> = picker
+        .rows
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows_height.max(1))
+        .map(|(index, row)| {
+            let mark = if row.auto {
+                MANAGED
+            } else if row.picked {
+                PICKED
+            } else {
+                UNPICKED
+            };
+            let mark_style = if row.picked && !row.auto {
+                theme::active()
+            } else {
+                theme::chrome()
+            };
+            // The cursor is a colour on the whole row, which is the same signal the
+            // agent form uses for its focused field: where the next keystroke lands
+            // is something the eye should find without a marker column.
+            let name_style = if index == picker.cursor {
+                theme::action()
+            } else {
+                theme::content()
+            };
+            let scope_style = if row.auto {
+                theme::chrome()
+            } else {
+                theme::action()
+            };
+            Line::from(vec![
+                Span::styled(format!(" {mark} "), mark_style),
+                Span::styled(format!("{:<22}", truncate(&row.id, 22)), name_style),
+                Span::styled(format!("{:<8}", truncate(&row.scope, 8)), scope_style),
+                Span::styled(
+                    truncate(&row.description, area.width.saturating_sub(38) as usize),
+                    theme::chrome(),
+                ),
+            ])
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The panel, centred in `body` and clamped to it.
+///
+/// `width.min(body.width)` and `height.min(body.height)`, because adding to a
+/// small body would push the panel off the edge and ratatui would clip it into
+/// something unreadable rather than reporting it.
+fn centered(body: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(body.width);
+    let height = height.min(body.height);
+    Rect {
+        x: body.x + (body.width - width) / 2,
+        y: body.y + (body.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Cut to `max` display columns, with an ellipsis when anything was cut.
+///
+/// `Line::width` for the measure and `char_indices` for the walk, so a name with
+/// an accent or a CJK glyph is cut on a character boundary rather than splitting
+/// one — the same reason the chat input's tail is cut the way it is.
+fn truncate(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if Line::from(text).width() <= max {
+        return text.to_string();
+    }
+    let mut cut = String::new();
+    let mut width = 0;
+    for (index, ch) in text.char_indices() {
+        let ch_width = Line::from(ch.to_string()).width();
+        if width + ch_width + 1 > max {
+            break;
+        }
+        cut.push_str(&text[index..index + ch.len_utf8()]);
+        width += ch_width;
+    }
+    cut.push('…');
+    cut
 }
 
 #[cfg(test)]
@@ -304,8 +438,138 @@ mod tests {
                 .draw(|f| {
                     render_confirm_delete(f, body, "project", "fudi");
                     render_skill_proposals(f, body, &[proposal("demo")], 0, &[]);
+                    render_skill_picker(f, body, &picker(&[("a", false)]));
                 })
                 .unwrap();
         }
+    }
+
+    fn picker(rows: &[(&str, bool)]) -> SkillPicker {
+        use crate::tui::views::skill_picker::SkillRow;
+        SkillPicker {
+            rows: rows
+                .iter()
+                .map(|(id, picked)| SkillRow {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    description: format!("{id} does something"),
+                    scope: "LlamaR".to_string(),
+                    auto: false,
+                    picked: *picked,
+                })
+                .collect(),
+            cursor: 0,
+        }
+    }
+
+    /// The three states a row can be in, and the glyph that tells them apart.
+    /// This is the picker's whole reason for existing: before it, a user could not
+    /// tell which ids the agent already had without remembering what they typed.
+    #[test]
+    fn the_three_row_states_are_distinguishable() {
+        let mut modal = picker(&[("chosen", true), ("managed", false)]);
+        modal.rows[1].auto = true;
+        let text = all_text(&render_picker(&modal));
+
+        assert!(text.contains(PICKED), "a picked row is ticked: {text}");
+        assert!(text.contains(MANAGED), "a managed row is not: {text}");
+        assert!(
+            !text.contains(UNPICKED),
+            "neither row is unpicked, so the dot must be absent: {text}"
+        );
+    }
+
+    /// A catalogue longer than the panel still shows the cursor's row. Without the
+    /// window, `↓` walks off the bottom and the last skills are unreachable.
+    #[test]
+    fn a_long_catalogue_scrolls_to_keep_the_cursor_visible() {
+        let mut modal = picker(&[("skill-00", false), ("skill-01", false)]);
+        modal.rows = (0..40)
+            .map(|n| crate::tui::views::skill_picker::SkillRow {
+                id: format!("skill-{n:02}"),
+                name: format!("skill-{n:02}"),
+                description: "does something".to_string(),
+                scope: "LlamaR".to_string(),
+                auto: false,
+                picked: false,
+            })
+            .collect();
+        modal.cursor = 35;
+
+        let text = all_text(&render_picker(&modal));
+        assert!(
+            text.contains("skill-35"),
+            "the row under the cursor must be drawn: {text}"
+        );
+        assert!(
+            !text.contains("skill-00"),
+            "and rows above the window must not be, or it is not scrolling"
+        );
+    }
+
+    /// The dialog keeps a border, because the user is choosing from a list and the
+    /// box is what separates that list from the form behind it. It lives in this
+    /// module for the same reason, and `only_the_modals_draw_borders` is what makes
+    /// that mechanical.
+    #[test]
+    fn the_picker_is_bordered() {
+        let text = all_text(&render_picker(&picker(&[("a", false)])));
+
+        for corner in ['┌', '┐', '└', '┘'] {
+            assert!(text.contains(corner), "the dialog keeps a border: {text}");
+        }
+    }
+
+    /// Cutting to width must not split a character: a CJK glyph is two cells, so a
+    /// byte- or char-index cut lands the ellipsis mid-glyph.
+    #[test]
+    fn truncate_cuts_on_a_character_boundary() {
+        assert_eq!(truncate("abcdefghij", 5), "abcd…");
+        assert_eq!(truncate("abc", 10), "abc", "short enough is untouched");
+        assert_eq!(truncate("anything", 0), "", "no room is no room");
+
+        let wide = truncate("日本語プロジェクト", 7);
+        assert!(
+            Line::from(wide.as_str()).width() <= 7,
+            "a wide glyph must not overshoot the budget: {wide:?}"
+        );
+    }
+
+    /// The panel must not be drawn over the bar's row, or the header goes the way
+    /// it used to before `body` existed.
+    #[test]
+    fn the_bar_row_survives_the_picker() {
+        let modal = picker(&[("a", false)]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|f| {
+                let c = chrome::layout(f.area());
+                chrome::render_bar(
+                    f,
+                    c.bar,
+                    &["Dashboard", "Projects", "Chat"],
+                    1,
+                    &chrome::Context::default(),
+                    true,
+                );
+                render_skill_picker(f, c.body, &modal);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        assert!(
+            row_text(&buffer, 0).contains("Dashboard"),
+            "the bar row must survive the dialog: {:?}",
+            row_text(&buffer, 0)
+        );
+    }
+
+    fn render_picker(modal: &SkillPicker) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render_skill_picker(f, Rect::new(0, 1, 80, 22), modal))
+            .unwrap();
+        terminal.backend().buffer().clone()
     }
 }

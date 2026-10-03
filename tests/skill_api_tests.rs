@@ -29,8 +29,8 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use tempfile::TempDir;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use tokio_stream::Stream;
 use tower::ServiceExt;
 
@@ -38,6 +38,18 @@ static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn test_lock() -> &'static Mutex<()> {
     TEST_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Serialises the tests that move `LLAMA_R_DIR`, which is process-wide.
+///
+/// A plain `Mutex` held across an `await` is what clippy calls a held guard, and
+/// it is right to: these tests only need to exclude each other, and holding the
+/// guard for the whole test is exactly the exclusion they want. The alternative —
+/// an async mutex — would mean the guard had to be re-acquirable, which is more
+/// machinery for a property these tests already have: they run inside one
+/// `#[tokio::test]` and the lock is released when it returns.
+fn serialise() -> impl Drop {
+    test_lock().lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// The endpoint never calls the provider, so this only has to satisfy the trait.
@@ -114,12 +126,15 @@ async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::V
 
 #[tokio::test]
 async fn lists_installed_skills_with_their_metadata() {
-    let _guard: MutexGuard<'static, ()> = test_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = serialise();
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("LLAMA_R_DIR", dir.path());
-    write_skill(&dir.path().join("skills"), "nutrition-standards", "Nutrition", "clinical rules");
+    write_skill(
+        &dir.path().join("skills"),
+        "nutrition-standards",
+        "Nutrition",
+        "clinical rules",
+    );
 
     let manager = SkillManager::with_paths(vec![dir.path().join("skills")]);
     manager.scan_and_load();
@@ -142,9 +157,7 @@ async fn lists_installed_skills_with_their_metadata() {
 
 #[tokio::test]
 async fn the_response_carries_no_skill_bodies_and_no_paths() {
-    let _guard: MutexGuard<'static, ()> = test_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = serialise();
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("LLAMA_R_DIR", dir.path());
     write_skill(
@@ -178,7 +191,12 @@ async fn the_response_carries_no_skill_bodies_and_no_paths() {
     // Pin the exact key set, so a field added to `Skill` later cannot leak into
     // the response by accident: the response type does not deny unknown fields.
     let entry = &body["skills"][0];
-    let mut keys: Vec<&str> = entry.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    let mut keys: Vec<&str> = entry
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
     keys.sort_unstable();
     assert_eq!(
         keys,
@@ -189,14 +207,22 @@ async fn the_response_carries_no_skill_bodies_and_no_paths() {
 
 #[tokio::test]
 async fn a_project_scoped_request_sees_the_projects_own_skills() {
-    let _guard: MutexGuard<'static, ()> = test_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = serialise();
     let base = tempfile::tempdir().unwrap();
     std::env::set_var("LLAMA_R_DIR", base.path());
     let project: PathBuf = base.path().join("project");
-    write_skill(&base.path().join("skills"), "shared-skill", "Shared", "everywhere");
-    write_skill(&project.join("skills"), "project-skill", "Project", "just here");
+    write_skill(
+        &base.path().join("skills"),
+        "shared-skill",
+        "Shared",
+        "everywhere",
+    );
+    write_skill(
+        &project.join("skills"),
+        "project-skill",
+        "Project",
+        "just here",
+    );
 
     let manager = SkillManager::with_paths(vec![base.path().join("skills")]);
     manager.scan_and_load();
@@ -219,15 +245,16 @@ async fn a_project_scoped_request_sees_the_projects_own_skills() {
     assert_eq!(status, StatusCode::OK, "body was {body}");
     let response: SkillsResponse = serde_json::from_value(body).unwrap();
     let ids: Vec<&str> = response.skills.iter().map(|s| s.id.as_str()).collect();
-    assert!(ids.contains(&"project-skill"), "the project's own skill: {ids:?}");
+    assert!(
+        ids.contains(&"project-skill"),
+        "the project's own skill: {ids:?}"
+    );
     assert!(ids.contains(&"shared-skill"), "and the shared one: {ids:?}");
 }
 
 #[tokio::test]
 async fn an_unknown_project_is_rejected_rather_than_silently_ignored() {
-    let _guard: MutexGuard<'static, ()> = test_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = serialise();
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("LLAMA_R_DIR", dir.path());
 

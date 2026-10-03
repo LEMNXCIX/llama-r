@@ -94,7 +94,12 @@ pub async fn list_skills_api(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SkillsQuery>,
 ) -> Result<Json<SkillsResponse>, AppError> {
-    let skills = match query.project_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+    let skills = match query
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
         Some(project_id) => {
             let context = state
                 .context_store

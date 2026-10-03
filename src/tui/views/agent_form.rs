@@ -61,6 +61,12 @@ const GAP: usize = 2;
 /// [`theme::action`], so where the user is typing is a colour rather than a
 /// border. A thin rule then separates the prompt, which is the longest thing
 /// typed here and takes the full width of the body.
+///
+/// `skills_summary` is a summary for display, not the id list. The picker writes
+/// the ids into the form's state and this renders what was picked; the field
+/// used to receive the raw comma list, so it was both the data and the display,
+/// and a long catalogue ran past the value column with nothing to say it had
+/// been cut.
 pub fn render_agent_form(
     f: &mut Frame,
     body: Rect,
@@ -70,11 +76,19 @@ pub fn render_agent_form(
     project_id: &str,
     rules: &str,
     optimize_rules: &str,
-    skills: &str,
+    skills_summary: &str,
     prompt: &str,
     field_index: usize,
 ) {
-    let values = [id, name, model, project_id, rules, optimize_rules, skills];
+    let values = [
+        id,
+        name,
+        model,
+        project_id,
+        rules,
+        optimize_rules,
+        skills_summary,
+    ];
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

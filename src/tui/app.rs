@@ -5,7 +5,47 @@ use crate::tui::chrome;
 use crate::tui::views::chat::render_chat;
 use crate::tui::views::dashboard::render_dashboard;
 use crate::tui::views::modals::render_confirm_delete;
+use crate::tui::views::modals::render_skill_picker;
 use crate::tui::views::projects::ListBounds;
+use crate::tui::views::skill_picker::{InstalledSkill, SkillPicker};
+
+/// The skills field in the agent form, by its index in the form's field table.
+/// Named because the picker key and the summary both key off it, and a bare `6`
+/// would be the kind of thing a reordered table changes silently.
+const SKILLS_FIELD: usize = 6;
+
+/// The installed skills a picker over `project_id` should offer.
+///
+/// The manager wants a project's *path* and the form holds an id. Handing it the
+/// id would make it look for `fudi/skills` relative to the working directory —
+/// a directory that does not exist — so the project's own skills would vanish
+/// from the picker and only the shared ones would show, with nothing saying so.
+///
+/// An id with no saved context has no path to resolve, so this falls back to the
+/// unscoped listing rather than reporting none: the user is choosing from what is
+/// installed, and an unsaved project still has shared skills to pick.
+///
+/// Takes the store and the manager rather than the whole `AppState`, so the
+/// resolution is testable without standing up a runtime.
+fn available_skills(
+    store: &crate::context::store::ContextStore,
+    manager: &crate::services::skill_manager::SkillManager,
+    project_id: &str,
+) -> Vec<crate::domain::models::Skill> {
+    match store.get_context(project_id) {
+        Some(context) => manager.list_skills_for_project(Path::new(&context.path)),
+        None => manager.list_skills(),
+    }
+}
+
+fn scope_label(scope: crate::domain::models::SkillScope) -> &'static str {
+    use crate::domain::models::SkillScope;
+    match scope {
+        SkillScope::Harness => "Harness",
+        SkillScope::LlamaR => "LlamaR",
+        SkillScope::Project => "Project",
+    }
+}
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -14,6 +54,7 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -71,6 +112,12 @@ enum KeyTarget {
     Proposals,
     /// The delete confirmation, drawn over the projects view.
     DeleteConfirm,
+    /// The skill picker, drawn over the agent form.
+    ///
+    /// Another screen whose keys belong to no `CurrentView`: `Space` toggles a row
+    /// and means nothing anywhere else, so without this arm the form's footer
+    /// would keep naming `Enter: next field` while the picker is up.
+    SkillPicker,
     /// The agent form, at a given field. Two of its keys mean different things
     /// field by field, so the field index is part of what the row says.
     AgentForm(usize),
@@ -118,12 +165,20 @@ fn key_target(
     projects_bounds: ListBounds,
     form_field_index: usize,
     confirm_delete: bool,
+    skill_picker: bool,
 ) -> KeyTarget {
     // Checked first because it outranks every axis below it: the handler in the
     // event loop takes every key while the confirmation is up and `continue`s, so
     // no keypress reaches the screen any other target here describes.
     if confirm_delete {
         return KeyTarget::DeleteConfirm;
+    }
+    // Same story as the confirmation: the picker takes every key while it is up,
+    // and the form underneath it is still the current view, so without this the
+    // form's own row keeps naming `Enter: next field` under a list where `Enter`
+    // confirms.
+    if skill_picker {
+        return KeyTarget::SkillPicker;
     }
     if matches!(view, CurrentView::Analysis) && matches!(analysis, AnalysisState::Proposals { .. })
     {
@@ -311,6 +366,9 @@ pub struct TuiApp {
     context_scroll: usize,
     // Delete confirmation
     confirm_delete: Option<(String, String)>,
+    /// The skill picker, while it is up. Dropping it is how `Esc` cancels, so
+    /// there is no undo stack to keep in sync with the form behind it.
+    skill_picker: Option<crate::tui::views::skill_picker::SkillPicker>,
     // Chat state
     chat_messages: Arc<Mutex<Vec<(String, String)>>>,
     chat_input: String,
@@ -355,6 +413,7 @@ impl TuiApp {
             log_scroll: 0,
             context_scroll: 0,
             confirm_delete: None,
+            skill_picker: None,
             chat_messages: Arc::new(Mutex::new(Vec::new())),
             chat_input: String::new(),
             chat_loading: Arc::new(AtomicBool::new(false)),
@@ -595,6 +654,69 @@ impl TuiApp {
         }
     }
 
+    /// The picker over what is installed for `project_id`, with the agent's
+    /// current skills ticked and the analysis-chosen ones marked untouchable.
+    ///
+    /// Read from `state.skill_manager` in process rather than over HTTP: the TUI
+    /// and the runtime share one `AppState`, so a request would be a round trip
+    /// to this same object. `GET /api/skills` exists for callers that cannot do
+    /// that.
+    fn skill_picker_over(&self, project_id: &str) -> SkillPicker {
+        let available: Vec<InstalledSkill> = available_skills(
+            &self.state.context_store,
+            &self.state.skill_manager,
+            project_id,
+        )
+        .iter()
+        .map(|skill| InstalledSkill {
+            id: skill.id.clone(),
+            name: skill.metadata.name.clone(),
+            description: skill.metadata.description.clone(),
+            scope: scope_label(skill.scope).to_string(),
+        })
+        .collect();
+
+        let chosen: Vec<String> = self
+            .form_skills
+            .split(',')
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+
+        SkillPicker::for_agent(available, &chosen, &self.editing_auto_skills())
+    }
+
+    /// The `auto_skills` of the agent being edited, and none when creating one —
+    /// there is no agent yet, so there is nothing for the analysis to have chosen.
+    fn editing_auto_skills(&self) -> Vec<String> {
+        let Some(agent_id) = &self.editing_agent else {
+            return Vec::new();
+        };
+        self.state
+            .agent_registry
+            .get_agent(agent_id)
+            .map(|agent| agent.config.auto_skills.clone())
+            .unwrap_or_default()
+    }
+
+    /// The one-line summary the form shows for the skills field.
+    ///
+    /// A count and the ids, rather than the bare comma list the field used to
+    /// hold: that list was both the display and the data, so a long catalogue ran
+    /// past the value column with nothing to say it had been cut.
+    fn skills_summary(&self) -> String {
+        let chosen: Vec<&str> = self
+            .form_skills
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .collect();
+        match chosen.len() {
+            0 => "none — press s to choose".to_string(),
+            n => format!("{n} skills: {}", chosen.join(", ")),
+        }
+    }
+
     fn refresh_available_agents(&mut self) {
         let mut agents: Vec<String> = self
             .state
@@ -712,6 +834,14 @@ impl TuiApp {
             // interception is before the quit binding too. Naming what answers
             // the question is what makes the footer and the behaviour agree.
             KeyTarget::DeleteConfirm => vec![("y", "delete"), ("n", "cancel"), ("Esc", "cancel")],
+            // Sized to fit 80 columns: a hint that does not fit is clipped from
+            // the right, which takes `Esc: cancel` first.
+            KeyTarget::SkillPicker => vec![
+                ("↑/↓", "move"),
+                ("Space", "toggle"),
+                ("Enter", "confirm"),
+                ("Esc", "cancel"),
+            ],
             // Unreachable through `key_target`, which resolves the form to
             // `AgentForm(field)` above. Kept honest rather than merged into one of
             // the other arms: this is the row that would name a false `Enter` on
@@ -897,6 +1027,7 @@ impl TuiApp {
                     self.project_list_bounds,
                     self.form_field_index,
                     self.confirm_delete.is_some(),
+                    self.skill_picker.is_some(),
                 ));
                 chrome::render_bar(
                     f,
@@ -935,7 +1066,7 @@ impl TuiApp {
                             &self.form_project_id,
                             &self.form_rules,
                             &self.form_optimize_rules,
-                            &self.form_skills,
+                            &self.skills_summary(),
                             &self.form_prompt,
                             self.form_field_index,
                         );
@@ -980,6 +1111,9 @@ impl TuiApp {
                         self.chat_scroll_max = scroll_max;
                         self.chat_messages_rect = msg_rect;
                     }
+                }
+                if let Some(picker) = &self.skill_picker {
+                    render_skill_picker(f, c.body, picker);
                 }
                 if let Some((ref confirm_type, ref confirm_id)) = self.confirm_delete {
                     render_confirm_delete(f, c.body, confirm_type, confirm_id);
@@ -1104,6 +1238,13 @@ impl TuiApp {
                                     let _ = self.state.agent_registry.reload_all(&[]);
                                     self.current_view = CurrentView::Projects;
                                 }
+                                // The skills field is not typed into. `s` opens
+                                // the picker instead, because `Enter` already
+                                // means "next field" here and cannot be freed.
+                                KeyCode::Char('s') if self.form_field_index == SKILLS_FIELD => {
+                                    self.skill_picker =
+                                        Some(self.skill_picker_over(&self.form_project_id));
+                                }
                                 KeyCode::Char(c) => match self.form_field_index {
                                     0 => self.form_id.push(c),
                                     1 => self.form_name.push(c),
@@ -1111,7 +1252,7 @@ impl TuiApp {
                                     3 => {} // Project is handled by arrows
                                     4 => self.form_rules.push(c),
                                     5 => self.form_optimize_rules.push(c),
-                                    6 => self.form_skills.push(c),
+                                    6 => {} // Skills is chosen in the picker
                                     7 => self.form_prompt.push(c),
                                     _ => {}
                                 },
@@ -1145,6 +1286,43 @@ impl TuiApp {
                         }
 
                         // Confirm delete interception
+                        if self.skill_picker.is_some() {
+                            let mut handled = true;
+                            match key.code {
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    if let Some(picker) = self.skill_picker.as_mut() {
+                                        picker.move_cursor(1);
+                                    }
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    if let Some(picker) = self.skill_picker.as_mut() {
+                                        picker.move_cursor(-1);
+                                    }
+                                }
+                                KeyCode::Char(' ') => {
+                                    if let Some(picker) = self.skill_picker.as_mut() {
+                                        picker.toggle_current();
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    // Confirm writes the ids back as the comma
+                                    // separated string the save path already
+                                    // parses, so the form's own plumbing is
+                                    // untouched by this.
+                                    if let Some(picker) = self.skill_picker.take() {
+                                        self.form_skills = picker.chosen_ids().join(", ");
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    self.skill_picker = None;
+                                }
+                                _ => {
+                                    handled = false;
+                                }
+                            }
+                            let _ = handled;
+                            continue;
+                        }
                         if self.confirm_delete.is_some() {
                             match key.code {
                                 KeyCode::Char('y') | KeyCode::Enter => {
@@ -1653,6 +1831,7 @@ mod tests {
             projects_bounds,
             0,
             false,
+            false,
         )
     }
 
@@ -1967,6 +2146,7 @@ mod tests {
                     &AnalysisState::Idle,
                     ListBounds::default(),
                     field,
+                    false,
                     false
                 ),
                 KeyTarget::AgentForm(field),
@@ -2058,6 +2238,134 @@ mod tests {
         );
     }
 
+    /// The skill picker is a fifth screen whose keys belong to no `CurrentView`,
+    /// and the same defect the proposals modal and the delete confirmation each
+    /// had: it takes every key while it is up, so without its own target the form
+    /// underneath keeps naming `Enter: next field` under a list where `Enter`
+    /// confirms and `Space` toggles.
+    #[test]
+    fn the_picker_owns_the_footer_while_it_is_up() {
+        let idle = AnalysisState::Idle;
+        let drawn = drawn_bounds();
+        let form = &CurrentView::AgentForm;
+
+        let with_picker = key_target(form, true, &idle, drawn, SKILLS_FIELD, false, true);
+        assert_eq!(
+            with_picker,
+            KeyTarget::SkillPicker,
+            "the picker is up, so it outranks the form"
+        );
+
+        let row = footer_row(KeyTarget::SkillPicker);
+        for expected in ["Space: toggle", "Enter: confirm", "Esc: cancel"] {
+            assert!(
+                row.contains(expected),
+                "{expected:?} must be on the row: {row:?}"
+            );
+        }
+        assert!(
+            !row.contains("next field"),
+            "the form's own Enter must not leak through: {row:?}"
+        );
+
+        // Every other view keeps its own keys: the picker is up over the form, so
+        // this is really about the form, but the axis is not view-scoped and could
+        // have been written to swallow more.
+        let without_picker = key_target(form, true, &idle, drawn, SKILLS_FIELD, false, false);
+        assert_eq!(without_picker, KeyTarget::AgentForm(SKILLS_FIELD));
+        assert!(
+            footer_row(without_picker).contains("next field"),
+            "and the form gets its row back once the picker is down"
+        );
+    }
+
+    /// The picker reads a project's *path* out of the context store, not the id
+    /// the form holds.
+    ///
+    /// Worth a test because the wrong version compiles and looks right:
+    /// `list_skills_for_project` takes a `&Path`, and an id is a perfectly good
+    /// `&str` to hand it. It would then look for `fudi/skills` relative to the
+    /// working directory — a directory that does not exist — and the picker would
+    /// show only the shared skills, with the project's own quietly missing.
+    #[test]
+    fn the_picker_resolves_a_project_id_to_its_path() {
+        use crate::context::store::ContextStore;
+        use crate::services::skill_manager::SkillManager;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LLAMA_R_DIR", dir.path());
+        // Deliberately NOT named after the id, so a lookup by id cannot stumble
+        // onto it by accident — the two are only distinguishable here.
+        let project_path = dir.path().join("checkout");
+        std::fs::create_dir_all(project_path.join("skills/project-only")).unwrap();
+        std::fs::write(
+            project_path.join("skills/project-only/SKILL.md"),
+            "---\nname: Project Only\ndescription: d\n---\nbody\n",
+        )
+        .unwrap();
+
+        let manager = SkillManager::with_paths(vec![dir.path().join("skills")]);
+        manager.scan_and_load();
+
+        let store = ContextStore::new();
+        store
+            .save_context(crate::context::store::ProjectContext {
+                project_id: "fudi".to_string(),
+                path: project_path.to_string_lossy().to_string(),
+                context_md: String::new(),
+                project_type: "rust".to_string(),
+                skills_injected: Vec::new(),
+                last_analyzed: chrono::Utc::now(),
+                custom_rules: String::new(),
+            })
+            .unwrap();
+
+        let ids: Vec<String> = available_skills(&store, &manager, "fudi")
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(
+            ids.contains(&"project-only".to_string()),
+            "the project's own skill must reach the picker: {ids:?}"
+        );
+
+        // The wrong version — passing the id where a path is wanted — finds
+        // nothing here, which is exactly why the store lookup is not optional.
+        let by_id: Vec<String> = manager
+            .list_skills_for_project(Path::new("fudi"))
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert!(
+            !by_id.contains(&"project-only".to_string()),
+            "passing the id must NOT find them, or this test proves nothing: {by_id:?}"
+        );
+    }
+
+    /// The picker opens on the skills field and nowhere else. A `s` that opened it
+    /// from the prompt would swallow a character the user is typing.
+    #[test]
+    fn only_the_skills_field_opens_the_picker() {
+        let idle = AnalysisState::Idle;
+        let drawn = drawn_bounds();
+
+        for field in 0..SKILLS_FIELD {
+            assert_eq!(
+                key_target(
+                    &CurrentView::AgentForm,
+                    true,
+                    &idle,
+                    drawn,
+                    field,
+                    false,
+                    false
+                ),
+                KeyTarget::AgentForm(field),
+                "field {field} is a typing field and must not be the picker"
+            );
+        }
+    }
+
     /// **The delete confirmation is the same defect, on the sibling modal.** Its
     /// handler takes *every* key while it is up — it is consulted before the chat
     /// and before `q`, and every branch `continue`s — so the projects row
@@ -2081,7 +2389,7 @@ mod tests {
             (CurrentView::AgentForm, true),
         ] {
             assert_eq!(
-                key_target(&view, focus, &idle, drawn, 0, true),
+                key_target(&view, focus, &idle, drawn, 0, true, false),
                 KeyTarget::DeleteConfirm,
                 "{view:?} with the confirmation up is not {view:?}"
             );
