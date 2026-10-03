@@ -735,6 +735,26 @@ mod tests {
             bounds.project_rows, 1,
             "the one row left goes to the project list, and the agent keys then defer: {bounds:?}"
         );
+
+        // Four rows is the threshold the spec names: rule, label, one project row
+        // and one agent row. Pinned from both sides so the sentence in
+        // `design.md` has a test behind it rather than a number that could drift.
+        let mut four = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        let reported = std::cell::Cell::new(ListBounds::default());
+        four.draw(|f| {
+            reported.set(render_projects(
+                f,
+                Rect::new(0, 0, 80, 4),
+                &state,
+                p00,
+                0,
+                false,
+            ));
+        })
+        .unwrap();
+        let bounds = reported.get();
+        assert_eq!(bounds.agent_rows, 1, "four rows fit one agent: {bounds:?}");
+        assert_eq!(bounds.project_rows, 1, "and one project: {bounds:?}");
     }
     /// The agent list's order is a guarantee, not an accident of the registry.
     ///

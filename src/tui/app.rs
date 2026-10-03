@@ -5,6 +5,7 @@ use crate::tui::chrome;
 use crate::tui::views::chat::render_chat;
 use crate::tui::views::dashboard::render_dashboard;
 use crate::tui::views::modals::render_confirm_delete;
+use crate::tui::views::projects::ListBounds;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -105,15 +106,74 @@ fn key_target(
     view: &CurrentView,
     active_in_project_list: bool,
     analysis: &AnalysisState,
+    projects_bounds: ListBounds,
 ) -> KeyTarget {
     if matches!(view, CurrentView::Analysis) && matches!(analysis, AnalysisState::Proposals { .. })
     {
         return KeyTarget::Proposals;
     }
-    if matches!(view, CurrentView::Projects) && !active_in_project_list {
+    // The agent list's keys, and only when the agent list has a row to aim at.
+    // `ProjectAgents` is reached by focusing it, and focus can be on it with
+    // nothing in it — a project with no agents, or a body too short for the list
+    // after the rule and the label. Naming `e: edit  d: delete` over an empty list
+    // is the same invisible state the keys themselves refuse: the labels and the
+    // behaviour have to agree, or the footer is advertising a lie.
+    if matches!(view, CurrentView::Projects)
+        && !active_in_project_list
+        && projects_bounds.agent_rows > 0
+    {
         return KeyTarget::ProjectAgents;
     }
     KeyTarget::View(view.clone())
+}
+
+/// Whether a key aimed at the agent list may act, given what the last frame drew.
+///
+/// With a body too short for the list — three rows, where the rule and the label
+/// take two — there is no row to act on, and acting on `agent_index` anyway would
+/// mean editing an agent nobody can see. The four bindings consult this; it is a
+/// free function over the bounds so a test can reach it, because a predicate that
+/// only exists inside the event loop is a predicate with no test.
+fn agent_list_is_drawn(bounds: ListBounds) -> bool {
+    bounds.agent_rows > 0
+}
+
+/// The agent `e` and `d` should act on, or `None` when there is nothing to act on.
+///
+/// Two ways to get `None`, and both mean the same thing to the user: the list was
+/// not drawn, or `agent_index` names no agent. Either way the key would be
+/// operating on a row that is not on screen.
+fn selected_agent(
+    bounds: ListBounds,
+    agents: &[crate::domain::agent::Agent],
+    agent_index: usize,
+) -> Option<&crate::domain::agent::Agent> {
+    if !agent_list_is_drawn(bounds) {
+        return None;
+    }
+    agents.get(agent_index)
+}
+
+/// Where `↑` or `↓` leaves the selection in the agent list.
+///
+/// Wraps, as it always has, and leaves it alone when the list was not drawn: there
+/// is no row to move to, and a selection that moves while nothing moves on screen
+/// is the invisible state this whole arrangement exists to prevent.
+fn move_agent_selection(bounds: ListBounds, current: usize, count: usize, delta: isize) -> usize {
+    if !agent_list_is_drawn(bounds) || count == 0 {
+        return current;
+    }
+    let next = (current as isize + delta).rem_euclid(count as isize);
+    next as usize
+}
+
+/// Whether `←`/`→` may move focus onto the agent list.
+///
+/// Only onto a list with rows. Focus that lands on an empty list is the state where
+/// the footer would have to relabel itself and `d` would silently do nothing
+/// instead of deleting the selected project — so it does not land there.
+fn may_move_list_focus(bounds: ListBounds) -> bool {
+    agent_list_is_drawn(bounds)
 }
 
 pub struct TuiApp {
@@ -125,7 +185,7 @@ pub struct TuiApp {
     /// Rows the last frame actually drew for each of the projects view's two
     /// lists. The agent list is smaller than the body at some project counts, so
     /// the four keys that drive it read this rather than assuming it is there.
-    project_list_bounds: crate::tui::views::projects::ListBounds,
+    project_list_bounds: ListBounds,
     // Form state
     form_id: String,
     form_name: String,
@@ -541,16 +601,6 @@ impl TuiApp {
         crate::tui::views::projects::agents_of_project(&self.state, selected_project_id)
     }
 
-    /// Whether the projects view drew any agent row at all.
-    ///
-    /// The four bindings that drive the agent list consult this: with three body
-    /// rows the list gets none, and acting on `agent_index` then would mean
-    /// editing a row nobody can see. `false` makes them do nothing, which is the
-    /// honest answer — better than a footer advertising `e: edit` over nothing.
-    fn agent_list_is_drawn(&self) -> bool {
-        self.project_list_bounds.agent_rows > 0
-    }
-
     fn update_chat_selected_agent(&mut self) {
         if self.available_agents.is_empty() || self.chat_agent_index == 0 {
             self.chat_selected_agent = None;
@@ -708,6 +758,7 @@ impl TuiApp {
                     &self.current_view,
                     self.active_in_project_list,
                     &analysis,
+                    self.project_list_bounds,
                 ));
                 chrome::render_bar(
                     f,
@@ -1124,11 +1175,13 @@ impl TuiApp {
                                             self.project_index = (self.project_index + 1) % count;
                                             self.agent_index = 0;
                                         }
-                                    } else if self.agent_list_is_drawn() {
-                                        let agent_count = self.project_agents().len();
-                                        if agent_count > 0 {
-                                            self.agent_index = (self.agent_index + 1) % agent_count;
-                                        }
+                                    } else {
+                                        self.agent_index = move_agent_selection(
+                                            self.project_list_bounds,
+                                            self.agent_index,
+                                            self.project_agents().len(),
+                                            1,
+                                        );
                                     }
                                 } else if self.current_view == CurrentView::Dashboard {
                                     self.log_scroll = self.log_scroll.saturating_add(1);
@@ -1149,15 +1202,13 @@ impl TuiApp {
                                             };
                                             self.agent_index = 0;
                                         }
-                                    } else if self.agent_list_is_drawn() {
-                                        let agent_count = self.project_agents().len();
-                                        if agent_count > 0 {
-                                            self.agent_index = if self.agent_index == 0 {
-                                                agent_count - 1
-                                            } else {
-                                                self.agent_index - 1
-                                            };
-                                        }
+                                    } else {
+                                        self.agent_index = move_agent_selection(
+                                            self.project_list_bounds,
+                                            self.agent_index,
+                                            self.project_agents().len(),
+                                            -1,
+                                        );
                                     }
                                 } else if self.current_view == CurrentView::Dashboard {
                                     self.log_scroll = self.log_scroll.saturating_sub(1);
@@ -1177,8 +1228,7 @@ impl TuiApp {
                             | KeyCode::Char('h')
                             | KeyCode::Left => {
                                 if self.current_view == CurrentView::Projects
-                                    && (self.project_list_bounds.project_rows > 0
-                                        || self.project_list_bounds.agent_rows > 0)
+                                    && may_move_list_focus(self.project_list_bounds)
                                 {
                                     self.active_in_project_list = !self.active_in_project_list;
                                 }
@@ -1209,12 +1259,13 @@ impl TuiApp {
                                                 project.project_id.clone(),
                                             ));
                                         }
-                                    } else if self.agent_list_is_drawn() {
-                                        let agents = self.project_agents();
-                                        if let Some(agent) = agents.get(self.agent_index) {
-                                            self.confirm_delete =
-                                                Some(("agent".to_string(), agent.id.clone()));
-                                        }
+                                    } else if let Some(agent) = selected_agent(
+                                        self.project_list_bounds,
+                                        &self.project_agents(),
+                                        self.agent_index,
+                                    ) {
+                                        self.confirm_delete =
+                                            Some(("agent".to_string(), agent.id.clone()));
                                     }
                                 }
                             }
@@ -1249,10 +1300,13 @@ impl TuiApp {
                             KeyCode::Char('e') => {
                                 if self.current_view == CurrentView::Projects
                                     && !self.active_in_project_list
-                                    && self.agent_list_is_drawn()
                                 {
                                     let agents = self.project_agents();
-                                    if let Some(agent) = agents.get(self.agent_index) {
+                                    if let Some(agent) = selected_agent(
+                                        self.project_list_bounds,
+                                        &agents,
+                                        self.agent_index,
+                                    ) {
                                         self.form_id = agent.id.clone();
                                         self.form_name = agent.config.name.clone();
                                         self.form_model = agent.config.model.clone();
@@ -1561,7 +1615,12 @@ mod tests {
             results: Vec::new(),
         };
         assert_eq!(
-            key_target(&CurrentView::Analysis, true, &pending),
+            key_target(
+                &CurrentView::Analysis,
+                true,
+                &pending,
+                ListBounds::default()
+            ),
             KeyTarget::Proposals
         );
 
@@ -1601,7 +1660,7 @@ mod tests {
             AnalysisState::Error("boom".into()),
         ] {
             assert_eq!(
-                key_target(&CurrentView::Analysis, true, &state),
+                key_target(&CurrentView::Analysis, true, &state, ListBounds::default()),
                 KeyTarget::View(CurrentView::Analysis),
                 "{state:?} is not the proposal modal"
             );
@@ -1627,7 +1686,12 @@ mod tests {
         };
         // Inside the modal: the modal's keys.
         assert_eq!(
-            key_target(&CurrentView::Analysis, true, &pending),
+            key_target(
+                &CurrentView::Analysis,
+                true,
+                &pending,
+                ListBounds::default()
+            ),
             KeyTarget::Proposals
         );
 
@@ -1641,7 +1705,7 @@ mod tests {
             CurrentView::AgentForm,
         ] {
             assert_eq!(
-                key_target(&view, true, &pending),
+                key_target(&view, true, &pending, ListBounds::default()),
                 KeyTarget::View(view.clone()),
                 "{view:?} is not the proposal modal, whatever the analysis state says"
             );
@@ -1674,9 +1738,15 @@ mod tests {
     #[test]
     fn the_projects_footer_follows_the_list_that_has_focus() {
         let idle = AnalysisState::Idle;
+        // The agent list has rows, which is the precondition for its keys existing
+        // at all — see the test below for when it has none.
+        let drawn = ListBounds {
+            project_rows: 3,
+            agent_rows: 2,
+        };
 
         assert_eq!(
-            key_target(&CurrentView::Projects, true, &idle),
+            key_target(&CurrentView::Projects, true, &idle, drawn),
             KeyTarget::View(CurrentView::Projects)
         );
         assert!(
@@ -1687,7 +1757,7 @@ mod tests {
         );
 
         assert_eq!(
-            key_target(&CurrentView::Projects, false, &idle),
+            key_target(&CurrentView::Projects, false, &idle, drawn),
             KeyTarget::ProjectAgents
         );
         let agents = TuiApp::hints_for(KeyTarget::ProjectAgents);
@@ -1709,7 +1779,170 @@ mod tests {
             "analysing a project is the project row's key, not the agent list's: {agents:?}"
         );
     }
+    /// An agent list with rows, as `render_projects` reports it.
+    fn drawn_bounds() -> ListBounds {
+        ListBounds {
+            project_rows: 3,
+            agent_rows: 2,
+        }
+    }
 
+    /// An agent list with none: a body too short for it after the rule and the
+    /// label, or a project with no agents.
+    fn undrawn_bounds() -> ListBounds {
+        ListBounds {
+            project_rows: 3,
+            agent_rows: 0,
+        }
+    }
+
+    /// Two agents, by id, so a test can name one.
+    fn agents_named(ids: &[&str]) -> Vec<crate::domain::agent::Agent> {
+        ids.iter()
+            .map(|id| crate::domain::agent::Agent {
+                id: (*id).to_string(),
+                config: crate::domain::agent::AgentConfig::default(),
+                project_id: Some("fudi".to_string()),
+            })
+            .collect()
+    }
+
+    /// **The deferral is guarded.** `e` and `d` must not act on an agent when the
+    /// list was not drawn: the row is on the model's screen and nowhere else, so
+    /// `e` would open a form for an agent the user cannot see highlighted.
+    ///
+    /// This is the predicate `e` and `d` call, extracted so a test can reach it —
+    /// inside the event loop it was a guard with no test, which is the failure mode
+    /// this branch had already produced five times.
+    #[test]
+    fn a_key_aimed_at_the_agent_list_does_nothing_when_the_list_was_not_drawn() {
+        let agents = agents_named(&["nutricion", "pediatra"]);
+
+        // Drawn: the selected agent is the target.
+        for (index, expected) in [(0, "nutricion"), (1, "pediatra")] {
+            assert_eq!(
+                selected_agent(drawn_bounds(), &agents, index).map(|a| a.id.as_str()),
+                Some(expected),
+                "index {index} must name a row that is on screen"
+            );
+        }
+
+        // Not drawn: nothing, however good the index is.
+        for index in 0..4 {
+            assert!(
+                selected_agent(undrawn_bounds(), &agents, index).is_none(),
+                "index {index} names no visible row, so the key must do nothing"
+            );
+        }
+
+        // Drawn but the index is past the end: also nothing.
+        assert!(selected_agent(drawn_bounds(), &agents, 99).is_none());
+
+        // No agents at all, whatever the bounds say.
+        let empty: Vec<crate::domain::agent::Agent> = Vec::new();
+        assert!(selected_agent(drawn_bounds(), &empty, 0).is_none());
+    }
+
+    /// The same for the two navigation keys, which move a selection that would
+    /// otherwise move with nothing on screen moving.
+    #[test]
+    fn the_agent_selection_does_not_move_when_the_list_was_not_drawn() {
+        let count = 3;
+        // Drawn: it wraps in both directions, as it always has.
+        assert_eq!(move_agent_selection(drawn_bounds(), 0, count, 1), 1);
+        assert_eq!(move_agent_selection(drawn_bounds(), 2, count, 1), 0);
+        assert_eq!(move_agent_selection(drawn_bounds(), 0, count, -1), 2);
+
+        // Not drawn: unmoved, for every index and both directions. A selection that
+        // advances while the highlighted row stays where it is drawn is exactly the
+        // invisible state the window exists to prevent.
+        for index in 0..count {
+            for delta in [-1, 1] {
+                assert_eq!(
+                    move_agent_selection(undrawn_bounds(), index, count, delta),
+                    index,
+                    "index {index} must not move while the list is undrawn"
+                );
+            }
+        }
+
+        // Drawn but empty: nothing to move to.
+        assert_eq!(move_agent_selection(drawn_bounds(), 0, 0, 1), 0);
+        // Drawn with a stale index: the wrap puts it back in range, so one arrow
+        // press recovers a selection that had drifted off the end rather than
+        // leaving it there.
+        assert_eq!(
+            move_agent_selection(drawn_bounds(), 99, 2, -1),
+            0,
+            "a stale index self-heals on the next press"
+        );
+    }
+
+    /// Focus does not move onto a list with no rows — which is what keeps
+    /// `d` meaning "delete the selected agent" once it gets there, rather than
+    /// silently doing nothing because the focus is on nothing.
+    #[test]
+    fn focus_does_not_move_onto_a_list_with_no_rows() {
+        assert!(
+            may_move_list_focus(drawn_bounds()),
+            "the agent list has rows, so focus may move onto it"
+        );
+        assert!(
+            !may_move_list_focus(undrawn_bounds()),
+            "the agent list has none, so focus must not move onto it"
+        );
+        assert!(
+            !may_move_list_focus(ListBounds::default()),
+            "nor when neither list has a row"
+        );
+        // …but a project row alone is still focusable: the projects list is where
+        // `a`, `n` and `d` are bound.
+        assert!(
+            !agent_list_is_drawn(undrawn_bounds()),
+            "the predicate the other two are built on says the same"
+        );
+    }
+
+    /// **The labels follow the rows.** A project with no agents has an empty agent
+    /// list at any terminal size, so focusing it used to rename the footer to
+    /// `e: edit  d: delete` while all four keys did nothing and no row was
+    /// highlighted anywhere. The footer names the agent keys exactly when the
+    /// agent keys can act.
+    #[test]
+    fn the_footer_does_not_name_agent_keys_when_no_agent_row_is_drawn() {
+        let idle = AnalysisState::Idle;
+        // Focus is on the agent list and it is empty: this is the state `→` reaches
+        // on a project with no agents.
+        assert_eq!(
+            key_target(&CurrentView::Projects, false, &idle, undrawn_bounds()),
+            KeyTarget::View(CurrentView::Projects),
+            "an empty agent list must not get the agent row's labels"
+        );
+        let row = footer_row(KeyTarget::View(CurrentView::Projects));
+        assert!(
+            !row.contains("e: edit"),
+            "nothing can be edited when no agent row is drawn: {row:?}"
+        );
+        for label in ["e: edit", "←/→: projects"] {
+            assert!(
+                !row.contains(label),
+                "the projects row must not carry the agent row's {label:?}: {row:?}"
+            );
+        }
+        // …and it keeps the keys that *do* work there.
+        assert!(
+            row.contains("a: analyze") && row.contains("d: delete"),
+            "the projects footer must name its own keys: {row:?}"
+        );
+
+        // With rows drawn, the agent labels are back — so the gate is not simply
+        // deleting them.
+        assert_eq!(
+            key_target(&CurrentView::Projects, false, &idle, drawn_bounds()),
+            KeyTarget::ProjectAgents
+        );
+        assert!(footer_row(KeyTarget::ProjectAgents).contains("e: edit"));
+    }
     fn key(code: KeyCode, modifiers: KeyModifiers) -> event::KeyEvent {
         event::KeyEvent {
             code,

@@ -107,11 +107,10 @@ Llama-R │ Dashboard │ Projects │ Chat             fudi/ops  ● q
  agentes de fudi
   nutricion         llama3
   pediatra          llama3
-─────────────────────────────────────────────────────────
  Tab vista  ←→ agentes  ↑↓ seleccionar  a analizar  n nuevo  d borrar  q salir
 ```
 
-Two lists of plain rows separated by a thin rule — no box, no title on either.
+Two lists of plain rows separated by a thin rule — no box, no title on either. One rule, between the two lists; nothing closes the agent list, exactly as nothing closes the chat input above its rule.
 
 The upper list is the projects, one row each: name, agent count, whether it has been analysed. The counts stay inline rather than only inside a sub-view.
 
@@ -119,7 +118,7 @@ The upper list is the projects, one row each: name, agent count, whether it has 
 
 The mockup this replaces advertised `Enter ver agentes`, a key that was never bound to anything. There is no sub-view: the agents are on this screen.
 
-Both lists are windows on their own selection rather than the head of the list, and each keeps at least one row whenever the other has something to show. So on a body too short for both, the selected row of each is still drawn and every row stays reachable. Actions permanently visible instead of hidden.
+Both lists are windows on their own selection rather than the head of the list, and from a four-row body up each keeps at least one row — the agent list never at the project list's expense. So on a body too short to show either list whole, the selected row of *each* is still drawn and every row stays reachable. Below four rows the agent list has none: the rule and the label take two, and one row is left for a project. Its four keys then do nothing and the footer says so, rather than naming keys that would act on a row nobody can see. Actions permanently visible instead of hidden.
 
 ### Dashboard
 
