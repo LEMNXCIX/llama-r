@@ -172,11 +172,16 @@ fn prompt_cursor(prompt: &str, area: Rect) -> (u16, u16) {
         // place on exactly the prompts that have them.
         let line_width = Line::from(*line).width();
         if index < lines.len() - 1 {
-            // Every row this line occupies, and nothing more: the hard newline
+            // The rows this line occupies, and nothing more: the hard newline
             // does not spend a row of its own, it only puts the next line on the
             // row after this one's last. Adding one here detaches the caret by a
             // row for every newline already typed.
-            rows += line_width.div_ceil(width);
+            //
+            // `max(1)` because a blank line is one row and not none. `Paragraph`
+            // emits an empty row for it — pressing Enter twice is how a prompt
+            // gets a paragraph break — and `div_ceil(0, width)` is 0, which would
+            // lose the caret a row for every break.
+            rows += line_width.div_ceil(width).max(1);
         } else {
             // The caret goes *after* the last character, and floor is what puts
             // it there: `ceil - 1` is only the same when the line does not end
@@ -224,18 +229,29 @@ mod tests {
         "demo",
     ];
 
-    /// The form on an 80x24 terminal, inside the body the chrome leaves under
-    /// the bar, with the active field `field_index`.
+    /// Columns and rows of the terminal [`draw_form`] builds.
+    ///
+    /// The prompt's caret arithmetic is in terms of the prompt area's width, so a
+    /// test that pins a wrap boundary must read the width from here rather than
+    /// restate it: a restated `80` silently stops being the boundary when
+    /// [`draw_form`] changes.
+    const TERMINAL_WIDTH: u16 = 80;
+    const TERMINAL_HEIGHT: u16 = 24;
+
+    /// The form on a [`TERMINAL_WIDTH`]x[`TERMINAL_HEIGHT`] terminal, inside the
+    /// body the chrome leaves under the bar, with the active field
+    /// `field_index`.
     ///
     /// Returns the buffer and the caret the terminal ended up with: a caret is
     /// not drawn into the buffer, so it can only be read back off the terminal.
     fn draw_form(prompt: &str, field_index: usize) -> (Buffer, (u16, u16)) {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut terminal =
+            Terminal::new(TestBackend::new(TERMINAL_WIDTH, TERMINAL_HEIGHT)).unwrap();
         terminal
             .draw(|f| {
                 render_agent_form(
                     f,
-                    Rect::new(0, 1, 80, 22),
+                    Rect::new(0, 1, TERMINAL_WIDTH, TERMINAL_HEIGHT - 2),
                     VALUES[0],
                     VALUES[1],
                     VALUES[2],
@@ -444,6 +460,69 @@ mod tests {
         );
     }
 
+    /// A blank line in the prompt is one row, not none.
+    ///
+    /// Pressing Enter twice is how a system prompt gets a paragraph break, so
+    /// this is ordinary typing rather than a corner case. `Paragraph` renders the
+    /// blank line as an empty row and the line after it on the next one, so a
+    /// caret that skips the blank row lands on the line *above* the one being
+    /// edited.
+    ///
+    /// The rendered rows are read back first: they are what makes `+2` mean
+    /// "the row `dos` rendered on" rather than an arithmetic assertion the
+    /// implementation could agree with by being wrong the same way twice.
+    #[test]
+    fn a_blank_line_in_the_prompt_still_takes_a_row() {
+        let (buffer, caret) = draw_form("uno\n\ndos", PROMPT_INDEX);
+        let prompt_row = row_of(PROMPT_INDEX + 2);
+        let rows: Vec<String> = (0..3)
+            .map(|offset| {
+                row_text(&buffer, prompt_row + offset as u16)
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["uno", "", "dos"],
+            "the blank line must render as its own row: {rows:?}"
+        );
+        assert_eq!(
+            caret,
+            (3, prompt_row + 2),
+            "the caret must sit after `dos`, on the row it rendered on, not the blank one above it"
+        );
+    }
+
+    /// A line of only whitespace is a blank line too, and `Wrap { trim: true }`
+    /// renders it as one empty row rather than as its three spaces.
+    ///
+    /// Reachable the same way as an empty line — trailing spaces typed before an
+    /// Enter — and it is a different branch of the reflow than the empty line is,
+    /// so it is worth pinning separately.
+    #[test]
+    fn a_whitespace_only_line_in_the_prompt_still_takes_a_row() {
+        let (buffer, caret) = draw_form("uno\n   \ndos", PROMPT_INDEX);
+        let prompt_row = row_of(PROMPT_INDEX + 2);
+        let rows: Vec<String> = (0..3)
+            .map(|offset| {
+                row_text(&buffer, prompt_row + offset as u16)
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["uno", "", "dos"],
+            "the whitespace-only line must render as one trimmed row: {rows:?}"
+        );
+        assert_eq!(
+            caret,
+            (3, prompt_row + 2),
+            "the caret must sit after `dos`, on the row it rendered on"
+        );
+    }
+
     /// A final line that exactly fills the row leaves the caret on the next row
     /// at column 0: "after the last character" is the start of the row below, and
     /// that is where a terminal puts it too.
@@ -452,7 +531,7 @@ mod tests {
     /// occupies exactly one row, and the caret is the row past it.
     #[test]
     fn the_cursor_sits_after_a_final_line_that_exactly_fills_the_row() {
-        let full_row = "x".repeat(80);
+        let full_row = "x".repeat(TERMINAL_WIDTH as usize);
         let (buffer, caret) = draw_form(&full_row, PROMPT_INDEX);
         let prompt_row = row_of(PROMPT_INDEX + 2);
         assert_eq!(
