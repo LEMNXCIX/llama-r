@@ -24,14 +24,18 @@ const DOWN: &str = "○";
 /// A row of status, a rule, then the log list: the three-row product banner and
 /// the four bordered blocks it used to spend 13 rows on are now two. The banner
 /// went because the shared bar already carries the interface's identity — which
-/// view you are in, under which context, and whether the provider answers — and
-/// the status row below names this gateway without a title. What is left
-/// answers the three questions a user lands here with: are the servers up, how
-/// much is configured, and what has happened since.
+/// view you are in, under which context, and whether the HTTP server is up — and
+/// the status row below names this gateway's two servers without a title. What
+/// is left answers the three questions a user lands here with: are the servers
+/// up, how much is configured, and what has happened since.
 ///
-/// What the bar does *not* carry is the product's name: `Llama-R` appears
-/// nowhere in the TUI now. Restoring it belongs to the bar itself, not to a
-/// view that would otherwise repeat the banner this function deleted.
+/// Two things the bar does *not* carry, which a reader of this file would
+/// otherwise assume it does. Its dot is the HTTP listener's liveness
+/// (`api_running`, set just before `axum::serve` and cleared when it errors) —
+/// nothing in the TUI reports whether the provider answers. And the product's
+/// name is nowhere: `Llama-R` appears in no view. Restoring it belongs to the
+/// bar, not to a view that would otherwise repeat the banner this function
+/// deleted.
 pub fn render_dashboard(f: &mut Frame, body: Rect, state: &AppState, log_scroll: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -288,7 +292,9 @@ mod tests {
     /// A fresh fixture's request counters are all zero, which would leave a
     /// hardcoded `0` indistinguishable from the real figure, so they are moved
     /// off zero first. Every number the row shows is then pinned to the state
-    /// field it comes from.
+    /// field it comes from, which needs the counters to be *pairwise* unequal:
+    /// at one chat and one fallback, swapping those two fields in the
+    /// implementation would satisfy every assertion below just as well.
     #[test]
     fn the_status_numbers_come_from_the_state() {
         let _env = crate::core::paths::lock_env_for_tests();
@@ -297,6 +303,7 @@ mod tests {
             state.observability.record_http_request();
         }
         state.observability.record_chat_request(800);
+        state.observability.record_chat_request(1200);
         state.observability.record_fallback();
         // 400 characters in, 200 out: the metric's own one-token-per-four-
         // characters heuristic makes that 50 saved tokens.
