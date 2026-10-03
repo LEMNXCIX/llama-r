@@ -150,8 +150,9 @@ pub fn render_projects(
         .zip(&counts)
         .enumerate()
         .map(|(index, (project, count))| {
-            // Bold is the only bold in the interface, so it marks the row the
-            // next keystroke acts on — and only while this list has focus.
+            // In a list, bold marks the row the next keystroke acts on, and
+            // only while this list has focus. Bold is not exclusive to that: the
+            // bar's current view and two rows in `modals.rs` wear it too.
             let name_style = if active_in_project_list && index == project_index {
                 theme::active()
             } else {

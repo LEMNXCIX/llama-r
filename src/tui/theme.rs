@@ -33,10 +33,12 @@ pub fn action() -> Style {
     Style::default().fg(Color::Cyan)
 }
 
-/// The current selection. The only bold *token*, so a bold row means "selected".
-/// A view may still add bold on top of one for a label — the analysis view does
-/// it for the `Error: ` prefix — which is a label the user has to read, not a row
-/// they can act on.
+/// The current selection. The only bold *token*: in a list it marks the row the
+/// next keystroke acts on. Bold is not exclusive to that — the current view's name
+/// on the bar (`chrome::render_bar`) and two rows in `views/modals.rs`, the delete
+/// question and the warning before approval, wear it because the user has to read
+/// them. A view may also add bold on top of another token for a label
+/// (`views/analysis.rs` does it for `Error: `).
 pub fn active() -> Style {
     Style::default()
         .fg(Color::Yellow)

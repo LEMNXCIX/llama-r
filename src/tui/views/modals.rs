@@ -105,9 +105,10 @@ pub fn render_skill_proposals(
         let marker = if index == selected { ">" } else { " " };
         lines.push(Line::from(vec![
             Span::styled(format!("{marker} "), theme::action()),
-            // The selected proposal wears `active`, the same one bold token the
-            // rest of the interface uses for "this is what the next key acts
-            // on". The marker alone could not carry that: it is one character.
+            // The selected proposal wears `active`, the only bold token
+            // in the interface. In a list that token marks the row the next keystroke
+            // acts on — something the marker alone could not carry here, being one
+            // character.
             Span::styled(
                 proposal.id.clone(),
                 if index == selected {
@@ -200,10 +201,11 @@ mod tests {
     }
 
     /// The selected proposal is the one `Enter` acts on, so it has to be marked by
-    /// more than the `>` glyph: it wears the same bold-and-yellow `active` token
-    /// the rest of the interface uses for "the next keystroke lands here", and
-    /// nothing else wears it. An unselected proposal wears `content`, so the two
-    /// cannot be confused.
+    /// more than the `>` glyph: it wears the bold-and-yellow `active` token the
+    /// list rows use for "the next keystroke lands here". An unselected proposal
+    /// wears `content`, so the two cannot be confused. Not "the only one wearing
+    /// `active`": the banner above and the delete question wear it too, which is
+    /// why the count below is scoped to the proposal rows.
     #[test]
     fn the_selected_proposal_is_the_only_one_wearing_active() {
         let buffer = render_proposals(&["uno", "dos", "tres"], 1);
