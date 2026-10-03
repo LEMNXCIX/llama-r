@@ -149,29 +149,46 @@ pub enum AnalysisState {
 /// re-triggers an analysis and `d` opens the delete confirmation. The delete
 /// confirmation is the same story with no view to go back to: it takes *every*
 /// key while it is up, so the row underneath names keys that do nothing.
-fn key_target(
-    view: &CurrentView,
+/// Everything the footer row depends on that is not the `CurrentView` alone.
+///
+/// Seven positional `bool`/`usize` arguments was what this replaces. The problem
+/// was never the count — it was that `key_target(form, true, &idle, drawn, 0,
+/// false, false)` reads as a row of flags with no way to tell two `false`s apart,
+/// and swapping two of them compiles and silently changes which screen owns the
+/// keys. Named fields cannot be swapped by accident, and a new axis is one field
+/// here rather than one argument at every call site.
+#[derive(Clone)]
+struct ScreenState<'a> {
+    view: &'a CurrentView,
+    /// Whether focus is on the project list rather than its agent list.
     active_in_project_list: bool,
-    analysis: &AnalysisState,
+    analysis: &'a AnalysisState,
+    /// What the projects view actually drew last frame. A key may only act on a
+    /// row that was on screen.
     projects_bounds: ListBounds,
     form_field_index: usize,
+    /// The delete confirmation, up over the projects view.
     confirm_delete: bool,
+    /// The skill picker, up over the agent form.
     skill_picker: bool,
-) -> KeyTarget {
+}
+
+fn key_target(state: &ScreenState<'_>) -> KeyTarget {
     // Checked first because it outranks every axis below it: the handler in the
     // event loop takes every key while the confirmation is up and `continue`s, so
     // no keypress reaches the screen any other target here describes.
-    if confirm_delete {
+    if state.confirm_delete {
         return KeyTarget::DeleteConfirm;
     }
     // Same story as the confirmation: the picker takes every key while it is up,
     // and the form underneath it is still the current view, so without this the
     // form's own row keeps naming `Enter: next field` under a list where `Enter`
     // confirms.
-    if skill_picker {
+    if state.skill_picker {
         return KeyTarget::SkillPicker;
     }
-    if matches!(view, CurrentView::Analysis) && matches!(analysis, AnalysisState::Proposals { .. })
+    if matches!(state.view, CurrentView::Analysis)
+        && matches!(state.analysis, AnalysisState::Proposals { .. })
     {
         return KeyTarget::Proposals;
     }
@@ -181,19 +198,19 @@ fn key_target(
     // after the rule and the label. Naming `e: edit  d: delete` over an empty list
     // is the same invisible state the keys themselves refuse: the labels and the
     // behaviour have to agree, or the footer is advertising a lie.
-    if matches!(view, CurrentView::Projects)
-        && !active_in_project_list
-        && projects_bounds.agent_rows > 0
+    if matches!(state.view, CurrentView::Projects)
+        && !state.active_in_project_list
+        && state.projects_bounds.agent_rows > 0
     {
         return KeyTarget::ProjectAgents;
     }
     // The form's own keys are not one set: `Enter` and the arrows mean different
     // things on different fields, so the field index is part of the target rather
     // than a detail the handler keeps to itself.
-    if matches!(view, CurrentView::AgentForm) {
-        return KeyTarget::AgentForm(form_field_index);
+    if matches!(state.view, CurrentView::AgentForm) {
+        return KeyTarget::AgentForm(state.form_field_index);
     }
-    KeyTarget::View(view.clone())
+    KeyTarget::View(state.view.clone())
 }
 
 /// Whether a key aimed at the agent list may act, given what the last frame drew.
@@ -721,6 +738,24 @@ impl TuiApp {
     /// This is the single place hint text lives. No `self`: the text depends
     /// only on which keys the screen answers to, which keeps it reachable from a
     /// test without a terminal or an `AppState`.
+    /// What the footer row is being drawn for right now.
+    ///
+    /// One place reads the app's fields, so a new axis is added here and nowhere
+    /// else. `analysis` is behind a lock that a poisoned mutex must not take the
+    /// whole frame down with it, so a failed `try_lock` reads as `Idle` — which
+    /// is what the draw already did before this existed.
+    fn screen_state<'a>(&'a self, analysis: &'a AnalysisState) -> ScreenState<'a> {
+        ScreenState {
+            view: &self.current_view,
+            active_in_project_list: self.active_in_project_list,
+            analysis,
+            projects_bounds: self.project_list_bounds,
+            form_field_index: self.form_field_index,
+            confirm_delete: self.confirm_delete.is_some(),
+            skill_picker: self.skill_picker.is_some(),
+        }
+    }
+
     fn hints_for(target: KeyTarget) -> Vec<(&'static str, &'static str)> {
         match target {
             KeyTarget::View(CurrentView::Dashboard) => {
@@ -1006,15 +1041,7 @@ impl TuiApp {
                     .try_lock()
                     .map(|g| g.clone())
                     .unwrap_or(AnalysisState::Idle);
-                let hints = Self::hints_for(key_target(
-                    &self.current_view,
-                    self.active_in_project_list,
-                    &analysis,
-                    self.project_list_bounds,
-                    self.form_field_index,
-                    self.confirm_delete.is_some(),
-                    self.skill_picker.is_some(),
-                ));
+                let hints = Self::hints_for(key_target(&self.screen_state(&analysis)));
                 chrome::render_bar(
                     f,
                     c.bar,
@@ -1797,28 +1824,36 @@ mod tests {
         ]
     }
 
-    /// `key_target` with the delete confirmation down and the form's caret at
-    /// field 0.
+    /// A screen with no dialog over it and the form's caret at field 0.
     ///
-    /// Every screen below is one with no dialog over it, and naming the two extra
-    /// axes here rather than at eight call sites is what keeps the argument list
-    /// honest: a test that wants the confirmation up, or a field, calls
-    /// `key_target`.
+    /// Every screen below is one of those, and naming the two extra axes here
+    /// rather than at eight call sites is what keeps the argument list honest: a
+    /// test that wants the confirmation up, or a field, builds its own
+    /// [`ScreenState`] and mutates the one field it cares about — which cannot be
+    /// done by accident, where two positional `false`s could be swapped.
+    fn screen(view: &CurrentView, focus_on_projects: bool, bounds: ListBounds) -> ScreenState<'_> {
+        ScreenState {
+            view,
+            active_in_project_list: focus_on_projects,
+            analysis: &AnalysisState::Idle,
+            projects_bounds: bounds,
+            form_field_index: 0,
+            confirm_delete: false,
+            skill_picker: false,
+        }
+    }
+
+    /// `key_target` for a screen with no dialog over it.
     fn keys_for(
         view: &CurrentView,
         active_in_project_list: bool,
         analysis: &AnalysisState,
         projects_bounds: ListBounds,
     ) -> KeyTarget {
-        key_target(
-            view,
-            active_in_project_list,
+        key_target(&ScreenState {
             analysis,
-            projects_bounds,
-            0,
-            false,
-            false,
-        )
+            ..screen(view, active_in_project_list, projects_bounds)
+        })
     }
 
     /// Every footer fits one row and loses nothing to the clip.
@@ -2126,15 +2161,10 @@ mod tests {
         // makes rather than one the test supplies directly.
         for field in 0..=PROMPT_INDEX {
             assert_eq!(
-                key_target(
-                    &CurrentView::AgentForm,
-                    true,
-                    &AnalysisState::Idle,
-                    ListBounds::default(),
-                    field,
-                    false,
-                    false
-                ),
+                key_target(&ScreenState {
+                    form_field_index: field,
+                    ..screen(&CurrentView::AgentForm, true, ListBounds::default())
+                }),
                 KeyTarget::AgentForm(field),
                 "the form's target carries the field it is on"
             );
@@ -2231,11 +2261,18 @@ mod tests {
     /// confirms and `Space` toggles.
     #[test]
     fn the_picker_owns_the_footer_while_it_is_up() {
-        let idle = AnalysisState::Idle;
-        let drawn = drawn_bounds();
-        let form = &CurrentView::AgentForm;
+        let base = screen(&CurrentView::AgentForm, true, drawn_bounds());
+        let on_skills_field = ScreenState {
+            form_field_index: SKILLS_FIELD,
+            ..base.clone()
+        };
 
-        let with_picker = key_target(form, true, &idle, drawn, SKILLS_FIELD, false, true);
+        // The one field that differs is named, so there is nothing to read twice
+        // to check which of the two `false`s is which.
+        let with_picker = key_target(&ScreenState {
+            skill_picker: true,
+            ..on_skills_field.clone()
+        });
         assert_eq!(
             with_picker,
             KeyTarget::SkillPicker,
@@ -2257,7 +2294,7 @@ mod tests {
         // Every other view keeps its own keys: the picker is up over the form, so
         // this is really about the form, but the axis is not view-scoped and could
         // have been written to swallow more.
-        let without_picker = key_target(form, true, &idle, drawn, SKILLS_FIELD, false, false);
+        let without_picker = key_target(&on_skills_field);
         assert_eq!(without_picker, KeyTarget::AgentForm(SKILLS_FIELD));
         assert!(
             footer_row(without_picker).contains("next field"),
@@ -2337,15 +2374,10 @@ mod tests {
 
         for field in 0..SKILLS_FIELD {
             assert_eq!(
-                key_target(
-                    &CurrentView::AgentForm,
-                    true,
-                    &idle,
-                    drawn,
-                    field,
-                    false,
-                    false
-                ),
+                key_target(&ScreenState {
+                    form_field_index: field,
+                    ..screen(&CurrentView::AgentForm, true, drawn)
+                }),
                 KeyTarget::AgentForm(field),
                 "field {field} is a typing field and must not be the picker"
             );
@@ -2375,7 +2407,10 @@ mod tests {
             (CurrentView::AgentForm, true),
         ] {
             assert_eq!(
-                key_target(&view, focus, &idle, drawn, 0, true, false),
+                key_target(&ScreenState {
+                    confirm_delete: true,
+                    ..screen(&view, focus, drawn)
+                }),
                 KeyTarget::DeleteConfirm,
                 "{view:?} with the confirmation up is not {view:?}"
             );
