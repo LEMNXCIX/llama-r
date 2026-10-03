@@ -443,8 +443,8 @@ impl TuiApp {
             }
             // The project list. `Tab` switches *views*, not lists — it is `←/→`
             // that moves between this list and the agent list below it — so the
-            // row says so where the key is named. Seven hints fill the row
-            // exactly, which is also why `n` is the only one named by one word.
+            // row says so where the key is named. `n` is the only hint named by
+            // one word, and only because adding "agent" to it overflows the row.
             KeyTarget::View(CurrentView::Projects) => vec![
                 ("Tab", "view"),
                 ("←/→", "agents"),
@@ -494,10 +494,12 @@ impl TuiApp {
                 ("Tab", "view"),
                 ("Esc", "back"),
             ],
-            // The modal's own keys. Nothing else on this screen answers while a
-            // proposal is pending, so nothing else is advertised: the analysis
-            // view's `r` and `Esc` are the modal's `Esc` and nothing more, and
-            // `AnalysisState::Proposals` is what the modal draws.
+            // The modal's own keys. The analysis view's handler is still the one
+            // running underneath, so `↑/↓` and `r` answer too — but a proposal
+            // list is a queue to clear, not a document to scroll, and `r`
+            // would discard what is on screen without asking. Advertising them
+            // here would be recommending them; they keep working for anyone who
+            // knows them, as `PgUp` does in the chat.
             KeyTarget::Proposals => vec![
                 ("Enter", "approve"),
                 ("a", "approve all"),
