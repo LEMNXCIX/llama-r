@@ -241,6 +241,7 @@ cargo test --target-dir target-tests
   - `model` matches a global agent id
 - Multi-turn: prior user/assistant messages in the request body are forwarded to Rig as chat history
 - Streaming (`stream: true` / SSE): agent path uses `AgentEngine::run_stream` (Nivel-A: final token + completed). Tool call/result events are not yet mapped to SSE.
+- **`AgentRuntime` holds a `ContextEnricher`, and `system_prompt: None` means "build it".** It used to mean "use the manifest's `system_prompt` and nothing else", which silently dropped every section the enricher adds: the agent's `rules`, its project context, its selected skills. The HTTP chat path passes an already-enriched prompt, so it was unaffected; the TUI passed `None` and so lost all of them — a rule typed into the agent form reached the model as nothing. A prompt the caller *does* bring is used verbatim, because `chat_core` has already run it through the optimiser and the metrics. `tests/agent_runtime_tests.rs` pins both halves.
 - On engine failure, requests fall back to legacy Ollama chat
 - Direct model requests (no agent resolved) always use the legacy provider path
 - Source modules: `src/adapters/rig_engine/` (`builder.rs`, `tools.rs`, `limits.rs`)

@@ -1,5 +1,6 @@
 //! Orchestrates a single agent turn: scope → (optional) history → engine → learn.
 
+use crate::context::analyzer::ContextEnricher;
 use crate::domain::models::ChatMessage;
 use crate::domain::scope::AgentScope;
 use crate::error::AppError;
@@ -15,6 +16,16 @@ pub struct AgentRuntime {
     pub engine: Arc<dyn AgentEngine>,
     pub history: Option<Arc<dyn ConversationStore>>,
     pub rag: Option<Arc<dyn RagStore>>,
+    /// Builds the system prompt for a caller that did not bring one.
+    ///
+    /// Present because the alternative was a silent one: a request with no
+    /// `system_prompt` used to fall back to the manifest's `system_prompt` and
+    /// nothing else, which drops every section `ContextEnricher` adds — the agent's
+    /// rules, its project context, its selected skills. The HTTP chat path passes an
+    /// already-enriched prompt; the TUI passed `None`, so the same agent answered
+    /// differently depending on which client asked, and a rule typed into the form
+    /// simply never arrived.
+    pub enricher: Arc<ContextEnricher>,
 }
 
 pub struct RuntimeChatRequest {
@@ -25,13 +36,25 @@ pub struct RuntimeChatRequest {
     /// Prior turns (user/assistant), excluding the injected system prompt and the current user message.
     pub history: Vec<ChatMessage>,
     pub model_override: Option<String>,
-    /// Pre-built system prompt (from ContextEnricher). If empty, uses raw manifest prompt.
+    /// Pre-built system prompt. `None` means "build it from the agent's
+    /// configuration", which `AgentRuntime` does with its `ContextEnricher` — not
+    /// "use the manifest's `system_prompt` and drop the rest", which is what this
+    /// used to do.
     pub system_prompt: Option<String>,
     pub default_model: String,
 }
 
 impl AgentRuntime {
-    fn build_run_request(&self, req: RuntimeChatRequest) -> Result<AgentRunRequest, AppError> {
+    /// Resolve the agent and settle on the system prompt.
+    ///
+    /// A prompt the caller brought is used verbatim: `chat_core` has already run it
+    /// through the optimiser and the metrics, so rebuilding it would do that work
+    /// twice and the numbers would lie. A caller that brought none gets the enriched
+    /// one, which is the only prompt that contains the agent's configuration.
+    async fn build_run_request(
+        &self,
+        req: RuntimeChatRequest,
+    ) -> Result<AgentRunRequest, AppError> {
         let registered = self
             .registry
             .resolve(req.project_id.as_deref(), req.agent_id.as_deref())
@@ -40,9 +63,10 @@ impl AgentRuntime {
         let scope: AgentScope = registered.scope.clone();
         let agent = registered.agent.clone();
 
-        let system_prompt = req
-            .system_prompt
-            .unwrap_or_else(|| agent.config.system_prompt.clone());
+        let system_prompt = match req.system_prompt {
+            Some(prompt) => prompt,
+            None => self.enricher.build_system_prompt(&agent).await,
+        };
 
         let model = req.model_override.unwrap_or_else(|| {
             if agent.config.model.is_empty() {
@@ -111,7 +135,7 @@ impl AgentRuntime {
         updated_req.conversation_id = resolved_conv_id;
         updated_req.history = req_history;
 
-        let run_req = self.build_run_request(updated_req)?;
+        let run_req = self.build_run_request(updated_req).await?;
 
         let span = tracing::info_span!(
             "agent.run",
@@ -195,7 +219,7 @@ impl AgentRuntime {
         updated_req.conversation_id = resolved_conv_id;
         updated_req.history = req_history;
 
-        let run_req = self.build_run_request(updated_req)?;
+        let run_req = self.build_run_request(updated_req).await?;
 
         let span = tracing::info_span!(
             "agent.run_stream",

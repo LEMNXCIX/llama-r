@@ -352,6 +352,8 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         agent_registry.clone(),
         rag_store.clone(),
         history_store.clone(),
+        context_store.clone(),
+        skill_manager.clone(),
     );
     let state = build_app_state(
         provider_impl,
@@ -518,6 +520,8 @@ fn build_agent_runtime(
     agent_registry: Arc<AgentRegistry>,
     rag: Option<Arc<dyn RagStore>>,
     history_store: Option<Arc<dyn ConversationStore>>,
+    context_store: Arc<ContextStore>,
+    skill_manager: Arc<SkillManager>,
 ) -> Option<Arc<AgentRuntime>> {
     #[cfg(feature = "rig-engine")]
     {
@@ -534,6 +538,21 @@ fn build_agent_runtime(
             engine,
             history: history_store,
             rag,
+            // A second `ContextEnricher`, configured identically to the one
+            // `build_app_state` makes. That is safe because the enricher holds no
+            // mutable state — two shared handles, a string and the embedding
+            // provider — so two of them cannot disagree about anything. It is built
+            // here rather than threaded from `build_app_state` only because that
+            // would change a public signature four test files call, for no
+            // behavioural gain.
+            enricher: Arc::new(
+                ContextEnricher::new(context_store, skill_manager, config.default_model.clone())
+                    .with_embeddings(Arc::new(OllamaEmbeddings::new(
+                        config.ollama_url.clone(),
+                        config.embedding_model.clone(),
+                        config.embedding_dimensions,
+                    )) as Arc<dyn EmbeddingProvider>),
+            ),
         }))
     }
 

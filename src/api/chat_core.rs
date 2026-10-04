@@ -506,6 +506,19 @@ mod tests {
         crate::core::paths::lock_env_for_tests()
     }
 
+    /// The enricher a test-built runtime needs.
+    ///
+    /// The real thing, not a stub: `AgentRuntime` enriches whenever the caller
+    /// brings no system prompt of its own, and a fake here would have kept these
+    /// tests green while the production runtime quietly dropped the agent's rules.
+    fn test_enricher() -> Arc<crate::context::analyzer::ContextEnricher> {
+        Arc::new(crate::context::analyzer::ContextEnricher::new(
+            Arc::new(crate::context::store::ContextStore::new()),
+            Arc::new(crate::services::skill_manager::SkillManager::new()),
+            "test-model".to_string(),
+        ))
+    }
+
     struct FakeProvider {
         fail_primary_once: AtomicBool,
         fail_always: bool,
@@ -856,6 +869,7 @@ mod tests {
             engine,
             history: None,
             rag: None,
+            enricher: test_enricher(),
         });
         let provider = Arc::new(FakeProvider {
             fail_primary_once: AtomicBool::new(false),
@@ -918,6 +932,7 @@ mod tests {
             engine,
             history: None,
             rag: None,
+            enricher: test_enricher(),
         });
         let provider = Arc::new(FakeProvider {
             fail_primary_once: AtomicBool::new(false),
@@ -976,6 +991,7 @@ mod tests {
             engine,
             history: None,
             rag: None,
+            enricher: test_enricher(),
         });
         let provider = Arc::new(FakeProvider {
             fail_primary_once: AtomicBool::new(false),
@@ -1067,6 +1083,7 @@ mod tests {
             engine,
             history: None,
             rag: None,
+            enricher: test_enricher(),
         });
         let provider = Arc::new(FakeProvider {
             fail_primary_once: AtomicBool::new(false),
@@ -1141,6 +1158,7 @@ mod tests {
             engine,
             history: None,
             rag: None,
+            enricher: test_enricher(),
         });
         let provider = Arc::new(FakeProvider {
             fail_primary_once: AtomicBool::new(false),
@@ -1212,6 +1230,7 @@ mod tests {
             engine,
             history: None,
             rag: None,
+            enricher: test_enricher(),
         });
         let provider = Arc::new(FakeProvider {
             fail_primary_once: AtomicBool::new(false),
