@@ -5,7 +5,8 @@ use crate::tui::chrome;
 use crate::tui::views::chat::render_chat;
 use crate::tui::views::dashboard::render_dashboard;
 use crate::tui::views::modals::render_confirm_delete;
-use crate::tui::views::modals::{render_rule_editor, render_skill_picker};
+use crate::tui::views::modals::{render_opt_tools, render_rule_editor, render_skill_picker};
+use crate::tui::views::opt_tools::{opt_tools_action, OptTools, OptToolsAction};
 use crate::tui::views::projects::ListBounds;
 use crate::tui::views::rule_editor::{rule_action, RuleAction, RuleEditor};
 use crate::tui::views::skill_picker::{picker_action, PickerAction};
@@ -22,6 +23,13 @@ const SKILLS_FIELD: usize = 6;
 /// over this field, and a bare `4` would be the kind of thing a reordered table
 /// changes silently.
 const RULES_FIELD: usize = 4;
+
+/// The optimization-tools field, by its index in the form's field table.
+///
+/// `Ctrl+O` opens the tool picker over it, so the same reasoning as `RULES_FIELD`
+/// applies: a bare `5` would be the kind of thing a reordered table changes
+/// silently.
+const OPTIMIZE_FIELD: usize = 5;
 
 /// The installed skills a picker over `project_id` should offer.
 ///
@@ -124,6 +132,11 @@ enum KeyTarget {
     /// every unshifted key here types — `Space` is a character and `a`, `d`
     /// and `n` are letters — so every action in it is a modified key.
     RuleEditor,
+    /// The optimization-tool picker, drawn over the agent form.
+    ///
+    /// A sixth screen, and the only one that is *not* also a form field: it has no
+    /// caret and every key does one of three things.
+    OptTools,
     /// The agent form, at a given field. Two of its keys mean different things
     /// field by field, so the field index is part of what the row says.
     AgentForm(usize),
@@ -188,6 +201,8 @@ struct ScreenState<'a> {
     skill_picker: bool,
     /// The rule editor, up over the agent form.
     rule_editor: bool,
+    /// The optimization-tool picker, up over the agent form.
+    opt_tools: bool,
 }
 
 fn key_target(state: &ScreenState<'_>) -> KeyTarget {
@@ -210,6 +225,9 @@ fn key_target(state: &ScreenState<'_>) -> KeyTarget {
     // editor where `Enter` writes a newline.
     if state.rule_editor {
         return KeyTarget::RuleEditor;
+    }
+    if state.opt_tools {
+        return KeyTarget::OptTools;
     }
     if matches!(state.view, CurrentView::Analysis)
         && matches!(state.analysis, AnalysisState::Proposals { .. })
@@ -383,7 +401,14 @@ pub struct TuiApp {
     form_model: String,
     form_prompt: String,
     form_rules: Vec<String>,
-    form_optimize_rules: String,
+    /// The agent's `optimize.rules`, as a list. This used to be a `String` joined
+    /// with commas, which made a name that matched no tool indistinguishable from
+    /// one that did — and a name that matched nothing was a silent no-op.
+    form_optimize_rules: Vec<String>,
+    /// `optimize.enabled`. Set by the tool picker, and following its selection: the
+    /// form used to write `true` whether or not anything was selected, producing a
+    /// config that claimed to be optimising while running nothing.
+    form_optimize_enabled: bool,
     form_skills: String,
     form_project_id: String,
     form_field_index: usize, // 0: ID, 1: Name, 2: Model, 3: Project, 4: Rules, 5: Optim. Rules, 6: Skills, 7: Prompt
@@ -404,6 +429,8 @@ pub struct TuiApp {
     /// The rule editor, while it is up. `None` is the normal state; the form's own
     /// row for the rules is a one-line join of the list this holds.
     rule_editor: Option<crate::tui::views::rule_editor::RuleEditor>,
+    /// The optimization-tool picker, while it is up.
+    opt_tools: Option<crate::tui::views::opt_tools::OptTools>,
     // Chat state
     chat_messages: Arc<Mutex<Vec<(String, String)>>>,
     chat_input: String,
@@ -437,9 +464,11 @@ impl TuiApp {
             form_model: String::new(),
             form_prompt: String::new(),
             form_rules: Vec::new(),
-            form_optimize_rules: String::new(),
+            form_optimize_rules: Vec::new(),
+            form_optimize_enabled: false,
             form_skills: String::new(),
             rule_editor: None,
+            opt_tools: None,
             form_project_id: String::new(),
             form_field_index: 0,
             available_projects: Vec::new(),
@@ -782,6 +811,7 @@ impl TuiApp {
             confirm_delete: self.confirm_delete.is_some(),
             skill_picker: self.skill_picker.is_some(),
             rule_editor: self.rule_editor.is_some(),
+            opt_tools: self.opt_tools.is_some(),
         }
     }
 
@@ -856,6 +886,13 @@ impl TuiApp {
                         .then_some(("Ctrl+R", "edit rules"))
                         .into_iter(),
                 )
+                // Only on the tools row, for the same reason: the row is a one-line
+                // join of a list, and elsewhere every key types into the field.
+                .chain(
+                    (field == OPTIMIZE_FIELD)
+                        .then_some(("Ctrl+O", "edit tools"))
+                        .into_iter(),
+                )
                 .collect()
             }
             KeyTarget::View(CurrentView::Analysis) => {
@@ -908,6 +945,13 @@ impl TuiApp {
                 ("^n", "add rule"),
                 ("^d", "delete rule"),
                 ("esc", "done"),
+            ],
+            KeyTarget::OptTools => vec![
+                ("↑/↓", "move"),
+                ("space", "toggle"),
+                ("type", "filter"),
+                ("enter", "save"),
+                ("esc", "cancel"),
             ],
             // Unreachable through `key_target`, which resolves the form to
             // `AgentForm(field)` above. Kept honest rather than merged into one of
@@ -1123,8 +1167,8 @@ impl TuiApp {
                             &self.form_name,
                             &self.form_model,
                             &self.form_project_id,
-                            &rules_line(&self.form_rules),
-                            &self.form_optimize_rules,
+                            &Self::rules_line(&self.form_rules),
+                            &Self::optimize_line(&self.form_optimize_rules),
                             &self.skills_summary(),
                             &self.form_prompt,
                             self.form_field_index,
@@ -1171,6 +1215,9 @@ impl TuiApp {
                         self.chat_messages_rect = msg_rect;
                     }
                 }
+                if let Some(picker) = &self.opt_tools {
+                    render_opt_tools(f, c.body, picker, &hints);
+                }
                 if let Some(editor) = &self.rule_editor {
                     render_rule_editor(f, c.body, editor, &hints);
                 }
@@ -1197,6 +1244,26 @@ impl TuiApp {
                 match event::read()? {
                     Event::Key(key) => {
                         if key.kind != event::KeyEventKind::Press {
+                            continue;
+                        }
+                        // Optimization tool picker interception
+                        //
+                        // Above the other dialogs for the same reason: the first guard to match
+                        // swallows the key, and this one opens from the agent form like
+                        // the rest of them.
+                        if self.opt_tools.is_some() {
+                            let Some(picker) = self.opt_tools.as_mut() else {
+                                unreachable!("guarded on is_some above");
+                            };
+                            match opt_tools_action(picker, key.code) {
+                                OptToolsAction::Applied => {}
+                                OptToolsAction::Save { tools, enabled } => {
+                                    self.opt_tools = None;
+                                    self.form_optimize_rules = tools;
+                                    self.form_optimize_enabled = enabled;
+                                }
+                                OptToolsAction::Cancel => self.opt_tools = None,
+                            }
                             continue;
                         }
                         // Rule editor interception
@@ -1362,12 +1429,14 @@ impl TuiApp {
                                     // rule containing a comma silently become two
                                     // rules with nothing on screen saying so.
                                     let rules_vec: Vec<String> = self.form_rules.clone();
-                                    let opt_rules_vec: Vec<String> = self
-                                        .form_optimize_rules
-                                        .split(',')
-                                        .map(|s| s.trim().to_string())
-                                        .filter(|s| !s.is_empty())
-                                        .collect();
+                                    // Already a list. It used to be joined with commas
+                                    // and split here, which is what made a tool name
+                                    // containing a comma indistinguishable from two
+                                    // tools — and a name matching no tool was already
+                                    // a silent no-op, so the split only added ways to
+                                    // get one by accident.
+                                    let opt_rules_vec: Vec<String> =
+                                        self.form_optimize_rules.clone();
                                     let skills_vec: Vec<String> = self
                                         .form_skills
                                         .split(',')
@@ -1392,8 +1461,8 @@ impl TuiApp {
                                     };
 
                                     let toml_content = format!(
-                                    "name = \"{}\"\nmodel = \"{}\"\nsystem_prompt = \"\"\"\n{}\n\"\"\"\ncontext_project = \"{}\"\nrules = {}\nskills = {}\n\n[optimize]\nenabled = true\nrules = {}\n",
-                                    self.form_name, self.form_model, self.form_prompt, project_id, rules_str, skills_str, opt_rules_str
+                                    "name = \"{}\"\nmodel = \"{}\"\nsystem_prompt = \"\"\"\n{}\n\"\"\"\ncontext_project = \"{}\"\nrules = {}\nskills = {}\n\n[optimize]\nenabled = {}\nrules = {}\n",
+                                    self.form_name, self.form_model, self.form_prompt, project_id, rules_str, skills_str, self.form_optimize_enabled, opt_rules_str
                                 );
                                     let path =
                                         crate::core::paths::get_project_agents_dir(project_id)
@@ -1408,6 +1477,14 @@ impl TuiApp {
                                 KeyCode::Char('s') if self.form_field_index == SKILLS_FIELD => {
                                     self.skill_picker =
                                         Some(self.skill_picker_over(&self.form_project_id));
+                                }
+                                // Opens the tool picker. Modified, because `o` is a
+                                // letter the user would otherwise type into the field.
+                                KeyCode::Char('o')
+                                    if self.form_field_index == OPTIMIZE_FIELD
+                                        && key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                                {
+                                    self.open_opt_tools_with(None);
                                 }
                                 // Opens the rule editor over the list this field
                                 // joins into a line. Modified, because a bare letter
@@ -1431,7 +1508,7 @@ impl TuiApp {
                                     // the picker shipped inert. Typing here opens the
                                     // editor and lands the character in it.
                                     4 => self.open_rule_editor_with(Some(c)),
-                                    5 => self.form_optimize_rules.push(c),
+                                    5 => self.open_opt_tools_with(Some(c)),
                                     6 => {} // Skills is chosen in the picker
                                     7 => self.form_prompt.push(c),
                                     _ => {}
@@ -1455,9 +1532,7 @@ impl TuiApp {
                                         // seen before it happens.
                                         self.open_rule_editor_with(None);
                                     }
-                                    5 => {
-                                        self.form_optimize_rules.pop();
-                                    }
+                                    5 => self.open_opt_tools_with(None),
                                     6 => {
                                         self.form_skills.pop();
                                     }
@@ -1694,7 +1769,8 @@ impl TuiApp {
                                     self.form_model = String::new();
                                     self.form_prompt = String::new();
                                     self.form_rules = Vec::new();
-                                    self.form_optimize_rules = String::new();
+                                    self.form_optimize_rules = Vec::new();
+                                    self.form_optimize_enabled = false;
                                     self.form_skills = String::new();
                                     self.available_projects = self
                                         .state
@@ -1731,7 +1807,8 @@ impl TuiApp {
                                         self.form_prompt = agent.config.system_prompt.clone();
                                         self.form_rules = agent.config.rules.clone();
                                         self.form_optimize_rules =
-                                            agent.config.optimize.rules.join(", ");
+                                            agent.config.optimize.rules.clone();
+                                        self.form_optimize_enabled = agent.config.optimize.enabled;
                                         self.form_skills = agent.config.skills.join(", ");
                                         self.form_project_id =
                                             agent.project_id.clone().unwrap_or_default();
@@ -1858,6 +1935,43 @@ impl TuiApp {
     fn open_rule_editor_with(&mut self, first: Option<char>) {
         self.rule_editor = Some(rule_editor_opening(&self.form_rules, first));
     }
+
+    /// Open the optimization-tool picker over the agent's tools, optionally with a
+    /// character already in the filter.
+    ///
+    /// Three things open it, as with the rules editor: `Ctrl+O` deliberately, and
+    /// typing or backspacing on the field not so much. The row is a one-line join of
+    /// a list, so there is nothing in it to append at, and a field that looks
+    /// editable, swallows every keypress and shows nothing is the picker-inert bug
+    /// in another field.
+    fn open_opt_tools_with(&mut self, first: Option<char>) {
+        let mut picker = OptTools::for_agent(&self.form_optimize_rules);
+        if let Some(c) = first {
+            picker.push_filter_char(c);
+        }
+        self.opt_tools = Some(picker);
+    }
+
+    /// The one-line view of an agent's optimization tools, for the form's own row.
+    ///
+    /// A rendering, not the truth: `form_optimize_rules` is the list and
+    /// `TokenOptimizer` applies it. `Ctrl+O` is how the whole thing is chosen.
+    fn optimize_line(rules: &[String]) -> String {
+        if rules.is_empty() {
+            "none".to_string()
+        } else {
+            rules.join(", ")
+        }
+    }
+
+    /// The one-line view of an agent's rules, for the form's own row.
+    ///
+    /// A rendering, not the truth: `form_rules` is the list and `analyzer.rs` renders
+    /// each element as its own bullet. The join is what the form can afford to draw on
+    /// one row, and `Ctrl+R` is how the whole thing is seen and written.
+    fn rules_line(rules: &[String]) -> String {
+        rules.join(", ")
+    }
 }
 
 /// The editor to open for `rules`, with `first` already typed into the focused rule.
@@ -1914,15 +2028,6 @@ pub fn chat_input_action(key: event::KeyEvent, loading: bool) -> ChatAction {
     }
 }
 
-/// The one-line view of an agent's rules, for the form's own row.
-///
-/// A rendering, not the truth: `form_rules` is the list and `analyzer.rs` renders
-/// each element as its own bullet. The join is what the form can afford to draw on
-/// one row, and `Ctrl+R` is how the whole thing is seen and written.
-fn rules_line(rules: &[String]) -> String {
-    rules.join(", ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1958,6 +2063,7 @@ mod tests {
             confirm_delete: false,
             skill_picker: false,
             rule_editor: false,
+            opt_tools: false,
         }
     }
 
@@ -2446,18 +2552,50 @@ mod tests {
         );
     }
 
+    /// The optimizer's `enabled` flag is the picker's, not the form's.
+    ///
+    /// The format string said `enabled = true` literally while
+    /// `form_optimize_enabled` was assigned by the picker, loaded from the agent and
+    /// reset on a new form — and never read. Every saved agent claimed to be
+    /// optimising whether or not anything was selected, and nothing caught it: the
+    /// field *was* used, just not on the line that mattered.
+    ///
+    /// Asserted against the source rather than a value, because the defect is a
+    /// literal in a `format!`. A behavioural test cannot see it: the written TOML is
+    /// exactly what the code says it is.
+    #[test]
+    fn the_saved_optimize_flag_comes_from_the_picker() {
+        let body = include_str!("app.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("app.rs has a test module");
+
+        assert!(
+            !body.contains("enabled = true\\nrules"),
+            "the saved TOML must take `enabled` from the picker, not hard-code it"
+        );
+        assert!(
+            body.contains("enabled = {}\\nrules"),
+            "and it must still write the key at all"
+        );
+        assert!(
+            body.contains("self.form_optimize_enabled, opt_rules_str"),
+            "the picker's value has to reach the format string"
+        );
+    }
+
     /// The form's rules row is a one-line join, and the join is the whole reason
     /// there is an editor: a list drawn on one row cannot be read.
     #[test]
     fn the_rules_row_joins_the_list_and_keeps_it_readable() {
-        assert_eq!(rules_line(&[]), "", "no rules, nothing to show");
+        assert_eq!(TuiApp::rules_line(&[]), "", "no rules, nothing to show");
         assert_eq!(
-            rules_line(&["una".to_string()]),
+            TuiApp::rules_line(&["una".to_string()]),
             "una",
             "a single rule is itself"
         );
         assert_eq!(
-            rules_line(&["una".to_string(), "dos".to_string()]),
+            TuiApp::rules_line(&["una".to_string(), "dos".to_string()]),
             "una, dos",
             "two rules are separated, so the row is countable at a glance"
         );

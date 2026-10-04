@@ -20,7 +20,7 @@ const FIELDS: [&str; 7] = [
     "Model",
     "Project Context",
     "Rules",
-    "Optimization Rules",
+    "Optimization Tools",
     "Skills/Tools",
 ];
 
@@ -99,7 +99,7 @@ pub fn render_agent_form(
                 Constraint::Length(1), // 2: Model
                 Constraint::Length(1), // 3: Project
                 Constraint::Length(1), // 4: Rules
-                Constraint::Length(1), // 5: Optimization Rules
+                Constraint::Length(1), // 5: Optimization Tools
                 Constraint::Length(1), // 6: Skills/Tools
                 Constraint::Length(1), // 7: the rule
                 Constraint::Length(1), // 8: the prompt's label
@@ -383,7 +383,7 @@ mod tests {
             .enumerate()
             .map(|(index, value)| column_of_or_panic(&buffer, row_of(index), value))
             .collect();
-        let expected = Line::from("Optimization Rules").width() + 2;
+        let expected = Line::from("Optimization Tools").width() + 2;
         assert_eq!(
             columns,
             vec![expected; FIELDS.len()],

@@ -241,10 +241,20 @@ cargo test --target-dir target-tests
   - `model` matches a global agent id
 - Multi-turn: prior user/assistant messages in the request body are forwarded to Rig as chat history
 - Streaming (`stream: true` / SSE): agent path uses `AgentEngine::run_stream` (Nivel-A: final token + completed). Tool call/result events are not yet mapped to SSE.
-- **`AgentRuntime` holds a `ContextEnricher`, and `system_prompt: None` means "build it".** It used to mean "use the manifest's `system_prompt` and nothing else", which silently dropped every section the enricher adds: the agent's `rules`, its project context, its selected skills. The HTTP chat path passes an already-enriched prompt, so it was unaffected; the TUI passed `None` and so lost all of them — a rule typed into the agent form reached the model as nothing. A prompt the caller *does* bring is used verbatim, because `chat_core` has already run it through the optimiser and the metrics. `tests/agent_runtime_tests.rs` pins both halves.
+- **`AgentRuntime` holds a `ContextEnricher` and a `TokenOptimizer`.** Two `None`s it used to mean something narrower than "build it": a `system_prompt` of `None` fell back to the manifest's `system_prompt` alone, dropping the agent's `rules`, its project context and its selected skills; and the agent's optimization tools were applied only by `chat_core`, so from the TUI they were configuration that appeared to work and did not. Both paths now agree. A prompt or message the caller *does* bring is still used as given, because `chat_core` has already run it through the metrics. `tests/agent_runtime_tests.rs` pins it.
+  - `chat_core` still optimizes, but only when `state.agent_runtime.is_none()` — the same field its own dispatch branches on, so the two cannot disagree about which engine will run. Doing it in both places ran every tool twice, which is invisible until a tool turns out not to be idempotent.
 - On engine failure, requests fall back to legacy Ollama chat
 - Direct model requests (no agent resolved) always use the legacy provider path
 - Source modules: `src/adapters/rig_engine/` (`builder.rs`, `tools.rs`, `limits.rs`)
+
+## Optimization tools
+
+- `src/optimizer/tools.rs` holds the catalog (`TOOLS`) and every implementation. The picker offers that list and nothing else, so what is offered and what is implemented cannot drift.
+- `apply_rule`'s old AST round-trip is gone. A tool is handed the text and returns the text; it locates what it cares about with `fenced_blocks` and splices the **original** bytes. Re-emitting every node re-tagged untagged JSON blocks as ```` ```json ````, and made the text outside blocks one opaque node that no tool could touch.
+- `compress_code` strips comments per language family. `#` is a comment in Python and a preprocessor directive in C, so a block whose language is not in the table has **nothing** stripped — which is what stopped it deleting `#!/bin/bash`. A shebang is never stripped.
+- `dedent_code` skips languages where indentation is meaning (`python`, `yaml`, `toml`, …) and skips untagged blocks: an untagged block of Python is still Python.
+- A tool name that matches nothing used to be a silent no-op. `AgentRegistry` now warns with the unknown and the known names when it loads an agent, and the picker drops unknown names on save after showing them.
+- `optimize.enabled` follows the selection: the form used to write `true` unconditionally, producing configs that claimed to be optimising while running nothing.
 
 ## Skills
 

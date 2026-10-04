@@ -192,26 +192,34 @@ async fn prepare_request(
     };
 
     if let Some(agent) = selected_agent {
-        let optimizer = TokenOptimizer::new(agent.config.optimize.clone());
-        let mut optimized_messages = Vec::with_capacity(payload.messages.len() + 1);
-        let sys_prompt_raw = state.context_enricher.build_system_prompt(&agent).await;
-        let sys_prompt = optimizer.optimize(&sys_prompt_raw);
-        state
-            .metrics
-            .record_optimization(sys_prompt_raw.len(), sys_prompt.len());
-        optimized_messages.push(ChatMessage {
+        let mut prepared_messages = Vec::with_capacity(payload.messages.len() + 1);
+        let sys_prompt = state.context_enricher.build_system_prompt(&agent).await;
+        prepared_messages.push(ChatMessage {
             role: "system".to_string(),
             content: sys_prompt,
         });
+        prepared_messages.append(&mut payload.messages);
 
-        for mut msg in payload.messages {
-            let original_len = msg.content.len();
-            msg.content = optimizer.optimize(&msg.content);
-            state
-                .metrics
-                .record_optimization(original_len, msg.content.len());
-            optimized_messages.push(msg);
+        // Only for the requests this module sends itself. When an agent runtime is
+        // present the request goes to `AgentRuntime`, which applies the agent's
+        // tools on its way to the engine; doing it here as well ran every tool
+        // twice, and the second application is the kind of thing that stays
+        // invisible until a tool turns out not to be idempotent.
+        //
+        // The condition is the same field the dispatch below branches on, so the
+        // two cannot disagree about which engine is going to run.
+        if state.agent_runtime.is_none() {
+            let optimizer = TokenOptimizer::new(agent.config.optimize.clone());
+            for message in prepared_messages.iter_mut() {
+                let original_len = message.content.len();
+                message.content = optimizer.optimize(&message.content);
+                state
+                    .metrics
+                    .record_optimization(original_len, message.content.len());
+            }
         }
+
+        let optimized_messages = prepared_messages;
 
         let resolved_model = state.context_enricher.resolve_model(&agent);
         tracing::info!(

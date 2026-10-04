@@ -11,6 +11,7 @@
 
 use crate::tui::chrome;
 use crate::tui::theme;
+use crate::tui::views::opt_tools::OptTools;
 use crate::tui::views::rule_editor::RuleEditor;
 use crate::tui::views::skill_picker::SkillPicker;
 use ratatui::{
@@ -432,6 +433,118 @@ pub fn render_rule_editor(f: &mut Frame, body: Rect, editor: &RuleEditor, hints:
     }
 
     f.render_widget(Paragraph::new(lines), inner[1]);
+    f.render_widget(Paragraph::new(chrome::hints_line(hints)), inner[2]);
+}
+
+/// The tool picker's top row: the needle, and how much of the catalog survived.
+///
+/// The count matters more here than in the skill picker. There are only five tools,
+/// so a filter that leaves one is not a smaller list — it is a mistake, and without
+/// the count a missing tool reads as a tool that does not exist.
+fn opt_tools_title(picker: &OptTools) -> Line<'static> {
+    let total = picker.rows.len();
+    let mut line = Line::from(Span::styled(" Optimization Tools", theme::chrome()));
+    if picker.filter.is_empty() {
+        line.push_span(Span::styled(
+            format!(" — {total} available "),
+            theme::chrome(),
+        ));
+        return line;
+    }
+    line.push_span(Span::styled(" / ", theme::chrome()));
+    line.push_span(Span::styled(picker.filter.clone(), theme::content()));
+    line.push_span(Span::styled(
+        format!(" — {} of {total} ", picker.visible().len()),
+        theme::chrome(),
+    ));
+    line
+}
+
+/// Draw the optimization-tool picker over `body`.
+///
+/// The same three rows as the skill picker — filter, list, keys — because it is the
+/// same shape of question: a closed list of things you may switch on. The rows
+/// carry a summary as well as an id, because "which of these five do I want" is
+/// unanswerable from `compress_code` alone.
+///
+/// As in the other dialogs, `hints` comes from `hints_for` and the caller silences
+/// the chrome footer while this is up.
+pub fn render_opt_tools(f: &mut Frame, body: Rect, picker: &OptTools, hints: &[(&str, &str)]) {
+    let width = chrome::hints_width(hints)
+        .saturating_add(4)
+        .max(60)
+        .min(body.width);
+    let area = centered(body, width, body.height.saturating_sub(2).max(7));
+
+    let block = Block::default().borders(Borders::ALL);
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ]
+            .as_ref(),
+        )
+        .split(block.inner(area));
+
+    // The block before its contents: a block paints every cell of its area, so
+    // drawn afterwards it would wipe the row the title was written to.
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(Paragraph::new(Vec::<Line>::new()).block(block), area);
+
+    f.render_widget(Paragraph::new(opt_tools_title(picker)), inner[0]);
+
+    let visible = picker.visible();
+    let rows_height = inner[1].height as usize;
+    let position = visible
+        .iter()
+        .position(|&index| index == picker.cursor)
+        .unwrap_or(0);
+    let first = position.saturating_sub(rows_height.saturating_sub(1));
+
+    let lines: Vec<Line> = visible
+        .iter()
+        .skip(first)
+        .take(rows_height)
+        .map(|&index| {
+            let row = &picker.rows[index];
+            // The cursor is a colour on the whole row, as in the other two dialogs:
+            // where the next keystroke lands should be findable without a marker.
+            let style = if index == picker.cursor {
+                theme::action()
+            } else {
+                theme::content()
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!(" {} ", if row.picked { PICKED } else { UNPICKED }),
+                    style,
+                ),
+                Span::styled(
+                    format!("{:<18}", truncate(&row.id, 18)),
+                    if row.unknown { theme::chrome() } else { style },
+                ),
+                Span::styled(
+                    truncate(&row.summary, (area.width as usize).saturating_sub(26)),
+                    theme::chrome(),
+                ),
+            ])
+        })
+        .collect();
+
+    f.render_widget(
+        Paragraph::new(if lines.is_empty() {
+            vec![Line::from(Span::styled(
+                " nothing matches ",
+                theme::chrome(),
+            ))]
+        } else {
+            lines
+        }),
+        inner[1],
+    );
     f.render_widget(Paragraph::new(chrome::hints_line(hints)), inner[2]);
 }
 

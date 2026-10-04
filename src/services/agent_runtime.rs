@@ -4,6 +4,7 @@ use crate::context::analyzer::ContextEnricher;
 use crate::domain::models::ChatMessage;
 use crate::domain::scope::AgentScope;
 use crate::error::AppError;
+use crate::optimizer::TokenOptimizer;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest};
 use crate::ports::history::ConversationStore;
 use crate::ports::rag::RagStore;
@@ -67,6 +68,14 @@ impl AgentRuntime {
             Some(prompt) => prompt,
             None => self.enricher.build_system_prompt(&agent).await,
         };
+        // Applied here rather than by the caller, so every client that reaches an
+        // engine gets the same prompt. `chat_core` used to do this itself and the
+        // TUI did not, which meant the agent's configured optimizations applied to
+        // HTTP requests and to nothing else — the same shape of disagreement as the
+        // system prompt had.
+        let optimizer = TokenOptimizer::new(agent.config.optimize.clone());
+        let system_prompt = optimizer.optimize(&system_prompt);
+        let user_message = optimizer.optimize(&req.user_message);
 
         let model = req.model_override.unwrap_or_else(|| {
             if agent.config.model.is_empty() {
@@ -81,7 +90,7 @@ impl AgentRuntime {
             scope,
             model,
             system_prompt,
-            user_message: req.user_message,
+            user_message,
             history: req.history,
             conversation_id: req.conversation_id,
         })

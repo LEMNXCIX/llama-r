@@ -126,18 +126,15 @@ fn a_dialog_opener_outranks_the_typing_arm() {
     }
 }
 
-/// Where a guard starts in the event loop, or `None` if it is not there.
+/// Every dialog, and the order they must appear in.
 ///
-/// The guards in `TuiApp::run` end in `continue`, so the first one that matches
-/// swallows the keystroke: order is the entire correctness argument, and the
-/// compiler cannot check it. The skill picker shipped inert because it was
-/// written *after* the agent form's guard — and it only opens from inside that
-/// form, so the form's guard always ran first and every key was consumed before
-/// the picker saw it.
+/// The three dialogs here open from the agent form, so the form's guard is live
+/// underneath all of them and whichever comes first takes the key. This is the
+/// check that would have caught the picker shipping inert, and it grows a line per
+/// dialog — which is the point: a fourth dialog that forgets to place its guard is
+/// the next version of the same bug.
 #[test]
-fn a_dialog_is_intercepted_before_the_view_it_sits_over() {
-    // Only the guards inside `run` matter: the same field names appear in
-    // `screen_state`, which builds the footer's target and consumes no keys.
+fn every_dialog_is_intercepted_before_the_view_it_sits_over() {
     let loop_body = APP
         .split("pub async fn run(")
         .nth(1)
@@ -148,9 +145,9 @@ fn a_dialog_is_intercepted_before_the_view_it_sits_over() {
     /// Searching backwards from something unique *inside* each guard, rather than
     /// forwards for the `if`. Every field name here also appears earlier in `run` —
     /// the expression that silences the chrome footer while a dialog is up mentions
-    /// `skill_picker` and `rule_editor` too — and a forward `find` was silently
-    /// pinning the footer expression instead of the guard, which made this test pass
-    /// with the guards in exactly the wrong order.
+    /// all three — and a forward `find` was silently pinning the footer expression
+    /// instead of the guard, which made this test pass with the guards in exactly
+    /// the wrong order.
     let guard_of = |body_marker: &str, guard: &str| -> usize {
         let body = loop_body
             .find(body_marker)
@@ -164,23 +161,29 @@ fn a_dialog_is_intercepted_before_the_view_it_sits_over() {
         .find("if self.current_view == CurrentView::AgentForm {")
         .expect("TuiApp::run no longer has the agent form's guard");
 
-    // Each of these opens from inside the form, so the form's guard is live while
-    // the dialog is up; their own guards have to come first or every key is consumed
-    // before they see one.
-    let picker = guard_of(
-        "picker_action(picker, key.code)",
-        "if self.skill_picker.is_some() {",
-    );
-    let editor = guard_of("RuleAction::Done(rules)", "if self.rule_editor.is_some() {");
-    let confirm = guard_of(
-        "match confirm_type.as_str()",
-        "if self.confirm_delete.is_some() {",
-    );
-
     for (what, at_) in [
-        ("the skill picker", picker),
-        ("the rule editor", editor),
-        ("the delete confirmation", confirm),
+        (
+            "the skill picker",
+            guard_of(
+                "picker_action(picker, key.code)",
+                "if self.skill_picker.is_some() {",
+            ),
+        ),
+        (
+            "the rule editor",
+            guard_of("RuleAction::Done(rules)", "if self.rule_editor.is_some() {"),
+        ),
+        (
+            "the optimization-tool picker",
+            guard_of("OptToolsAction::Save", "if self.opt_tools.is_some() {"),
+        ),
+        (
+            "the delete confirmation",
+            guard_of(
+                "match confirm_type.as_str()",
+                "if self.confirm_delete.is_some() {",
+            ),
+        ),
     ] {
         assert!(
             at_ < form,

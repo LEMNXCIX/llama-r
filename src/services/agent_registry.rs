@@ -1,6 +1,7 @@
 use crate::domain::agent::{Agent, AgentConfig};
 use crate::domain::scope::AgentScope;
 use crate::error::AppError;
+use crate::optimizer::TokenOptimizer;
 use crate::services::scope_builder::ScopeBuilder;
 use std::collections::HashMap;
 use std::fs;
@@ -113,6 +114,20 @@ impl AgentRegistry {
             project_id: project_id.map(str::to_string),
             config,
         };
+
+        // An optimization tool that names nothing is a setting that appears to do
+        // something and does not, which is the worst kind of configuration: there is
+        // no error, no output and no symptom to trace. Said here, once, at load.
+        let optimizer = TokenOptimizer::new(agent.config.optimize.clone());
+        let unknown = optimizer.unknown_tools();
+        if !unknown.is_empty() {
+            tracing::warn!(
+                agent = %agent.qualified_id(),
+                unknown = ?unknown,
+                known = ?crate::optimizer::tools::TOOLS.iter().map(|t| t.id).collect::<Vec<_>>(),
+                "agent config names optimization tools that do not exist; they will be ignored"
+            );
+        }
 
         // Validate mcp_sources against known server IDs
         for source in &agent.config.mcp_sources {

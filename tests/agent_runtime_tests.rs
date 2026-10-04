@@ -53,18 +53,21 @@ impl AgentEngine for RecordingEngine {
 ///
 /// The caller must hold `env_lock`: `reload_all` and both stores read
 /// `LLAMA_R_DIR`, so this cannot be parallel with anything else that moves it.
-fn world(rules: &[&str]) -> (AgentRuntime, Arc<Mutex<Option<AgentRunRequest>>>) {
+fn world(rules: &[&str], tools: &[&str]) -> (AgentRuntime, Arc<Mutex<Option<AgentRunRequest>>>) {
     let dir = TempDir::new().unwrap();
     std::env::set_var("LLAMA_R_DIR", dir.path());
 
     let agents = dir.path().join("agents");
     std::fs::create_dir_all(&agents).unwrap();
     let rendered: Vec<String> = rules.iter().map(|r| format!("{r:?}")).collect();
+    let tools: Vec<String> = tools.iter().map(|t| format!("{t:?}")).collect();
     std::fs::write(
         agents.join("reviewer.toml"),
         format!(
-            "name = \"Reviewer\"\nmodel = \"m\"\nsystem_prompt = \"Base prompt\"\nrules = [{}]\n",
-            rendered.join(", ")
+            "name = \"Reviewer\"\nmodel = \"m\"\nsystem_prompt = \"Base prompt\"\nrules = [{}]\n\
+             \n[optimize]\nenabled = true\nrules = [{}]\n",
+            rendered.join(", "),
+            tools.join(", ")
         ),
     )
     .unwrap();
@@ -131,7 +134,7 @@ fn enricher() -> ContextEnricher {
 #[test]
 fn a_turn_with_no_prebuilt_prompt_still_carries_the_agent_rules() {
     let _guard = env_lock().lock().unwrap();
-    let (runtime, seen) = world(&["Always explain the risk"]);
+    let (runtime, seen) = world(&["Always explain the risk"], &[]);
 
     chat_blocking(&runtime, request());
 
@@ -148,7 +151,7 @@ fn a_turn_with_no_prebuilt_prompt_still_carries_the_agent_rules() {
 #[test]
 fn enriching_keeps_the_manifest_prompt() {
     let _guard = env_lock().lock().unwrap();
-    let (runtime, seen) = world(&["Always explain the risk"]);
+    let (runtime, seen) = world(&["Always explain the risk"], &[]);
 
     chat_blocking(&runtime, request());
 
@@ -166,7 +169,7 @@ fn enriching_keeps_the_manifest_prompt() {
 #[test]
 fn a_prebuilt_prompt_is_used_verbatim() {
     let _guard = env_lock().lock().unwrap();
-    let (runtime, seen) = world(&["Always explain the risk"]);
+    let (runtime, seen) = world(&["Always explain the risk"], &[]);
 
     let mut req = request();
     req.system_prompt = Some("exactamente esto".to_string());
@@ -184,7 +187,7 @@ fn a_prebuilt_prompt_is_used_verbatim() {
 #[test]
 fn the_turn_carries_the_agent_it_resolved() {
     let _guard = env_lock().lock().unwrap();
-    let (runtime, seen) = world(&["Always explain the risk"]);
+    let (runtime, seen) = world(&["Always explain the risk"], &[]);
 
     chat_blocking(&runtime, request());
 
@@ -198,13 +201,77 @@ fn the_turn_carries_the_agent_it_resolved() {
     );
 }
 
+/// A turn whose agent configures a tool must arrive at the engine compressed.
+///
+/// This is the whole reason the tools are applied here. `chat_core` applied them
+/// for HTTP requests and nothing else, so from the TUI an agent's
+/// `optimize.rules` was configuration that appeared to work and did not — the same
+/// shape of bug as the unenriched system prompt one commit earlier.
+#[test]
+fn a_configured_tool_reaches_the_engine() {
+    let _guard = env_lock().lock().unwrap();
+    let (runtime, seen) = world(&["Always explain the risk"], &["compress_code"]);
+    let _ = seen;
+
+    chat_blocking(&runtime, request());
+
+    let seen = seen.lock().unwrap();
+    let run = seen.as_ref().unwrap();
+    assert!(
+        !run.system_prompt.contains("\n\n"),
+        "collapse_blanks ran on the prompt: {:?}",
+        run.system_prompt
+    );
+    assert!(
+        !run.user_message.contains("   "),
+        "the message was compressed too: {:?}",
+        run.user_message
+    );
+}
+
+/// One door, not two. `chat_core` still optimizes for the legacy provider path, and
+/// doing it there as well would run every tool twice. Both are idempotent today, and
+/// a tool that is not would be applied twice in silence.
+#[test]
+fn a_tool_is_applied_once_and_only_once() {
+    let _guard = env_lock().lock().unwrap();
+    let (runtime, seen) = world(&["Always explain the risk"], &["strip_ansi"]);
+
+    let mut req = request();
+    req.user_message = "\u{1b}[31mhola\u{1b}[0m".to_string();
+    chat_blocking(&runtime, req);
+
+    let run = seen.lock().unwrap();
+    let run = run.as_ref().unwrap();
+    assert_eq!(run.user_message, "hola", "the escapes went, once");
+}
+
+/// A tool name that matches nothing is reported when the agent loads, so it is never
+/// a silent no-op. Pinned here because the picker dropping it on save and the
+/// registry warning about it are the two halves of one behaviour: the picker removes
+/// what it cannot run, and the registry says what it removed.
+#[test]
+fn an_unknown_tool_is_named_by_the_loader() {
+    let _guard = env_lock().lock().unwrap();
+    let (runtime, _seen) = world(&["Always explain the risk"], &["compres_code"]);
+
+    let agent = runtime.registry.get_agent("reviewer").unwrap();
+    let optimizer = llama_r::optimizer::TokenOptimizer::new(agent.config.optimize.clone());
+    assert_eq!(optimizer.unknown_tools(), vec!["compres_code"]);
+    assert_eq!(
+        optimizer.optimize("```python\n# c\nx = 1\n```"),
+        "```python\n# c\nx = 1\n```",
+        "and it changed nothing, which is what the warning is about"
+    );
+}
+
 /// The enricher the runtime needs is the same one the chat path uses, so this is a
 /// reminder of what it must be built from — `ContextStore` and `SkillManager` read
 /// `LLAMA_R_DIR`, so both have to exist before the runtime is built.
 #[test]
 fn the_enricher_is_built_from_the_stores() {
     let _guard = env_lock().lock().unwrap();
-    let (_runtime, _seen) = world(&[]);
+    let (_runtime, _seen) = world(&[], &[]);
 
     let prompt = enricher();
     assert_eq!(
