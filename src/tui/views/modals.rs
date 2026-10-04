@@ -163,6 +163,14 @@ pub fn render_skill_picker(f: &mut Frame, body: Rect, picker: &SkillPicker) {
         .constraints([Constraint::Length(1), Constraint::Min(0)].as_ref())
         .split(block.inner(area));
 
+    // The block first, then the title and the rows on top of it. Drawn the other
+    // way round the border wipes the title, because the block paints every cell
+    // of `area` — including the row the title was written to. `Clear` matters for
+    // the same reason: without it the panel shows whatever was behind it through
+    // the gaps between rows.
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(Paragraph::new(Vec::<Line>::new()).block(block), area);
+
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " Skills — space to toggle, enter to confirm ",
@@ -193,10 +201,17 @@ pub fn render_skill_picker(f: &mut Frame, body: Rect, picker: &SkillPicker) {
             } else {
                 UNPICKED
             };
-            let mark_style = if row.picked && !row.auto {
+            // The unpicked mark is `content`, not `chrome`: a one-pixel middle dot
+            // in `DarkGray` on a dark terminal is close to invisible, which is how
+            // the column shipped looking empty. The three states have to be
+            // distinguishable at a glance, and the difference between "not
+            // chosen" and "chosen" is the whole reason the column exists.
+            let mark_style = if row.auto {
+                theme::chrome()
+            } else if row.picked {
                 theme::active()
             } else {
-                theme::chrome()
+                theme::content()
             };
             // The cursor is a colour on the whole row, which is the same signal the
             // agent form uses for its focused field: where the next keystroke lands
@@ -223,7 +238,7 @@ pub fn render_skill_picker(f: &mut Frame, body: Rect, picker: &SkillPicker) {
         })
         .collect();
 
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    f.render_widget(Paragraph::new(lines), inner[1]);
 }
 
 /// The panel, centred in `body` and clamped to it.
@@ -571,5 +586,63 @@ mod tests {
             .draw(|f| render_skill_picker(f, Rect::new(0, 1, 80, 22), modal))
             .unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// The panel's own instructions must survive being drawn.
+    ///
+    /// They did not for two reasons at once: the bordered `Block` was rendered
+    /// *after* the title, and a block paints every cell of its area, so it wiped
+    /// the row the title had been written to. And without a `Clear` the panel
+    /// showed the agent form through the gaps between rows, so the list read as
+    /// floating text on the form rather than as a dialog over it.
+    #[test]
+    fn the_panel_keeps_its_own_instructions() {
+        let text = all_text(&render_picker(&picker(&[("a", false)])));
+
+        assert!(
+            text.contains("space to toggle"),
+            "the panel must name its own keys: {text}"
+        );
+    }
+
+    /// Every one of the three states must be *legible*, not merely present.
+    ///
+    /// The unpicked mark shipped in `DarkGray` and a one-pixel middle dot on a
+    /// dark terminal is close to invisible: the column was in the buffer and on
+    /// screen the user reported the list as carrying no indication at all. A
+    /// mark that is emitted but cannot be read is not a mark, so this asserts the
+    /// styles differ rather than only that the glyphs are there.
+    #[test]
+    fn the_mark_column_is_legible_in_every_state() {
+        let mut modal = picker(&[("plain", false), ("ticked", true)]);
+        modal.rows[0].auto = false;
+        modal.rows[1].auto = false;
+        let buffer = render_picker(&modal);
+
+        let mark_column = 11; // the column the marks are written to
+        let style_at = |y: u16| buffer[(mark_column, y)].fg;
+
+        // Each row's mark must differ in colour from a plain description in
+        // `chrome`, which is what made the dot unreadable.
+        let rows: Vec<u16> = (0..buffer.area.height)
+            .filter(|y| {
+                let row: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, *y)].symbol().to_string())
+                    .collect();
+                row.contains("plain") || row.contains("ticked")
+            })
+            .collect();
+        assert_eq!(rows.len(), 2, "both rows must be drawn");
+
+        assert_ne!(
+            style_at(rows[0]),
+            ratatui::style::Color::DarkGray,
+            "the unpicked mark must not be `chrome`; it was invisible that way"
+        );
+        assert_ne!(
+            style_at(rows[1]),
+            style_at(rows[0]),
+            "a ticked row must not look like an unticked one"
+        );
     }
 }
