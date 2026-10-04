@@ -95,6 +95,37 @@ const MODAL_MODULE: &str = "modals";
 /// The dispatch that owns the chrome and `hints_for`.
 const APP: &str = include_str!("../src/tui/app.rs");
 
+/// The keys that open a dialog must be reachable from the form, and the form's
+/// own keys must not swallow them.
+///
+/// `Ctrl+R` for the rules and `s` for the skills are both gated on the field index
+/// they belong to, placed *above* the `Char(c)` arm that types into every field.
+/// Moving either below it would leave the dialog unopenable, and nothing else in
+/// the tree would say so — `hints_for` would keep advertising a key that does
+/// nothing.
+#[test]
+fn a_dialog_opener_outranks_the_typing_arm() {
+    let at = |needle: &str| {
+        APP.find(needle)
+            .unwrap_or_else(|| panic!("src/tui/app.rs no longer contains {needle:?}"))
+    };
+
+    let rules_opener = at("KeyCode::Char('r')\n");
+    let skills_opener = at("KeyCode::Char('s') if self.form_field_index == SKILLS_FIELD =>");
+    let typing_arm = at("KeyCode::Char(c) => match self.form_field_index {");
+
+    for (what, at_) in [
+        ("the rules editor", rules_opener),
+        ("the picker", skills_opener),
+    ] {
+        assert!(
+            at_ < typing_arm,
+            "{what}'s opener must come before the arm that types into every field, \
+             or the character is typed instead of opening it"
+        );
+    }
+}
+
 /// Where a guard starts in the event loop, or `None` if it is not there.
 ///
 /// The guards in `TuiApp::run` end in `continue`, so the first one that matches
@@ -111,27 +142,52 @@ fn a_dialog_is_intercepted_before_the_view_it_sits_over() {
         .split("pub async fn run(")
         .nth(1)
         .expect("src/tui/app.rs no longer has TuiApp::run");
-    let at = |needle: &str| {
-        loop_body
-            .find(needle)
-            .unwrap_or_else(|| panic!("TuiApp::run no longer contains {needle:?}"))
+
+    /// The guard that owns `body_marker`: the nearest `guard` at or above it.
+    ///
+    /// Searching backwards from something unique *inside* each guard, rather than
+    /// forwards for the `if`. Every field name here also appears earlier in `run` —
+    /// the expression that silences the chrome footer while a dialog is up mentions
+    /// `skill_picker` and `rule_editor` too — and a forward `find` was silently
+    /// pinning the footer expression instead of the guard, which made this test pass
+    /// with the guards in exactly the wrong order.
+    let guard_of = |body_marker: &str, guard: &str| -> usize {
+        let body = loop_body
+            .find(body_marker)
+            .unwrap_or_else(|| panic!("TuiApp::run no longer contains {body_marker:?}"));
+        loop_body[..body]
+            .rfind(guard)
+            .unwrap_or_else(|| panic!("no {guard:?} at or above {body_marker:?} in TuiApp::run"))
     };
 
-    let picker = at("if self.skill_picker.is_some() {");
-    let form = at("if self.current_view == CurrentView::AgentForm {");
-    assert!(
-        picker < form,
-        "the picker opens from the skills field, so the form's guard is live \
-         whenever the picker is up; its own guard must come first or every key \
-         is consumed before it sees one"
+    let form = loop_body
+        .find("if self.current_view == CurrentView::AgentForm {")
+        .expect("TuiApp::run no longer has the agent form's guard");
+
+    // Each of these opens from inside the form, so the form's guard is live while
+    // the dialog is up; their own guards have to come first or every key is consumed
+    // before they see one.
+    let picker = guard_of(
+        "picker_action(picker, key.code)",
+        "if self.skill_picker.is_some() {",
+    );
+    let editor = guard_of("RuleAction::Done(rules)", "if self.rule_editor.is_some() {");
+    let confirm = guard_of(
+        "match confirm_type.as_str()",
+        "if self.confirm_delete.is_some() {",
     );
 
-    let confirm = at("if self.confirm_delete.is_some() {");
-    assert!(
-        confirm < form,
-        "same reasoning: the confirmation can be open over the form's siblings, \
-         and a dialog's guard must precede any view guard it can shadow"
-    );
+    for (what, at_) in [
+        ("the skill picker", picker),
+        ("the rule editor", editor),
+        ("the delete confirmation", confirm),
+    ] {
+        assert!(
+            at_ < form,
+            "{what}'s guard must come before the form's, or the dialog is inert \
+             while it is up: the form takes the key first and continues"
+        );
+    }
 }
 
 /// The module that draws the bar.

@@ -5,8 +5,9 @@ use crate::tui::chrome;
 use crate::tui::views::chat::render_chat;
 use crate::tui::views::dashboard::render_dashboard;
 use crate::tui::views::modals::render_confirm_delete;
-use crate::tui::views::modals::render_skill_picker;
+use crate::tui::views::modals::{render_rule_editor, render_skill_picker};
 use crate::tui::views::projects::ListBounds;
+use crate::tui::views::rule_editor::{rule_action, RuleAction, RuleEditor};
 use crate::tui::views::skill_picker::{picker_action, PickerAction};
 use crate::tui::views::skill_picker::{InstalledSkill, SkillPicker};
 
@@ -14,6 +15,13 @@ use crate::tui::views::skill_picker::{InstalledSkill, SkillPicker};
 /// Named because the picker key and the summary both key off it, and a bare `6`
 /// would be the kind of thing a reordered table changes silently.
 const SKILLS_FIELD: usize = 6;
+
+/// The rules field, by its index in the form's field table.
+///
+/// Named for the same reason as `SKILLS_FIELD`: `Ctrl+R` opens the rule editor
+/// over this field, and a bare `4` would be the kind of thing a reordered table
+/// changes silently.
+const RULES_FIELD: usize = 4;
 
 /// The installed skills a picker over `project_id` should offer.
 ///
@@ -110,6 +118,12 @@ enum KeyTarget {
     /// and means nothing anywhere else, so without this arm the form's footer
     /// would keep naming `Enter: next field` while the picker is up.
     SkillPicker,
+    /// The rule editor, drawn over the agent form.
+    ///
+    /// A fifth screen whose keys belong to no `CurrentView`. Unlike the picker,
+    /// every unshifted key here types — `Space` is a character and `a`, `d`
+    /// and `n` are letters — so every action in it is a modified key.
+    RuleEditor,
     /// The agent form, at a given field. Two of its keys mean different things
     /// field by field, so the field index is part of what the row says.
     AgentForm(usize),
@@ -172,6 +186,8 @@ struct ScreenState<'a> {
     confirm_delete: bool,
     /// The skill picker, up over the agent form.
     skill_picker: bool,
+    /// The rule editor, up over the agent form.
+    rule_editor: bool,
 }
 
 fn key_target(state: &ScreenState<'_>) -> KeyTarget {
@@ -187,6 +203,13 @@ fn key_target(state: &ScreenState<'_>) -> KeyTarget {
     // confirms.
     if state.skill_picker {
         return KeyTarget::SkillPicker;
+    }
+    // The rule editor opens from the rules field like the picker does from the
+    // skills one, and the same reasoning applies: while it is up the form is still
+    // the current view, so its own row would name `Enter: next field` under an
+    // editor where `Enter` writes a newline.
+    if state.rule_editor {
+        return KeyTarget::RuleEditor;
     }
     if matches!(state.view, CurrentView::Analysis)
         && matches!(state.analysis, AnalysisState::Proposals { .. })
@@ -359,7 +382,7 @@ pub struct TuiApp {
     form_name: String,
     form_model: String,
     form_prompt: String,
-    form_rules: String,
+    form_rules: Vec<String>,
     form_optimize_rules: String,
     form_skills: String,
     form_project_id: String,
@@ -378,6 +401,9 @@ pub struct TuiApp {
     /// The skill picker, while it is up. Dropping it is how `Esc` cancels, so
     /// there is no undo stack to keep in sync with the form behind it.
     skill_picker: Option<crate::tui::views::skill_picker::SkillPicker>,
+    /// The rule editor, while it is up. `None` is the normal state; the form's own
+    /// row for the rules is a one-line join of the list this holds.
+    rule_editor: Option<crate::tui::views::rule_editor::RuleEditor>,
     // Chat state
     chat_messages: Arc<Mutex<Vec<(String, String)>>>,
     chat_input: String,
@@ -410,9 +436,10 @@ impl TuiApp {
             form_name: String::new(),
             form_model: String::new(),
             form_prompt: String::new(),
-            form_rules: String::new(),
+            form_rules: Vec::new(),
             form_optimize_rules: String::new(),
             form_skills: String::new(),
+            rule_editor: None,
             form_project_id: String::new(),
             form_field_index: 0,
             available_projects: Vec::new(),
@@ -754,6 +781,7 @@ impl TuiApp {
             form_field_index: self.form_field_index,
             confirm_delete: self.confirm_delete.is_some(),
             skill_picker: self.skill_picker.is_some(),
+            rule_editor: self.rule_editor.is_some(),
         }
     }
 
@@ -819,6 +847,15 @@ impl TuiApp {
                 ]
                 .into_iter()
                 .filter(|(key, _)| cycled || *key != "←/→")
+                // Only on the rules row, and only because the row is a one-line
+                // join of a list: elsewhere in the form every key types into the
+                // field, so a hint about writing them somewhere else would be a lie
+                // about a row that has no such row to go to.
+                .chain(
+                    (field == RULES_FIELD)
+                        .then_some(("Ctrl+R", "edit rules"))
+                        .into_iter(),
+                )
                 .collect()
             }
             KeyTarget::View(CurrentView::Analysis) => {
@@ -864,6 +901,13 @@ impl TuiApp {
                 ("type", "filter"),
                 ("enter", "save"),
                 ("esc", "cancel"),
+            ],
+            KeyTarget::RuleEditor => vec![
+                ("⇥", "rule"),
+                ("⏎", "new line"),
+                ("^n", "add rule"),
+                ("^d", "delete rule"),
+                ("esc", "done"),
             ],
             // Unreachable through `key_target`, which resolves the form to
             // `AgentForm(field)` above. Kept honest rather than merged into one of
@@ -1079,7 +1123,7 @@ impl TuiApp {
                             &self.form_name,
                             &self.form_model,
                             &self.form_project_id,
-                            &self.form_rules,
+                            &rules_line(&self.form_rules),
                             &self.form_optimize_rules,
                             &self.skills_summary(),
                             &self.form_prompt,
@@ -1127,6 +1171,9 @@ impl TuiApp {
                         self.chat_messages_rect = msg_rect;
                     }
                 }
+                if let Some(editor) = &self.rule_editor {
+                    render_rule_editor(f, c.body, editor, &hints);
+                }
                 if let Some(picker) = &self.skill_picker {
                     render_skill_picker(f, c.body, picker, &hints);
                 }
@@ -1137,11 +1184,12 @@ impl TuiApp {
                 // same hints, through the same renderer, next to the list they
                 // apply to. Saying them twice in one screen is how a footer stops
                 // being read.
-                let hints: &[(&str, &str)] = if self.skill_picker.is_some() {
-                    &[]
-                } else {
-                    &hints
-                };
+                let hints: &[(&str, &str)] =
+                    if self.skill_picker.is_some() || self.rule_editor.is_some() {
+                        &[]
+                    } else {
+                        &hints
+                    };
                 chrome::render_footer(f, c.footer, hints);
             })?;
 
@@ -1149,6 +1197,25 @@ impl TuiApp {
                 match event::read()? {
                     Event::Key(key) => {
                         if key.kind != event::KeyEventKind::Press {
+                            continue;
+                        }
+                        // Rule editor interception
+                        //
+                        // Above the skill picker's guard, not below it: both open
+                        // from the agent form, and the order between two dialogs
+                        // matters for the same reason it matters between a dialog
+                        // and a view — whichever guard comes first swallows the key.
+                        if self.rule_editor.is_some() {
+                            let Some(editor) = self.rule_editor.as_mut() else {
+                                unreachable!("guarded on is_some above");
+                            };
+                            match rule_action(editor, key) {
+                                RuleAction::Applied => {}
+                                RuleAction::Done(rules) => {
+                                    self.rule_editor = None;
+                                    self.form_rules = rules;
+                                }
+                            }
                             continue;
                         }
                         // Delete confirmation interception
@@ -1290,12 +1357,11 @@ impl TuiApp {
                                 {
                                     // Save agent
                                     let project_id = &self.form_project_id;
-                                    let rules_vec: Vec<String> = self
-                                        .form_rules
-                                        .split(',')
-                                        .map(|s| s.trim().to_string())
-                                        .filter(|s| !s.is_empty())
-                                        .collect();
+                                    // Already a list. It used to be joined with
+                                    // commas and split here, which is what made a
+                                    // rule containing a comma silently become two
+                                    // rules with nothing on screen saying so.
+                                    let rules_vec: Vec<String> = self.form_rules.clone();
                                     let opt_rules_vec: Vec<String> = self
                                         .form_optimize_rules
                                         .split(',')
@@ -1343,12 +1409,28 @@ impl TuiApp {
                                     self.skill_picker =
                                         Some(self.skill_picker_over(&self.form_project_id));
                                 }
+                                // Opens the rule editor over the list this field
+                                // joins into a line. Modified, because a bare letter
+                                // here would be a letter the user could not type into
+                                // their own rules.
+                                KeyCode::Char('r')
+                                    if self.form_field_index == RULES_FIELD
+                                        && key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                                {
+                                    self.open_rule_editor_with(None);
+                                }
                                 KeyCode::Char(c) => match self.form_field_index {
                                     0 => self.form_id.push(c),
                                     1 => self.form_name.push(c),
                                     2 => self.form_model.push(c),
                                     3 => {} // Project is handled by arrows
-                                    4 => self.form_rules.push(c),
+                                    // The rules row is a one-line join of a list, so
+                                    // there is nothing here to append to. Swallowing
+                                    // the key would make the row look editable and
+                                    // do nothing — the field that looked broken when
+                                    // the picker shipped inert. Typing here opens the
+                                    // editor and lands the character in it.
+                                    4 => self.open_rule_editor_with(Some(c)),
                                     5 => self.form_optimize_rules.push(c),
                                     6 => {} // Skills is chosen in the picker
                                     7 => self.form_prompt.push(c),
@@ -1365,7 +1447,13 @@ impl TuiApp {
                                         self.form_model.pop();
                                     }
                                     4 => {
-                                        self.form_rules.pop();
+                                        // Opens the editor and deletes nothing.
+                                        // Backspacing the join is ambiguous — the
+                                        // last character may belong to the last
+                                        // rule, or it may be the separator — and
+                                        // the editor is where a deletion can be
+                                        // seen before it happens.
+                                        self.open_rule_editor_with(None);
                                     }
                                     5 => {
                                         self.form_optimize_rules.pop();
@@ -1605,7 +1693,7 @@ impl TuiApp {
                                     self.form_name = String::new();
                                     self.form_model = String::new();
                                     self.form_prompt = String::new();
-                                    self.form_rules = String::new();
+                                    self.form_rules = Vec::new();
                                     self.form_optimize_rules = String::new();
                                     self.form_skills = String::new();
                                     self.available_projects = self
@@ -1641,7 +1729,7 @@ impl TuiApp {
                                         self.form_name = agent.config.name.clone();
                                         self.form_model = agent.config.model.clone();
                                         self.form_prompt = agent.config.system_prompt.clone();
-                                        self.form_rules = agent.config.rules.join(", ");
+                                        self.form_rules = agent.config.rules.clone();
                                         self.form_optimize_rules =
                                             agent.config.optimize.rules.join(", ");
                                         self.form_skills = agent.config.skills.join(", ");
@@ -1757,6 +1845,32 @@ impl TuiApp {
 
         Ok(())
     }
+
+    /// The editor to open for `rules`, with `first` already typed into the focused
+    /// rule.
+    ///
+    /// Three things open it: `Ctrl+R` deliberately, and typing or backspacing on the
+    /// rules row not so much. The row is a one-line join of a list, so there is no
+    /// caret position in it to append at — and a row that looks editable, swallows
+    /// every keypress and shows nothing is the same failure the skill picker shipped,
+    /// in a different field. Landing the character in the editor it opens is what the
+    /// user meant by pressing it.
+    fn open_rule_editor_with(&mut self, first: Option<char>) {
+        self.rule_editor = Some(rule_editor_opening(&self.form_rules, first));
+    }
+}
+
+/// The editor to open for `rules`, with `first` already typed into the focused rule.
+///
+/// `RuleEditor::new` starts empty and typing creates the first rule, so a character
+/// pressed on the form's rules row survives the trip into the dialog rather than
+/// being dropped on the way.
+fn rule_editor_opening(rules: &[String], first: Option<char>) -> RuleEditor {
+    let mut editor = RuleEditor::new(rules.to_vec());
+    if let Some(c) = first {
+        editor.type_char(c);
+    }
+    editor
 }
 
 /// What a key press means in the chat input.
@@ -1800,6 +1914,15 @@ pub fn chat_input_action(key: event::KeyEvent, loading: bool) -> ChatAction {
     }
 }
 
+/// The one-line view of an agent's rules, for the form's own row.
+///
+/// A rendering, not the truth: `form_rules` is the list and `analyzer.rs` renders
+/// each element as its own bullet. The join is what the form can afford to draw on
+/// one row, and `Ctrl+R` is how the whole thing is seen and written.
+fn rules_line(rules: &[String]) -> String {
+    rules.join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1834,6 +1957,7 @@ mod tests {
             form_field_index: 0,
             confirm_delete: false,
             skill_picker: false,
+            rule_editor: false,
         }
     }
 
@@ -2245,6 +2369,97 @@ mod tests {
         assert!(
             !projects.contains("approve"),
             "and nothing from the modal: {projects:?}"
+        );
+    }
+
+    /// The skill picker is a fifth screen whose keys belong to no `CurrentView`,
+    /// and the same defect the proposals modal and the delete confirmation each
+    /// had: it takes every key while it is up, so without its own target the form
+    /// underneath keeps naming `Enter: next field` under a list where `Enter`
+    /// confirms and `Space` toggles.
+    /// `Ctrl+R` names the rules row and only the rules row. Every other field's keys
+    /// type into that field, so a hint pointing elsewhere would advertise an action
+    /// the row cannot take.
+    #[test]
+    fn the_edit_rules_hint_is_on_the_rules_row_alone() {
+        let row = footer_row(KeyTarget::AgentForm(RULES_FIELD));
+        assert!(
+            row.contains("Ctrl+R: edit rules"),
+            "the rules row must say how to open the editor: {row:?}"
+        );
+
+        for field in 0..=crate::tui::views::agent_form::PROMPT_INDEX {
+            if field == RULES_FIELD {
+                continue;
+            }
+            let row = footer_row(KeyTarget::AgentForm(field));
+            assert!(
+                !row.contains("edit rules"),
+                "field {field} has no rules to edit, so it must not say so: {row:?}"
+            );
+        }
+    }
+
+    /// While the editor is up it owns every key, so its footer must not keep naming
+    /// the form's: `Enter` writes a newline in there and moves to the next field out
+    /// here, and both cannot be on screen.
+    #[test]
+    fn the_rule_editor_outranks_the_form_it_sits_on() {
+        let editor = key_target(&ScreenState {
+            rule_editor: true,
+            ..screen(&CurrentView::AgentForm, true, drawn_bounds())
+        });
+        assert_eq!(editor, KeyTarget::RuleEditor);
+
+        let row = footer_row(KeyTarget::RuleEditor);
+        assert!(row.contains("new line"), "the editor's own keys: {row:?}");
+        assert!(
+            !row.contains("next field"),
+            "and none of the form's: {row:?}"
+        );
+    }
+
+    /// A character pressed on the rules row has to arrive inside the editor. That is
+    /// the whole reason typing opens the dialog rather than being swallowed, and a
+    /// lost character is a word silently missing from the user's own rules.
+    #[test]
+    fn a_character_typed_on_the_rules_row_lands_in_the_editor() {
+        let opened = rule_editor_opening(&["primera".to_string()], Some('!'));
+        assert_eq!(
+            opened.rules,
+            vec!["primera!".to_string()],
+            "appended to the focused rule, which is the first one"
+        );
+
+        let empty = rule_editor_opening(&[], Some('a'));
+        assert_eq!(
+            empty.rules,
+            vec!["a".to_string()],
+            "and on an agent with no rules the character becomes the first one, \
+             rather than being dropped for want of a row to land in"
+        );
+
+        assert_eq!(
+            rule_editor_opening(&["primera".to_string()], None).rules,
+            vec!["primera".to_string()],
+            "`Ctrl+R` and `Backspace` open the editor and change nothing"
+        );
+    }
+
+    /// The form's rules row is a one-line join, and the join is the whole reason
+    /// there is an editor: a list drawn on one row cannot be read.
+    #[test]
+    fn the_rules_row_joins_the_list_and_keeps_it_readable() {
+        assert_eq!(rules_line(&[]), "", "no rules, nothing to show");
+        assert_eq!(
+            rules_line(&["una".to_string()]),
+            "una",
+            "a single rule is itself"
+        );
+        assert_eq!(
+            rules_line(&["una".to_string(), "dos".to_string()]),
+            "una, dos",
+            "two rules are separated, so the row is countable at a glance"
         );
     }
 

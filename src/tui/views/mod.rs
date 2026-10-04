@@ -5,6 +5,7 @@ pub mod context;
 pub mod dashboard;
 pub mod modals;
 pub mod projects;
+pub mod rule_editor;
 pub mod skill_picker;
 
 #[cfg(test)]

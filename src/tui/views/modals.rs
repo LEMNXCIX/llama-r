@@ -11,6 +11,7 @@
 
 use crate::tui::chrome;
 use crate::tui::theme;
+use crate::tui::views::rule_editor::RuleEditor;
 use crate::tui::views::skill_picker::SkillPicker;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -310,6 +311,130 @@ fn picker_title(picker: &SkillPicker) -> Line<'static> {
     line
 }
 
+/// Draw the rule editor over `body`: an agent's rules as a list, the focused one
+/// grown open underneath so it can be read and typed into.
+///
+/// The arrangement is the point. A list of one-line rows would be no better than
+/// the form field it replaces — a long rule would be cut at the panel's edge, and
+/// the field's whole problem was that rules are longer than a line. So the focused
+/// rule takes every row the others do not need and wraps inside them, which means
+/// the rule being written is always the tallest thing on screen and never the one
+/// being cropped.
+///
+/// As in the picker, `hints` is `hints_for`'s own slice laid out by
+/// `chrome::hints_line`, and the caller silences the chrome footer while this is up.
+pub fn render_rule_editor(f: &mut Frame, body: Rect, editor: &RuleEditor, hints: &[(&str, &str)]) {
+    // As tall as the screen allows and as wide as the rules need: a rule is prose,
+    // and prose that wraps at forty columns is prose nobody reads back.
+    let width = body.width.saturating_sub(4).max(40);
+    let area = centered(body, width, body.height.saturating_sub(2).max(9));
+
+    let block = Block::default().borders(Borders::ALL);
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ]
+            .as_ref(),
+        )
+        .split(block.inner(area));
+
+    // The block before its contents, for the reason `render_skill_picker` does: a
+    // block paints every cell of its area and would wipe whatever was written first.
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(Paragraph::new(Vec::<Line>::new()).block(block), area);
+
+    let total = editor.rules.len();
+    let title = if total == 0 {
+        " Agent Rules — nothing yet ".to_string()
+    } else {
+        format!(" Agent Rules — {total} ")
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(title, theme::chrome()))),
+        inner[0],
+    );
+
+    let text_width = inner[1].width as usize;
+    if total == 0 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " write something — every key types here ",
+                theme::chrome(),
+            ))),
+            inner[1],
+        );
+        f.render_widget(Paragraph::new(chrome::hints_line(hints)), inner[2]);
+        return;
+    }
+
+    let focus_text = editor.focused().cloned().unwrap_or_default();
+    // The focused row is drawn where it sits in the list, wrapped over as many lines
+    // as it needs, and the rows around it are pushed down rather than scrolled away:
+    // the list grows around the row being typed into instead of the editor scrolling
+    // under the caret.
+    let mut lines: Vec<Line> = Vec::new();
+    let push_summary = |index: usize, lines: &mut Vec<Line>| {
+        let style = if index < editor.focus {
+            theme::content()
+        } else {
+            theme::chrome()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {:>2} ", index + 1), theme::chrome()),
+            Span::styled(
+                truncate(
+                    &editor.rules[index].replace('\n', " "),
+                    text_width.saturating_sub(4),
+                ),
+                style,
+            ),
+        ]));
+    };
+
+    for index in editor.scroll..editor.focus {
+        push_summary(index, &mut lines);
+    }
+
+    // A separator, so the open rule is visibly not one more row of the list.
+    if editor.focus > editor.scroll {
+        lines.push(Line::from(Span::styled("   ·", theme::chrome())));
+    }
+
+    let parts = wrap(&focus_text, text_width.saturating_sub(4));
+    let last_part = parts.len().saturating_sub(1);
+    for (offset, text) in parts.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                if offset == 0 {
+                    format!(" {:>2}▸", editor.focus + 1)
+                } else {
+                    "    ".to_string()
+                },
+                theme::action(),
+            ),
+            Span::styled(text.clone(), theme::content()),
+            // The caret sits on the last line of the open rule, which is where the
+            // next character lands.
+            if offset == last_part {
+                Span::styled("▏", theme::action())
+            } else {
+                Span::raw("")
+            },
+        ]));
+    }
+
+    for index in (editor.focus + 1)..total {
+        push_summary(index, &mut lines);
+    }
+
+    f.render_widget(Paragraph::new(lines), inner[1]);
+    f.render_widget(Paragraph::new(chrome::hints_line(hints)), inner[2]);
+}
+
 /// The panel, centred in `body` and clamped to it.
 ///
 /// `width.min(body.width)` and `height.min(body.height)`, because adding to a
@@ -324,6 +449,56 @@ fn centered(body: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     }
+}
+
+/// Break `text` into lines no wider than `width`, on character boundaries.
+///
+/// Word-aware where it can be. The one part of this panel that is prose is the
+/// part being typed into, and prose broken mid-word reads as broken text — so a
+/// line is filled with whole words, and only a single word too long for the panel
+/// is split, because there is nothing else to do with it.
+///
+/// `text` may already contain newlines; each becomes its own line, which is what
+/// makes a multi-line rule read as more than one line.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            let candidate = if line.is_empty() {
+                word.chars().count()
+            } else {
+                line.chars().count() + 1 + word.chars().count()
+            };
+            if candidate <= width {
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                continue;
+            }
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            // A word wider than the panel has to be split, or it would be cut off
+            // and the rule would lose characters silently.
+            let mut rest = word;
+            while rest.chars().count() > width {
+                let split_at = rest
+                    .char_indices()
+                    .nth(width)
+                    .map(|(at, _)| at)
+                    .unwrap_or(rest.len());
+                out.push(rest[..split_at].to_string());
+                rest = &rest[split_at..];
+            }
+            line = rest.to_string();
+        }
+        // An empty paragraph is a blank line the user typed, not a missing one.
+        out.push(line);
+    }
+    out
 }
 
 /// Cut to `max` display columns, with an ellipsis when anything was cut.
@@ -758,6 +933,214 @@ mod tests {
             text.contains("alp") && text.contains("1 of 3"),
             "the needle and the count share the title row: {text}"
         );
+    }
+
+    fn render_editor(editor: &RuleEditor) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                render_rule_editor(
+                    f,
+                    Rect::new(0, 1, 80, 22),
+                    editor,
+                    &[
+                        ("⇥", "rule"),
+                        ("⏎", "new line"),
+                        ("^N", "add"),
+                        ("^D", "delete"),
+                        ("esc", "done"),
+                    ],
+                )
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn editor_of(rules: &[&str]) -> RuleEditor {
+        RuleEditor::new(rules.iter().map(|r| r.to_string()).collect())
+    }
+
+    /// Wrapping, not cropping. The field this panel replaces cut a rule at the end
+    /// of one line, and a rule of prose is longer than one line by definition — so
+    /// a panel that crops would reproduce the very problem it was built to solve.
+    #[test]
+    fn a_long_rule_wraps_instead_of_being_cut() {
+        // Longer than the panel, so wrapping is the only way all of it can be on
+        // screen. A rule that fits proves nothing about cropping.
+        let rule = "responde siempre en español y cita la fuente de cada dato \
+                    que afirmes, y cuando no la tengas di que no lo sabes en vez \
+                    de inventar uno";
+        let buffer = render_editor(&editor_of(&[rule]));
+        let text = all_text(&buffer);
+
+        for fragment in [
+            "responde siempre en español",
+            "cita la fuente de cada dato",
+            "en vez de inventar uno",
+        ] {
+            assert!(
+                text.contains(fragment),
+                "{fragment:?} must be on screen; the tail is what a crop loses: {text}"
+            );
+        }
+        assert!(
+            text.lines()
+                .filter(|line| line.contains('▏') || line.contains("  1▸"))
+                .count()
+                >= 2,
+            "and the rule had to take more than one row: {text}"
+        );
+    }
+
+    /// Only the focused rule opens. A list where every rule is expanded is the form
+    /// field again, and the point is that one rule at a time is legible.
+    #[test]
+    fn only_the_focused_rule_is_open() {
+        let buffer = render_editor(&editor_of(&["uno", "dos", "tres"]));
+        let text = all_text(&buffer);
+
+        let markers = [" 1▸", " 2 ", " 3 "].map(|m| text.contains(m));
+        assert_eq!(markers, [true, true, true], "every rule is listed: {text}");
+        assert_eq!(
+            text.matches('▸').count(),
+            1,
+            "and exactly one of them is open: {text}"
+        );
+    }
+
+    /// The caret belongs on the last line of the open rule, which is where the next
+    /// character lands. A rule with a newline in it therefore ends its caret below
+    /// the newline, not above it.
+    #[test]
+    fn the_caret_is_on_the_last_line_of_the_open_rule() {
+        let buffer = render_editor(&editor_of(&["primera\nsegunda"]));
+        let caret = row_of(&buffer, "segunda");
+
+        assert!(
+            row_text(&buffer, caret).contains('▏'),
+            "the caret is on the same row as the text it follows: {}",
+            row_text(&buffer, caret)
+        );
+    }
+
+    /// A rule containing a comma is one row, not two. This is the regression the
+    /// whole panel exists for: the field it replaces split on commas, so this rule
+    /// silently became two rules on save.
+    #[test]
+    fn a_comma_does_not_split_the_row() {
+        let buffer = render_editor(&editor_of(&["usa comas, no puntos"]));
+        let text = all_text(&buffer);
+
+        assert!(
+            text.contains("usa comas, no puntos"),
+            "the rule is intact: {text}"
+        );
+        assert!(
+            !text.contains("usa comas\n") && !text.contains(" 2 "),
+            "and it is one row, not two: {text}"
+        );
+    }
+
+    /// The panel's own legend, inside the border, from the slice it was handed.
+    /// `modals` names no key: the strings above are data the caller supplied.
+    #[test]
+    fn the_editor_legend_is_inside_the_panel() {
+        let buffer = render_editor(&editor_of(&["una"]));
+        let legend = row_of(&buffer, "new line");
+        let row = row_text(&buffer, legend);
+        let right = row.rfind('│').expect("the panel's right border");
+
+        for hint in ["rule", "new line", "add", "delete", "done"] {
+            assert!(
+                row[..right].contains(hint),
+                "{hint:?} must be inside the border: {:?}",
+                &row[..right]
+            );
+        }
+    }
+
+    /// An agent with no rules opens an editor, not a list of one blank row. The
+    /// empty state has to invite writing, since every key types.
+    #[test]
+    fn an_agent_with_no_rules_opens_an_empty_editor() {
+        let buffer = render_editor(&RuleEditor::default());
+        let text = all_text(&buffer);
+
+        assert!(text.contains("nothing yet"), "the count is honest: {text}");
+        assert!(
+            text.contains("every key types"),
+            "and the empty state says what to do: {text}"
+        );
+    }
+
+    /// The title counts the rules, so the list is countable rather than decorative.
+    #[test]
+    fn the_title_counts_the_rules() {
+        let text = all_text(&render_editor(&editor_of(&["a", "b", "c"])));
+        assert!(text.contains("Agent Rules — 3"), "{text}");
+    }
+
+    /// Word wrapping, spelled out. A line is filled with whole words, and only a
+    /// word too long for the panel is split.
+    #[test]
+    fn wrap_breaks_on_words_and_only_splits_an_oversized_one() {
+        assert_eq!(wrap("uno dos tres", 20), vec!["uno dos tres"]);
+
+        assert_eq!(
+            wrap("uno dos tres", 8),
+            vec!["uno dos", "tres"],
+            "a word is never split to fill a line"
+        );
+
+        assert_eq!(
+            wrap("abcdefghijkl", 5),
+            vec!["abcde", "fghij", "kl"],
+            "a word longer than the panel has to be split or it is lost"
+        );
+
+        assert_eq!(
+            wrap("uno\ndos", 20),
+            vec!["uno", "dos"],
+            "a newline the user typed is a line of its own"
+        );
+
+        assert_eq!(
+            wrap("uno\n\ndos", 20),
+            vec!["uno", "", "dos"],
+            "and a blank one stays blank rather than disappearing"
+        );
+
+        assert_eq!(
+            wrap("  uno   dos  ", 20),
+            vec!["uno dos"],
+            "runs of spaces collapse, as any terminal shows them"
+        );
+    }
+
+    /// Wrapping must never lose a character. A wrap that dropped or duplicated one
+    /// would silently corrupt a rule while looking correct.
+    #[test]
+    fn wrap_loses_nothing() {
+        // Compared per character, not per word: below the width of the longest word
+        // the wrap has to split words, and the property that still has to hold is
+        // that no character is dropped or doubled. Word identity is the previous
+        // test's job and only holds when the words fit.
+        let bare = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+        for width in 1..12 {
+            for text in [
+                "usa comas, no puntos y punto y coma tampoco",
+                "a",
+                "  espacios  raros  ",
+                "palabramuyylargasque no cabe en ninguna linea",
+                "acentos: ñandú, CORE, 日本語",
+            ] {
+                assert_eq!(
+                    bare(&wrap(text, width).join(" ")),
+                    bare(text),
+                    "width {width}, {text:?}"
+                );
+            }
+        }
     }
 
     /// The panel's legend must not be the title row's job any more: the title now
