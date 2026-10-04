@@ -9,6 +9,7 @@
 //! [`crate::tui::views::skill_picker`]; only its panel is here, because the
 //! border is what put it in this file and the border is the whole reason.
 
+use crate::tui::chrome;
 use crate::tui::theme;
 use crate::tui::views::skill_picker::SkillPicker;
 use ratatui::{
@@ -147,20 +148,50 @@ const MANAGED: &str = "—";
 ///
 /// A dialog, and so one of the three places in the interface that keep a border:
 /// the user is choosing from a list, and a box is what separates that list from
-/// the form still sitting behind it. The keys are the shared footer's job, through
-/// `KeyTarget::SkillPicker`.
-pub fn render_skill_picker(f: &mut Frame, body: Rect, picker: &SkillPicker) {
-    let area = centered(body, 60, body.height.saturating_sub(2).max(5));
+/// the form still sitting behind it.
+///
+/// `hints` is the *same* slice `KeyTarget::SkillPicker` feeds the chrome footer,
+/// and it is laid out by the same `chrome::hints_line` — not by
+/// `chrome::render_footer`, which the chrome's own row is the one call site of.
+/// The panel carries its own keys because it is centred in the screen while the
+/// chrome's footer is pinned to the last row, and a legend nine lines below the
+/// list it describes is a legend nobody reads. Nothing here names a key:
+/// `hints_for` stays the one place the list is written down, so the panel and the
+/// footer cannot disagree about what a key does. The caller silences the chrome
+/// footer while the picker is up, so the keys appear once, next to what they act
+/// on.
+pub fn render_skill_picker(
+    f: &mut Frame,
+    body: Rect,
+    picker: &SkillPicker,
+    hints: &[(&str, &str)],
+) {
+    // Wide enough for the legend it has to show, never wider than the screen. A
+    // fixed width truncates the tail of the hints, and the tail is where `esc`
+    // lives: a dialog whose way out is the part that got cut is worse than a
+    // dialog that is slightly too wide.
+    let width = chrome::hints_width(hints)
+        .saturating_add(4)
+        .max(60)
+        .min(body.width);
+    let area = centered(body, width, body.height.saturating_sub(2).max(7));
 
-    // The block wraps the title as well as the rows, so the inner rect is computed
-    // from the border rather than from the panel. Splitting `area` instead would
-    // leave the title on the border's own row, where it is overwritten — and the
-    // window height one row too large, which puts the cursor's row off the bottom
-    // of a full list.
+    // The block wraps the title and the keys as well as the rows, so the inner
+    // rect is computed from the border rather than from the panel. Splitting
+    // `area` instead would leave the title on the border's own row, where it is
+    // overwritten — and the window height one row too large, which puts the
+    // cursor's row off the bottom of a full list.
     let block = Block::default().borders(Borders::ALL);
     let inner = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)].as_ref())
+        .constraints(
+            [
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ]
+            .as_ref(),
+        )
         .split(block.inner(area));
 
     // The block first, then the title and the rows on top of it. Drawn the other
@@ -171,74 +202,112 @@ pub fn render_skill_picker(f: &mut Frame, body: Rect, picker: &SkillPicker) {
     f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(Paragraph::new(Vec::<Line>::new()).block(block), area);
 
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            " Skills — space to toggle, enter to confirm ",
-            theme::chrome(),
-        ))),
-        inner[0],
-    );
+    f.render_widget(Paragraph::new(picker_title(picker)), inner[0]);
 
-    // One row per skill, windowed to the panel: a catalogue longer than the screen
-    // has to scroll or the bottom of the list is unreachable.
+    // One row per visible skill, windowed to the panel: a catalogue longer than
+    // the screen has to scroll or the bottom of the list is unreachable. The
+    // window is over `visible`, not over `rows`, so the cursor's position within
+    // what is on screen is what decides the offset.
+    let visible = picker.visible();
     let rows_height = inner[1].height as usize;
-    let first = picker
-        .cursor
-        .saturating_sub(rows_height.saturating_sub(1))
-        .min(picker.cursor);
-
-    let lines: Vec<Line> = picker
-        .rows
+    let position = visible
         .iter()
-        .enumerate()
-        .skip(first)
-        .take(rows_height.max(1))
-        .map(|(index, row)| {
-            let mark = if row.auto {
-                MANAGED
-            } else if row.picked {
-                PICKED
-            } else {
-                UNPICKED
-            };
-            // The unpicked mark is `content`, not `chrome`: a one-pixel middle dot
-            // in `DarkGray` on a dark terminal is close to invisible, which is how
-            // the column shipped looking empty. The three states have to be
-            // distinguishable at a glance, and the difference between "not
-            // chosen" and "chosen" is the whole reason the column exists.
-            let mark_style = if row.auto {
-                theme::chrome()
-            } else if row.picked {
-                theme::active()
-            } else {
-                theme::content()
-            };
-            // The cursor is a colour on the whole row, which is the same signal the
-            // agent form uses for its focused field: where the next keystroke lands
-            // is something the eye should find without a marker column.
-            let name_style = if index == picker.cursor {
-                theme::action()
-            } else {
-                theme::content()
-            };
-            let scope_style = if row.auto {
-                theme::chrome()
-            } else {
-                theme::action()
-            };
-            Line::from(vec![
-                Span::styled(format!(" {mark} "), mark_style),
-                Span::styled(format!("{:<22}", truncate(&row.id, 22)), name_style),
-                Span::styled(format!("{:<8}", truncate(&row.scope, 8)), scope_style),
-                Span::styled(
-                    truncate(&row.description, area.width.saturating_sub(38) as usize),
-                    theme::chrome(),
-                ),
-            ])
-        })
-        .collect();
+        .position(|&index| index == picker.cursor)
+        .unwrap_or(0);
+    let first = position.saturating_sub(rows_height.saturating_sub(1));
+
+    let lines: Vec<Line> = if visible.is_empty() {
+        vec![Line::from(Span::styled(
+            " nothing matches ",
+            theme::chrome(),
+        ))]
+    } else {
+        visible
+            .iter()
+            .skip(first)
+            .take(rows_height)
+            .map(|&index| {
+                let row = &picker.rows[index];
+                let mark = if row.auto {
+                    MANAGED
+                } else if row.picked {
+                    PICKED
+                } else {
+                    UNPICKED
+                };
+                // The unpicked mark is `content`, not `chrome`: a one-pixel middle
+                // dot in `DarkGray` on a dark terminal is close to invisible,
+                // which is how the column shipped looking empty. The three states
+                // have to be distinguishable at a glance, and the difference
+                // between "not chosen" and "chosen" is the whole reason the column
+                // exists.
+                let mark_style = if row.auto {
+                    theme::chrome()
+                } else if row.picked {
+                    theme::active()
+                } else {
+                    theme::content()
+                };
+                // The cursor is a colour on the whole row, which is the same signal
+                // the agent form uses for its focused field: where the next
+                // keystroke lands is something the eye should find without a
+                // marker column.
+                let name_style = if index == picker.cursor {
+                    theme::action()
+                } else {
+                    theme::content()
+                };
+                let scope_style = if row.auto {
+                    theme::chrome()
+                } else {
+                    theme::action()
+                };
+                Line::from(vec![
+                    Span::styled(format!(" {mark} "), mark_style),
+                    Span::styled(format!("{:<22}", truncate(&row.id, 22)), name_style),
+                    Span::styled(format!("{:<8}", truncate(&row.scope, 8)), scope_style),
+                    Span::styled(
+                        truncate(&row.description, area.width.saturating_sub(38) as usize),
+                        theme::chrome(),
+                    ),
+                ])
+            })
+            .collect()
+    };
 
     f.render_widget(Paragraph::new(lines), inner[1]);
+    // The panel's own legend. It is a `hints_line`, not a second `render_footer`:
+    // `only_the_dispatch_draws_the_footer` counts call sites, and a dialog that
+    // reaches for the footer renderer *is* the second footer it exists to catch.
+    // Same list, same formatter, and `app.rs` silences the chrome row while the
+    // picker is up, so exactly one of the two is ever on screen.
+    f.render_widget(Paragraph::new(chrome::hints_line(hints)), inner[2]);
+}
+
+/// The panel's top row: the filter being typed, and how much of the catalogue is
+/// still on screen.
+///
+/// The count is what makes the filter trustworthy. Without it a narrowed list is
+/// indistinguishable from a short catalogue, and the user cannot tell whether the
+/// skill they wanted is missing or merely spelled differently.
+fn picker_title(picker: &SkillPicker) -> Line<'static> {
+    let total = picker.rows.len();
+    let shown = picker.visible().len();
+    let mut line = Line::from(Span::styled(" Skills", theme::chrome()));
+    if picker.filter.is_empty() {
+        line.push_span(Span::styled(
+            format!(" — {total} installed "),
+            theme::chrome(),
+        ));
+        return line;
+    }
+    line.push_span(Span::styled(" / ", theme::chrome()));
+    line.push_span(Span::styled(picker.filter.clone(), theme::content()));
+    line.push_span(Span::styled(
+        format!(" — {shown} of {total} "),
+        theme::chrome(),
+    ));
+    line
 }
 
 /// The panel, centred in `body` and clamped to it.
@@ -453,7 +522,7 @@ mod tests {
                 .draw(|f| {
                     render_confirm_delete(f, body, "project", "fudi");
                     render_skill_proposals(f, body, &[proposal("demo")], 0, &[]);
-                    render_skill_picker(f, body, &picker(&[("a", false)]));
+                    render_skill_picker(f, body, &picker(&[("a", false)]), &[]);
                 })
                 .unwrap();
         }
@@ -474,6 +543,7 @@ mod tests {
                 })
                 .collect(),
             cursor: 0,
+            filter: String::new(),
         }
     }
 
@@ -568,7 +638,7 @@ mod tests {
                     &chrome::Context::default(),
                     true,
                 );
-                render_skill_picker(f, c.body, &modal);
+                render_skill_picker(f, c.body, &modal, &[]);
             })
             .unwrap();
 
@@ -581,27 +651,126 @@ mod tests {
     }
 
     fn render_picker(modal: &SkillPicker) -> Buffer {
+        render_picker_with(modal, PICKER_HINTS)
+    }
+
+    /// The keys the panel is handed. In the app these are the very slice
+    /// `KeyTarget::SkillPicker` produces; the panel names no key of its own.
+    const PICKER_HINTS: &[(&str, &str)] = &[
+        ("↑/↓", "move"),
+        ("space", "toggle"),
+        ("type", "filter"),
+        ("enter", "save"),
+        ("esc", "cancel"),
+    ];
+
+    fn render_picker_with(modal: &SkillPicker, hints: &[(&str, &str)]) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render_skill_picker(f, Rect::new(0, 1, 80, 22), modal))
+            .draw(|f| render_skill_picker(f, Rect::new(0, 1, 80, 22), modal, hints))
             .unwrap();
         terminal.backend().buffer().clone()
     }
 
-    /// The panel's own instructions must survive being drawn.
+    /// The panel's own keys must reach the screen, and must land inside the border.
     ///
-    /// They did not for two reasons at once: the bordered `Block` was rendered
-    /// *after* the title, and a block paints every cell of its area, so it wiped
-    /// the row the title had been written to. And without a `Clear` the panel
-    /// showed the agent form through the gaps between rows, so the list read as
-    /// floating text on the form rather than as a dialog over it.
+    /// Two failures were stacked here. The keys used to be a title the module
+    /// hard-coded, and a bordered `Block` rendered *after* it wiped the row it had
+    /// been written to — so the panel had no legend at all. Now the hints arrive
+    /// from `hints_for` and are drawn by `chrome::render_footer` into the panel's
+    /// last inner row, which is why this asserts the whole line rather than one
+    /// word: a legend with its keys on the border is not a legend.
     #[test]
     fn the_panel_keeps_its_own_instructions() {
         let text = all_text(&render_picker(&picker(&[("a", false)])));
 
+        for (key, what) in PICKER_HINTS {
+            assert!(
+                text.contains(&format!("{key}: {what}")),
+                "{key:?} must be legible inside the panel: {text}"
+            );
+        }
+    }
+
+    /// The legend must be *whole* inside the border, not merely present in the
+    /// buffer.
+    ///
+    /// The panel used to be a fixed 60 columns and the hint list is 64, so
+    /// `esc: cancel` fell off the right edge — inside a dialog, the one key that
+    /// gets you out of it. Checking that the words appear would have passed: a
+    /// truncated hint is still in the buffer, just outside the box.
+    #[test]
+    fn the_whole_legend_fits_inside_the_border() {
+        let buffer = render_picker(&picker(&[("a", false)]));
+        // The legend is on the last row before the border, so the first pair that
+        // fits is the marker for "this row holds the whole thing".
+        let legend = row_of(
+            &buffer,
+            &format!("{}: {}", PICKER_HINTS[0].0, PICKER_HINTS[0].1),
+        );
+        let row = row_text(&buffer, legend);
+        let right_border = row
+            .rfind('│')
+            .unwrap_or_else(|| panic!("the panel's right border is gone: {row:?}"));
+        let inside = &row[..right_border];
+
+        for (key, what) in PICKER_HINTS {
+            let hint = format!("{key}: {what}");
+            assert!(
+                inside.contains(&hint),
+                "{hint:?} was cut at the border; the panel is too narrow for its \
+                 own legend: {inside:?}"
+            );
+        }
+    }
+
+    /// A filter narrow enough to match nothing must say so on screen. A blank list
+    /// under a needle reads as "the catalogue is empty", which is a different and
+    /// much more alarming thing than "your spelling is wrong".
+    #[test]
+    fn a_filter_matching_nothing_says_so() {
+        let mut modal = picker(&[("alpha", false), ("beta", false)]);
+        modal.push_filter_char('z');
+
+        let text = all_text(&render_picker(&modal));
         assert!(
-            text.contains("space to toggle"),
-            "the panel must name its own keys: {text}"
+            text.contains("nothing matches"),
+            "an empty list under a needle must be explained: {text}"
+        );
+        assert!(
+            text.contains("0 of 2"),
+            "and the count must say the catalogue itself is not empty: {text}"
+        );
+    }
+
+    /// The title row carries the filter and how much survived. Without the count a
+    /// narrowed list is indistinguishable from a short catalogue.
+    #[test]
+    fn the_title_reports_how_much_of_the_catalogue_survived() {
+        let mut modal = picker(&[("alpha", false), ("beta", false), ("gamma", false)]);
+        assert!(all_text(&render_picker(&modal)).contains("3 installed"));
+
+        modal.push_filter_char('a');
+        modal.push_filter_char('l');
+        modal.push_filter_char('p');
+        let text = all_text(&render_picker(&modal));
+        assert!(
+            text.contains("alp") && text.contains("1 of 3"),
+            "the needle and the count share the title row: {text}"
+        );
+    }
+
+    /// The panel's legend must not be the title row's job any more: the title now
+    /// belongs to the filter, and a legend sharing a row with the filter would put
+    /// two unrelated things in one line.
+    #[test]
+    fn the_legend_is_not_the_title() {
+        let buffer = render_picker(&picker(&[("a", false)]));
+
+        assert_ne!(
+            row_of(&buffer, "type: filter"),
+            row_of(&buffer, " Skills"),
+            "the filter and the legend need their own rows"
         );
     }
 

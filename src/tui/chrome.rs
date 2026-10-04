@@ -161,11 +161,17 @@ pub fn render_bar(
 
 /// Draws the key hints for the current view: each key in `action`, its
 /// meaning in `chrome`.
-pub fn render_footer(f: &mut Frame, rect: Rect, hints: &[(&str, &str)]) {
-    if rect.is_empty() {
-        return;
-    }
-
+/// The hint list as one line: `key: what it does`, pairs separated by `GAP`.
+///
+/// Split out from `render_footer` so the picker's panel can draw the *same* line
+/// inside its box without becoming a second footer. The panel is centred in the
+/// screen while the chrome's footer is pinned to the last row, and a legend nine
+/// lines below the list it describes is a legend nobody reads — so when the picker
+/// is up the panel shows it and the chrome footer goes silent. One list, one
+/// formatter, one of the two on screen at a time.
+///
+/// `hints_for` in `app.rs` remains the only place the pairs are written down.
+pub fn hints_line<'a>(hints: &[(&'a str, &'a str)]) -> Line<'a> {
     let mut line = Line::default();
     for (index, (key, hint)) in hints.iter().enumerate() {
         if index > 0 {
@@ -174,8 +180,34 @@ pub fn render_footer(f: &mut Frame, rect: Rect, hints: &[(&str, &str)]) {
         line.push_span(Span::styled(*key, theme::action()));
         line.push_span(Span::styled(format!(": {hint}"), theme::chrome()));
     }
+    line
+}
 
-    f.render_widget(Paragraph::new(line), rect);
+pub fn render_footer(f: &mut Frame, rect: Rect, hints: &[(&str, &str)]) {
+    if rect.is_empty() {
+        return;
+    }
+
+    f.render_widget(Paragraph::new(hints_line(hints)), rect);
+}
+
+/// How many columns `hints` needs to render in full.
+///
+/// Lives next to `render_footer` because the two are one decision: a hint list
+/// that does not fit is a hint list that loses its tail. The panel sizes itself
+/// with this rather than with a width someone picked, which is how its legend
+/// ended up losing `esc: cancel` — the one key a dialog you cannot get out of
+/// needs you to see.
+pub fn hints_width(hints: &[(&str, &str)]) -> u16 {
+    // `chars().count()`, never `len()`. A key like `↑/↓` is three columns and
+    // seven bytes, so the byte count would inflate every panel that has to fit
+    // its legend — the picker came out six columns wider than it needed to be.
+    let used: u16 = hints
+        .iter()
+        .map(|(key, hint)| (key.chars().count() + hint.chars().count() + 2) as u16)
+        .sum();
+    let gaps = GAP.len() as u16 * hints.len().saturating_sub(1) as u16;
+    used.saturating_add(gaps)
 }
 
 /// Draws a thin horizontal rule across `rect.width`.
@@ -244,6 +276,66 @@ mod tests {
         (0..buffer.area.width)
             .map(|x| buffer[(x, y)].symbol().to_string())
             .collect()
+    }
+
+    /// The measured width, against spelled-out arithmetic rather than against the
+    /// line this module renders — comparing the two would only prove they agree
+    /// with each other, which is what a wrong `hints_line` and a wrong
+    /// `hints_width` would look like together.
+    ///
+    /// "a: b" is four columns; two hints carry one two-column `GAP` between them.
+    #[test]
+    fn hints_width_counts_the_gap_between_pairs() {
+        assert_eq!(hints_width(&[]), 0, "no pairs, no columns");
+        assert_eq!(hints_width(&[("a", "b")]), 4, "`a: b` is four columns");
+        assert_eq!(
+            hints_width(&[("a", "b"), ("c", "d")]),
+            10,
+            "two pairs and the gap between them"
+        );
+        assert_eq!(
+            hints_width(&[("abc", "de"), ("f", "ghij")]),
+            7 + 7 + 2,
+            "each pair is its key, a colon and its text; one gap between them"
+        );
+    }
+
+    /// The measured width must be the width the line actually needs, checked by
+    /// drawing it: the pair drawn into exactly `hints_width` columns loses its
+    /// last character, and into one more loses nothing.
+    ///
+    /// The hint list is `↑/↓: move · space: toggle · …` — the shipped one — because
+    /// the arrows are three columns and seven bytes, and a `len()` counts bytes.
+    #[test]
+    fn hints_width_is_the_column_the_last_hint_ends_on() {
+        let hints = [
+            ("↑/↓", "move"),
+            ("space", "toggle"),
+            ("type", "filter"),
+            ("enter", "save"),
+            ("esc", "cancel"),
+        ];
+
+        for width in 0..=hints_width(&hints) + 2 {
+            let mut terminal = Terminal::new(TestBackend::new(width.max(1), 1)).unwrap();
+            terminal
+                .draw(|f| f.render_widget(Paragraph::new(hints_line(&hints)), f.area()))
+                .unwrap();
+            let drawn = row_text(terminal.backend().buffer(), 0);
+
+            if width < hints_width(&hints) {
+                assert!(
+                    !drawn.ends_with("cancel"),
+                    "at {width} columns the tail must not fit whole: {drawn:?}"
+                );
+            } else {
+                assert_eq!(
+                    drawn.trim_end().chars().count(),
+                    hints_width(&hints) as usize,
+                    "at {width} columns the whole line is present: {drawn:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

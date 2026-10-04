@@ -7,6 +7,7 @@ use crate::tui::views::dashboard::render_dashboard;
 use crate::tui::views::modals::render_confirm_delete;
 use crate::tui::views::modals::render_skill_picker;
 use crate::tui::views::projects::ListBounds;
+use crate::tui::views::skill_picker::{picker_action, PickerAction};
 use crate::tui::views::skill_picker::{InstalledSkill, SkillPicker};
 
 /// The skills field in the agent form, by its index in the form's field table.
@@ -859,9 +860,10 @@ impl TuiApp {
             // the right, which takes `Esc: cancel` first.
             KeyTarget::SkillPicker => vec![
                 ("↑/↓", "move"),
-                ("Space", "toggle"),
-                ("Enter", "confirm"),
-                ("Esc", "cancel"),
+                ("space", "toggle"),
+                ("type", "filter"),
+                ("enter", "save"),
+                ("esc", "cancel"),
             ],
             // Unreachable through `key_target`, which resolves the form to
             // `AgentForm(field)` above. Kept honest rather than merged into one of
@@ -1126,12 +1128,21 @@ impl TuiApp {
                     }
                 }
                 if let Some(picker) = &self.skill_picker {
-                    render_skill_picker(f, c.body, picker);
+                    render_skill_picker(f, c.body, picker, &hints);
                 }
                 if let Some((ref confirm_type, ref confirm_id)) = self.confirm_delete {
                     render_confirm_delete(f, c.body, confirm_type, confirm_id);
                 }
-                chrome::render_footer(f, c.footer, &hints);
+                // Silent while the picker is up: the panel already draws these
+                // same hints, through the same renderer, next to the list they
+                // apply to. Saying them twice in one screen is how a footer stops
+                // being read.
+                let hints: &[(&str, &str)] = if self.skill_picker.is_some() {
+                    &[]
+                } else {
+                    &hints
+                };
+                chrome::render_footer(f, c.footer, hints);
             })?;
 
             if event::poll(std::time::Duration::from_millis(50))? {
@@ -1197,40 +1208,21 @@ impl TuiApp {
                         }
                         // Skill picker interception
                         if self.skill_picker.is_some() {
-                            let mut handled = true;
-                            match key.code {
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    if let Some(picker) = self.skill_picker.as_mut() {
-                                        picker.move_cursor(1);
-                                    }
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    if let Some(picker) = self.skill_picker.as_mut() {
-                                        picker.move_cursor(-1);
-                                    }
-                                }
-                                KeyCode::Char(' ') => {
-                                    if let Some(picker) = self.skill_picker.as_mut() {
-                                        picker.toggle_current();
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    // Confirm writes the ids back as the comma
-                                    // separated string the save path already
-                                    // parses, so the form's own plumbing is
-                                    // untouched by this.
-                                    if let Some(picker) = self.skill_picker.take() {
-                                        self.form_skills = picker.chosen_ids().join(", ");
-                                    }
-                                }
-                                KeyCode::Esc => {
+                            let Some(picker) = self.skill_picker.as_mut() else {
+                                unreachable!("guarded on is_some above");
+                            };
+                            // The key map lives in `picker_action` so it can be
+                            // tested: this arm used to spell the rules out inline,
+                            // where no test could reach them — and where, written
+                            // below the form's own guard, none of them ran.
+                            match picker_action(picker, key.code) {
+                                PickerAction::Applied => {}
+                                PickerAction::Save(ids) => {
                                     self.skill_picker = None;
+                                    self.form_skills = ids.join(", ");
                                 }
-                                _ => {
-                                    handled = false;
-                                }
+                                PickerAction::Cancel => self.skill_picker = None,
                             }
-                            let _ = handled;
                             continue;
                         }
                         if self.current_view == CurrentView::AgentForm {
@@ -2282,7 +2274,12 @@ mod tests {
         );
 
         let row = footer_row(KeyTarget::SkillPicker);
-        for expected in ["Space: toggle", "Enter: confirm", "Esc: cancel"] {
+        for expected in [
+            "space: toggle",
+            "type: filter",
+            "enter: save",
+            "esc: cancel",
+        ] {
             assert!(
                 row.contains(expected),
                 "{expected:?} must be on the row: {row:?}"
