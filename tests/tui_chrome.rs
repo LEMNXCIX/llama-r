@@ -95,6 +95,45 @@ const MODAL_MODULE: &str = "modals";
 /// The dispatch that owns the chrome and `hints_for`.
 const APP: &str = include_str!("../src/tui/app.rs");
 
+/// Where a guard starts in the event loop, or `None` if it is not there.
+///
+/// The guards in `TuiApp::run` end in `continue`, so the first one that matches
+/// swallows the keystroke: order is the entire correctness argument, and the
+/// compiler cannot check it. The skill picker shipped inert because it was
+/// written *after* the agent form's guard — and it only opens from inside that
+/// form, so the form's guard always ran first and every key was consumed before
+/// the picker saw it.
+#[test]
+fn a_dialog_is_intercepted_before_the_view_it_sits_over() {
+    // Only the guards inside `run` matter: the same field names appear in
+    // `screen_state`, which builds the footer's target and consumes no keys.
+    let loop_body = APP
+        .split("pub async fn run(")
+        .nth(1)
+        .expect("src/tui/app.rs no longer has TuiApp::run");
+    let at = |needle: &str| {
+        loop_body
+            .find(needle)
+            .unwrap_or_else(|| panic!("TuiApp::run no longer contains {needle:?}"))
+    };
+
+    let picker = at("if self.skill_picker.is_some() {");
+    let form = at("if self.current_view == CurrentView::AgentForm {");
+    assert!(
+        picker < form,
+        "the picker opens from the skills field, so the form's guard is live \
+         whenever the picker is up; its own guard must come first or every key \
+         is consumed before it sees one"
+    );
+
+    let confirm = at("if self.confirm_delete.is_some() {");
+    assert!(
+        confirm < form,
+        "same reasoning: the confirmation can be open over the form's siblings, \
+         and a dialog's guard must precede any view guard it can shadow"
+    );
+}
+
 /// The module that draws the bar.
 const CHROME: &str = include_str!("../src/tui/chrome.rs");
 

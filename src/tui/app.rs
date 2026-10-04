@@ -1140,6 +1140,99 @@ impl TuiApp {
                         if key.kind != event::KeyEventKind::Press {
                             continue;
                         }
+                        // Delete confirmation interception
+                        if self.confirm_delete.is_some() {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Enter => {
+                                    let action = self.confirm_delete.take();
+                                    if let Some((ref confirm_type, ref confirm_id)) = action {
+                                        match confirm_type.as_str() {
+                                            "project" => {
+                                                let _ = self
+                                                    .state
+                                                    .context_store
+                                                    .delete_context(confirm_id);
+                                                self.project_index = 0;
+                                            }
+                                            "agent" => {
+                                                let agents =
+                                                    self.state.agent_registry.list_agents();
+                                                if let Some(agent) =
+                                                    agents.iter().find(|a| a.id == *confirm_id)
+                                                {
+                                                    let path = if let Some(ref pid) =
+                                                        agent.project_id
+                                                    {
+                                                        crate::core::paths::get_project_agents_dir(
+                                                            pid,
+                                                        )
+                                                        .join(format!("{}.toml", agent.id))
+                                                    } else {
+                                                        crate::core::paths::get_agents_dir()
+                                                            .join(format!("{}.toml", agent.id))
+                                                    };
+                                                    let _ = std::fs::remove_file(path);
+                                                    let _ =
+                                                        self.state.agent_registry.reload_all(&[]);
+                                                }
+                                                self.agent_index = 0;
+                                                // Not just the index: the focus has
+                                                // to leave a list that may now be
+                                                // empty, or the footer keeps
+                                                // naming the agent keys over rows
+                                                // that are gone.
+                                                self.active_in_project_list =
+                                                    focus_after_agent_delete();
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('n') | KeyCode::Esc => {
+                                    self.confirm_delete = None;
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // Skill picker interception
+                        if self.skill_picker.is_some() {
+                            let mut handled = true;
+                            match key.code {
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    if let Some(picker) = self.skill_picker.as_mut() {
+                                        picker.move_cursor(1);
+                                    }
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    if let Some(picker) = self.skill_picker.as_mut() {
+                                        picker.move_cursor(-1);
+                                    }
+                                }
+                                KeyCode::Char(' ') => {
+                                    if let Some(picker) = self.skill_picker.as_mut() {
+                                        picker.toggle_current();
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    // Confirm writes the ids back as the comma
+                                    // separated string the save path already
+                                    // parses, so the form's own plumbing is
+                                    // untouched by this.
+                                    if let Some(picker) = self.skill_picker.take() {
+                                        self.form_skills = picker.chosen_ids().join(", ");
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    self.skill_picker = None;
+                                }
+                                _ => {
+                                    handled = false;
+                                }
+                            }
+                            let _ = handled;
+                            continue;
+                        }
                         if self.current_view == CurrentView::AgentForm {
                             match key.code {
                                 KeyCode::Esc => self.current_view = CurrentView::Projects,
@@ -1299,97 +1392,6 @@ impl TuiApp {
                         }
 
                         // Confirm delete interception
-                        if self.skill_picker.is_some() {
-                            let mut handled = true;
-                            match key.code {
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    if let Some(picker) = self.skill_picker.as_mut() {
-                                        picker.move_cursor(1);
-                                    }
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    if let Some(picker) = self.skill_picker.as_mut() {
-                                        picker.move_cursor(-1);
-                                    }
-                                }
-                                KeyCode::Char(' ') => {
-                                    if let Some(picker) = self.skill_picker.as_mut() {
-                                        picker.toggle_current();
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    // Confirm writes the ids back as the comma
-                                    // separated string the save path already
-                                    // parses, so the form's own plumbing is
-                                    // untouched by this.
-                                    if let Some(picker) = self.skill_picker.take() {
-                                        self.form_skills = picker.chosen_ids().join(", ");
-                                    }
-                                }
-                                KeyCode::Esc => {
-                                    self.skill_picker = None;
-                                }
-                                _ => {
-                                    handled = false;
-                                }
-                            }
-                            let _ = handled;
-                            continue;
-                        }
-                        if self.confirm_delete.is_some() {
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Enter => {
-                                    let action = self.confirm_delete.take();
-                                    if let Some((ref confirm_type, ref confirm_id)) = action {
-                                        match confirm_type.as_str() {
-                                            "project" => {
-                                                let _ = self
-                                                    .state
-                                                    .context_store
-                                                    .delete_context(confirm_id);
-                                                self.project_index = 0;
-                                            }
-                                            "agent" => {
-                                                let agents =
-                                                    self.state.agent_registry.list_agents();
-                                                if let Some(agent) =
-                                                    agents.iter().find(|a| a.id == *confirm_id)
-                                                {
-                                                    let path = if let Some(ref pid) =
-                                                        agent.project_id
-                                                    {
-                                                        crate::core::paths::get_project_agents_dir(
-                                                            pid,
-                                                        )
-                                                        .join(format!("{}.toml", agent.id))
-                                                    } else {
-                                                        crate::core::paths::get_agents_dir()
-                                                            .join(format!("{}.toml", agent.id))
-                                                    };
-                                                    let _ = std::fs::remove_file(path);
-                                                    let _ =
-                                                        self.state.agent_registry.reload_all(&[]);
-                                                }
-                                                self.agent_index = 0;
-                                                // Not just the index: the focus has
-                                                // to leave a list that may now be
-                                                // empty, or the footer keeps
-                                                // naming the agent keys over rows
-                                                // that are gone.
-                                                self.active_in_project_list =
-                                                    focus_after_agent_delete();
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('n') | KeyCode::Esc => {
-                                    self.confirm_delete = None;
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
 
                         // Chat view handling
                         if self.current_view == CurrentView::Chat {
