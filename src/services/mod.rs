@@ -3,6 +3,7 @@ pub mod agent_registry;
 pub mod agent_runtime;
 pub mod agent_skill_sync;
 pub mod rag_ingest;
+pub mod router_config;
 pub mod scope_builder;
 pub mod skill_generation;
 pub mod skill_index;
