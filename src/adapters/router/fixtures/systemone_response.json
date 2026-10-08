@@ -1,0 +1,22 @@
+{
+  "model": "d1",
+  "answers": {
+    "agent": {
+      "type": "choice",
+      "choice": "fudi::ops",
+      "confidence": 0.82,
+      "probabilities": {
+        "fudi::ops": 0.87,
+        "fudi::fudi": 0.13
+      }
+    },
+    "specialized": {
+      "type": "noul",
+      "noul": 0.96
+    }
+  },
+  "usage": {
+    "input_tokens": 74,
+    "output_tokens": 0
+  }
+}
