@@ -8,3 +8,4 @@ pub mod engine;
 pub mod history;
 pub mod mcp;
 pub mod rag;
+pub mod router;
