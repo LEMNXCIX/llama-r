@@ -1,5 +1,6 @@
 /target
 /target-tests
+.worktrees
 /agents
 /contextos
 /logs
