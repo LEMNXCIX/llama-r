@@ -519,10 +519,12 @@ async fn a_winner_absent_from_the_probabilities_is_said_rather_than_shown() {
     assert!((raw_winner - 0.95).abs() < 1e-6);
 }
 
-/// Step 4: the non-streaming chat response carries the decision the router
-/// made. Deliberately not gated on `X-Debug` (the brief says
-/// `response.debug_route = resolved.routed`), unlike `debug_prompt`, which
-/// stays `None` for this request.
+/// Step 4: with `X-Debug: true`, the non-streaming chat response carries
+/// the decision the router made — gated exactly like `debug_prompt`, which
+/// rides on this same request. (Round 1 shipped this field ungated per the
+/// brief's literal wording; the controller ruled it an information
+/// disclosure — every caller would receive the roster and distribution —
+/// and it now answers to the same header as every other debug field.)
 #[tokio::test]
 async fn debug_route_rides_on_the_non_streaming_chat_response() {
     let _env = PreviewEnv::new();
@@ -545,24 +547,75 @@ async fn debug_route_rides_on_the_non_streaming_chat_response() {
             project_id: Some("fudi"),
             agent_id: None,
             conversation_id: None,
-            debug: false,
+            debug: true,
         },
     )
     .await
     .unwrap();
 
     assert!(
-        response.debug_prompt.is_none(),
-        "no X-Debug: no debug_prompt"
+        response.debug_prompt.is_some(),
+        "X-Debug: true also adds debug_prompt, the pre-existing field"
     );
     let routed = response
         .debug_route
-        .expect("a routed non-streaming chat carries its decision");
+        .expect("X-Debug: true adds the routing decision too");
     assert_eq!(routed.outcome, "agent");
     assert_eq!(routed.project_id, "fudi");
     assert_eq!(routed.winner.as_deref(), Some("fudi::ops"));
     assert!(routed.probabilities_note.is_none());
     assert!(routed.probabilities.contains_key("fudi::ops"));
+}
+
+/// The gate, pinned in both directions on one state: `X-Debug: true` adds
+/// the decision with its routing detail; without it the field is absent —
+/// not an empty `RoutedDebug` that would still name the project and the
+/// offered candidates, and not even a `null` key in the serialized response
+/// (`skip_serializing_if` keeps the disclosure out of the bytes too).
+#[tokio::test]
+async fn the_debug_header_decides_whether_debug_route_rides() {
+    let _env = PreviewEnv::new();
+    let (_dir, state) = state_with(
+        Arc::new(EchoProvider),
+        true,
+        Some(FakeRouter::returning(choice_for("fudi::ops"))),
+    );
+
+    let chat = || ChatRequest {
+        model: "fallback-model".to_string(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: "cancela el pedido 42".to_string(),
+        }],
+        stream: false,
+    };
+    let selection = |debug: bool| AgentSelection {
+        project_id: Some("fudi"),
+        agent_id: None,
+        conversation_id: None,
+        debug,
+    };
+
+    let with_debug = execute_chat(&state, chat(), selection(true)).await.unwrap();
+    let routed = with_debug
+        .debug_route
+        .expect("X-Debug: true must add the routing decision");
+    assert_eq!(routed.outcome, "agent");
+    assert_eq!(routed.winner.as_deref(), Some("fudi::ops"));
+
+    let without_debug = execute_chat(&state, chat(), selection(false))
+        .await
+        .unwrap();
+    assert!(
+        without_debug.debug_route.is_none(),
+        "no X-Debug: the decision must not ride at all"
+    );
+    assert!(without_debug.debug_prompt.is_none());
+    let json = serde_json::to_value(&without_debug).unwrap();
+    assert!(
+        json.get("debug_route").is_none(),
+        "the field must be absent from the response bytes, not serialized as null"
+    );
 }
 
 /// The same inconsistency check on the chat surface: `debug_route` withholds
@@ -590,7 +643,7 @@ async fn debug_route_withholds_a_distribution_that_does_not_account_for_its_winn
             project_id: Some("fudi"),
             agent_id: None,
             conversation_id: None,
-            debug: false,
+            debug: true,
         },
     )
     .await

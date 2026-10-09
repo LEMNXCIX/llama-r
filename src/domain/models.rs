@@ -26,7 +26,9 @@ pub struct ChatResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_prompt: Option<String>,
     /// The routing decision that led to this response, when the router was
-    /// consulted — the non-streaming surface only; `ChatStreamEvent` and the
+    /// consulted **and the request carried `X-Debug: true`** — the same gate
+    /// as `debug_prompt`; without it the field is absent from the response
+    /// entirely. The non-streaming surface only; `ChatStreamEvent` and the
     /// gRPC `ChatResponse` deliberately do not carry it.
     ///
     /// `skip_deserializing`: no in-repo code deserializes a `ChatResponse`,

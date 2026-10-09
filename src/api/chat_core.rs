@@ -82,6 +82,11 @@ impl ResolvedSelection {
 /// The routing decision, for the debug surface: what was offered, what the
 /// model answered, and what dispatch did about it.
 ///
+/// It reaches a client only when `X-Debug: true` asked for it — the same
+/// gate that adds `debug_prompt`, and the reason the field can carry the
+/// project's full roster and distribution without disclosing them to every
+/// caller.
+///
 /// `outcome` is `"agent"` (a specialist won and was verified to exist) or
 /// `"general"` (the request stayed with the project's general agent).
 /// `reason` is one of
@@ -792,6 +797,15 @@ pub async fn execute_chat(
     } else {
         None
     };
+    // The routing decision is debug output too, gated exactly like
+    // `debug_prompt` and built beside it: without `X-Debug: true` the field
+    // is `None`, so an ordinary caller never receives the project's agent
+    // roster and the distribution over it.
+    let debug_route = if selection.debug {
+        resolved.routed
+    } else {
+        None
+    };
 
     // Use agent engine when headers or model resolve an agent and runtime is available.
     if let Some((project_id, agent_id)) = engine_ids {
@@ -811,10 +825,7 @@ pub async fn execute_chat(
                         },
                         done: true,
                         debug_prompt,
-                        // The brief's literal line: the decision rides on the
-                        // response whether or not `X-Debug` was asked for —
-                        // `debug_prompt` stays header-gated, this does not.
-                        debug_route: resolved.routed,
+                        debug_route,
                     };
                     state
                         .observability
@@ -836,10 +847,10 @@ pub async fn execute_chat(
     let started_at = Instant::now();
     let mut response = run_with_fallback(state, prepared, &requested_model).await?;
     response.debug_prompt = debug_prompt;
-    // Same as the engine path above: the router's decision rides on the
-    // non-streaming response, unconditionally. The streaming path has no
-    // field to carry it and gRPC drops it deliberately.
-    response.debug_route = resolved.routed;
+    // The decision rides here too — `None` unless `X-Debug: true` asked for
+    // it, same as the engine path above. The streaming path has no field to
+    // carry it and gRPC drops it deliberately.
+    response.debug_route = debug_route;
 
     state
         .observability
