@@ -256,8 +256,15 @@ versus "pedidos").
 Sections with no content are omitted.
 
 When an agent has no usable description — `description` defaults to empty, and nothing
-writes it — the agent's **id is used as its criteria text** and a warning is logged at
+writes it — the agent's **id stands in for them as the header** and the `Skills:` /
+`Tools:` / `Sources:` sections still follow, and a warning is logged at
 candidate-build time naming each such agent.
+
+The id replaces only the missing `name` and `description`, not the sections.
+Discarding the sections too would hand the model `"fudi::ops"` and nothing else —
+no capability signal at all, for precisely the agents that are already the weakest
+— while a sibling agent missing only its `description` keeps them. Consistency
+with that sibling arm is the rule: the header degrades, the signal survives.
 
 The alternative (dropping the candidate) was rejected because it turns a request that
 succeeds today into a `400`: a project whose agents all lack `description` would have
