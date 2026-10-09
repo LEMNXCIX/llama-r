@@ -18,8 +18,9 @@
 //! feature is not a server fault.
 
 use crate::api::chat_core::{
-    agent_not_found, build_state_text, peeked_answer, recheck_winner, PeekedAnswer, WinnerRecheck,
-    ROUTE_STATE_BUDGET_CHARS, STALE_WINNER,
+    agent_not_found, build_state_text, peeked_answer, recheck_winner,
+    skip_decision_without_a_fallback, PeekedAnswer, WinnerRecheck, ROUTE_STATE_BUDGET_CHARS,
+    STALE_WINNER,
 };
 use crate::api::handlers::AppState;
 use crate::domain::models::ChatMessage;
@@ -204,27 +205,43 @@ pub async fn route_preview(
         role: "user".to_string(),
         content: body.prompt.clone(),
     }];
-    let request = DecisionRequest {
-        state: build_state_text(&messages, ROUTE_STATE_BUDGET_CHARS),
-        questions: build_questions(&candidates),
-    };
 
-    let started_at = Instant::now();
-    let result = router.decide(request).await;
-    let router_latency_ms = started_at.elapsed().as_millis() as u64;
+    // The same guard dispatch runs, shared so the two surfaces cannot
+    // disagree: without a general agent to degrade to, rung 2 of `route`
+    // rejects the response unread, so the preview skips the call it would
+    // only throw away. A chat pays nothing here either — a preview that
+    // charged for a decision the chat refuses to make would be showing an
+    // economy that does not exist.
+    let skipped = skip_decision_without_a_fallback(&candidates);
+    let decided = skipped.is_none();
 
-    // Every consultation records, whatever comes back — latency always,
-    // health after the answer (or its absence), an error count only when the
-    // call itself failed. Deliberately *not* `record_route_to_agent`/`..._to_
-    // general`: those count dispatches, and a preview dispatches nothing.
-    state.observability.record_router_latency(router_latency_ms);
-    match &result {
-        Ok(_) => state.record_router_health(true),
-        Err(_) => {
-            state.observability.record_router_error();
-            state.record_router_health(false);
+    let (result, router_latency_ms) = match skipped {
+        Some(error) => (Err(error), 0),
+        None => {
+            let request = DecisionRequest {
+                state: build_state_text(&messages, ROUTE_STATE_BUDGET_CHARS),
+                questions: build_questions(&candidates),
+            };
+
+            let started_at = Instant::now();
+            let result = router.decide(request).await;
+            let router_latency_ms = started_at.elapsed().as_millis() as u64;
+
+            // Every consultation records, whatever comes back — latency always,
+            // health after the answer (or its absence), an error count only when the
+            // call itself failed. Deliberately *not* `record_route_to_agent`/`..._to_
+            // general`: those count dispatches, and a preview dispatches nothing.
+            state.observability.record_router_latency(router_latency_ms);
+            match &result {
+                Ok(_) => state.record_router_health(true),
+                Err(_) => {
+                    state.observability.record_router_error();
+                    state.record_router_health(false);
+                }
+            }
+            (result, router_latency_ms)
         }
-    }
+    };
 
     // The raw answer, before `route` consumes the response. A router that
     // did not answer has no raw answer: `null`, not an empty object that
@@ -238,15 +255,20 @@ pub async fn route_preview(
         Err(_) => PeekedAnswer::default(),
     };
 
-    tracing::info!(
-        project = %body.project_id,
-        chosen_key = ?peeked.winner,
-        confidence = ?peeked.confidence,
-        specialised = ?peeked.specialised,
-        candidates = candidates.len(),
-        router_latency_ms,
-        "route preview decision"
-    );
+    // The preview's decision log, keyed off an actually-spent decision: a
+    // call the guard skipped narrates nothing, and `router_latency_ms` is
+    // the `0` of a call never made rather than the measurement of one.
+    if decided {
+        tracing::info!(
+            project = %body.project_id,
+            chosen_key = ?peeked.winner,
+            confidence = ?peeked.confidence,
+            specialised = ?peeked.specialised,
+            candidates = candidates.len(),
+            router_latency_ms,
+            "route preview decision"
+        );
+    }
 
     let decision = route(
         &body.project_id,
@@ -265,7 +287,9 @@ pub async fn route_preview(
         // The ladder's only other hard stop, and the preview reports it the
         // way the chat itself would — same words, same status — because a
         // preview that promised a decision a chat would refuse to make would
-        // be lying about the thing it exists to show.
+        // be lying about the thing it exists to show. The guard's stand-in
+        // arrives here when the candidate set never held a general agent;
+        // a real response only gets past rung 2 when one does.
         NoRoute::NoGeneralAgent => agent_not_found(&body.project_id, &body.project_id),
     })?;
 

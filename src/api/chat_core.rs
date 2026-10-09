@@ -177,6 +177,31 @@ pub fn build_state_text(messages: &[ChatMessage], budget_chars: usize) -> String
     kept.join("\n")
 }
 
+/// The guard both decision callers run before spending a decision — `None`
+/// when a decision is worth spending, the stand-in to answer with when it
+/// is not.
+///
+/// Every rung below rung 2 of the ladder degrades to the project's general
+/// agent, and rung 2 checks that one exists *before* it reads the response:
+/// for a candidate set without one the answer is already known, so deciding
+/// first would buy a forward pass nobody reads. The error returned here
+/// stands in for the skipped call — callers still hand it to `route`, whose
+/// `NoGeneralAgent` arm turns it into the same `400` it has always
+/// produced, so only the wasted call changes and the message still comes
+/// from the ladder rather than from a second copy of its words.
+pub(crate) fn skip_decision_without_a_fallback(candidates: &[RouteCandidate]) -> Option<AppError> {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.is_project_general)
+    {
+        None
+    } else {
+        Some(AppError::Unavailable(
+            "decision skipped: the project has no general agent to degrade to".into(),
+        ))
+    }
+}
+
 /// Resolve the selection dispatch runs with: the header when there is one,
 /// the routing decision when there is not.
 ///
@@ -209,8 +234,11 @@ pub async fn resolve_selection(
 /// 5. no candidates for this project: the ladder would answer
 ///    `NoCandidates`, a 400 — *not routing* must not be one.
 ///
-/// Past the gates exactly one decision is spent, and [`route`] decides from
-/// it. A specialist is re-resolved through `registry` before it is
+/// Past the gates, one decision is spent — unless
+/// [`skip_decision_without_a_fallback`] has already seen that the candidate
+/// set holds no general agent to degrade to, in which case [`route`] is
+/// still asked and answers with today's `400` without the router being
+/// called. A specialist is re-resolved through `registry` before it is
 /// returned: hot reload can remove it between the decision and the use, and
 /// an id that was never verified to exist must never reach dispatch.
 pub async fn resolve_selection_with(
@@ -246,25 +274,40 @@ pub async fn resolve_selection_with(
         return Ok(ResolvedSelection::from_selection(&selection));
     }
 
-    let request = DecisionRequest {
-        state: build_state_text(messages, ROUTE_STATE_BUDGET_CHARS),
-        questions: build_questions(&candidates),
-    };
-    let started_at = Instant::now();
-    let result = router.decide(request).await;
-    let latency_ms = started_at.elapsed().as_millis() as u64;
+    // The guard, in front of the decision: rung 2 of [`route`] checks for
+    // the general agent *before* it reads the response, so for a set
+    // without one the answer is already known — a decision here would be
+    // bought only to be thrown away. The stand-in is what `route` receives
+    // in place of a response, and its `NoGeneralAgent` arm turns it into
+    // the same 400 as ever.
+    let skipped = skip_decision_without_a_fallback(&candidates);
+    let decided = skipped.is_none();
 
-    // Every consultation records, whatever comes back: latency always,
-    // health after the answer (or its absence), an error count only when
-    // the call itself failed — "d1 said no" is not a router error.
-    state.observability.record_router_latency(latency_ms);
-    match &result {
-        Ok(_) => state.record_router_health(true),
-        Err(_) => {
-            state.observability.record_router_error();
-            state.record_router_health(false);
+    let (result, latency_ms) = match skipped {
+        Some(error) => (Err(error), 0),
+        None => {
+            let request = DecisionRequest {
+                state: build_state_text(messages, ROUTE_STATE_BUDGET_CHARS),
+                questions: build_questions(&candidates),
+            };
+            let started_at = Instant::now();
+            let result = router.decide(request).await;
+            let latency_ms = started_at.elapsed().as_millis() as u64;
+
+            // Every consultation records, whatever comes back: latency always,
+            // health after the answer (or its absence), an error count only when
+            // the call itself failed — "d1 said no" is not a router error.
+            state.observability.record_router_latency(latency_ms);
+            match &result {
+                Ok(_) => state.record_router_health(true),
+                Err(_) => {
+                    state.observability.record_router_error();
+                    state.record_router_health(false);
+                }
+            }
+            (result, latency_ms)
         }
-    }
+    };
 
     // The model's own answer, read before `route` consumes the response.
     // Each score is `None` when the response carried no usable value — never
@@ -289,16 +332,19 @@ pub async fn resolve_selection_with(
 
     // One decision log per consultation, before any rung's own warning can
     // narrate over it: the project, the model's chosen key, both scores,
-    // how wide the choice was, and what the decision cost.
-    tracing::info!(
-        project = %project_id,
-        chosen_key = ?peeked.winner,
-        confidence = ?peeked.confidence,
-        specialised = ?peeked.specialised,
-        candidates = candidate_keys.len(),
-        latency_ms,
-        "routing decision"
-    );
+    // how wide the choice was, and what the decision cost. A consultation
+    // the guard skipped logs nothing — there was no decision to narrate.
+    if decided {
+        tracing::info!(
+            project = %project_id,
+            chosen_key = ?peeked.winner,
+            confidence = ?peeked.confidence,
+            specialised = ?peeked.specialised,
+            candidates = candidate_keys.len(),
+            latency_ms,
+            "routing decision"
+        );
+    }
 
     match route(
         project_id,
@@ -378,7 +424,10 @@ pub async fn resolve_selection_with(
             // Today's 400, verbatim: a project with specialists but no
             // general agent has nothing to degrade to, and before routing
             // existed the same request failed the same way in
-            // `prepare_request`.
+            // `prepare_request`. The guard arrives here with its stand-in
+            // when the set never held a general agent — a response is only
+            // ever judged past rung 2 when one does — so the message keeps
+            // coming from this one place.
             Err(agent_not_found(project_id, project_id))
         }
     }

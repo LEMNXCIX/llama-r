@@ -361,6 +361,18 @@ fn state_with(
     router_enabled: bool,
     fake: Option<FakeRouter>,
 ) -> (TempDir, Arc<AppState>) {
+    state_with_agents(provider, router_enabled, fake, true)
+}
+
+/// [`state_with`] with `general: false` dropping `fudi.toml` — a
+/// specialists-only project, where the ladder has nothing to degrade to and
+/// a decision spent before rung 2 is a decision thrown away.
+fn state_with_agents(
+    provider: Arc<dyn LLMProvider + Send + Sync>,
+    router_enabled: bool,
+    fake: Option<FakeRouter>,
+    general: bool,
+) -> (TempDir, Arc<AppState>) {
     if router_enabled {
         std::env::set_var("ROUTER_ENABLED", "true");
     }
@@ -374,7 +386,9 @@ fn state_with(
         .join("fudi")
         .join("agents");
     std::fs::create_dir_all(&agents_dir).unwrap();
-    std::fs::write(agents_dir.join("fudi.toml"), GENERAL).unwrap();
+    if general {
+        std::fs::write(agents_dir.join("fudi.toml"), GENERAL).unwrap();
+    }
     std::fs::write(agents_dir.join("ops.toml"), OPS).unwrap();
 
     let registry = Arc::new(AgentRegistry::new());
@@ -506,6 +520,36 @@ async fn preview_returns_the_candidates_it_would_have_offered() {
     // The raw answer travels untouched beside the derived decision.
     assert_eq!(body.raw["answers"]["agent"]["key"], "fudi::ops");
     assert!(fake.was_called(), "the preview must consult the router");
+}
+
+/// Round 1: the preview shows what a chat *would* do, and a chat with no
+/// general agent to degrade to is refused by the ladder at rung 2 — before
+/// the response is read. Spending a decision to show a 400 would charge for
+/// the one fact the candidate list already held.
+#[tokio::test]
+async fn the_preview_refuses_a_specialists_only_project_without_spending_a_decision() {
+    let _env = PreviewEnv::new();
+    let fake = FakeRouter::returning(choice_for("fudi::ops"));
+    let (_dir, state) = state_with_agents(Arc::new(EchoProvider), true, Some(fake.clone()), false);
+
+    let err = call_preview(&state, &preview_json("fudi", "cancela el pedido 42"), true)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        err.status_code(),
+        StatusCode::BAD_REQUEST,
+        "the preview must report the refusal the chat would make"
+    );
+    assert!(
+        err.to_string()
+            .contains("Agent 'fudi' not found for project 'fudi'"),
+        "the 400 must be the same one as before, verbatim: {err}"
+    );
+    assert!(
+        !fake.was_called(),
+        "rung 2 rejects this answer unread — a decision would be spent and discarded"
+    );
 }
 
 /// Registration, end to end: the route exists on the `Router` and the gate

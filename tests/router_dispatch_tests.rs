@@ -10,6 +10,7 @@
 //! feature — is the end-to-end check that it did not widen it.
 
 use async_trait::async_trait;
+use axum::http::StatusCode;
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::api::chat_core::{
     build_state_text, resolve_selection, resolve_selection_with, AgentSelection,
@@ -216,6 +217,12 @@ fn user(content: &str) -> ChatMessage {
     }
 }
 
+/// [`state_with_agents`] with the general agent present — the fixture every
+/// pre-existing test here was written against.
+fn state_with_project_agent(project_id: &str) -> Arc<AppState> {
+    state_with_agents(project_id, true)
+}
+
 /// An `AppState` whose registry holds project `fudi`'s own agents —
 /// `contextos/projects/fudi/agents/fudi.toml` (the general agent — id equals
 /// project id) and `contextos/projects/fudi/agents/ops.toml` (a specialist) —
@@ -227,6 +234,11 @@ fn user(content: &str) -> ChatMessage {
 /// this file reaches that conversion, and a regression there would 400
 /// every request routed to a global agent.
 ///
+/// `general: false` drops the general agent's manifest, leaving a
+/// specialists-only project: the case where every ladder rung has nowhere
+/// to degrade to, and where a decision spent before rung 2 is a decision
+/// thrown away.
+///
 /// The router config comes from the ambient environment, which `DispatchEnv`
 /// has cleared: `router_config.enabled == false` and `state.router is None`
 /// unless the test switched `ROUTER_ENABLED` on before calling this. With
@@ -237,7 +249,7 @@ fn user(content: &str) -> ChatMessage {
 /// The manifests only have to outlive `reload_all`: the registry copies them
 /// into memory, and nothing on the resolution path reads them again, so the
 /// temp dir may go when this function returns.
-fn state_with_project_agent(project_id: &str) -> Arc<AppState> {
+fn state_with_agents(project_id: &str, general: bool) -> Arc<AppState> {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("LLAMA_R_DIR", dir.path());
 
@@ -248,14 +260,16 @@ fn state_with_project_agent(project_id: &str) -> Arc<AppState> {
         .join(project_id)
         .join("agents");
     std::fs::create_dir_all(&agents_dir).unwrap();
-    std::fs::write(
-        agents_dir.join(format!("{project_id}.toml")),
-        format!(
-            "name = \"{project_id}\"\nsystem_prompt = \"base\"\n\
-             description = \"Asistente general de {project_id}.\"\n"
-        ),
-    )
-    .unwrap();
+    if general {
+        std::fs::write(
+            agents_dir.join(format!("{project_id}.toml")),
+            format!(
+                "name = \"{project_id}\"\nsystem_prompt = \"base\"\n\
+                 description = \"Asistente general de {project_id}.\"\n"
+            ),
+        )
+        .unwrap();
+    }
     std::fs::write(
         agents_dir.join("ops.toml"),
         "name = \"Ops\"\nsystem_prompt = \"base\"\n\
@@ -398,6 +412,48 @@ async fn a_project_request_without_an_agent_reaches_the_router() {
     // say which one won; the project half of the pair can.
     assert_eq!(resolved.project_id.as_deref(), Some("fudi"));
     assert!(fake.was_called());
+}
+
+// Round 1: the ladder checks for the general agent at rung 2, *before* it
+// reads the response — a specialists-only project therefore has its answer
+// before the router is asked anything, and a decision spent here would be
+// bought only to be discarded. The 400 must arrive untouched either way;
+// what this pins is that it arrives *without* the call.
+#[tokio::test]
+async fn a_specialists_only_project_is_refused_without_spending_a_decision() {
+    let _env = DispatchEnv::new();
+    std::env::set_var("ROUTER_ENABLED", "true");
+    let state = state_with_agents("fudi", false);
+    let fake = FakeRouter::returning(choice_for("fudi::ops"));
+    *state.router.write().unwrap() = Some(Arc::new(fake.with_call_counter()));
+
+    let err = resolve_selection(
+        &state,
+        AgentSelection {
+            project_id: Some("fudi"),
+            agent_id: None,
+            conversation_id: None,
+            debug: false,
+        },
+        &[user("cancela el pedido 42")],
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        err.status_code(),
+        StatusCode::BAD_REQUEST,
+        "no general agent to degrade to has always been a 400"
+    );
+    assert!(
+        err.to_string()
+            .contains("Agent 'fudi' not found for project 'fudi'"),
+        "the 400 must be the same one as before, verbatim: {err}"
+    );
+    assert!(
+        !fake.was_called(),
+        "rung 2 rejects this answer unread — a decision would be spent and discarded"
+    );
 }
 
 // Review Focus: the global-winner dispatch path. `build_candidates` keeps
