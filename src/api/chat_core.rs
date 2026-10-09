@@ -293,7 +293,8 @@ pub async fn resolve_selection_with(
             // registry the caller passed. If it is gone — agents reloaded
             // mid-request — degrade to the project's general agent, the
             // ladder's own fallback, and say so. An id never verified to
-            // exist must never reach dispatch.
+            // exist must never reach dispatch — the general fallback taken
+            // below is the one deliberate exception, and it is named there.
             let present = if winner_project.is_empty() {
                 // An empty project id marks a global winner (pinned by
                 // `a_global_winner_carries_an_empty_project_id`): its
@@ -333,11 +334,20 @@ pub async fn resolve_selection_with(
                 );
                 state.observability.record_route_to_general();
                 let Some(general) = candidates.iter().find(|c| c.is_project_general) else {
-                    // `route` only returns `Agent` when a general candidate
-                    // exists to degrade to, so this cannot happen — and if
-                    // it ever did, the header path is the safe answer.
+                    // `route` only returns `Agent` when the pre-reload
+                    // candidate set holds a general candidate to degrade to,
+                    // so this cannot happen — and if it ever did, the header
+                    // path is the safe answer.
                     return Ok(ResolvedSelection::from_selection(&selection));
                 };
+                // The one deliberate exception to "an id never verified to
+                // exist must never reach dispatch": `general.agent_id` comes
+                // from the pre-reload candidate set and is *not* re-checked
+                // against `registry`. Re-checking it would have nowhere
+                // safer to land — the general agent is the fallback — so if
+                // the same reload removed it too, `prepare_request` finds
+                // nothing and reproduces today's 400 rather than dispatching
+                // to something worse than the report.
                 Ok(ResolvedSelection {
                     project_id: Some(project_id.to_string()),
                     agent_id: Some(general.agent_id.clone()),
