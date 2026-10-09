@@ -167,7 +167,7 @@ POST /v1/chat/completions
 
 If `X-Project` is sent without `X-Agent`, Llama-R loads the project general agent whose id matches the project id (e.g., `contextos/projects/my-project/agents/my-project.toml`).
 
-With routing enabled (`ROUTER_ENABLED=true`), two behaviours change against the two paragraphs above — and only then; with the router off (the default) both behave exactly as written:
+With routing enabled (`ROUTER_ENABLED=true`), one of the two behaviours above changes, and only then; with the router off (the default) both behave exactly as written:
 
 - `X-Project` without `X-Agent` no longer always resolves to the general agent: it is routed among that project's agents plus the global agents, keyed by the registry's scheme (`project::agent` for project agents, the bare id for globals). `X-Agent` still pins the target and never spends a decision.
 - A project with specialised agents but **no general agent still returns `400`** — it never routes. Every rung of the ladder degrades to the general agent, so `route` checks that one exists *before* it reads any answer, and the check runs before the decision is spent: such a request fails with the same `agent_not_found` `400` as always, without the decision model being consulted at all.
