@@ -10,13 +10,14 @@
 //! candidate against.
 //!
 //! Two decisions are worth knowing before editing. A blank description never
-//! removes a candidate: the agent id stands in for its text, with a warning,
-//! because dropping it would turn a request that resolves the general agent
-//! today into a `400` — an agent with a weak description routes badly, an
-//! agent that cannot be routed at all is worse, and silently. And the list is
-//! sorted by key, because an unstable order hands d1 two different prompts
-//! for the same request, which makes a confidence threshold impossible to
-//! interpret.
+//! removes a candidate: the agent id stands in for the missing name and
+//! description, the capability sections still follow it, and a warning is
+//! logged — because dropping the agent would turn a request that resolves
+//! the general agent today into a `400`: an agent with a weak description
+//! routes badly, an agent that cannot be routed at all is worse, and
+//! silently. And the list is sorted by key, because an unstable order hands
+//! d1 two different prompts for the same request, which makes a confidence
+//! threshold impossible to interpret.
 
 use crate::domain::agent::Agent;
 use crate::services::agent_registry::AgentRegistry;
@@ -120,9 +121,12 @@ pub fn build_candidates(
 /// of `Skills:`, `Tools:` and `Sources:` sections have content, joined by
 /// newlines.
 ///
-/// When both `name` and `description` are blank the agent id stands in for
-/// them: an empty `Choice` criterion is worse than a terse one, and an agent
-/// that cannot describe itself still has to be routable.
+/// When both `name` and `description` are blank the agent id takes their
+/// place as the **header**, and the sections still follow it — the id is the
+/// floor, never the whole text: an agent with no name, no description, no
+/// skills and no tools gets the bare id (an empty `Choice` criterion is
+/// worse than a terse one), while one with no words but real skills still
+/// shows them.
 pub fn derive_criteria_text(agent: &Agent) -> String {
     let config = &agent.config;
 
@@ -138,8 +142,12 @@ pub fn derive_criteria_text(agent: &Agent) -> String {
 
     let name = config.name.trim();
     let description = config.description.trim();
+    // With both blank the id takes the header's place instead of ending the
+    // function: the sections below still follow, because an agent that
+    // cannot name itself may still hold exactly the capability d1 needs to
+    // pick it — the id is the floor, never the whole text.
     let header = match (name.is_empty(), description.is_empty()) {
-        (true, true) => return agent.id.clone(),
+        (true, true) => agent.id.clone(),
         (false, true) => name.to_string(),
         (true, false) => description.to_string(),
         (false, false) => format!("{name} — {description}"),
@@ -341,11 +349,50 @@ mod tests {
     fn an_agent_with_no_description_falls_back_to_its_id_and_stays_a_candidate() {
         // The spec rejects excluding it: a project whose agents all lack a
         // description would otherwise 400 on requests that succeed today.
+        //
+        // Selected on the routing key, never on `agent_id`: the fixture also
+        // registers a *described* global `ops`, so a `find` on the id could
+        // match that one and stay green even after every description-less
+        // agent is dropped from the set.
         let _guard = crate::core::paths::lock_env_for_tests();
         let (_dir, registry) = fudi_registry();
         let candidates = build_candidates(&registry, "fudi", &[]);
-        let ops = candidates.iter().find(|c| c.agent_id == "ops").unwrap();
-        assert!(!ops.criteria.trim().is_empty());
+        let ops = candidates
+            .iter()
+            .find(|c| c.key == "fudi::ops")
+            .expect("the description-less project agent must stay a candidate");
+        assert!(!ops.is_project_general);
+        // Exact, not just non-empty: the criteria must be this agent's id —
+        // the fixture gives it no name, no skills and no tools to add.
+        assert_eq!(ops.criteria, "ops");
+    }
+
+    #[test]
+    fn a_nameless_agent_keeps_its_capability_sections_under_the_id_header() {
+        // The shape `analyze` generates: no name, no description, but the
+        // skills and tools ARE the routing signal. The id takes the missing
+        // header's place; it must not swallow what follows it.
+        let agent = agent_with(
+            RoutingConfig::default(),
+            "",
+            &["facturacion"],
+            &["fudi/list_orders"],
+        );
+        assert_eq!(
+            derive_criteria_text(&agent),
+            "demo\nSkills: facturacion\nTools: fudi/list_orders"
+        );
+    }
+
+    #[test]
+    fn an_agent_with_nothing_at_all_still_gets_its_id_as_criteria() {
+        // The never-empty guarantee: no name, no description, no skills, no
+        // tools, no sources — the id alone has to carry the criterion, and a
+        // blank `Choice` option must stay unrepresentable.
+        let agent = agent_with(RoutingConfig::default(), "", &[], &[]);
+        let text = derive_criteria_text(&agent);
+        assert!(!text.trim().is_empty());
+        assert_eq!(text, "demo");
     }
 
     #[test]
@@ -388,6 +435,13 @@ mod tests {
         // Review Focus #2. `ops::night` would split back ambiguously.
         let _guard = crate::core::paths::lock_env_for_tests();
         let (_dir, registry) = registry_with_global("ops::night");
+        // The manifest must actually load. Otherwise a future filename
+        // validation in `load_dir` would kill the skip branch behind a test
+        // that still passes by asserting nothing was ever there.
+        assert!(
+            registry.get_agent("ops::night").is_some(),
+            "fixture must load the separator-named agent for the skip to mean anything"
+        );
         let candidates = build_candidates(&registry, "fudi", &[]);
         assert!(!candidates.iter().any(|c| c.agent_id == "ops::night"));
     }
