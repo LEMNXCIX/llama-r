@@ -107,6 +107,12 @@ pub struct RoutedDebug {
     /// The full distribution, so a decision near the threshold can be
     /// judged after the fact rather than only its winner.
     pub probabilities: BTreeMap<String, f32>,
+    /// Set only when the model named a winner its own `probabilities` does
+    /// not contain: the distribution is withheld rather than emitted as an
+    /// account of a winner it does not explain — see
+    /// [`peeked_answer`], the one extractor both debug surfaces read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probabilities_note: Option<String>,
     /// The routing keys that were offered, sorted (as built).
     pub candidates: Vec<String>,
 }
@@ -115,7 +121,7 @@ pub struct RoutedDebug {
 ///
 /// 8 000 is comfortably inside d1-3B's 32 K context, leaving room for both
 /// questions and every candidate's criteria text.
-const ROUTE_STATE_BUDGET_CHARS: usize = 8_000;
+pub(crate) const ROUTE_STATE_BUDGET_CHARS: usize = 8_000;
 
 /// The [`RoutedDebug::reason`] spelling for a winner that a hot reload
 /// removed between the decision and the use — the rung the ladder cannot
@@ -243,11 +249,11 @@ pub async fn resolve_selection_with(
     }
 
     // The model's own answer, read before `route` consumes the response.
-    // `None` means "no usable value" — never `0.0`, which would narrate a
-    // malformed answer as a real score.
-    let (winner, confidence, specialised, probabilities) = match &result {
+    // Each score is `None` when the response carried no usable value — never
+    // `0.0`, which would narrate a malformed answer as a real score.
+    let peeked = match &result {
         Ok(response) => peeked_answer(response),
-        Err(_) => (None, None, None, BTreeMap::new()),
+        Err(_) => PeekedAnswer::default(),
     };
     let candidate_keys: Vec<String> = candidates.iter().map(|c| c.key.clone()).collect();
 
@@ -255,10 +261,11 @@ pub async fn resolve_selection_with(
         project_id: project_id.to_string(),
         outcome,
         reason,
-        winner: winner.clone(),
-        confidence,
-        specialised,
-        probabilities: probabilities.clone(),
+        winner: peeked.winner.clone(),
+        confidence: peeked.confidence,
+        specialised: peeked.specialised,
+        probabilities: peeked.probabilities.clone(),
+        probabilities_note: peeked.probabilities_note.clone(),
         candidates: candidate_keys.clone(),
     };
 
@@ -267,9 +274,9 @@ pub async fn resolve_selection_with(
     // how wide the choice was, and what the decision cost.
     tracing::info!(
         project = %project_id,
-        chosen_key = ?winner,
-        confidence = ?confidence,
-        specialised = ?specialised,
+        chosen_key = ?peeked.winner,
+        confidence = ?peeked.confidence,
+        specialised = ?peeked.specialised,
         candidates = candidate_keys.len(),
         latency_ms,
         "routing decision"
@@ -385,38 +392,66 @@ pub async fn resolve_selection_with(
 }
 
 /// The model's answer, read out of the response before [`route`] consumes
-/// it: `(winner, confidence, specialised, probabilities)`, each `None` when
-/// the response did not carry a usable value.
+/// it. Each field is `None` when the response did not carry a usable value.
 ///
 /// The same discipline `route` applies rung by rung — a missing, wrong-kind
 /// or non-finite number reads as *no value*, never as `0.0`: a malformed
 /// answer narrated as a real score is how a broken adapter starts looking
 /// like a model with an opinion.
-fn peeked_answer(
-    response: &DecisionResponse,
-) -> (
-    Option<String>,
-    Option<f32>,
-    Option<f32>,
-    BTreeMap<String, f32>,
-) {
-    let (winner, confidence, probabilities) = match response.answers.get(CHOICE_KEY) {
+#[derive(Debug, Clone, Default)]
+pub struct PeekedAnswer {
+    pub winner: Option<String>,
+    pub confidence: Option<f32>,
+    pub specialised: Option<f32>,
+    pub probabilities: BTreeMap<String, f32>,
+    /// Set only when `winner` is a label the returned `probabilities` does
+    /// not contain: the distribution is withheld and the inconsistency is
+    /// said out loud, because emitting it beside the winner would present it
+    /// as an account of a decision it does not explain. Both debug surfaces
+    /// — the preview endpoint and `ChatResponse::debug_route` — read this
+    /// one extractor, so they cannot disagree about it.
+    pub probabilities_note: Option<String>,
+}
+
+pub(crate) fn peeked_answer(response: &DecisionResponse) -> PeekedAnswer {
+    let mut peeked = PeekedAnswer::default();
+    match response.answers.get(CHOICE_KEY) {
         Some(Answer::Choice {
             key,
             confidence,
             probabilities,
-        }) => (
-            Some(key.clone()),
-            confidence.is_finite().then_some(*confidence),
-            probabilities.clone(),
-        ),
-        _ => (None, None, BTreeMap::new()),
-    };
-    let specialised = match response.answers.get(NOUL_KEY) {
+        }) => {
+            peeked.winner = Some(key.clone());
+            peeked.confidence = confidence.is_finite().then_some(*confidence);
+            // The adapter never checks that a `Choice`'s `key` appears among
+            // its own `probabilities`, so an answer whose distribution does
+            // not account for its own winner can arrive from the wire. The
+            // ladder still decides from the winner — the distribution is
+            // evidence, not the decision — so nothing is dropped silently:
+            // `raw` on the preview keeps exactly what the router answered.
+            if probabilities.contains_key(key) {
+                peeked.probabilities = probabilities.clone();
+            } else {
+                tracing::warn!(
+                    winner = %key,
+                    "router named a winner its own probabilities do not contain; \
+                     withholding the distribution"
+                );
+                peeked.probabilities_note = Some(format!(
+                    "the model chose '{}' but its probabilities do not contain it; \
+                     the distribution is withheld rather than presented as an account \
+                     of a winner it does not explain",
+                    key
+                ));
+            }
+        }
+        _ => {}
+    }
+    peeked.specialised = match response.answers.get(NOUL_KEY) {
         Some(Answer::Noul { value }) => value.is_finite().then_some(*value),
         _ => None,
     };
-    (winner, confidence, specialised, probabilities)
+    peeked
 }
 
 /// Split prepared messages into system prompt, prior turns, and current user message.
@@ -475,7 +510,7 @@ fn engine_target(
 /// to. Same words, so a client cannot tell which path produced it — and a
 /// project that has no general agent failed exactly like this before
 /// routing existed.
-fn agent_not_found(target: &str, project_id: &str) -> AppError {
+pub(crate) fn agent_not_found(target: &str, project_id: &str) -> AppError {
     AppError::Validation(format!(
         "Agent '{}' not found for project '{}'. Ensure the agent exists in 'contextos/projects/{}/agents/'.",
         target, project_id, project_id
@@ -776,6 +811,10 @@ pub async fn execute_chat(
                         },
                         done: true,
                         debug_prompt,
+                        // The brief's literal line: the decision rides on the
+                        // response whether or not `X-Debug` was asked for —
+                        // `debug_prompt` stays header-gated, this does not.
+                        debug_route: resolved.routed,
                     };
                     state
                         .observability
@@ -797,6 +836,10 @@ pub async fn execute_chat(
     let started_at = Instant::now();
     let mut response = run_with_fallback(state, prepared, &requested_model).await?;
     response.debug_prompt = debug_prompt;
+    // Same as the engine path above: the router's decision rides on the
+    // non-streaming response, unconditionally. The streaming path has no
+    // field to carry it and gRPC drops it deliberately.
+    response.debug_route = resolved.routed;
 
     state
         .observability
@@ -995,6 +1038,7 @@ mod tests {
                 },
                 done: true,
                 debug_prompt: None,
+                debug_route: None,
             })
         }
 

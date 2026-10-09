@@ -161,6 +161,7 @@ impl LLMProvider for FakeProvider {
             },
             done: true,
             debug_prompt: None,
+            debug_route: None,
         })
     }
 

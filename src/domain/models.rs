@@ -1,3 +1,4 @@
+use crate::api::chat_core::RoutedDebug;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -24,6 +25,15 @@ pub struct ChatResponse {
     /// Optional: the full expanded prompt used for this request (only if requested via headers)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_prompt: Option<String>,
+    /// The routing decision that led to this response, when the router was
+    /// consulted — the non-streaming surface only; `ChatStreamEvent` and the
+    /// gRPC `ChatResponse` deliberately do not carry it.
+    ///
+    /// `skip_deserializing`: no in-repo code deserializes a `ChatResponse`,
+    /// and [`RoutedDebug`] holds `&'static str` fields that cannot be read
+    /// back off the wire.
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub debug_route: Option<RoutedDebug>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]

@@ -1,7 +1,11 @@
 use crate::api::agent_api::{AgentResponse, AgentScopeResponse, CreateAgentRequest};
+use crate::api::chat_core::RoutedDebug;
 use crate::api::context_api::CreateContextRequest;
-use crate::api::health::HealthResponse;
+use crate::api::health::{HealthResponse, RouterHealth};
+use crate::api::observability::ObservabilitySnapshot;
+use crate::api::route_api::{RouteCandidateView, RoutePreviewRequest, RoutePreviewResponse};
 use crate::context::store::ProjectContext;
+use crate::domain::agent::OptimizeConfig;
 use crate::domain::models::{
     ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, JsonRpcRequest, JsonRpcResponse,
     ListModelsResponse, ModelInfo,
@@ -33,6 +37,7 @@ use utoipa::OpenApi;
         crate::api::context_api::update_context,
         crate::api::context_api::delete_context,
         crate::api::context_api::analyze_project,
+        crate::api::route_api::route_preview,
     ),
     components(
         schemas(
@@ -45,11 +50,18 @@ use utoipa::OpenApi;
             JsonRpcRequest,
             JsonRpcResponse,
             HealthResponse,
+            RouterHealth,
+            ObservabilitySnapshot,
+            RoutedDebug,
             CreateAgentRequest,
+            OptimizeConfig,
             AgentResponse,
             AgentScopeResponse,
             CreateContextRequest,
             ProjectContext,
+            RoutePreviewRequest,
+            RoutePreviewResponse,
+            RouteCandidateView,
         )
     ),
     tags(
@@ -59,6 +71,7 @@ use utoipa::OpenApi;
         (name = "Agents", description = "Agent management CRUD"),
         (name = "Contexts", description = "Project context management"),
         (name = "MCP", description = "Model Context Protocol endpoints"),
+        (name = "Router", description = "Routing decision dry-run, for tuning MIN_CONFIDENCE"),
     )
 )]
 pub struct ApiDoc;
