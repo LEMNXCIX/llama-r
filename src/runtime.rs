@@ -1,5 +1,6 @@
 use crate::adapters::mcp::{McpServerConfig, StaticMcpRegistry};
 use crate::adapters::rag::{FileRagStore, OllamaEmbeddings};
+use crate::adapters::router::LlamaCppRouter;
 use crate::api::agent_api::{
     create_agent, delete_agent, get_agent, get_agent_scope, list_agents_api, update_agent,
 };
@@ -28,11 +29,13 @@ use crate::ports::engine::AgentEngine;
 use crate::ports::history::ConversationStore;
 use crate::ports::mcp::McpServerRegistry;
 use crate::ports::rag::{EmbeddingProvider, RagStore};
+use crate::ports::router::DecisionRouter;
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::agent_runtime::AgentRuntime;
 use crate::services::rag_ingest::RagIngestService;
+use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
 use axum::{
     routing::{get, post},
@@ -91,6 +94,38 @@ pub fn build_app_state(
         )),
     );
 
+    // Router configuration. `RouterConfig` deliberately does not load `.env`
+    // itself (that is `Config::from_env`'s job, which has already run on this
+    // boot path), so this reads deployment values from the environment plus
+    // the optional `router.toml` overlay. An unusable config must not stop a
+    // server that otherwise works: warn — the message names the offending
+    // variable — and fall back to the inert defaults, routing off.
+    let router_config = match RouterConfig::load() {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "Invalid router configuration; falling back to defaults (routing disabled)"
+            );
+            RouterConfig::default()
+        }
+    };
+    let router: Option<Arc<dyn DecisionRouter>> = if router_config.enabled {
+        tracing::info!(
+            url = %router_config.url,
+            model = %router_config.model,
+            "Decision router initialized"
+        );
+        Some(Arc::new(LlamaCppRouter::new(
+            router_config.url.clone(),
+            router_config.model.clone(),
+            router_config.timeout_ms,
+        )))
+    } else {
+        tracing::info!("Router disabled via ROUTER_ENABLED=false");
+        None
+    };
+
     Arc::new(AppState {
         provider,
         agent_registry,
@@ -109,6 +144,9 @@ pub fn build_app_state(
         rag_store,
         rag_ingest,
         history_store,
+        router: RwLock::new(router),
+        router_config: Arc::new(router_config),
+        router_healthy: AtomicBool::new(false),
     })
 }
 

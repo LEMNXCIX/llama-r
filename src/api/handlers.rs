@@ -10,10 +10,12 @@ use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::mcp::McpServerRegistry;
 use crate::ports::rag::RagStore;
+use crate::ports::router::DecisionRouter;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::agent_runtime::AgentRuntime;
 use crate::services::rag_ingest::RagIngestService;
+use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
 use axum::{
     extract::State,
@@ -25,7 +27,7 @@ use axum::{
 };
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio_stream::StreamExt as _;
 
@@ -55,6 +57,16 @@ pub struct AppState {
     pub rag_ingest: Option<Arc<RagIngestService>>,
     /// Conversation history store. None when feature is off or uninitialized.
     pub history_store: Option<Arc<dyn ConversationStore>>,
+    /// Decision router. `RwLock` rather than a plain field so tests can swap in a
+    /// fake without `build_app_state` — which five call sites construct — growing
+    /// a parameter. Mirrors the existing `known_mcp_servers` field. `None` while
+    /// `ROUTER_ENABLED` is off, so the default deployment builds nothing.
+    pub router: RwLock<Option<Arc<dyn DecisionRouter>>>,
+    /// Router configuration loaded at boot (env, then `router.toml`).
+    pub router_config: Arc<RouterConfig>,
+    /// Last known router reachability, set by the ladder. Deliberately not a live
+    /// probe: `health()` already probes the provider on every call.
+    pub router_healthy: AtomicBool,
 }
 
 impl AppState {
@@ -69,6 +81,13 @@ impl AppState {
         if let Ok(mut guard) = self.known_mcp_servers.write() {
             *guard = ids;
         }
+    }
+
+    /// Record the router's last known reachability. The ladder calls this after
+    /// every decision — `true` when d1 answered, `false` when the call errored —
+    /// and `/health` reads the last value rather than probing again.
+    pub fn record_router_health(&self, healthy: bool) {
+        self.router_healthy.store(healthy, Ordering::SeqCst);
     }
 }
 

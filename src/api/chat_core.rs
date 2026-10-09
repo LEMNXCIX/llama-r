@@ -463,6 +463,7 @@ mod tests {
     use crate::providers::LLMProvider;
     use crate::services::agent_registry::AgentRegistry;
     use crate::services::agent_runtime::AgentRuntime;
+    use crate::services::router_config::RouterConfig;
     use crate::services::skill_manager::SkillManager;
     use async_trait::async_trait;
     use std::collections::VecDeque;
@@ -657,6 +658,11 @@ mod tests {
             rag_store: None,
             rag_ingest: None,
             history_store: None,
+            // No test here consults the router; the routing ladder is injected
+            // through these fields by the tests that do.
+            router: RwLock::new(None),
+            router_config: Arc::new(RouterConfig::default()),
+            router_healthy: AtomicBool::new(false),
         });
         (temp_dir, state)
     }
