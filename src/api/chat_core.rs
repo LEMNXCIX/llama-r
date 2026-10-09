@@ -3,13 +3,27 @@ use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEv
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
 use crate::ports::engine::AgentRunEvent;
+use crate::ports::router::{Answer, DecisionRequest, DecisionResponse};
+use crate::services::agent_registry::AgentRegistry;
+use crate::services::agent_router::{
+    build_questions, route, NoRoute, RoutingDecision, CHOICE_KEY, NOUL_KEY,
+};
 use crate::services::agent_runtime::RuntimeChatRequest;
+use crate::services::route_candidates::build_candidates;
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Instant;
 use tokio_stream::{Stream, StreamExt};
+use utoipa::ToSchema;
 
 pub type AppChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, AppError>> + Send>>;
 
+/// The header-derived, borrowed *input* to dispatch: `X-Project`, `X-Agent`,
+/// `X-Conversation-Id` and `X-Debug` as the handlers read them.
+///
+/// What dispatch actually runs with is [`ResolvedSelection`] — the header's
+/// answer, or the routing decision when there is no header.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AgentSelection<'a> {
     pub project_id: Option<&'a str>,
@@ -18,19 +32,381 @@ pub struct AgentSelection<'a> {
     pub debug: bool,
 }
 
-impl<'a> AgentSelection<'a> {
-    fn requested_target(&self, fallback_model: &str) -> String {
-        match (self.project_id, self.agent_id) {
-            (Some(project_id), Some(agent_id)) => format!("{}/{}", project_id, agent_id),
-            (Some(project_id), None) => format!("{}/{}", project_id, project_id),
-            (None, Some(agent_id)) => agent_id.to_string(),
-            (None, None) => fallback_model.to_string(),
+/// What dispatch resolved: where the request is answered from, plus the
+/// routing decision that got it there when a router was consulted.
+///
+/// The pair is deliberately the same one [`AgentSelection`] would have
+/// carried — routing fills the hole `X-Agent` would have filled and nothing
+/// else — so [`engine_target`] cannot tell a routed request from a
+/// header-pinned one, and nothing downstream of it knows routing exists.
+/// `routed` is `None` on every path that did not consult the router, which
+/// is how the debug surface hangs off dispatch without touching it.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedSelection {
+    pub project_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub routed: Option<RoutedDebug>,
+}
+
+impl ResolvedSelection {
+    /// The header-derived selection, owned and fully resolved.
+    ///
+    /// `X-Project` without `X-Agent` means the project's own agent, so the
+    /// id is spelled out rather than left as `None` for
+    /// `resolve_agent(Some(p), None)` to find: the registry resolves
+    /// `(p, None)` and `(p, Some(p))` to the same key, and
+    /// [`ResolvedSelection::requested_target`] formats both as `p/p`, so
+    /// nothing downstream can tell — today's behaviour, byte for byte, with
+    /// the pair made complete.
+    fn from_selection(selection: &AgentSelection<'_>) -> Self {
+        Self {
+            project_id: selection.project_id.map(str::to_string),
+            agent_id: selection
+                .agent_id
+                .or(selection.project_id)
+                .map(str::to_string),
+            routed: None,
         }
     }
 
-    fn has_agent_headers(&self) -> bool {
-        self.project_id.is_some() || self.agent_id.is_some()
+    fn requested_target(&self, fallback_model: &str) -> String {
+        match (&self.project_id, &self.agent_id) {
+            (Some(project_id), Some(agent_id)) => format!("{}/{}", project_id, agent_id),
+            (Some(project_id), None) => format!("{}/{}", project_id, project_id),
+            (None, Some(agent_id)) => agent_id.clone(),
+            (None, None) => fallback_model.to_string(),
+        }
     }
+}
+
+/// The routing decision, for the debug surface: what was offered, what the
+/// model answered, and what dispatch did about it.
+///
+/// `outcome` is `"agent"` (a specialist won and was verified to exist) or
+/// `"general"` (the request stayed with the project's general agent).
+/// `reason` is one of
+/// [`GeneralReason`](crate::services::agent_router::GeneralReason)'s
+/// spellings — except `"stale_winner"`, which names the one rung the ladder
+/// never sees: the winner was trusted, then removed by a hot reload before
+/// it could be used. `winner`, `confidence` and `specialised` are `None`
+/// when the router did not answer with a usable value, never `0.0` — an
+/// absent value and a real zero are different reports.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RoutedDebug {
+    /// The project the request was routed *for*. A global winner keeps it:
+    /// the empty project id lives in [`ResolvedSelection`], not here.
+    pub project_id: String,
+    /// `"agent"` or `"general"` — where the request was dispatched.
+    pub outcome: &'static str,
+    /// Why the general agent kept it, or `None` when a specialist won.
+    pub reason: Option<&'static str>,
+    /// The label the model chose, when it answered the choice question.
+    pub winner: Option<String>,
+    pub confidence: Option<f32>,
+    pub specialised: Option<f32>,
+    /// The full distribution, so a decision near the threshold can be
+    /// judged after the fact rather than only its winner.
+    pub probabilities: BTreeMap<String, f32>,
+    /// The routing keys that were offered, sorted (as built).
+    pub candidates: Vec<String>,
+}
+
+/// Characters of the conversation the decision model may see.
+///
+/// 8 000 is comfortably inside d1-3B's 32 K context, leaving room for both
+/// questions and every candidate's criteria text.
+const ROUTE_STATE_BUDGET_CHARS: usize = 8_000;
+
+/// The [`RoutedDebug::reason`] spelling for a winner that a hot reload
+/// removed between the decision and the use — the rung the ladder cannot
+/// report, because to the ladder the winner was valid.
+const STALE_WINNER: &str = "stale_winner";
+
+/// The conversation, as `"{role}: {content}"` lines, newest last.
+///
+/// Accumulation runs from the newest message backwards (the lines are
+/// reversed at the end), so a conversation longer than the budget keeps the
+/// turns that say what the request *is* and drops the oldest — truncation
+/// that cut the newest message would decide on a stale request. The loop
+/// stops *after* the line that crosses `budget_chars`, so the newest turn
+/// always survives and at most one line overshoots: an oversized
+/// conversation truncates, it never fails.
+///
+/// `system` messages are dropped: a system prompt is not conversation, and
+/// sending it would let a project's own prompt steer the decision that
+/// should be made from the user's words.
+pub fn build_state_text(messages: &[ChatMessage], budget_chars: usize) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for message in messages.iter().rev() {
+        if message.role == "system" {
+            continue;
+        }
+        // The line itself plus the newline it will be joined with.
+        used += message.role.len() + message.content.len() + 3;
+        kept.push(format!("{}: {}", message.role, message.content));
+        if used > budget_chars {
+            break;
+        }
+    }
+    kept.reverse();
+    kept.join("\n")
+}
+
+/// Resolve the selection dispatch runs with: the header when there is one,
+/// the routing decision when there is not.
+///
+/// Delegates to [`resolve_selection_with`] with the registry dispatch
+/// itself consults, so in production the decision and its re-check read the
+/// same registry — two reads of a lock that hot reload can swap between.
+pub async fn resolve_selection(
+    state: &AppState,
+    selection: AgentSelection<'_>,
+    messages: &[ChatMessage],
+) -> Result<ResolvedSelection, AppError> {
+    resolve_selection_with(state, &state.agent_registry, selection, messages).await
+}
+
+/// [`resolve_selection`]'s body, with the registry named — the parameter is
+/// what makes the hot-reload race testable: a test can hand it a registry
+/// that no longer holds the winner, which is exactly the second read of the
+/// real lock after a reload.
+///
+/// The gates, in order. Each one returns the header untouched rather than
+/// inventing a failure, so a request nobody routes behaves byte-identically
+/// to how it did before routing existed:
+///
+/// 1. an explicit `X-Agent` pins the target — routing never spends a
+///    decision on a request somebody already routed;
+/// 2. no `X-Project`: there is no candidate set to choose between;
+/// 3. routing switched off — an update that only ships this code changes
+///    nothing;
+/// 4. nobody installed a router (degraded boot, tests);
+/// 5. no candidates for this project: the ladder would answer
+///    `NoCandidates`, a 400 — *not routing* must not be one.
+///
+/// Past the gates exactly one decision is spent, and [`route`] decides from
+/// it. A specialist is re-resolved through `registry` before it is
+/// returned: hot reload can remove it between the decision and the use, and
+/// an id that was never verified to exist must never reach dispatch.
+pub async fn resolve_selection_with(
+    state: &AppState,
+    registry: &AgentRegistry,
+    selection: AgentSelection<'_>,
+    messages: &[ChatMessage],
+) -> Result<ResolvedSelection, AppError> {
+    if selection.agent_id.is_some() {
+        return Ok(ResolvedSelection::from_selection(&selection));
+    }
+    let Some(project_id) = selection.project_id else {
+        return Ok(ResolvedSelection::from_selection(&selection));
+    };
+    if !state.router_config.enabled {
+        return Ok(ResolvedSelection::from_selection(&selection));
+    }
+    // The Arc leaves the lock before the `.await`: a guard held across the
+    // decision's network call would stall every other reader — including
+    // the next chat — for the length of one decision.
+    let router = state.router.read().ok().and_then(|guard| (*guard).clone());
+    let Some(router) = router else {
+        return Ok(ResolvedSelection::from_selection(&selection));
+    };
+
+    let config = &state.router_config;
+    // Candidates come from the registry dispatch resolves against; the
+    // `registry` parameter is the *re-check* — the second read of a lock
+    // that reload can have swapped between the two, which is precisely the
+    // race under test.
+    let candidates = build_candidates(&state.agent_registry, project_id, &config.exclude);
+    if candidates.is_empty() {
+        return Ok(ResolvedSelection::from_selection(&selection));
+    }
+
+    let request = DecisionRequest {
+        state: build_state_text(messages, ROUTE_STATE_BUDGET_CHARS),
+        questions: build_questions(&candidates),
+    };
+    let started_at = Instant::now();
+    let result = router.decide(request).await;
+    let latency_ms = started_at.elapsed().as_millis() as u64;
+
+    // Every consultation records, whatever comes back: latency always,
+    // health after the answer (or its absence), an error count only when
+    // the call itself failed — "d1 said no" is not a router error.
+    state.observability.record_router_latency(latency_ms);
+    match &result {
+        Ok(_) => state.record_router_health(true),
+        Err(_) => {
+            state.observability.record_router_error();
+            state.record_router_health(false);
+        }
+    }
+
+    // The model's own answer, read before `route` consumes the response.
+    // `None` means "no usable value" — never `0.0`, which would narrate a
+    // malformed answer as a real score.
+    let (winner, confidence, specialised, probabilities) = match &result {
+        Ok(response) => peeked_answer(response),
+        Err(_) => (None, None, None, BTreeMap::new()),
+    };
+    let candidate_keys: Vec<String> = candidates.iter().map(|c| c.key.clone()).collect();
+
+    let debug = |outcome: &'static str, reason: Option<&'static str>| RoutedDebug {
+        project_id: project_id.to_string(),
+        outcome,
+        reason,
+        winner: winner.clone(),
+        confidence,
+        specialised,
+        probabilities: probabilities.clone(),
+        candidates: candidate_keys.clone(),
+    };
+
+    // One decision log per consultation, before any rung's own warning can
+    // narrate over it: the project, the model's chosen key, both scores,
+    // how wide the choice was, and what the decision cost.
+    tracing::info!(
+        project = %project_id,
+        chosen_key = ?winner,
+        confidence = ?confidence,
+        specialised = ?specialised,
+        candidates = candidate_keys.len(),
+        latency_ms,
+        "routing decision"
+    );
+
+    match route(
+        project_id,
+        &candidates,
+        config.min_confidence,
+        config.min_specialised,
+        result,
+    ) {
+        Ok(RoutingDecision::Agent {
+            project_id: winner_project,
+            agent_id,
+            ..
+        }) => {
+            // Review Focus #4 — the hot-reload race. `route` decided from
+            // the candidates as they were; a reload can remove the winner
+            // before it is used, so the key is resolved again through the
+            // registry the caller passed. If it is gone — agents reloaded
+            // mid-request — degrade to the project's general agent, the
+            // ladder's own fallback, and say so. An id never verified to
+            // exist must never reach dispatch.
+            let present = if winner_project.is_empty() {
+                // An empty project id marks a global winner (pinned by
+                // `a_global_winner_carries_an_empty_project_id`): its
+                // registry key is the bare id, so `get_agent` — never
+                // `get_project_agent` under the requesting project, which
+                // would look for a same-named *project* agent instead.
+                registry.get_agent(&agent_id).is_some()
+            } else {
+                registry
+                    .get_project_agent(&winner_project, &agent_id)
+                    .is_some()
+            };
+
+            if present {
+                state.observability.record_route_to_agent();
+                let winner_project = if winner_project.is_empty() {
+                    None
+                } else {
+                    Some(winner_project)
+                };
+                Ok(ResolvedSelection {
+                    project_id: winner_project,
+                    agent_id: Some(agent_id),
+                    routed: Some(debug("agent", None)),
+                })
+            } else {
+                let vanished_key = if winner_project.is_empty() {
+                    agent_id.clone()
+                } else {
+                    format!("{winner_project}::{agent_id}")
+                };
+                tracing::warn!(
+                    project = %project_id,
+                    vanished_key = %vanished_key,
+                    "routed agent removed by a hot reload between the decision and the use; \
+                     falling back to the project's general agent"
+                );
+                state.observability.record_route_to_general();
+                let Some(general) = candidates.iter().find(|c| c.is_project_general) else {
+                    // `route` only returns `Agent` when a general candidate
+                    // exists to degrade to, so this cannot happen — and if
+                    // it ever did, the header path is the safe answer.
+                    return Ok(ResolvedSelection::from_selection(&selection));
+                };
+                Ok(ResolvedSelection {
+                    project_id: Some(project_id.to_string()),
+                    agent_id: Some(general.agent_id.clone()),
+                    routed: Some(debug("general", Some(STALE_WINNER))),
+                })
+            }
+        }
+        Ok(RoutingDecision::ProjectGeneral {
+            project_id: general_project,
+            agent_id,
+            reason,
+            ..
+        }) => {
+            state.observability.record_route_to_general();
+            Ok(ResolvedSelection {
+                project_id: Some(general_project),
+                agent_id: Some(agent_id),
+                routed: Some(debug("general", Some(reason.as_str()))),
+            })
+        }
+        Err(NoRoute::NoCandidates) => {
+            // Cannot fire: `candidates` was checked non-empty above and
+            // `route`'s first rung checks the same slice. The contract
+            // stands anyway — not routing must not be a failure.
+            Ok(ResolvedSelection::from_selection(&selection))
+        }
+        Err(NoRoute::NoGeneralAgent) => {
+            // Today's 400, verbatim: a project with specialists but no
+            // general agent has nothing to degrade to, and before routing
+            // existed the same request failed the same way in
+            // `prepare_request`.
+            Err(agent_not_found(project_id, project_id))
+        }
+    }
+}
+
+/// The model's answer, read out of the response before [`route`] consumes
+/// it: `(winner, confidence, specialised, probabilities)`, each `None` when
+/// the response did not carry a usable value.
+///
+/// The same discipline `route` applies rung by rung — a missing, wrong-kind
+/// or non-finite number reads as *no value*, never as `0.0`: a malformed
+/// answer narrated as a real score is how a broken adapter starts looking
+/// like a model with an opinion.
+fn peeked_answer(
+    response: &DecisionResponse,
+) -> (
+    Option<String>,
+    Option<f32>,
+    Option<f32>,
+    BTreeMap<String, f32>,
+) {
+    let (winner, confidence, probabilities) = match response.answers.get(CHOICE_KEY) {
+        Some(Answer::Choice {
+            key,
+            confidence,
+            probabilities,
+        }) => (
+            Some(key.clone()),
+            confidence.is_finite().then_some(*confidence),
+            probabilities.clone(),
+        ),
+        _ => (None, None, BTreeMap::new()),
+    };
+    let specialised = match response.answers.get(NOUL_KEY) {
+        Some(Answer::Noul { value }) => value.is_finite().then_some(*value),
+        _ => None,
+    };
+    (winner, confidence, specialised, probabilities)
 }
 
 /// Split prepared messages into system prompt, prior turns, and current user message.
@@ -60,17 +436,20 @@ fn split_engine_messages(
 
 /// Decide whether the engine path should run, and which project/agent ids to resolve.
 ///
-/// Engine is used when headers select an agent, or when `model` matches a global agent id.
+/// Engine is used when the resolved selection names a project or an agent —
+/// header-pinned or router-chosen, indistinguishable here on purpose — or
+/// when `model` matches a global agent id. That first arm is the whole
+/// trick: because a routed selection produces the same `(project_id,
+/// agent_id)` pair an `X-Agent` header would have, nothing below this
+/// function can tell the two apart, which is why routing had to change no
+/// code downstream of it.
 fn engine_target(
     state: &AppState,
-    selection: AgentSelection<'_>,
+    selection: &ResolvedSelection,
     original_model: &str,
 ) -> Option<(Option<String>, Option<String>)> {
-    if selection.has_agent_headers() {
-        return Some((
-            selection.project_id.map(str::to_string),
-            selection.agent_id.map(str::to_string),
-        ));
+    if selection.project_id.is_some() || selection.agent_id.is_some() {
+        return Some((selection.project_id.clone(), selection.agent_id.clone()));
     }
 
     if state.agent_registry.get_agent(original_model).is_some() {
@@ -78,6 +457,19 @@ fn engine_target(
     }
 
     None
+}
+
+/// Today's "agent not found" complaint, in one place: `prepare_request`
+/// says it for a header naming a missing agent, and the ladder's
+/// `NoGeneralAgent` says it for a project with no general agent to degrade
+/// to. Same words, so a client cannot tell which path produced it — and a
+/// project that has no general agent failed exactly like this before
+/// routing existed.
+fn agent_not_found(target: &str, project_id: &str) -> AppError {
+    AppError::Validation(format!(
+        "Agent '{}' not found for project '{}'. Ensure the agent exists in 'contextos/projects/{}/agents/'.",
+        target, project_id, project_id
+    ))
 }
 
 fn build_runtime_request(
@@ -166,7 +558,7 @@ fn engine_events_to_chat_stream(
 async fn prepare_request(
     state: &AppState,
     mut payload: ChatRequest,
-    selection: AgentSelection<'_>,
+    selection: &ResolvedSelection,
 ) -> Result<ChatRequest, AppError> {
     if payload.messages.is_empty() {
         return Err(AppError::Validation(
@@ -174,17 +566,21 @@ async fn prepare_request(
         ));
     }
 
-    let selected_agent = if selection.project_id.is_some() || selection.agent_id.is_some() {
-        let agent = state
-            .agent_registry
-            .resolve_agent(selection.project_id, selection.agent_id);
+    // Read as `Option<&str>` so this function cannot tell a header-derived
+    // selection from a routed one — it sees the same pair either way. With
+    // routing, a project that has a general agent always resolves, so the
+    // 400 below only fires for a genuinely agentless project, which is what
+    // it always meant.
+    let project_id = selection.project_id.as_deref();
+    let agent_id = selection.agent_id.as_deref();
+    let selected_agent = if project_id.is_some() || agent_id.is_some() {
+        let agent = state.agent_registry.resolve_agent(project_id, agent_id);
 
-        if agent.is_none() && selection.project_id.is_some() {
-            let target = selection.agent_id.unwrap_or(selection.project_id.unwrap());
-            return Err(AppError::Validation(format!(
-                "Agent '{}' not found for project '{}'. Ensure the agent exists in 'contextos/projects/{}/agents/'.",
-                target, selection.project_id.unwrap(), selection.project_id.unwrap()
-            )));
+        if agent.is_none() {
+            if let Some(project_id) = project_id {
+                let target = agent_id.unwrap_or(project_id);
+                return Err(agent_not_found(target, project_id));
+            }
         }
         agent
     } else {
@@ -331,10 +727,13 @@ pub async fn execute_chat(
     payload: ChatRequest,
     selection: AgentSelection<'_>,
 ) -> Result<ChatResponse, AppError> {
-    let requested_model = selection.requested_target(&payload.model);
+    // Resolve first: from here on the selection is the router's answer or
+    // the header's, in one shape, and every step below reads that shape.
+    let resolved = resolve_selection(state, selection, &payload.messages).await?;
+    let requested_model = resolved.requested_target(&payload.model);
     let original_model = payload.model.clone();
-    let engine_ids = engine_target(state, selection, &original_model);
-    let prepared = prepare_request(state, payload, selection).await?;
+    let engine_ids = engine_target(state, &resolved, &original_model);
+    let prepared = prepare_request(state, payload, &resolved).await?;
 
     let debug_prompt = if selection.debug {
         Some(
@@ -406,10 +805,13 @@ pub async fn execute_chat_stream(
     selection: AgentSelection<'_>,
 ) -> Result<AppChatStream, AppError> {
     payload.stream = true;
-    let requested_model = selection.requested_target(&payload.model);
+    // Same resolve-first shape as `execute_chat`: one selection type feeds
+    // `requested_target`, `engine_target` and `prepare_request` here too.
+    let resolved = resolve_selection(state, selection, &payload.messages).await?;
+    let requested_model = resolved.requested_target(&payload.model);
     let original_model = payload.model.clone();
-    let engine_ids = engine_target(state, selection, &original_model);
-    let prepared = prepare_request(state, payload, selection).await?;
+    let engine_ids = engine_target(state, &resolved, &original_model);
+    let prepared = prepare_request(state, payload, &resolved).await?;
     let started_at = Instant::now();
 
     if let Some((project_id, agent_id)) = engine_ids {
