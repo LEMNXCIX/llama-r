@@ -136,5 +136,8 @@ mod tests {
         assert_eq!(snap.routed_to_general, 1);
         assert_eq!(snap.router_errors, 1);
         assert_eq!(snap.router_latency_ms_total, 30);
+        // The dashboard's rate numerator: the two outcomes, and nothing else —
+        // an error is not a decision, so it must not inflate the count.
+        assert_eq!(obs.router_decisions(), 3);
     }
 }
