@@ -18,7 +18,8 @@
 //! feature is not a server fault.
 
 use crate::api::chat_core::{
-    agent_not_found, build_state_text, peeked_answer, PeekedAnswer, ROUTE_STATE_BUDGET_CHARS,
+    agent_not_found, build_state_text, peeked_answer, recheck_winner, PeekedAnswer, WinnerRecheck,
+    ROUTE_STATE_BUDGET_CHARS, STALE_WINNER,
 };
 use crate::api::handlers::AppState;
 use crate::domain::models::ChatMessage;
@@ -126,13 +127,17 @@ pub struct RoutePreviewResponse {
     /// The model's reported specialisation score, same discipline.
     pub specialised: Option<f32>,
     /// The distribution over candidates as it may be reported next to the
-    /// decision. Empty when [`probabilities_note`] explains why it was
-    /// withheld.
+    /// decision. Kept whenever informative — a partial distribution is
+    /// calibration input, so it is attached even when it names only some
+    /// candidates. Empty only when the model reported none, or when a
+    /// non-empty distribution contradicted its own winner;
+    /// [`probabilities_note`](Self::probabilities_note) says which.
     pub probabilities: BTreeMap<String, f32>,
-    /// Set only when the model named a winner its own `probabilities` does
-    /// not contain: the distribution is withheld rather than emitted as an
-    /// account of a winner it does not explain. `raw` still carries exactly
-    /// what the router answered.
+    /// Set whenever the distribution is not a plain account of the winner,
+    /// naming which case: none reported, partial (the map is attached), or
+    /// contradicting the winner — absent from its own distribution, or
+    /// outscored by another candidate (the map is withheld). `raw` still
+    /// carries exactly what the router answered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probabilities_note: Option<String>,
     /// Wall-clock cost of the decision, in milliseconds — what one
@@ -229,7 +234,7 @@ pub async fn route_preview(
         Err(_) => serde_json::Value::Null,
     };
     let peeked: PeekedAnswer = match &result {
-        Ok(response) => peeked_answer(response),
+        Ok(response) => peeked_answer(response, candidates.len()),
         Err(_) => PeekedAnswer::default(),
     };
 
@@ -265,7 +270,37 @@ pub async fn route_preview(
     })?;
 
     let (decision, reason) = match &decision {
-        RoutingDecision::Agent { .. } => ("agent".to_string(), None),
+        RoutingDecision::Agent {
+            project_id: winner_project,
+            agent_id,
+            ..
+        } => {
+            // The same re-check dispatch applies after `route` decides, so
+            // the preview reports what the chat WOULD do: a winner a hot
+            // reload removed is `general` with `stale_winner`, not `agent`.
+            // Shared, not duplicated — `recheck_winner` is the one the
+            // dispatch path runs, and the log line it emits is the same one.
+            match recheck_winner(
+                &state.agent_registry,
+                &body.project_id,
+                winner_project,
+                agent_id,
+                &candidates,
+            ) {
+                WinnerRecheck::Present => ("agent".to_string(), None),
+                WinnerRecheck::Stale(_) => ("general".to_string(), Some(STALE_WINNER.to_string())),
+                // Cannot fire: `route` only returns `Agent` when a general
+                // candidate exists to degrade to. The preview reports it the
+                // way the chat itself would anyway — dispatch would land on
+                // the project's general agent and, with none registered,
+                // fail this same 400 — because a preview that promised a
+                // decision the chat would refuse to make would be lying
+                // about the thing it exists to show.
+                WinnerRecheck::NoFallback => {
+                    return Err(agent_not_found(&body.project_id, &body.project_id));
+                }
+            }
+        }
         RoutingDecision::ProjectGeneral { reason, .. } => {
             ("general".to_string(), Some(reason.as_str().to_string()))
         }

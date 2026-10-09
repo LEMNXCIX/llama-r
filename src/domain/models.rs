@@ -30,11 +30,7 @@ pub struct ChatResponse {
     /// as `debug_prompt`; without it the field is absent from the response
     /// entirely. The non-streaming surface only; `ChatStreamEvent` and the
     /// gRPC `ChatResponse` deliberately do not carry it.
-    ///
-    /// `skip_deserializing`: no in-repo code deserializes a `ChatResponse`,
-    /// and [`RoutedDebug`] holds `&'static str` fields that cannot be read
-    /// back off the wire.
-    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_route: Option<RoutedDebug>,
 }
 

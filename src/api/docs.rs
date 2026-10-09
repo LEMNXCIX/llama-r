@@ -41,6 +41,15 @@ use utoipa::OpenApi;
     ),
     components(
         schemas(
+            // utoipa 5 collects transitively referenced schemas on its own:
+            // every type below that is reachable from a registered path or
+            // schema is emitted even when it is not listed here (verified by
+            // deleting entries and re-generating — the document stayed
+            // complete). The entries that merely document a dependency —
+            // `RouterHealth`, `ObservabilitySnapshot`, `RoutedDebug`,
+            // `OptimizeConfig` — are therefore explicit documentation of the
+            // graph rather than a repair, and they keep the document correct
+            // if utoipa's collection behaviour ever changes.
             ChatRequest,
             ChatResponse,
             ChatStreamEvent,

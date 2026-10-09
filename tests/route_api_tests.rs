@@ -218,10 +218,31 @@ impl DecisionRouter for FakeRouter {
     }
 }
 
+/// A router whose `decide` first performs the hot reload the race needs: it
+/// deletes the winner's manifest and reloads the registry, so the re-check
+/// that runs *after* the decision finds the winner gone — exactly what a
+/// reload landing in the `.await` window of a real decision does, against
+/// the same registry the candidate set was built from.
+#[derive(Clone)]
+struct VanishingWinnerRouter {
+    winner_manifest: std::path::PathBuf,
+    registry: Arc<AgentRegistry>,
+    reply: DecisionResponse,
+}
+
+#[async_trait]
+impl DecisionRouter for VanishingWinnerRouter {
+    async fn decide(&self, _request: DecisionRequest) -> Result<DecisionResponse, AppError> {
+        std::fs::remove_file(&self.winner_manifest).ok();
+        self.registry.reload_all(&[]).unwrap();
+        Ok(self.reply.clone())
+    }
+}
+
 /// A response that picks `key` with enough confidence (0.95) and enough
-/// specialisation (0.95) to clear both default thresholds — and a
-/// `probabilities` map that contains its own winner, which is the shape a
-/// consistent `Choice` has.
+/// specialisation (0.95) to clear both default thresholds — and a full,
+/// consistent `probabilities` map: both of `fudi`'s candidates are named
+/// and the winner is top-scored, the shape a well-formed `Choice` has.
 fn choice_for(key: &str) -> DecisionResponse {
     DecisionResponse {
         answers: BTreeMap::from([
@@ -230,7 +251,10 @@ fn choice_for(key: &str) -> DecisionResponse {
                 Answer::Choice {
                     key: key.to_string(),
                     confidence: 0.95,
-                    probabilities: BTreeMap::from([(key.to_string(), 0.95)]),
+                    probabilities: BTreeMap::from([
+                        (key.to_string(), 0.9),
+                        ("fudi::fudi".to_string(), 0.1),
+                    ]),
                 },
             ),
             (NOUL_KEY.to_string(), Answer::Noul { value: 0.95 }),
@@ -251,6 +275,67 @@ fn choice_omitting_its_winner() -> DecisionResponse {
                     key: "fudi::ops".to_string(),
                     confidence: 0.95,
                     probabilities: BTreeMap::from([("fudi::fudi".to_string(), 0.95)]),
+                },
+            ),
+            (NOUL_KEY.to_string(), Answer::Noul { value: 0.95 }),
+        ]),
+    }
+}
+
+/// A distribution that names only the winner: informative, but covering
+/// one of the two candidates the question offered. It is calibration
+/// input — the endpoint's reason to exist — so it must be attached with
+/// its coverage named, never dropped.
+fn choice_with_partial_probabilities() -> DecisionResponse {
+    DecisionResponse {
+        answers: BTreeMap::from([
+            (
+                CHOICE_KEY.to_string(),
+                Answer::Choice {
+                    key: "fudi::ops".to_string(),
+                    confidence: 0.95,
+                    probabilities: BTreeMap::from([("fudi::ops".to_string(), 0.95)]),
+                },
+            ),
+            (NOUL_KEY.to_string(), Answer::Noul { value: 0.95 }),
+        ]),
+    }
+}
+
+/// A distribution whose top score names a candidate the model did not
+/// choose: it contradicts the winner, so it must be withheld with a note
+/// rather than attached as evidence for the choice it argues against.
+fn choice_outscored_by_its_own_probabilities() -> DecisionResponse {
+    DecisionResponse {
+        answers: BTreeMap::from([
+            (
+                CHOICE_KEY.to_string(),
+                Answer::Choice {
+                    key: "fudi::ops".to_string(),
+                    confidence: 0.95,
+                    probabilities: BTreeMap::from([
+                        ("fudi::ops".to_string(), 0.3),
+                        ("fudi::fudi".to_string(), 0.7),
+                    ]),
+                },
+            ),
+            (NOUL_KEY.to_string(), Answer::Noul { value: 0.95 }),
+        ]),
+    }
+}
+
+/// No distribution at all beside the winner — nothing to show, and worth
+/// saying: an empty map beside a winner is not something an operator can
+/// calibrate a threshold against.
+fn choice_without_probabilities() -> DecisionResponse {
+    DecisionResponse {
+        answers: BTreeMap::from([
+            (
+                CHOICE_KEY.to_string(),
+                Answer::Choice {
+                    key: "fudi::ops".to_string(),
+                    confidence: 0.95,
+                    probabilities: BTreeMap::new(),
                 },
             ),
             (NOUL_KEY.to_string(), Answer::Noul { value: 0.95 }),
@@ -519,6 +604,119 @@ async fn a_winner_absent_from_the_probabilities_is_said_rather_than_shown() {
     assert!((raw_winner - 0.95).abs() < 1e-6);
 }
 
+/// Ask the preview once with the given reply, swapping the fake router in
+/// first — how the tests below walk several answers through one state.
+async fn preview_with(state: &Arc<AppState>, reply: DecisionResponse) -> RoutePreviewResponse {
+    *state.router.write().unwrap() = Some(Arc::new(FakeRouter::returning(reply)));
+    call_preview(state, &preview_json("fudi", "cancela el pedido 42"), true)
+        .await
+        .unwrap()
+}
+
+/// Finding (c): the note must say WHICH way the distribution failed, and
+/// the map is kept whenever it is informative. A partial distribution is
+/// calibration input — the endpoint's whole reason to exist — so it is
+/// attached with its coverage named; only an empty or contradicting map is
+/// withheld.
+#[tokio::test]
+async fn the_note_names_which_way_the_distribution_failed() {
+    let _env = PreviewEnv::new();
+    let (_dir, state) = state_with(Arc::new(EchoProvider), true, None);
+
+    let partial = preview_with(&state, choice_with_partial_probabilities()).await;
+    assert_eq!(partial.decision, "agent");
+    assert!(
+        partial.probabilities.contains_key("fudi::ops"),
+        "a partial distribution is calibration input and must be attached"
+    );
+    let note = partial
+        .probabilities_note
+        .expect("partial coverage must be said");
+    assert!(
+        note.contains("1 of 2"),
+        "the note must name the coverage: {note}"
+    );
+
+    let contradicted = preview_with(&state, choice_outscored_by_its_own_probabilities()).await;
+    assert_eq!(
+        contradicted.decision, "agent",
+        "the ladder decides from the winner, not from the distribution"
+    );
+    assert!(
+        contradicted.probabilities.is_empty(),
+        "a distribution contradicting its winner must be withheld"
+    );
+    let note = contradicted
+        .probabilities_note
+        .expect("the contradiction must be said");
+    assert!(
+        note.contains("higher"),
+        "the note must name the contradiction: {note}"
+    );
+
+    let empty = preview_with(&state, choice_without_probabilities()).await;
+    assert!(empty.probabilities.is_empty());
+    let note = empty
+        .probabilities_note
+        .expect("an absent distribution must be said");
+    assert!(
+        note.contains("no probabilities"),
+        "the note must name the absence: {note}"
+    );
+}
+
+/// Finding (b): the preview must report the same rung the chat would for a
+/// winner a hot reload removed — `general` with `stale_winner`, not
+/// `agent`. The vanishing router performs the reload *inside* `decide`,
+/// which is exactly where the race lives: the candidate set was already
+/// built from the registry, and the re-check is the registry's second read.
+#[tokio::test]
+async fn the_preview_reports_a_stale_winner_the_way_the_chat_would() {
+    let _env = PreviewEnv::new();
+    let (dir, state) = state_with(
+        Arc::new(EchoProvider),
+        true,
+        Some(FakeRouter::returning(choice_for("fudi::ops"))),
+    );
+
+    // Control: the winner is present, so the preview reports the agent it
+    // would dispatch to.
+    let body = preview_with(&state, choice_for("fudi::ops")).await;
+    assert_eq!(body.decision, "agent");
+    assert!(body.reason.is_none());
+
+    // The reload lands between the decision and its use: the winner's
+    // manifest is deleted and the registry reloaded during `decide`, so the
+    // re-check after it finds `fudi::ops` gone — and `fudi` (the general)
+    // still there, as the fallback the chat would take.
+    *state.router.write().unwrap() = Some(Arc::new(VanishingWinnerRouter {
+        winner_manifest: dir
+            .path()
+            .join("contextos")
+            .join("projects")
+            .join("fudi")
+            .join("agents")
+            .join("ops.toml"),
+        registry: state.agent_registry.clone(),
+        reply: choice_for("fudi::ops"),
+    }));
+    let body = call_preview(&state, &preview_json("fudi", "cancela el pedido 42"), true)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        body.decision, "general",
+        "a winner a reload removed must not be reported as the dispatch target"
+    );
+    // `STALE_WINNER` is `pub(crate)`; the spelling is interface, so the
+    // integration test names it literally.
+    assert_eq!(
+        body.reason.as_deref(),
+        Some("stale_winner"),
+        "the preview must report the rung the chat reports"
+    );
+}
+
 /// Step 4: with `X-Debug: true`, the non-streaming chat response carries
 /// the decision the router made — gated exactly like `debug_prompt`, which
 /// rides on this same request. (Round 1 shipped this field ungated per the
@@ -665,13 +863,20 @@ async fn debug_route_withholds_a_distribution_that_does_not_account_for_its_winn
     );
 }
 
-/// Open item 1: every `$ref` the document emits must resolve inside it.
-/// `HealthResponse` (carrying `RouterHealth`), `ChatResponse` (carrying
-/// `RoutedDebug`) and the new path's schemas are exactly the shapes whose
-/// registration this pins — an unregistered `ToSchema` field type produces a
-/// `$ref` pointing at nothing.
+/// Two invariants, honestly scoped — and what this test does **not** prove.
+///
+/// (1) Every `$ref` the document emits resolves inside it. A genuine
+/// invariant worth pinning, but utoipa 5 currently satisfies it on its own
+/// by collecting transitively referenced schemas, so this test cannot
+/// detect a schema that is unlisted yet collected: the explicit entries in
+/// `docs.rs` are documentation of the dependency graph, not something this
+/// walk can verify.
+///
+/// (2) `/api/route` is *listed* — the assertion that actually pins the
+/// endpoint's registration, because registering the `utoipa::path`
+/// annotation in `docs.rs` is the only thing that puts it here.
 #[test]
-fn the_openapi_document_has_no_unresolved_refs() {
+fn every_openapi_ref_resolves_and_the_route_preview_path_is_listed() {
     let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
     fn walk(value: &serde_json::Value, doc: &serde_json::Value, checked: &mut usize) {

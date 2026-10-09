@@ -9,8 +9,8 @@ use crate::services::agent_router::{
     build_questions, route, NoRoute, RoutingDecision, CHOICE_KEY, NOUL_KEY,
 };
 use crate::services::agent_runtime::RuntimeChatRequest;
-use crate::services::route_candidates::build_candidates;
-use serde::Serialize;
+use crate::services::route_candidates::{build_candidates, RouteCandidate};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Instant;
@@ -96,15 +96,21 @@ impl ResolvedSelection {
 /// it could be used. `winner`, `confidence` and `specialised` are `None`
 /// when the router did not answer with a usable value, never `0.0` — an
 /// absent value and a real zero are different reports.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct RoutedDebug {
     /// The project the request was routed *for*. A global winner keeps it:
     /// the empty project id lives in [`ResolvedSelection`], not here.
     pub project_id: String,
     /// `"agent"` or `"general"` — where the request was dispatched.
-    pub outcome: &'static str,
+    ///
+    /// `String`, not `&'static str`: [`ChatResponse`] derives `Deserialize`,
+    /// and a `&'static str` field would have forced `skip_deserializing`
+    /// on it — a silent change to a public type's serde contract. The two
+    /// spellings are constants either way; `String` just survives a
+    /// round-trip.
+    pub outcome: String,
     /// Why the general agent kept it, or `None` when a specialist won.
-    pub reason: Option<&'static str>,
+    pub reason: Option<String>,
     /// The label the model chose, when it answered the choice question.
     pub winner: Option<String>,
     pub confidence: Option<f32>,
@@ -131,7 +137,7 @@ pub(crate) const ROUTE_STATE_BUDGET_CHARS: usize = 8_000;
 /// The [`RoutedDebug::reason`] spelling for a winner that a hot reload
 /// removed between the decision and the use — the rung the ladder cannot
 /// report, because to the ladder the winner was valid.
-const STALE_WINNER: &str = "stale_winner";
+pub(crate) const STALE_WINNER: &str = "stale_winner";
 
 /// The conversation, as `"{role}: {content}"` lines, newest last.
 ///
@@ -257,15 +263,15 @@ pub async fn resolve_selection_with(
     // Each score is `None` when the response carried no usable value — never
     // `0.0`, which would narrate a malformed answer as a real score.
     let peeked = match &result {
-        Ok(response) => peeked_answer(response),
+        Ok(response) => peeked_answer(response, candidates.len()),
         Err(_) => PeekedAnswer::default(),
     };
     let candidate_keys: Vec<String> = candidates.iter().map(|c| c.key.clone()).collect();
 
     let debug = |outcome: &'static str, reason: Option<&'static str>| RoutedDebug {
         project_id: project_id.to_string(),
-        outcome,
-        reason,
+        outcome: outcome.to_string(),
+        reason: reason.map(str::to_string),
         winner: peeked.winner.clone(),
         confidence: peeked.confidence,
         specialised: peeked.specialised,
@@ -299,72 +305,47 @@ pub async fn resolve_selection_with(
             agent_id,
             ..
         }) => {
-            // Review Focus #4 — the hot-reload race. `route` decided from
-            // the candidates as they were; a reload can remove the winner
-            // before it is used, so the key is resolved again through the
-            // registry the caller passed. If it is gone — agents reloaded
-            // mid-request — degrade to the project's general agent, the
-            // ladder's own fallback, and say so. An id never verified to
-            // exist must never reach dispatch — the general fallback taken
-            // below is the one deliberate exception, and it is named there.
-            let present = if winner_project.is_empty() {
-                // An empty project id marks a global winner (pinned by
-                // `a_global_winner_carries_an_empty_project_id`): its
-                // registry key is the bare id, so `get_agent` — never
-                // `get_project_agent` under the requesting project, which
-                // would look for a same-named *project* agent instead.
-                registry.get_agent(&agent_id).is_some()
-            } else {
-                registry
-                    .get_project_agent(&winner_project, &agent_id)
-                    .is_some()
-            };
-
-            if present {
-                state.observability.record_route_to_agent();
-                let winner_project = if winner_project.is_empty() {
-                    None
-                } else {
-                    Some(winner_project)
-                };
-                Ok(ResolvedSelection {
-                    project_id: winner_project,
-                    agent_id: Some(agent_id),
-                    routed: Some(debug("agent", None)),
-                })
-            } else {
-                let vanished_key = if winner_project.is_empty() {
-                    agent_id.clone()
-                } else {
-                    format!("{winner_project}::{agent_id}")
-                };
-                tracing::warn!(
-                    project = %project_id,
-                    vanished_key = %vanished_key,
-                    "routed agent removed by a hot reload between the decision and the use; \
-                     falling back to the project's general agent"
-                );
-                state.observability.record_route_to_general();
-                let Some(general) = candidates.iter().find(|c| c.is_project_general) else {
-                    // `route` only returns `Agent` when the pre-reload
-                    // candidate set holds a general candidate to degrade to,
-                    // so this cannot happen — and if it ever did, the header
-                    // path is the safe answer.
-                    return Ok(ResolvedSelection::from_selection(&selection));
-                };
-                // The one deliberate exception to "an id never verified to
-                // exist must never reach dispatch": `general.agent_id` comes
-                // from the pre-reload candidate set and is *not* re-checked
-                // against `registry`. Re-checking it would have nowhere
-                // safer to land — the general agent is the fallback — so if
-                // the same reload removed it too, `prepare_request` finds
-                // nothing and reproduces today's 400 rather than dispatching
-                // to something worse than the report.
-                Ok(ResolvedSelection {
-                    project_id: Some(project_id.to_string()),
-                    agent_id: Some(general.agent_id.clone()),
-                    routed: Some(debug("general", Some(STALE_WINNER))),
-                })
+            // Review Focus #4 — the hot-reload race, checked by the shared
+            // [`recheck_winner`] so the preview reports the same rung this
+            // dispatch does. The counters below are dispatch's own: a
+            // preview decides nothing and must not inflate them.
+            match recheck_winner(
+                registry,
+                project_id,
+                &winner_project,
+                &agent_id,
+                &candidates,
+            ) {
+                WinnerRecheck::Present => {
+                    state.observability.record_route_to_agent();
+                    let winner_project = if winner_project.is_empty() {
+                        None
+                    } else {
+                        Some(winner_project)
+                    };
+                    Ok(ResolvedSelection {
+                        project_id: winner_project,
+                        agent_id: Some(agent_id),
+                        routed: Some(debug("agent", None)),
+                    })
+                }
+                WinnerRecheck::Stale(general_agent_id) => {
+                    state.observability.record_route_to_general();
+                    Ok(ResolvedSelection {
+                        project_id: Some(project_id.to_string()),
+                        agent_id: Some(general_agent_id),
+                        routed: Some(debug("general", Some(STALE_WINNER))),
+                    })
+                }
+                WinnerRecheck::NoFallback => {
+                    // `recheck_winner` only reports this when the candidate
+                    // set holds no general agent, which `route` never lets
+                    // happen — and if it ever did, the header path is the
+                    // safe answer. The counter fires as it always has on
+                    // this arm.
+                    state.observability.record_route_to_general();
+                    Ok(ResolvedSelection::from_selection(&selection))
+                }
             }
         }
         Ok(RoutingDecision::ProjectGeneral {
@@ -396,6 +377,75 @@ pub async fn resolve_selection_with(
     }
 }
 
+/// The re-check every winner survives after [`route`] decides, shared by
+/// dispatch and the preview endpoint so the two surfaces cannot disagree
+/// about the rung: hot reload can remove the winner between the decision
+/// and its use, so the key is resolved again through `registry`.
+///
+/// `request_project` is the project the decision was made for — it appears
+/// in the log line; a global winner keeps its own (empty) project id in
+/// `winner_project`, pinned by
+/// `a_global_winner_carries_an_empty_project_id`: its registry key is the
+/// bare id, so [`AgentRegistry::get_agent`] — never `get_project_agent`
+/// under the requesting project, which would look for a same-named
+/// *project* agent instead.
+///
+/// [`WinnerRecheck::Stale`]'s general agent id comes from the pre-reload
+/// candidate set and is deliberately **not** re-checked against
+/// `registry`. That is the one exception to "an id never verified to exist
+/// must never reach dispatch" — named in both callers — because
+/// re-checking it would have nowhere safer to land: the general agent is
+/// the fallback, so if the same reload removed it too, `prepare_request`
+/// finds nothing and reproduces today's 400 rather than dispatching to
+/// something worse than the report.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum WinnerRecheck {
+    /// The winner is still in `registry`; use it.
+    Present,
+    /// A reload removed the winner; fall back to this general agent (the
+    /// ladder's own fallback, taken from the pre-reload candidate set).
+    Stale(String),
+    /// The candidate set held no general agent to degrade to. `route` only
+    /// returns `Agent` when one exists, so this cannot happen; each caller
+    /// supplies its own safe answer — the header path for dispatch, the
+    /// chat's own 400 for the preview.
+    NoFallback,
+}
+
+pub(crate) fn recheck_winner(
+    registry: &AgentRegistry,
+    request_project: &str,
+    winner_project: &str,
+    agent_id: &str,
+    candidates: &[RouteCandidate],
+) -> WinnerRecheck {
+    let present = if winner_project.is_empty() {
+        registry.get_agent(agent_id).is_some()
+    } else {
+        registry
+            .get_project_agent(winner_project, agent_id)
+            .is_some()
+    };
+    if present {
+        return WinnerRecheck::Present;
+    }
+    let vanished_key = if winner_project.is_empty() {
+        agent_id.to_string()
+    } else {
+        format!("{winner_project}::{agent_id}")
+    };
+    tracing::warn!(
+        project = %request_project,
+        vanished_key = %vanished_key,
+        "routed agent removed by a hot reload between the decision and the use; \
+         falling back to the project's general agent"
+    );
+    match candidates.iter().find(|c| c.is_project_general) {
+        Some(general) => WinnerRecheck::Stale(general.agent_id.clone()),
+        None => WinnerRecheck::NoFallback,
+    }
+}
+
 /// The model's answer, read out of the response before [`route`] consumes
 /// it. Each field is `None` when the response did not carry a usable value.
 ///
@@ -408,17 +458,30 @@ pub struct PeekedAnswer {
     pub winner: Option<String>,
     pub confidence: Option<f32>,
     pub specialised: Option<f32>,
+    /// The distribution as the model reported it, whenever it is
+    /// informative — a partial distribution is exactly what threshold
+    /// calibration reads, so it is kept even when it names only some
+    /// candidates (with [`probabilities_note`](Self::probabilities_note)
+    /// saying how much of the choice it covers). Empty only when the model
+    /// reported none, or when a non-empty distribution contradicted its own
+    /// winner.
     pub probabilities: BTreeMap<String, f32>,
-    /// Set only when `winner` is a label the returned `probabilities` does
-    /// not contain: the distribution is withheld and the inconsistency is
-    /// said out loud, because emitting it beside the winner would present it
-    /// as an account of a decision it does not explain. Both debug surfaces
-    /// — the preview endpoint and `ChatResponse::debug_route` — read this
-    /// one extractor, so they cannot disagree about it.
+    /// Set whenever the distribution is not a plain account of the winner,
+    /// naming which case: the model reported no probabilities at all; the
+    /// probabilities cover only some of the offered candidates (the map is
+    /// attached anyway); the winner is absent from its own distribution, or
+    /// another candidate outscores it (the map is withheld — an account of
+    /// a choice it contradicts must not be presented as evidence for it).
+    /// Both debug surfaces — the preview endpoint and
+    /// `ChatResponse::debug_route` — read this one extractor, so they
+    /// cannot disagree about it.
     pub probabilities_note: Option<String>,
 }
 
-pub(crate) fn peeked_answer(response: &DecisionResponse) -> PeekedAnswer {
+/// `offered` is the number of candidates the choice question named, so a
+/// distribution that covers only some of them can be kept *and* labelled
+/// rather than mistaken for a complete account.
+pub(crate) fn peeked_answer(response: &DecisionResponse, offered: usize) -> PeekedAnswer {
     let mut peeked = PeekedAnswer::default();
     match response.answers.get(CHOICE_KEY) {
         Some(Answer::Choice {
@@ -428,26 +491,78 @@ pub(crate) fn peeked_answer(response: &DecisionResponse) -> PeekedAnswer {
         }) => {
             peeked.winner = Some(key.clone());
             peeked.confidence = confidence.is_finite().then_some(*confidence);
-            // The adapter never checks that a `Choice`'s `key` appears among
-            // its own `probabilities`, so an answer whose distribution does
-            // not account for its own winner can arrive from the wire. The
-            // ladder still decides from the winner — the distribution is
-            // evidence, not the decision — so nothing is dropped silently:
-            // `raw` on the preview keeps exactly what the router answered.
-            if probabilities.contains_key(key) {
-                peeked.probabilities = probabilities.clone();
-            } else {
-                tracing::warn!(
-                    winner = %key,
-                    "router named a winner its own probabilities do not contain; \
-                     withholding the distribution"
-                );
-                peeked.probabilities_note = Some(format!(
-                    "the model chose '{}' but its probabilities do not contain it; \
-                     the distribution is withheld rather than presented as an account \
-                     of a winner it does not explain",
-                    key
-                ));
+            // The adapter never checks `probabilities` against the winner or
+            // the offered set, so the wire can carry a distribution that is
+            // empty, partial, or flatly contradictory. It is kept whenever
+            // it is informative — calibration is the preview's reason to
+            // exist — and withheld only when it is empty or contradicts the
+            // winner, with the note naming which case. The ladder still
+            // decides from the winner either way, and `raw` on the preview
+            // keeps exactly what the router answered: nothing is lost
+            // silently, only a misleading presentation is.
+            let top = probabilities
+                .values()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            match probabilities.get(key) {
+                // The winner is in its own distribution and top-scored (a
+                // tie at the top is not a contradiction): keep whatever the
+                // model offered, and say when it named only some candidates
+                // rather than letting a partial map read as a full account.
+                Some(score) if *score >= top => {
+                    if probabilities.len() < offered {
+                        peeked.probabilities_note = Some(format!(
+                            "the model's probabilities cover {} of {} candidates; \
+                             the partial distribution is attached",
+                            probabilities.len(),
+                            offered
+                        ));
+                    }
+                    peeked.probabilities = probabilities.clone();
+                }
+                // The winner is in the map but another candidate outscores
+                // it: the model contradicted its own choice. Withheld.
+                Some(_) => {
+                    tracing::warn!(
+                        winner = %key,
+                        "router probabilities score a candidate above the router's own winner; \
+                         withholding the distribution"
+                    );
+                    peeked.probabilities_note = Some(format!(
+                        "the model chose '{}' but its own probabilities score another \
+                         candidate higher; the distribution is withheld rather than \
+                         presented as an account of a choice it contradicts",
+                        key
+                    ));
+                }
+                // The winner is absent from the map: either the model
+                // reported no distribution at all, or a non-empty one that
+                // does not contain its own winner. Both are said; only the
+                // second is a contradiction.
+                None => {
+                    if probabilities.is_empty() {
+                        tracing::warn!(
+                            winner = %key,
+                            "router reported no probabilities beside its winner"
+                        );
+                        peeked.probabilities_note = Some(format!(
+                            "the model chose '{}' but reported no probabilities at all",
+                            key
+                        ));
+                    } else {
+                        tracing::warn!(
+                            winner = %key,
+                            "router named a winner its own probabilities do not contain; \
+                             withholding the distribution"
+                        );
+                        peeked.probabilities_note = Some(format!(
+                            "the model chose '{}' but its probabilities do not contain it; \
+                             the distribution is withheld rather than presented as an account \
+                             of a winner it does not explain",
+                            key
+                        ));
+                    }
+                }
             }
         }
         _ => {}
