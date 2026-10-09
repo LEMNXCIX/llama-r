@@ -120,7 +120,7 @@ Con `ROUTER_ENABLED=true`, una petición con `X-Project` y sin `X-Agent` se enru
 llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0   # sirve POST /v1/systemone en :8080
 ```
 
-Está **desactivado por defecto**: actualizar Llama-R sin tocar nada más no cambia su comportamiento. Si nada encaja (confianza por debajo de `MIN_CONFIDENCE`, especialización por debajo de `MIN_SPECIALIZED`, o el router no responde), la petición queda en el **agente general del proyecto** (`contextos/projects/<p>/agents/<p>.toml`), nunca en un modelo sin agente. Un router caído no impide el arranque: el servidor levanta igual, `/api/health` reporta `router` (donde `healthy` es una comprobación TCP del origen configurado, no una petición a `/v1/systemone`) y las peticiones degradan al agente general.
+Está **desactivado por defecto**: actualizar Llama-R sin tocar nada más no cambia su comportamiento. Si nada encaja (confianza por debajo de `MIN_CONFIDENCE`, especialización por debajo de `MIN_SPECIALIZED`, o el router no responde), la petición queda en el **agente general del proyecto** (`contextos/projects/<p>/agents/<p>.toml`), nunca en un modelo sin agente — y si el proyecto no tiene agente general no hay dónde degradar: responde `400`, como antes de que existiera el router, y sin llegar a gastar una decisión. Un router caído no impide el arranque: el servidor levanta igual, `/api/health` reporta `router` (donde `healthy` es una comprobación TCP del origen configurado, no una petición a `/v1/systemone`) y las peticiones degradan al agente general (o responden `400` si el proyecto carece de uno).
 
 Para probarlo de extremo a extremo (asumiendo el puerto por defecto de llama-r, `3000`):
 
