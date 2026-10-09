@@ -107,10 +107,45 @@ POST /v1/chat/completions
 
 **Headers:**
 - `X-Project` — selecciona el proyecto
-- `X-Agent` — selecciona un agente dentro del proyecto (si se omite, usa el agente general del proyecto)
-- `X-Debug` — si se envía, incluye `debug_prompt` en la respuesta
+- `X-Agent` — selecciona un agente dentro del proyecto (si se omite y el router está desactivado, que es el caso por defecto, usa el agente general del proyecto; con `ROUTER_ENABLED=true` el router elige, ver más abajo)
+- `X-Debug` — si se envía, incluye `debug_prompt` y `debug_route` en la respuesta
 
-**Validación estricta:** si se envía `X-Project`, Llama-R **requiere** que exista un agente válido dentro de ese proyecto. Si no se encuentra, responde con `400 Bad Request`.
+**Validación estricta:** si se envía `X-Project`, Llama-R **requiere** que exista un agente válido dentro de ese proyecto. Si no se encuentra, responde con `400 Bad Request`. Ese agente puede salir del router (abajo), pero siempre dentro del proyecto: una petición que nombra un proyecto nunca cae en un modelo sin agente.
+
+### Enrutamiento de agentes (opt-in)
+
+Con `ROUTER_ENABLED=true`, una petición con `X-Project` y sin `X-Agent` se enruta hacia el agente más adecuado de ese proyecto (más los agentes globales) mediante un modelo de decisión **Liquid AI d1**, en lugar de ir siempre al agente general. d1 no genera tokens: evalúa preguntas tipadas en un solo forward pass y devuelve probabilidades calibradas, así que **Ollama no puede servirlo** (sus endpoints son generativos). Necesita un `llama-server` aparte:
+
+```bash
+llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0   # sirve POST /v1/systemone en :8080
+```
+
+Está **desactivado por defecto**: actualizar Llama-R sin tocar nada más no cambia su comportamiento. Si nada encaja (confianza por debajo de `MIN_CONFIDENCE`, especialización por debajo de `MIN_SPECIALIZED`, o el router no responde), la petición queda en el **agente general del proyecto** (`contextos/projects/<p>/agents/<p>.toml`), nunca en un modelo sin agente. Un router caído no impide el arranque: el servidor levanta igual, `/api/health` reporta `router` (donde `healthy` es una comprobación TCP del origen configurado, no una petición a `/v1/systemone`) y las peticiones degradan al agente general.
+
+Para probarlo de extremo a extremo (asumiendo el puerto por defecto de llama-r, `3000`):
+
+```bash
+# 1. levantar el modelo de decisión
+llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0
+
+# 2. activar el router en .env y arrancar
+#    ROUTER_ENABLED=true
+cargo run
+
+# 3. decidir sin ejecutar el chat (calibra MIN_CONFIDENCE)
+curl -s http://127.0.0.1:3000/api/route \
+  -H 'Content-Type: application/json' -H 'X-Debug: true' \
+  -d '{"project_id":"mi-proyecto","prompt":"hazme un plan de comidas"}'
+
+# 4. chatear sin X-Agent: el router elige el agente
+curl -s http://127.0.0.1:3000/api/chat \
+  -H 'Content-Type: application/json' -H 'X-Project: mi-proyecto' \
+  -d '{"messages":[{"role":"user","content":"hazme un plan de comidas"}]}'
+```
+
+Variables: `ROUTER_ENABLED` (`false`), `ROUTER_URL` (`http://127.0.0.1:8080`), `ROUTER_MODEL` (`d1-3b`), `ROUTER_TIMEOUT_MS` (`3000`), `MIN_CONFIDENCE` (`0.60`), `MIN_SPECIALIZED` (`0.50`). Un `router.toml` opcional en el directorio base las sobreescribe (y es el único sitio donde poner la lista `exclude`).
+
+gRPC hereda el enrutado (mismos `x-project`/`x-agent` en metadatos, mismo dispatch). La TUI no enruta: ahí eliges el agente a propósito.
 
 ### Agentes CRUD
 ```

@@ -18,6 +18,9 @@ This file documents the current developer workflows and commands for working on 
 - On first run, when `DEFAULT_MODEL` is missing **and** a terminal is available, the app enters interactive provider setup and persists the result to `.env`.
 - The provider being unreachable is **not** a startup failure. With `DEFAULT_MODEL` set, llama-r boots degraded and `GET /api/health` reports `"status":"degraded"` with the underlying cause; chat and RAG requests fail with a `502`/`500` naming the connection error. It recovers on its own once the provider is reachable.
 - Without a TTY (systemd, Docker, CI) llama-r never blocks on an interactive prompt: it boots and logs a warning.
+- Agent routing is **off by default** (`ROUTER_ENABLED=false`): an update that only ships the router changes nothing. When it is enabled, a chat request carrying `X-Project` but no `X-Agent` is routed to that project's most appropriate agent by a Liquid AI d1 decision model. d1 generates no tokens — it evaluates typed questions in one forward pass and returns calibrated probabilities — so Ollama cannot serve it (its endpoints are generative); it runs in a separate `llama-server` process (`llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0`, which serves `POST /v1/systemone`).
+- A missing or unreachable router is **not** a startup failure, mirroring the provider rule above: with `DEFAULT_MODEL` set llama-r boots and logs a warning, `GET /api/health` reports the router's state, and the requests that would have been routed degrade to the project's general agent.
+- Routing lives inside the shared chat dispatch, so the HTTP chat endpoints and gRPC both inherit it (`src/api/grpc.rs` builds the same `AgentSelection` and calls the same `execute_chat`). The TUI does not route: it is a separate path, and there you pick an agent deliberately.
 - Agent configs are loaded from `agents/` and `contextos/projects/<project_id>/agents/`.
 - Project contexts are stored under `contextos/projects/<project_id>/`.
 - Hot reload watches the base Llama-R directory, so agent and context changes are picked up without restarting.
@@ -34,6 +37,16 @@ Primary environment variables:
 - `EMBEDDING_DIMENSIONS`: expected vector size, default `768`
 - `RAG_ENABLED`: build/use RAG store at runtime, default `true`
 - `HISTORY_RETENTION_DAYS`: purge conversations older than this many days, default `90`. `0` disables purging.
+- `ROUTER_ENABLED`: enable agent routing, default `false`. Off by default so an update that only ships the router changes nothing.
+- `ROUTER_URL`: decision-model origin (the separate `llama-server`), default `http://127.0.0.1:8080`
+- `ROUTER_MODEL`: model label sent with each decision, default `d1-3b`
+- `ROUTER_TIMEOUT_MS`: budget for one decision in milliseconds, default `3000`. `0` is rejected.
+- `MIN_CONFIDENCE`: below this `Choice` confidence the request stays with the project's general agent, default `0.60`. Must be greater than `0.0` and at most `1.0`; `0` is rejected rather than clamped.
+- `MIN_SPECIALIZED`: below this specialisation score a specialist does not win over the general agent, default `0.50`. Same `(0.0, 1.0]` bounds as `MIN_CONFIDENCE`. The env name uses a `z`; the matching `router.toml` key is `min_specialised`.
+
+A malformed router value (bad number, timeout `0`, threshold outside `(0.0, 1.0]`) is a configuration error naming the variable and the value received, not a silent clamp. At boot that error is logged as a warning and the router falls back to the inert defaults (routing disabled) — like a bad `ROUTER_URL`, it never stops startup.
+
+An optional `router.toml` in the base directory overrides any of the values above (`enabled`, `url`, `model`, `timeout_ms`, `min_confidence`, `min_specialised`, and an `exclude` list of agent ids routing must never select): the environment provides the defaults and the file wins on the keys it actually sets. There is no env var for `exclude`. A missing file is fine; an unreadable or malformed one is a configuration error naming the path, and at boot it is logged and falls back to the inert defaults (routing disabled) rather than being silently ignored.
 
 Recommended setup:
 
@@ -131,6 +144,8 @@ GET /health
 GET /api/health
 ```
 
+The response carries a `router` field: `{"enabled": bool, "healthy": bool, "url": …}`. `healthy` is a **last-known value**, not a live probe: it starts with a **TCP reachability check of the configured origin** at boot (a connect, not a request to `/v1/systemone`) and is then updated by the outcome of every decision. It means "something was listening at `ROUTER_URL`", **not** that `/v1/systemone` answers. A router that is switched off reports `healthy: false` (nothing has checked it), and `status` is `"ok"` only when the provider is healthy and the router is either disabled or healthy — an enabled-but-unreachable router reports `"degraded"`, for the same reason an unreachable provider does.
+
 ### Basic Endpoints
 ```text
 GET  /
@@ -151,6 +166,15 @@ POST /v1/chat/completions
 **Strict Validation:** If `X-Project` is provided, Llama-R **requires** a valid agent to be found within that project context. If the requested agent (or the project's default agent) is missing, the request will fail with a `400 Bad Request` error. This ensures that project-scoped requests never accidentally bypass the intended context and rules.
 
 If `X-Project` is sent without `X-Agent`, Llama-R loads the project general agent whose id matches the project id (e.g., `contextos/projects/my-project/agents/my-project.toml`).
+
+With routing enabled (`ROUTER_ENABLED=true`), two behaviours change against the two paragraphs above — and only then; with the router off (the default) both behave exactly as written:
+
+- `X-Project` without `X-Agent` no longer always resolves to the general agent: it is routed among that project's agents plus the global agents, keyed by the registry's scheme (`project::agent` for project agents, the bare id for globals). `X-Agent` still pins the target and never spends a decision.
+- A project with specialised agents but no general agent can now route, where before this request was `400` outright. If no specialist is selected — low `MIN_CONFIDENCE`, low `MIN_SPECIALIZED`, the router not answering — it returns `400` as before. A project with no agents to route between is not routed at all and keeps failing validation exactly as it did before routing existed.
+
+When nothing fits, the destination is the project's **general agent** (`contextos/projects/<p>/agents/<p>.toml`), never a bare `DEFAULT_MODEL`: a request that named a project must be answered inside that project with its context and rules, and falling through to an unscoped model would drop exactly what the request asked for.
+
+Routing is not HTTP-only: it lives inside `execute_chat`, so gRPC inherits it because `src/api/grpc.rs` builds the same `AgentSelection` from the `x-project`/`x-agent` metadata and calls the same dispatch — there is no per-surface opt-out. The TUI does not route: it is a separate path, and there you pick an agent deliberately.
 
 ### Agent API
 ```text
@@ -195,6 +219,15 @@ POST /api/rag/delete-document
 
 Returns `403` without the header (checked before the body is parsed), and `501` when RAG is disabled (`RAG_ENABLED=false`).
 
+### Router (debug/admin — requires `X-Debug: true`)
+```text
+POST /api/route
+```
+
+Body: `{"project_id": "...", "prompt": "..."}`. It runs the routing decision for that prompt — same candidates, same two questions, same thresholds as a chat would use — and returns the evidence (candidates, raw response, derived decision and reason, both scores, the probability distribution, decision latency) **without executing the chat**. This is the tool for calibrating `MIN_CONFIDENCE`: a preview costs one decision-model forward pass instead of a full agent turn.
+
+Returns `403` without the header (checked before the body is parsed), `400` when the project has no candidates to route between, and `501` when routing is disabled. The same evidence is available on a real chat response as `debug_route` when `X-Debug: true` is sent.
+
 ## Developer Commands
 ```powershell
 cargo fmt
@@ -208,6 +241,7 @@ cargo test --target-dir target-tests
 - `contextos/projects/<project_id>/context/`: saved generated context
 - `data/lancedb/`: persistent RAG collections (gitignored; FileRagStore JSONL per `source_id`)
 - `data/history.db`: SQLite conversation history (gitignored)
+- `router.toml` (optional): router tuning — the two thresholds, `exclude`, and any of the `ROUTER_*` values; overrides the environment defaults
 - `logs/llama-r.log`: rolling application logs
 
 ## TUI
