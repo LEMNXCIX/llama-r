@@ -398,6 +398,45 @@ mod tests {
         choice_and_noul("fudi::fudi", 1.0, 0.0)
     }
 
+    /// Every degrading rung must land on the project's general agent — by its
+    /// **bare `agent_id`** (`"fudi"`), because `get_project_agent` resolves
+    /// ids and not routing keys — under the project the request came in for.
+    /// The identity is the point of this helper: a `matches!` ending in `..`
+    /// would pass a fallback wired to `general.key` (`"fudi::fudi"`), which
+    /// would then miss on every degraded request in the next task while all
+    /// reason assertions stayed green.
+    ///
+    /// Both literals are `"fudi"` on purpose: it is the fixture's project
+    /// throughout this module, and its general agent's id equals the project
+    /// id — that is what `is_project_general` means. `context` names the rung
+    /// (or the offending value) in every panic.
+    fn assert_degrades_to_general(
+        decision: Result<RoutingDecision, NoRoute>,
+        reason: GeneralReason,
+        context: &str,
+    ) {
+        match decision {
+            Ok(RoutingDecision::ProjectGeneral {
+                project_id,
+                agent_id,
+                reason: got,
+                ..
+            }) => {
+                assert_eq!(
+                    project_id, "fudi",
+                    "{context}: the fallback stays in the request's project"
+                );
+                assert_eq!(
+                    agent_id, "fudi",
+                    "{context}: the fallback is the general candidate's bare agent_id, \
+                     not its routing key"
+                );
+                assert_eq!(got, reason, "{context}: wrong rung reported");
+            }
+            other => panic!("{context}: expected ProjectGeneral({reason:?}), got {other:?}"),
+        }
+    }
+
     // Review Focus #5: an empty set must short-circuit, not send a zero-option Choice.
     #[test]
     fn no_candidates_never_reaches_the_router() {
@@ -437,13 +476,56 @@ mod tests {
             0.5,
             Err(AppError::Provider("down".into())),
         );
-        assert!(matches!(
+        assert_degrades_to_general(
             decision,
-            Ok(RoutingDecision::ProjectGeneral {
-                reason: GeneralReason::RouterUnavailable,
-                ..
-            })
-        ));
+            GeneralReason::RouterUnavailable,
+            "router error rung",
+        );
+    }
+
+    /// Finding 1: the arm a mismatched or partially-parsing adapter lands
+    /// on. The response never answered the choice question at all — neither
+    /// shape has an entry under `CHOICE_KEY` — and the reason must be
+    /// `RouterUnavailable`, the string Task 7's log line and Task 8's
+    /// `debug_route` key on, not `NotSpecialised`/`LowConfidence` (wrong
+    /// rung named) and not an `Err` (a 400 for a project that routes fine
+    /// today).
+    #[test]
+    fn a_response_that_never_answered_the_choice_question_is_router_unavailable() {
+        let candidates = candidates(&[("fudi::ops", false), ("fudi::fudi", true)]);
+        let partial = [
+            ("empty answers map", BTreeMap::new()),
+            (
+                "specialised answer without a choice answer",
+                BTreeMap::from([(NOUL_KEY.to_string(), Answer::Noul { value: 0.91 })]),
+            ),
+        ];
+        for (context, answers) in partial {
+            let decision = route(
+                "fudi",
+                &candidates,
+                0.6,
+                0.5,
+                Ok(DecisionResponse { answers }),
+            );
+            assert_degrades_to_general(decision, GeneralReason::RouterUnavailable, context);
+        }
+    }
+
+    /// Finding 1, second shape: there *is* an entry under `CHOICE_KEY`, but
+    /// it answers a different question. Same rung, same reason.
+    #[test]
+    fn a_choice_slot_holding_a_noul_is_router_unavailable() {
+        let candidates = candidates(&[("fudi::ops", false), ("fudi::fudi", true)]);
+        let response = DecisionResponse {
+            answers: BTreeMap::from([(CHOICE_KEY.to_string(), Answer::Noul { value: 0.91 })]),
+        };
+        let decision = route("fudi", &candidates, 0.6, 0.5, Ok(response));
+        assert_degrades_to_general(
+            decision,
+            GeneralReason::RouterUnavailable,
+            "choice slot holds a noul",
+        );
     }
 
     #[test]
@@ -453,13 +535,7 @@ mod tests {
         let candidates = candidates(&[("fudi::fudi", true)]);
         let response = choice_response("fudi::ops", 0.99);
         let decision = route("fudi", &candidates, 0.6, 0.5, Ok(response));
-        assert!(matches!(
-            decision,
-            Ok(RoutingDecision::ProjectGeneral {
-                reason: GeneralReason::UnknownKey,
-                ..
-            })
-        ));
+        assert_degrades_to_general(decision, GeneralReason::UnknownKey, "unknown key rung");
     }
 
     #[test]
@@ -472,13 +548,11 @@ mod tests {
             0.5,
             Ok(choice_and_noul("fudi::ops", 0.95, 0.10)),
         );
-        assert!(matches!(
+        assert_degrades_to_general(
             decision,
-            Ok(RoutingDecision::ProjectGeneral {
-                reason: GeneralReason::NotSpecialised,
-                ..
-            })
-        ));
+            GeneralReason::NotSpecialised,
+            "specialisation gate",
+        );
     }
 
     #[test]
@@ -491,13 +565,7 @@ mod tests {
             0.5,
             Ok(choice_and_noul("fudi::ops", 0.30, 0.90)),
         );
-        assert!(matches!(
-            decision,
-            Ok(RoutingDecision::ProjectGeneral {
-                reason: GeneralReason::LowConfidence,
-                ..
-            })
-        ));
+        assert_degrades_to_general(decision, GeneralReason::LowConfidence, "confidence gate");
     }
 
     #[test]
@@ -510,13 +578,7 @@ mod tests {
             0.5,
             Ok(choice_and_noul("fudi::fudi", 0.99, 0.05)),
         );
-        assert!(matches!(
-            decision,
-            Ok(RoutingDecision::ProjectGeneral {
-                reason: GeneralReason::GeneralWon,
-                ..
-            })
-        ));
+        assert_degrades_to_general(decision, GeneralReason::GeneralWon, "who-won rung");
     }
 
     #[test]
@@ -531,16 +593,50 @@ mod tests {
         );
         match decision.unwrap() {
             RoutingDecision::Agent {
+                project_id,
                 agent_id,
                 confidence,
                 specialised,
-                ..
             } => {
+                assert_eq!(project_id, "fudi", "a project winner keeps its project");
                 assert_eq!(agent_id, "ops");
                 assert!((confidence - 0.88).abs() < 1e-6);
                 assert!((specialised - 0.91).abs() < 1e-6);
             }
             other => panic!("expected a specialist, got {other:?}"),
+        }
+    }
+
+    /// Finding 4: pins the global-winner contract Task 7 resolves on — an
+    /// empty `project_id` means "the winner is a global agent", so it is
+    /// resolved with `get_agent` and never looked up as a project agent of
+    /// the requesting project. Reusing the request's project here
+    /// (`project_id.to_string()` at rung 10) would compile and pass every
+    /// other test while routing a global pick to a same-named *project*
+    /// agent.
+    #[test]
+    fn a_global_winner_carries_an_empty_project_id() {
+        let candidates = candidates(&[("fudi::fudi", true), ("ops", false)]);
+        let decision = route(
+            "fudi",
+            &candidates,
+            0.6,
+            0.5,
+            Ok(choice_and_noul("ops", 0.88, 0.91)),
+        );
+        match decision.unwrap() {
+            RoutingDecision::Agent {
+                project_id,
+                agent_id,
+                confidence,
+                specialised,
+            } => {
+                assert_eq!(project_id, "", "a global agent has no project");
+                assert_eq!(agent_id, "ops");
+                assert!((confidence - 0.88).abs() < 1e-6);
+                assert!((specialised - 0.91).abs() < 1e-6);
+            }
+            other => panic!("expected the global specialist, got {other:?}"),
         }
     }
 
@@ -567,15 +663,45 @@ mod tests {
             0.5,
             Ok(choice_only("fudi::ops", 0.99)),
         );
-        assert!(
-            matches!(
-                decision,
-                Ok(RoutingDecision::ProjectGeneral {
-                    reason: GeneralReason::NotSpecialised,
-                    ..
-                })
-            ),
-            "an absent gate must not default to trusting a specialist"
+        assert_degrades_to_general(
+            decision,
+            GeneralReason::NotSpecialised,
+            "an absent gate must not default to trusting a specialist",
+        );
+    }
+
+    /// Finding 3: the mirror of rung 4, added deliberately in Task 5 and
+    /// untested until now — the specialised question *was* answered, just
+    /// not with a `Noul`, so the response did not answer what was asked and
+    /// the reason is `RouterUnavailable`, not a gate that never ran.
+    #[test]
+    fn a_specialised_question_answered_with_a_choice_is_router_unavailable() {
+        let candidates = candidates(&[("fudi::ops", false), ("fudi::fudi", true)]);
+        let response = DecisionResponse {
+            answers: BTreeMap::from([
+                (
+                    CHOICE_KEY.to_string(),
+                    Answer::Choice {
+                        key: "fudi::ops".into(),
+                        confidence: 0.99,
+                        probabilities: BTreeMap::new(),
+                    },
+                ),
+                (
+                    NOUL_KEY.to_string(),
+                    Answer::Choice {
+                        key: "fudi::fudi".into(),
+                        confidence: 0.9,
+                        probabilities: BTreeMap::new(),
+                    },
+                ),
+            ]),
+        };
+        let decision = route("fudi", &candidates, 0.6, 0.5, Ok(response));
+        assert_degrades_to_general(
+            decision,
+            GeneralReason::RouterUnavailable,
+            "noul slot holds a choice",
         );
     }
 
@@ -597,15 +723,10 @@ mod tests {
                 0.5,
                 Ok(choice_and_noul("fudi::ops", confidence, 0.91)),
             );
-            assert!(
-                matches!(
-                    &decision,
-                    Ok(RoutingDecision::ProjectGeneral {
-                        reason: GeneralReason::RouterUnavailable,
-                        ..
-                    })
-                ),
-                "confidence {confidence} must not be trusted: {decision:?}"
+            assert_degrades_to_general(
+                decision,
+                GeneralReason::RouterUnavailable,
+                &format!("confidence {confidence} must not be trusted"),
             );
         }
     }
@@ -625,15 +746,10 @@ mod tests {
                 0.5,
                 Ok(choice_and_noul("fudi::ops", 0.99, specialised)),
             );
-            assert!(
-                matches!(
-                    &decision,
-                    Ok(RoutingDecision::ProjectGeneral {
-                        reason: GeneralReason::RouterUnavailable,
-                        ..
-                    })
-                ),
-                "specialised {specialised} must not be trusted: {decision:?}"
+            assert_degrades_to_general(
+                decision,
+                GeneralReason::RouterUnavailable,
+                &format!("specialised {specialised} must not be trusted"),
             );
         }
     }
