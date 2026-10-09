@@ -809,16 +809,51 @@ mod tests {
         );
     }
 
+    /// Draw an ephemeral port, release the listener, and let the probe answer
+    /// whether the port is now closed. `true` means the probe DID report the
+    /// released port unreachable; `false` means every drawn port was grabbed
+    /// by another test before a probe could see it closed.
+    ///
+    /// The bind-drop-probe sequence is the retryable unit. A fresh port is
+    /// drawn per attempt because once a listener is dropped its port is
+    /// genuinely free — `adapters::rag::embeddings` tests bind ephemeral
+    /// listeners in this same lib binary and the kernel may hand them the
+    /// just-released port. Retrying the sequence instead of asserting on a
+    /// single draw is what keeps contention from ever failing this test.
+    fn released_port_probes_as_closed(attempts: u32) -> bool {
+        for _ in 0..attempts {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("the kernel hands out an ephemeral port on request");
+            let port = listener
+                .local_addr()
+                .expect("listener has an address")
+                .port();
+            drop(listener);
+            if !probe_router_origin(&format!("http://127.0.0.1:{port}"), 1000) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The probe must see a listener and must report a closed port as
     /// unreachable rather than hang or panic.
     ///
-    /// The closed-port half is theoretically flaky, and says so: it binds an
-    /// ephemeral port and drops it, so the connect is refused on loopback
-    /// *unless* another test in this lib binary draws the same just-released
-    /// port in the window between `drop` and the probe — and other tests here
-    /// do bind ephemeral ports (e.g. `adapters::rag::embeddings`). The window
-    /// is microseconds against a large ephemeral range, so in practice it has
-    /// not fired; if it ever does, harden the test rather than trust the luck.
+    /// The held-listener half is uncontended by construction, not by luck:
+    /// the kernel never assigns a bound, listening port to another `:0` bind,
+    /// rebinding a live port needs `SO_REUSEPORT` (std and tokio set only
+    /// `SO_REUSEADDR`, which does not allow two live listeners), and no test
+    /// in this lib binary binds a fixed port. The probe connects to a port
+    /// this test exclusively owns for the whole half.
+    ///
+    /// The released-port half IS contended, so the observation that the probe
+    /// reports the port closed and the test's pass condition are one event:
+    /// a second, later probe of the same port would reopen exactly the race
+    /// window this replaces — another test could draw the port between the
+    /// two probes. Contention instead retries the whole sequence with a
+    /// fresh port (`released_port_probes_as_closed`), and only a bounded run
+    /// of collisions fails the test, with the port-acquisition message it
+    /// deserves rather than a misleading "probe saw a listener".
     #[test]
     fn the_probe_sees_a_listener_and_misses_a_closed_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -828,9 +863,10 @@ mod tests {
             1000
         ));
         drop(listener);
-        assert!(!probe_router_origin(
-            &format!("http://127.0.0.1:{port}"),
-            1000
-        ));
+        assert!(
+            released_port_probes_as_closed(8),
+            "could not observe a released port as closed in 8 attempts — \
+             ephemeral-port contention in this test binary never relented"
+        );
     }
 }
