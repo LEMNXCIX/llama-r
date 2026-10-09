@@ -192,8 +192,14 @@ impl LLMProvider for FakeProvider {
 }
 
 struct TestApp {
-    _guard: MutexGuard<'static, ()>,
+    // Drop order is load-bearing: fields drop in declaration order, and the
+    // env guard MUST restore the ambient `ROUTER_*` values while `TEST_LOCK`
+    // is still held. Declared the other way round, `_guard` releases the lock
+    // first and the next thread to take it can build its `AppState` against a
+    // half-restored environment — a low-frequency race that made
+    // `health_should_report_runtime_status` fail under `ROUTER_ENABLED=true`.
     _router_env: RouterEnvGuard,
+    _guard: MutexGuard<'static, ()>,
     temp_dir: TempDir,
     router: axum::Router,
     grpc_service: GrpcService,
@@ -243,8 +249,8 @@ fn setup_app() -> TestApp {
     let grpc_service = GrpcService::new(state);
 
     TestApp {
-        _guard: guard,
         _router_env: router_env,
+        _guard: guard,
         temp_dir,
         router,
         grpc_service,

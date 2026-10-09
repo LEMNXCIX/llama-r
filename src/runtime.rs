@@ -810,9 +810,15 @@ mod tests {
     }
 
     /// The probe must see a listener and must report a closed port as
-    /// unreachable rather than hang or panic. The closed-port half binds an
-    /// ephemeral port and drops it: the connect is refused on loopback, and
-    /// no other test in this binary binds random ephemeral ports.
+    /// unreachable rather than hang or panic.
+    ///
+    /// The closed-port half is theoretically flaky, and says so: it binds an
+    /// ephemeral port and drops it, so the connect is refused on loopback
+    /// *unless* another test in this lib binary draws the same just-released
+    /// port in the window between `drop` and the probe — and other tests here
+    /// do bind ephemeral ports (e.g. `adapters::rag::embeddings`). The window
+    /// is microseconds against a large ephemeral range, so in practice it has
+    /// not fired; if it ever does, harden the test rather than trust the luck.
     #[test]
     fn the_probe_sees_a_listener_and_misses_a_closed_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
