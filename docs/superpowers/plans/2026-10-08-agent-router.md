@@ -1084,7 +1084,7 @@ Co-Authored-By: opencode <opencode@local>"
 Under Environment, add the six variables with their defaults from Task 3. Under "HTTP API Quick Reference", add `POST /api/route` with its `X-Debug` requirement. In the Chat Endpoints section, amend the `X-Project` paragraph with **both** behaviour changes from the spec's strict-validation section:
 
 - `X-Project` without `X-Agent` now routes among that project's agents plus global agents, instead of always loading the project's general agent.
-- A project with specialised agents but no general agent can now route; if no specialist is selected, it returns `400` as before.
+- A project with specialised agents but no general agent still returns `400` and never routes — the ladder checks for a general agent before it reads any answer. (This corrects an earlier draft of this plan, which claimed the case could route.)
 
 State that gRPC inherits the routing through the same dispatch, and that the TUI does not route.
 

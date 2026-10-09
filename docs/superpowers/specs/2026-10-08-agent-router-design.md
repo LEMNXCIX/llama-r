@@ -468,12 +468,25 @@ the bypass the rule exists to prevent — it would silently drop the project's c
 rules on a request that explicitly asked for them. The general agent is the
 "unspecialised" answer within the project's scope, and it keeps the invariant intact.
 
-Two behaviours change as a result:
+One behaviour changes as a result:
 
 1. **`X-Project` without `X-Agent` no longer always resolves to the general agent.** It
    now routes among the project's agents. That is the feature.
-2. **A project with specialised agents but no general agent can now route**, where
-   previously `X-Project` alone returned `400`. If routing selects no specialised agent,
-   the request returns `400` — the same as today.
 
-`AGENTS.md` must be updated with both changes when this ships.
+And one does not, which an earlier draft of this document got wrong:
+
+2. **A project with specialised agents but no general agent still returns `400`.** It
+   does not route. Every rung of the ladder degrades to the general agent, so the ladder
+   checks that one exists before it reads any answer — and the caller must make that
+   check *before* spending the decision, not after. Such a request is unwinnable by
+   construction: whatever the model said, the only reachable destination is an agent
+   that does not exist.
+
+The earlier draft claimed this case "can now route". It cannot, and it never could:
+rung 2 of the ladder returns `NoGeneralAgent` before the response is examined. The claim
+was copied into the plan, and from there into `AGENTS.md`, where it documented a
+capability the implementation does not have. The guard that skips the decision was
+added when the documentation review caught it, so the request also no longer pays a
+forward pass for a `400` it was always going to get.
+
+`AGENTS.md` must be updated when this ships.
