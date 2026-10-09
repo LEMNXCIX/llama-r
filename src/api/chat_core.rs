@@ -115,13 +115,20 @@ pub struct RoutedDebug {
     pub winner: Option<String>,
     pub confidence: Option<f32>,
     pub specialised: Option<f32>,
-    /// The full distribution, so a decision near the threshold can be
-    /// judged after the fact rather than only its winner.
+    /// The distribution over candidates as the model reported it, so a
+    /// decision near the threshold can be judged after the fact rather
+    /// than only by its winner. Kept whenever informative — a partial
+    /// distribution is calibration input, so it is attached even when it
+    /// names only some candidates. Empty only when the model reported
+    /// none, or when a non-empty distribution contradicted its own winner;
+    /// [`probabilities_note`](Self::probabilities_note) says which.
     pub probabilities: BTreeMap<String, f32>,
-    /// Set only when the model named a winner its own `probabilities` does
-    /// not contain: the distribution is withheld rather than emitted as an
-    /// account of a winner it does not explain — see
-    /// [`peeked_answer`], the one extractor both debug surfaces read.
+    /// Set whenever the distribution is not a plain account of the winner,
+    /// naming which case: none reported, partial (the map is attached), or
+    /// contradicting the winner — absent from its own distribution, or
+    /// outscored by another candidate (the map is withheld). One extractor
+    /// — [`peeked_answer`] — feeds this field and the preview endpoint's
+    /// twin, so the two surfaces describe the same answer the same way.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probabilities_note: Option<String>,
     /// The routing keys that were offered, sorted (as built).
