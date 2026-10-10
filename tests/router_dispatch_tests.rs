@@ -13,7 +13,8 @@ use async_trait::async_trait;
 use axum::http::StatusCode;
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::api::chat_core::{
-    build_state_text, resolve_selection, resolve_selection_with, AgentSelection,
+    build_state_text, execute_chat_stream, resolve_selection, resolve_selection_with,
+    AgentSelection,
 };
 use llama_r::api::handlers::AppState;
 use llama_r::context::store::ContextStore;
@@ -31,7 +32,7 @@ use std::error::Error;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 
 static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -108,6 +109,96 @@ impl DispatchEnv {
             _lock: lock,
         }
     }
+}
+
+/// Records the model it was asked for, so a *dispatch target* is observable
+/// on the streaming surface — which carries no `debug_route` by design, so
+/// the resolved agent can only be read back through what it was asked to run.
+///
+/// `chat_stream` is the only method that can answer here; `chat` mirrors it so
+/// the provider is usable from either path.
+#[derive(Default)]
+struct RecordingStreamProvider {
+    seen_model: std::sync::Mutex<Option<String>>,
+}
+
+impl RecordingStreamProvider {
+    fn seen_model(&self) -> Option<String> {
+        self.seen_model.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for RecordingStreamProvider {
+    fn get_base_url(&self) -> String {
+        "http://recording".to_string()
+    }
+    async fn health_check(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        Ok(())
+    }
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error + Send + Sync>> {
+        Ok(vec![])
+    }
+    async fn chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<ChatResponse, Box<dyn Error + Send + Sync>> {
+        *self.seen_model.lock().unwrap() = Some(request.model.clone());
+        Ok(ChatResponse {
+            model: request.model,
+            created_at: "now".to_string(),
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: "ok".to_string(),
+            },
+            done: true,
+            debug_prompt: None,
+            debug_route: None,
+        })
+    }
+    async fn chat_stream(
+        &self,
+        request: ChatRequest,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, Box<dyn Error + Send + Sync>>> + Send>>,
+        Box<dyn Error + Send + Sync>,
+    > {
+        *self.seen_model.lock().unwrap() = Some(request.model.clone());
+        Ok(Box::pin(tokio_stream::iter(vec![Ok(ChatStreamEvent {
+            model: request.model,
+            created_at: "now".to_string(),
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: "ok".to_string(),
+            },
+            done: true,
+        })])))
+    }
+}
+
+/// [`state_with_agents`]' `AppState` rebuilt over a different provider, keeping
+/// the registry (and therefore the manifests on disk under `LLAMA_R_DIR`) that
+/// resolution reads. `build_app_state` is the only constructor, so this is what
+/// an `AppState` with a recording provider costs.
+fn state_with_provider(
+    registry: &Arc<AgentRegistry>,
+    provider: Arc<RecordingStreamProvider>,
+) -> Arc<AppState> {
+    build_app_state(
+        provider as Arc<dyn LLMProvider>,
+        registry.clone(),
+        Arc::new(SkillManager::new()),
+        Arc::new(ContextStore::new()),
+        "fallback-model".to_string(),
+        Arc::new(Mutex::new(VecDeque::new())),
+        Vec::new(),
+        Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 /// The endpoint never answers here, but the trait must be satisfied.
@@ -250,11 +341,46 @@ fn state_with_project_agent(project_id: &str) -> Arc<AppState> {
 /// into memory, and nothing on the resolution path reads them again, so the
 /// temp dir may go when this function returns.
 fn state_with_agents(project_id: &str, general: bool) -> Arc<AppState> {
+    state_written(project_id, general, None)
+}
+
+/// [`state_with_agents`] with the temp dir **kept alive**, for the tests that
+/// write a manifest after the state exists and then reload — a second
+/// project's agents, or a `model` line the resolution has to read back.
+///
+/// `LLAMA_R_DIR` still points at `dir` after this returns (the env guard does
+/// not restore it; the lock the whole file runs under is what keeps another
+/// test from seeing it).
+fn held_state_with_agents(project_id: &str, general: bool) -> (tempfile::TempDir, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("LLAMA_R_DIR", dir.path());
+    let state = write_manifests_and_build(dir.path(), project_id, general);
+    (dir, state)
+}
 
-    let agents_dir = dir
-        .path()
+/// [`state_with_agents`] plus an optional `router.toml` in the base dir, read
+/// by `RouterConfig::load` inside `build_app_state` — the only place `exclude`
+/// can be set (there is no env var for a list).
+///
+/// Written before `build_app_state` runs, which is the whole point: the
+/// config is loaded once at construction, so a `router.toml` written
+/// afterwards would be a file nobody read.
+fn state_written(project_id: &str, general: bool, router_toml: Option<&str>) -> Arc<AppState> {
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LLAMA_R_DIR", dir.path());
+    if let Some(toml) = router_toml {
+        std::fs::write(dir.path().join("router.toml"), toml).unwrap();
+    }
+    write_manifests_and_build(dir.path(), project_id, general)
+}
+
+/// The fixture's manifests plus the `AppState` over them.
+fn write_manifests_and_build(
+    base: &std::path::Path,
+    project_id: &str,
+    general: bool,
+) -> Arc<AppState> {
+    let agents_dir = base
         .join("contextos")
         .join("projects")
         .join(project_id)
@@ -280,7 +406,7 @@ fn state_with_agents(project_id: &str, general: bool) -> Arc<AppState> {
     // The global agent: base-dir `agents/ops.toml`, registered with no
     // project — the half of the fixture the global-winner dispatch path
     // needs.
-    let global_agents_dir = dir.path().join("agents");
+    let global_agents_dir = base.join("agents");
     std::fs::create_dir_all(&global_agents_dir).unwrap();
     std::fs::write(
         global_agents_dir.join("ops.toml"),
@@ -357,6 +483,453 @@ async fn with_the_router_disabled_a_project_request_is_exactly_as_it_was() {
         resolved.agent_id.as_deref(),
         Some("fudi"),
         "disabled router must leave X-Project alone pointing at the project's own agent"
+    );
+}
+
+/// Finding I2: the property that gates everything else — *an update that only
+/// ships the router changes nothing* — tested at the gate that owns it, with
+/// nothing but that gate left to hold it.
+///
+/// `with_the_router_disabled_a_project_request_is_exactly_as_it_was` passes for
+/// the wrong reason: `build_app_state` withholds the router when
+/// `ROUTER_ENABLED` is absent, so the *second* gate (no router installed)
+/// catches the request even if the `enabled` check is deleted. Here the router
+/// IS installed, so only `!state.router_config.enabled` stands between the
+/// fake and a decision. Delete that gate and this test fails; the older one
+/// does not.
+#[tokio::test]
+async fn an_installed_router_is_never_consulted_while_routing_is_disabled() {
+    let _env = DispatchEnv::new();
+    // Ambient `ROUTER_ENABLED` cleared, so `router_config.enabled == false` —
+    // the *default* configuration, and the only thing keeping the fake out.
+    let state = state_with_project_agent("fudi");
+    let fake = FakeRouter::returning(choice_for("fudi::ops"));
+    *state.router.write().unwrap() = Some(Arc::new(fake.with_call_counter()));
+    assert!(
+        !state.router_config.enabled,
+        "the fixture must be in the disabled configuration for this to test anything"
+    );
+
+    let resolved = resolve_selection(
+        &state,
+        AgentSelection {
+            project_id: Some("fudi"),
+            agent_id: None,
+            conversation_id: None,
+            debug: false,
+        },
+        &[user("cancela el pedido 42")],
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !fake.was_called(),
+        "a router installed while routing is disabled must never be consulted"
+    );
+    assert_eq!(
+        resolved.agent_id.as_deref(),
+        Some("fudi"),
+        "resolution must be the project's general agent, byte for byte as before routing"
+    );
+    assert_eq!(resolved.project_id.as_deref(), Some("fudi"));
+    assert!(
+        resolved.routed.is_none(),
+        "nothing was decided, so nothing may be reported as decided"
+    );
+}
+
+/// Finding I1, through dispatch rather than through the candidate builder: a
+/// project whose own general agent is named in `exclude` must still route,
+/// and must still degrade to that agent when nothing wins.
+///
+/// The 400 this guards against arrived with the manifest still on disk —
+/// `contextos/projects/fudi/agents/fudi.toml` exists, and the identical
+/// request answers `200` with routing off. An operator's tuning list is a
+/// statement about which specialist may win, not a request to make the project
+/// unroutable.
+#[tokio::test]
+async fn excluding_the_projects_general_agent_still_routes_and_still_degrades_to_it() {
+    let _env = DispatchEnv::new();
+    std::env::set_var("ROUTER_ENABLED", "true");
+    // `exclude` is file-only (no env var for a list), so it arrives through
+    // `router.toml` in the base dir, read by `RouterConfig::load`.
+    let state = state_written("fudi", true, Some("exclude = [\"fudi\"]\n"));
+
+    // (1) A specialist still wins: the exclusion governs specialists, not the
+    // candidate set as a whole.
+    let fake = FakeRouter::returning(choice_for("fudi::ops"));
+    *state.router.write().unwrap() = Some(Arc::new(fake.clone()));
+    let resolved = resolve_selection(
+        &state,
+        AgentSelection {
+            project_id: Some("fudi"),
+            agent_id: None,
+            conversation_id: None,
+            debug: false,
+        },
+        &[user("cancela el pedido 42")],
+    )
+    .await
+    .expect("a project whose general agent is excluded must still route, not 400")
+    .clone();
+    assert_eq!(
+        resolved.agent_id.as_deref(),
+        Some("ops"),
+        "the specialist must still be dispatchable"
+    );
+    assert!(fake.was_called());
+
+    // (2) And when nothing wins, the fallback is still that agent. This is the
+    // 400: without the guard the ladder has no landing place and answers
+    // `agent_not_found` for a project that resolves today.
+    *state.router.write().unwrap() = Some(Arc::new(FakeRouter::failing()));
+    let resolved = resolve_selection(
+        &state,
+        AgentSelection {
+            project_id: Some("fudi"),
+            agent_id: None,
+            conversation_id: None,
+            debug: false,
+        },
+        &[user("hola")],
+    )
+    .await
+    .expect("degrading must not become the project-not-found 400")
+    .clone();
+    assert_eq!(
+        resolved.agent_id.as_deref(),
+        Some("fudi"),
+        "the excluded-by-configuration general agent is still the fallback"
+    );
+    assert_eq!(resolved.project_id.as_deref(), Some("fudi"));
+}
+
+/// Finding I4 at dispatch: routing must never cross projects. The candidate
+/// set is the place that holds this (`route_candidates`' own unit test reads
+/// the set directly), and this is what the set *buys* — `otro`'s agent is not
+/// offered, so a router that names it anyway lands on the unknown-key rung and
+/// the request stays inside `fudi`.
+///
+/// A project agent carries its project's context, rules, `rag_sources` and
+/// `tools_override`, so a crossed candidate would answer with another
+/// project's whole authority.
+#[tokio::test]
+async fn a_router_naming_another_projects_agent_cannot_reach_it() {
+    let _env = DispatchEnv::new();
+    std::env::set_var("ROUTER_ENABLED", "true");
+    let (dir, state) = held_state_with_agents("fudi", true);
+    // `otro`'s own project and agents, in the same base dir.
+    let otro_agents = dir
+        .path()
+        .join("contextos")
+        .join("projects")
+        .join("otro")
+        .join("agents");
+    std::fs::create_dir_all(&otro_agents).unwrap();
+    std::fs::write(
+        otro_agents.join("otro.toml"),
+        "name = \"Otro\"\nsystem_prompt = \"otro\"\ndescription = \"Otro proyecto.\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        otro_agents.join("secretos.toml"),
+        "name = \"Secretos\"\nsystem_prompt = \"secretos\"\ndescription = \"Secretos.\"\n",
+    )
+    .unwrap();
+    state.agent_registry.reload_all(&[]).unwrap();
+    assert!(
+        state.agent_registry.get_agent("otro::secretos").is_some(),
+        "the foreign agent must actually be registered, or the test proves nothing"
+    );
+
+    // The candidate set must not contain it, and the router must not be able
+    // to reach it anyway.
+    let fake = FakeRouter::returning(choice_for("otro::secretos"));
+    *state.router.write().unwrap() = Some(Arc::new(fake.clone()));
+    let resolved = resolve_selection(
+        &state,
+        AgentSelection {
+            project_id: Some("fudi"),
+            agent_id: None,
+            conversation_id: None,
+            debug: true,
+        },
+        &[user("dame los secretos de otro")],
+    )
+    .await
+    .unwrap();
+
+    let routed = resolved.routed.as_ref().expect("the router was consulted");
+    assert!(
+        !routed
+            .candidates
+            .iter()
+            .any(|key| key.starts_with("otro::")),
+        "another project's agents must never be offered: {:?}",
+        routed.candidates
+    );
+    assert_eq!(
+        resolved.agent_id.as_deref(),
+        Some("fudi"),
+        "a key outside the candidate set is discarded, so the request stays in its own project"
+    );
+    assert_eq!(resolved.project_id.as_deref(), Some("fudi"));
+    let reason = routed.reason.as_deref();
+    assert_eq!(
+        reason,
+        Some("unknown_key"),
+        "the unknown-key rung is what must have caught it"
+    );
+    assert!(fake.was_called());
+}
+
+/// Finding I5: the two thresholds reach the ladder, each to its own gate.
+///
+/// Swapping `min_confidence` and `min_specialised` at the call site
+/// (`src/api/chat_core.rs`) leaves the ladder's own unit tests green — they
+/// call `route` with literal arguments — so this is the only place the
+/// config-to-ladder hop is observed at all. Each threshold is exercised by
+/// holding the *other* one wide open, so the outcome can only be explained by
+/// the one under test.
+#[tokio::test]
+async fn min_confidence_governs_the_confidence_gate_and_min_specialized_the_other() {
+    // A response clearing nothing comfortably: confidence 0.70, specialisation
+    // 0.90. Both thresholds are set around it, one at a time.
+    let answer = |key: &str, confidence: f32, specialised: f32| DecisionResponse {
+        answers: BTreeMap::from([
+            (
+                CHOICE_KEY.to_string(),
+                Answer::Choice {
+                    key: key.to_string(),
+                    confidence,
+                    probabilities: BTreeMap::from([(key.to_string(), confidence)]),
+                },
+            ),
+            (NOUL_KEY.to_string(), Answer::Noul { value: specialised }),
+        ]),
+    };
+
+    // --- `MIN_CONFIDENCE` governs the confidence gate -----------------------
+    {
+        let _env = DispatchEnv::new();
+        std::env::set_var("ROUTER_ENABLED", "true");
+        // Above the reported confidence, below the specialisation: only the
+        // confidence gate can be the one that fired.
+        std::env::set_var("MIN_CONFIDENCE", "0.90");
+        std::env::set_var("MIN_SPECIALIZED", "0.10");
+        let state = state_with_project_agent("fudi");
+        *state.router.write().unwrap() = Some(Arc::new(FakeRouter::returning(answer(
+            "fudi::ops",
+            0.70,
+            0.90,
+        ))));
+        let resolved = resolve_selection(
+            &state,
+            AgentSelection {
+                project_id: Some("fudi"),
+                agent_id: None,
+                conversation_id: None,
+                debug: true,
+            },
+            &[user("cancela el pedido 42")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved.agent_id.as_deref(),
+            Some("fudi"),
+            "a confidence below MIN_CONFIDENCE must degrade to the general agent"
+        );
+        assert_eq!(
+            resolved.routed.as_ref().unwrap().reason.as_deref(),
+            Some("low_confidence"),
+            "the rung must name the confidence gate, not the specialisation one"
+        );
+    }
+
+    // And with only the confidence lowered, the very same answer wins.
+    {
+        let _env = DispatchEnv::new();
+        std::env::set_var("ROUTER_ENABLED", "true");
+        std::env::set_var("MIN_CONFIDENCE", "0.10");
+        std::env::set_var("MIN_SPECIALIZED", "0.10");
+        let state = state_with_project_agent("fudi");
+        *state.router.write().unwrap() = Some(Arc::new(FakeRouter::returning(answer(
+            "fudi::ops",
+            0.70,
+            0.90,
+        ))));
+        let resolved = resolve_selection(
+            &state,
+            AgentSelection {
+                project_id: Some("fudi"),
+                agent_id: None,
+                conversation_id: None,
+                debug: true,
+            },
+            &[user("cancela el pedido 42")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved.agent_id.as_deref(),
+            Some("ops"),
+            "lowering MIN_CONFIDENCE must change the outcome, or nothing is wired to it"
+        );
+    }
+
+    // --- `MIN_SPECIALIZED` governs the specialisation gate -------------------
+    {
+        let _env = DispatchEnv::new();
+        std::env::set_var("ROUTER_ENABLED", "true");
+        // The mirror: confidence far above the gate, specialisation below it.
+        std::env::set_var("MIN_CONFIDENCE", "0.10");
+        std::env::set_var("MIN_SPECIALIZED", "0.95");
+        let state = state_with_project_agent("fudi");
+        *state.router.write().unwrap() = Some(Arc::new(FakeRouter::returning(answer(
+            "fudi::ops",
+            0.99,
+            0.90,
+        ))));
+        let resolved = resolve_selection(
+            &state,
+            AgentSelection {
+                project_id: Some("fudi"),
+                agent_id: None,
+                conversation_id: None,
+                debug: true,
+            },
+            &[user("cancela el pedido 42")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved.agent_id.as_deref(),
+            Some("fudi"),
+            "a specialisation below MIN_SPECIALIZED must degrade to the general agent"
+        );
+        assert_eq!(
+            resolved.routed.as_ref().unwrap().reason.as_deref(),
+            Some("not_specialised"),
+            "the rung must name the specialisation gate, not the confidence one"
+        );
+    }
+}
+
+/// The streaming surface routes too. `execute_chat_stream` is a second entry
+/// point into the same dispatch, so "routing lives inside `execute_chat`" is
+/// a claim about one function until a test drives the other.
+///
+/// The routed agent's `model` is what the stream is asked for, which is how
+/// the choice becomes observable: the provider records the model it received,
+/// so the assertion reads the *dispatch target*, not a debug field the
+/// streaming surface deliberately does not carry.
+#[tokio::test]
+async fn a_streaming_project_request_is_routed_to_the_chosen_agent() {
+    let _env = DispatchEnv::new();
+    std::env::set_var("ROUTER_ENABLED", "true");
+    let (dir, state) = held_state_with_agents("fudi", true);
+    // Give the specialist its own model, so the provider's recorded model is
+    // the routed agent's and not the shared `fallback-model`.
+    let ops_manifest = dir
+        .path()
+        .join("contextos")
+        .join("projects")
+        .join("fudi")
+        .join("agents")
+        .join("ops.toml");
+    std::fs::write(
+        &ops_manifest,
+        "name = \"Ops\"\nmodel = \"ops-model\"\nsystem_prompt = \"base\"\n\
+         description = \"Cancela pedidos y gestiona operaciones.\"\n",
+    )
+    .unwrap();
+    state.agent_registry.reload_all(&[]).unwrap();
+
+    let provider = Arc::new(RecordingStreamProvider::default());
+    let routed_state = state_with_provider(&state.agent_registry, provider.clone());
+    let fake = FakeRouter::returning(choice_for("fudi::ops"));
+    *routed_state.router.write().unwrap() = Some(Arc::new(fake.with_call_counter()));
+
+    let mut stream = execute_chat_stream(
+        &routed_state,
+        ChatRequest {
+            model: "fallback-model".to_string(),
+            messages: vec![user("cancela el pedido 42")],
+            stream: true,
+        },
+        AgentSelection {
+            project_id: Some("fudi"),
+            agent_id: None,
+            conversation_id: None,
+            debug: false,
+        },
+    )
+    .await
+    .unwrap();
+    // Drain it: the provider is asked for the stream before the first token,
+    // so the recorded model is available as soon as this returns.
+    while let Some(_event) = stream.next().await {}
+
+    assert!(
+        fake.was_called(),
+        "the streaming path must consult the router"
+    );
+    assert_eq!(
+        provider.seen_model(),
+        Some("ops-model".to_string()),
+        "the stream must be built for the agent the router chose"
+    );
+}
+
+/// The control for the test above: with the same state and no `X-Agent`, a
+/// router that picks nothing must leave the general agent in place on the
+/// streaming path too. Without it, "the stream is built for the routed
+/// agent" could pass on a provider that is handed every model's requests.
+#[tokio::test]
+async fn a_streaming_request_that_routes_nowhere_keeps_the_general_agent() {
+    let _env = DispatchEnv::new();
+    std::env::set_var("ROUTER_ENABLED", "true");
+    let (dir, state) = held_state_with_agents("fudi", true);
+    std::fs::write(
+        dir.path()
+            .join("contextos")
+            .join("projects")
+            .join("fudi")
+            .join("agents")
+            .join("fudi.toml"),
+        "name = \"Fudi\"\nmodel = \"general-model\"\nsystem_prompt = \"base\"\n\
+         description = \"Asistente general.\"\n",
+    )
+    .unwrap();
+    state.agent_registry.reload_all(&[]).unwrap();
+    let provider = Arc::new(RecordingStreamProvider::default());
+    let routed_state = state_with_provider(&state.agent_registry, provider.clone());
+    *routed_state.router.write().unwrap() = Some(Arc::new(FakeRouter::failing()));
+
+    let mut stream = execute_chat_stream(
+        &routed_state,
+        ChatRequest {
+            model: "fallback-model".to_string(),
+            messages: vec![user("hola")],
+            stream: true,
+        },
+        AgentSelection {
+            project_id: Some("fudi"),
+            agent_id: None,
+            conversation_id: None,
+            debug: false,
+        },
+    )
+    .await
+    .unwrap();
+    while let Some(_event) = stream.next().await {}
+
+    assert_eq!(
+        provider.seen_model(),
+        Some("general-model".to_string()),
+        "a routing failure must degrade to the general agent on the streaming path as well"
     );
 }
 
