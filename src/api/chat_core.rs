@@ -1,5 +1,5 @@
 use crate::api::handlers::AppState;
-use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent};
+use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, RoutedDebug};
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
 use crate::ports::engine::AgentRunEvent;
@@ -10,12 +10,10 @@ use crate::services::agent_router::{
 };
 use crate::services::agent_runtime::RuntimeChatRequest;
 use crate::services::route_candidates::{build_candidates, RouteCandidate};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Instant;
 use tokio_stream::{Stream, StreamExt};
-use utoipa::ToSchema;
 
 pub type AppChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, AppError>> + Send>>;
 
@@ -77,62 +75,6 @@ impl ResolvedSelection {
             (None, None) => fallback_model.to_string(),
         }
     }
-}
-
-/// The routing decision, for the debug surface: what was offered, what the
-/// model answered, and what dispatch did about it.
-///
-/// It reaches a client only when `X-Debug: true` asked for it — the same
-/// gate that adds `debug_prompt`, and the reason the field can carry the
-/// project's full roster and distribution without disclosing them to every
-/// caller.
-///
-/// `outcome` is `"agent"` (a specialist won and was verified to exist) or
-/// `"general"` (the request stayed with the project's general agent).
-/// `reason` is one of
-/// [`GeneralReason`](crate::services::agent_router::GeneralReason)'s
-/// spellings — except `"stale_winner"`, which names the one rung the ladder
-/// never sees: the winner was trusted, then removed by a hot reload before
-/// it could be used. `winner`, `confidence` and `specialised` are `None`
-/// when the router did not answer with a usable value, never `0.0` — an
-/// absent value and a real zero are different reports.
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-pub struct RoutedDebug {
-    /// The project the request was routed *for*. A global winner keeps it:
-    /// the empty project id lives in [`ResolvedSelection`], not here.
-    pub project_id: String,
-    /// `"agent"` or `"general"` — where the request was dispatched.
-    ///
-    /// `String`, not `&'static str`: [`ChatResponse`] derives `Deserialize`,
-    /// and a `&'static str` field would have forced `skip_deserializing`
-    /// on it — a silent change to a public type's serde contract. The two
-    /// spellings are constants either way; `String` just survives a
-    /// round-trip.
-    pub outcome: String,
-    /// Why the general agent kept it, or `None` when a specialist won.
-    pub reason: Option<String>,
-    /// The label the model chose, when it answered the choice question.
-    pub winner: Option<String>,
-    pub confidence: Option<f32>,
-    pub specialised: Option<f32>,
-    /// The distribution over candidates as the model reported it, so a
-    /// decision near the threshold can be judged after the fact rather
-    /// than only by its winner. Kept whenever informative — a partial
-    /// distribution is calibration input, so it is attached even when it
-    /// names only some candidates. Empty only when the model reported
-    /// none, or when a non-empty distribution contradicted its own winner;
-    /// [`probabilities_note`](Self::probabilities_note) says which.
-    pub probabilities: BTreeMap<String, f32>,
-    /// Set whenever the distribution is not a plain account of the winner,
-    /// naming which case: none reported, partial (the map is attached), or
-    /// contradicting the winner — absent from its own distribution, or
-    /// outscored by another candidate (the map is withheld). One extractor
-    /// — [`peeked_answer`] — feeds this field and the preview endpoint's
-    /// twin, so the two surfaces describe the same answer the same way.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub probabilities_note: Option<String>,
-    /// The routing keys that were offered, sorted (as built).
-    pub candidates: Vec<String>,
 }
 
 /// Characters of the conversation the decision model may see.

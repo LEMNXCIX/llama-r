@@ -357,9 +357,9 @@ mod tests {
     }
 
     /// A response that answers only the `Choice` question — the shape the
-    /// unknown-key rung and the missing-`Noul` rung each need. The brief
-    /// names both call sites separately, so both names exist; they are one
-    /// shape seen from two rungs.
+    /// unknown-key rung and the missing-`Noul` rung each need. One helper for
+    /// both: they are one shape seen from two rungs, and the second name only
+    /// existed because the brief listed the two call sites separately.
     fn choice_response(key: &str, confidence: f32) -> DecisionResponse {
         DecisionResponse {
             answers: BTreeMap::from([(
@@ -371,12 +371,6 @@ mod tests {
                 },
             )]),
         }
-    }
-
-    /// [`choice_response`] under the name the missing-`Noul` test reads at
-    /// its call site: the `Choice` is answered and nothing else is.
-    fn choice_only(key: &str, confidence: f32) -> DecisionResponse {
-        choice_response(key, confidence)
     }
 
     /// Both answers in one response — the shape one forward pass returns.
@@ -661,7 +655,7 @@ mod tests {
             &candidates,
             0.6,
             0.5,
-            Ok(choice_only("fudi::ops", 0.99)),
+            Ok(choice_response("fudi::ops", 0.99)),
         );
         assert_degrades_to_general(
             decision,

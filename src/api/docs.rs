@@ -1,5 +1,4 @@
 use crate::api::agent_api::{AgentResponse, AgentScopeResponse, CreateAgentRequest};
-use crate::api::chat_core::RoutedDebug;
 use crate::api::context_api::CreateContextRequest;
 use crate::api::health::{HealthResponse, RouterHealth};
 use crate::api::observability::ObservabilitySnapshot;
@@ -8,7 +7,7 @@ use crate::context::store::ProjectContext;
 use crate::domain::agent::OptimizeConfig;
 use crate::domain::models::{
     ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, JsonRpcRequest, JsonRpcResponse,
-    ListModelsResponse, ModelInfo,
+    ListModelsResponse, ModelInfo, RoutedDebug,
 };
 use utoipa::OpenApi;
 
