@@ -39,7 +39,7 @@ Primary environment variables:
 - `HISTORY_RETENTION_DAYS`: purge conversations older than this many days, default `90`. `0` disables purging.
 - `ROUTER_ENABLED`: enable agent routing, default `false`. Off by default so an update that only ships the router changes nothing.
 - `ROUTER_URL`: decision-model origin (the separate `llama-server`), default `http://127.0.0.1:8080`
-- `ROUTER_MODEL`: model label sent with each decision, default `d1-3b`
+- `ROUTER_MODEL`: model label for the decision router, default `d1-3b`. It reaches only the adapter's own log line: the body sent to `POST /v1/systemone` is `{state, questions}`, with no model field, because the model is chosen by which `llama-server` process is running.
 - `ROUTER_TIMEOUT_MS`: budget for one decision in milliseconds, default `3000`. `0` is rejected.
 - `MIN_CONFIDENCE`: below this `Choice` confidence the request stays with the project's general agent, default `0.60`. Must be greater than `0.0` and at most `1.0`; `0` is rejected rather than clamped.
 - `MIN_SPECIALIZED`: below this specialisation score a specialist does not win over the general agent, default `0.50`. Same `(0.0, 1.0]` bounds as `MIN_CONFIDENCE`. The env name uses a `z`; the matching `router.toml` key is `min_specialised`.
@@ -47,6 +47,8 @@ Primary environment variables:
 A malformed router value (bad number, timeout `0`, threshold outside `(0.0, 1.0]`) is a configuration error naming the variable and the value received, not a silent clamp. At boot that error is logged as a warning and the router falls back to the inert defaults (routing disabled) — like a bad `ROUTER_URL`, it never stops startup.
 
 An optional `router.toml` in the base directory overrides any of the values above (`enabled`, `url`, `model`, `timeout_ms`, `min_confidence`, `min_specialised`, and an `exclude` list of agent ids routing must never select): the environment provides the defaults and the file wins on the keys it actually sets. There is no env var for `exclude`. A missing file is fine; an unreadable or malformed one is a configuration error naming the path, and at boot it is logged and falls back to the inert defaults (routing disabled) rather than being silently ignored.
+
+`exclude` matches on the bare agent id and drops the agent from that project's candidate set. It cannot drop a project's **own general agent** (`contextos/projects/<p>/agents/<p>.toml`): that agent is the one landing place every degrading rung of the ladder has, so excluding it would fail the request with `agent_not_found` instead of changing where it lands. The exclusion is ignored for that one agent and logged as a warning. A *global* whose id matches the project id is a different agent and stays excludable.
 
 Recommended setup:
 
@@ -170,6 +172,8 @@ If `X-Project` is sent without `X-Agent`, Llama-R loads the project general agen
 With routing enabled (`ROUTER_ENABLED=true`), one of the two behaviours above changes, and only then; with the router off (the default) both behave exactly as written:
 
 - `X-Project` without `X-Agent` no longer always resolves to the general agent: it is routed among that project's agents plus the global agents, keyed by the registry's scheme (`project::agent` for project agents, the bare id for globals). `X-Agent` still pins the target and never spends a decision.
+- The candidate set cannot cross projects — another project's agent is never offered, which is what keeps a routed request inside the authority its `X-Project` named. It *can* reach a **global**, and a global winner dispatches with `project_id: None`: answered outside the project, with none of that project's context, rules, `rag_sources` or `tools_override`. Precisely: never another project, sometimes no project at all.
+- Routing is **per request, not per conversation**. Each turn is a fresh decision, so the chosen agent can change between two messages of the same thread; there is no stickiness, and `X-Conversation-Id` is not read by the router.
 - A project with specialised agents but **no general agent still returns `400`** — it never routes. Every rung of the ladder degrades to the general agent, so `route` checks that one exists *before* it reads any answer, and the check runs before the decision is spent: such a request fails with the same `agent_not_found` `400` as always, without the decision model being consulted at all.
 - A project with no candidates left to route between (no project agents, and no global agents either after `exclude`) is not routed at all: resolution returns the request untouched and it fails validation exactly as it did before routing existed — also without spending a decision. Both cases answer the same `400` they always did; neither is a new kind of failure.
 
@@ -290,6 +294,11 @@ cargo test --target-dir target-tests
 - `dedent_code` skips languages where indentation is meaning (`python`, `yaml`, `toml`, …) and skips untagged blocks: an untagged block of Python is still Python.
 - A tool name that matches nothing used to be a silent no-op. `AgentRegistry` now warns with the unknown and the known names when it loads an agent, and the picker drops unknown names on save after showing them.
 - `optimize.enabled` follows the selection: the form used to write `true` unconditionally, producing configs that claimed to be optimising while running nothing.
+
+## Routing hints
+
+- `[routing]` in an agent TOML takes one field, `hint` (`AgentConfig.routing: Option<RoutingConfig>`). When non-blank it **replaces** the whole criteria text the router scores that agent against (`derive_criteria_text`) — one curated sentence instead of the derived `name — description` plus `Skills:`/`Tools:`/`Sources:` sections. It is the only curated lever on routing quality; nothing else in the manifest is read by the router except the id, the name and those sections.
+- The field is written by hand in the TOML and by nothing else. `build_agent_toml` (`src/api/agent_api.rs`) rewrites the manifest from `CreateAgentRequest`, which has no `routing` field, so **`PUT /api/agents/:id` erases a hand-written `hint`**. Curating a hint and then editing the agent through the API loses it.
 
 ## Skills
 

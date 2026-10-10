@@ -107,7 +107,7 @@ radius is the selection step and the modules it newly depends on.
 | `src/services/agent_router.rs` | **New.** The decision ladder. Pure; no I/O. |
 | `src/api/chat_core.rs` | **Changed.** `resolve_selection()` before `engine_target()`, in both `execute_chat` and `execute_chat_stream`. |
 | `src/runtime.rs` | **Changed.** Constructs the router, probes it once at startup, and adds it to `AppState`. |
-| `src/api/handlers.rs` | **Changed.** `AppState` gains `router: Option<Arc<dyn DecisionRouter>>` and `router_config: Arc<RouterConfig>`. |
+| `src/api/handlers.rs` | **Changed.** `AppState` gains `router: RwLock<Option<Arc<dyn DecisionRouter>>>` and `router_config: Arc<RouterConfig>`. The `RwLock` is what shipped: tests swap a fake router into a state `build_app_state` has already built, and an `Arc` clone leaves the lock before the decision's `.await` so no guard is held across a network call. |
 | `src/api/observability.rs` | **Changed.** Four routing counters. |
 | `src/domain/agent.rs` | **Changed.** Optional `routing` field on `AgentConfig`. |
 | `src/api/route_api.rs` | **New.** `POST /api/route` dry-run endpoint. |
@@ -127,21 +127,34 @@ X-Project present, X-Agent absent, router enabled
   │
   ├─ empty candidate set ─────────────────────────────► 400
   │                                                      (today's behaviour)
+  ├─ project has no general agent ─────────────────────► 400
+  │                                                      (today's behaviour;
+  │                                                       checked before the POST,
+  │                                                       so no decision is spent)
   ├─ POST /v1/systemone { state, questions }
   │     ├─ error / timeout / unparseable ──────────────► ProjectGeneral
   │     ├─ returned key not in candidate set ──────────► ProjectGeneral
   │     │
+  │     ├─ winner is the project's own general agent ──► ProjectGeneral
   │     ├─ noul("specialized") < MIN_SPECIALIZED ──────► ProjectGeneral
   │     ├─ choice.confidence < MIN_CONFIDENCE ─────────► ProjectGeneral
-  │     ├─ winner is the project's own general agent ──► ProjectGeneral
   │     └─ winner is a specialised agent ──────────────► that agent
   │
-  └─ project has no general agent ─────────────────────► 400
+  └─ (the winner a hot reload removed lands on ProjectGeneral too:
+       `stale_winner`, the rung the ladder cannot see)
 ```
 
 Every rejection lands on `ProjectGeneral` rather than on an error, except the two 400s
 that preserve today's contract. A router that is down, slow, or unsure degrades to
 exactly what a request with an explicit `X-Agent: <project>` would have done.
+
+The order of the three gates is the code's order, and it matters for the *reason* the
+response reports even though the destination is identical either way: "the general agent
+won" is checked first, because the gates exist to veto routing *away* from the general
+agent and a choice that already names it has nowhere else to go. The specialisation gate
+comes before the confidence gate on purpose — a low-confidence "does this need a
+specialist" and a low-confidence "which specialist" are different problems, and only the
+first licenses ignoring the second.
 
 ### The key validation guard
 
@@ -331,7 +344,7 @@ Infrastructure by environment, alongside `PORT` / `OLLAMA_URL` / `DEFAULT_MODEL`
 |---|---|---|
 | `ROUTER_ENABLED` | `false` | Master switch. Off by default. |
 | `ROUTER_URL` | `http://127.0.0.1:8080` | `llama-server` base URL. Note the port differs from Ollama's. |
-| `ROUTER_MODEL` | `d1-3b` | Model label sent to the decision endpoint. |
+| `ROUTER_MODEL` | `d1-3b` | Model label for the router. Not sent on the wire: the body is `{state, questions}` and the model is whichever `llama-server` is running. It reaches the adapter's log line only. |
 | `ROUTER_TIMEOUT_MS` | `3000` | Budget for one decision. Exceeding it falls to `ProjectGeneral`. |
 | `MIN_CONFIDENCE` | `0.60` | Below this, the winner is not trusted. |
 | `MIN_SPECIALIZED` | `0.50` | Below this, no specialisation is warranted. |
@@ -339,6 +352,11 @@ Infrastructure by environment, alongside `PORT` / `OLLAMA_URL` / `DEFAULT_MODEL`
 Plus an optional `router.toml` at the base directory (`LLAMA_R_DIR`, else cwd), holding
 the two thresholds and an optional `exclude` list of agent ids to keep out of routing.
 Env values are defaults; `router.toml` overrides them when present.
+
+`exclude` cannot name a project's own general agent: that agent is the fallback every
+degrading rung lands on, so removing it would fail the request with `agent_not_found`
+instead of changing where it lands. The exclusion is ignored for that one agent, with a
+warning.
 
 `router.toml` is read at startup, alongside the other base-directory config, and is not
 hot-reloaded in v1.
@@ -387,8 +405,9 @@ requests that would have been routed degrade to the project's general agent.
 |---|---|
 | `route_candidates` | Keys unique across globals and project agents; general agent present and flagged; `routing.hint` beats derived text; a description-less agent falls back to its id and is still a candidate; empty set is empty. |
 | `agent_router` (pure) | Each ladder rung separately, with a fake `DecisionRouter`. Including: unknown key rejected; low confidence → general; low specialised → general; general wins → general; router error → general. |
-| Adapter | A fixture captured from a real `llama-server` response pins the wire format. See § Open verification. |
-| Integration | `execute_chat` routes to the expected agent through a fake router, on both the plain and streaming paths. |
+| Adapter | A hand-written fixture pins the wire format. It was **not** captured from a live `llama-server`: none was available in the environment this was built in. See § Open verification. |
+| Integration | `execute_chat` and `execute_chat_stream` both route to the expected agent through a fake router — the streaming surface is asserted through the model the stream was built for, since it carries no `debug_route`. |
+| Invariants | The properties, each at the place that owns them: an installed router is never consulted while `enabled == false`; the candidate set never crosses projects; `exclude` cannot remove the project's own general agent; `MIN_CONFIDENCE`/`MIN_SPECIALIZED` reach the gates they name through dispatch. |
 | Regression | With the router down, a project-scoped request produces the same result as before this change. This is the test that justifies the claim that nothing downstream changed. |
 | Health | Configured-but-unreachable router reports degraded. |
 
@@ -408,13 +427,18 @@ the hosted API and `llama-server` are two implementations and the local one's en
 may differ.
 
 Mitigation: response parsing is confined to serde structs in the adapter. A mismatch
-changes that one file and nothing above it. The adapter test uses a fixture captured
-from a live `llama-server`, so the format is pinned by a real observation rather than by
-an assumption carried into code. The deserialiser should also tolerate an unknown
-envelope by failing into the `ProjectGeneral` rung rather than erroring the request.
+changes that one file and nothing above it. **This remains open.** No `llama-server` was
+available in the environment where the router was built, so the adapter's fixture
+(`src/adapters/router/fixtures/`) is hand-written from the hosted API's field names and is
+*not* a capture of a live local response — its own README says so. The wire format is
+therefore pinned by an assumption carried into code, not by an observation.
 
-The first implementation step is therefore: start `llama-server`, capture a real
-response, and fit the structs to it.
+The deserialiser does tolerate an unknown envelope: an unparseable body becomes a router
+error and fails into the `ProjectGeneral` rung rather than erroring the request.
+
+The first implementation step for anyone continuing this is therefore: start
+`llama-server`, capture a real response, replace the fixture with it, and fit the structs
+to it. Until that happens, treat the adapter's field names as unverified.
 
 ## Non-goals
 
@@ -467,6 +491,15 @@ The reason is that a project-scoped request falling through to a bare model is e
 the bypass the rule exists to prevent — it would silently drop the project's context and
 rules on a request that explicitly asked for them. The general agent is the
 "unspecialised" answer within the project's scope, and it keeps the invariant intact.
+
+What the invariant does *not* say is that every project-scoped request stays inside the
+project. A **global** agent is a legitimate candidate (§ Candidates), and a global winner
+dispatches with `project_id: None` — answered by an agent that holds none of the named
+project's context, rules, `rag_sources` or tools. That is intended: a global agent is
+exactly the "somewhere else entirely" answer, and it is what an operator installs a global
+for. The property that *is* enforced, and tested, is that routing can never cross into
+**another project** — no project agent outside `p` is ever offered. So: never another
+project, sometimes no project at all.
 
 One behaviour changes as a result:
 

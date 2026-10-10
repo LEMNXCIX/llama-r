@@ -110,7 +110,7 @@ POST /v1/chat/completions
 - `X-Agent` — selecciona un agente dentro del proyecto (si se omite y el router está desactivado, que es el caso por defecto, usa el agente general del proyecto; con `ROUTER_ENABLED=true` el router elige, ver más abajo)
 - `X-Debug` — si se envía, incluye `debug_prompt` y `debug_route` en la respuesta
 
-**Validación estricta:** si se envía `X-Project`, Llama-R **requiere** que exista un agente válido dentro de ese proyecto. Si no se encuentra, responde con `400 Bad Request`. Ese agente puede salir del router (abajo), pero siempre dentro del proyecto: una petición que nombra un proyecto nunca cae en un modelo sin agente.
+**Validación estricta:** si se envía `X-Project`, Llama-R **requiere** que exista un agente válido dentro de ese proyecto. Si no se encuentra, responde con `400 Bad Request`. Ese agente puede salir del router (abajo), pero nunca sale del **conjunto de candidatos**: el enrutado no puede alcanzar el agente de *otro* proyecto, y sí puede alcanzar un **agente global**, que se despacha sin proyecto y por tanto sin el contexto, las reglas, las fuentes RAG ni las herramientas de ese proyecto — el único límite es que nunca cruza a otro proyecto. Una petición que nombra un proyecto nunca cae en un modelo sin agente.
 
 ### Enrutamiento de agentes (opt-in)
 
@@ -146,6 +146,10 @@ curl -s http://127.0.0.1:3000/api/chat \
 Variables: `ROUTER_ENABLED` (`false`), `ROUTER_URL` (`http://127.0.0.1:8080`), `ROUTER_MODEL` (`d1-3b`), `ROUTER_TIMEOUT_MS` (`3000`), `MIN_CONFIDENCE` (`0.60`), `MIN_SPECIALIZED` (`0.50`). Un `router.toml` opcional en el directorio base las sobreescribe (y es el único sitio donde poner la lista `exclude`).
 
 gRPC hereda el enrutado (mismos `x-project`/`x-agent` en metadatos, mismo dispatch). La TUI no enruta: ahí eliges el agente a propósito.
+
+El enrutado ocurre **por petición, no por conversación**: cada turno vuelve a decidir, así que dentro de un mismo hilo el agente puede cambiar entre un mensaje y el siguiente. No hay estado de afinidad.
+
+Para curar la calidad del enrutado, cada agente acepta un `[routing]` opcional en su TOML con un único campo `hint`: una frase curada que **sustituye** la descripción que d1 puntúa para ese candidato (`derive_criteria_text`). Es la única palanca curada que hay, y `POST /api/agents` / `PUT /api/agents/:id` no la tocan: `build_agent_toml` reescribe el manifiesto entero, así que un `PUT` borra el `hint` que estuviera escrito a mano.
 
 ### Agentes CRUD
 ```
