@@ -279,11 +279,14 @@ mod tests {
 
     #[test]
     fn decode_reads_the_fixture_into_answers() {
+        // A response captured from a real `llama-server`, so this asserts what
+        // that server emits rather than what the hosted API documents.
         let body: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/systemone_response.json")).unwrap();
 
-        // The fixture itself spells the documented field names, independent of
-        // what decode does with them.
+        // The tag llama-server actually emits. It is checked exactly, so a
+        // fixture rewritten to drop it — or to spell it differently — fails
+        // here instead of quietly exercising a different decode path.
         assert_eq!(body["answers"]["agent"]["type"], "choice");
         assert_eq!(body["answers"]["agent"]["choice"], "fudi::ops");
         assert!(body["answers"]["agent"].get("confidence").is_some());
@@ -302,27 +305,31 @@ mod tests {
                 probabilities,
             } => {
                 assert_eq!(key, "fudi::ops");
-                assert_prob(*confidence, 0.82, "agent.confidence");
+                // Values below are read out of the captured fixture, not
+                // invented: a real d1-3B on "necesito cancelar el pedido 42
+                // urgentemente" put 0.9195 on the specialist and reported
+                // 0.8391 confidence.
+                assert_prob(*confidence, 0.8390929792303097, "agent.confidence");
                 assert_eq!(probabilities.len(), 2);
                 assert!(probabilities.contains_key("fudi::ops"));
                 assert!(probabilities.contains_key("fudi::fudi"));
                 assert_prob(
                     probabilities["fudi::ops"],
-                    0.87,
+                    0.9195464896151548,
                     "agent.probabilities[fudi::ops]",
                 );
                 assert_prob(
                     probabilities["fudi::fudi"],
-                    0.13,
+                    0.08045351038484523,
                     "agent.probabilities[fudi::fudi]",
                 );
             }
             other => panic!("agent must decode as a Choice, got {other:?}"),
         }
 
-        // The Noul is a float, not a label.
+        // The Noul is a float, not a label — 0.4399 for the same captured prompt.
         match &decoded.answers["specialized"] {
-            Answer::Noul { value } => assert_prob(*value, 0.96, "specialized.noul"),
+            Answer::Noul { value } => assert_prob(*value, 0.43992075151914617, "specialized.noul"),
             other => panic!("specialized must decode as a Noul, got {other:?}"),
         }
     }

@@ -411,7 +411,47 @@ requests that would have been routed degrade to the project's general agent.
 | Regression | With the router down, a project-scoped request produces the same result as before this change. This is the test that justifies the claim that nothing downstream changed. |
 | Health | Configured-but-unreachable router reports degraded. |
 
-## Open verification
+## Verification
+
+**CLOSED.** The response envelope — the one thing this design could not observe
+while it was written — has been captured from a real `llama-server`
+(`LiquidAI/d1-3B-GGUF:Q8_0`, llama.cpp built from source) and installed as
+`src/adapters/router/fixtures/systemone_response.json`, with its provenance in
+`fixtures/README.md`. The fields `decode_response` reads are the ones the local
+server actually emits, so the adapter's structs are pinned by observation rather
+than by inference from the hosted API.
+
+Two facts about the observed shape, both now relied on:
+
+- **Each answer carries an explicit `type` tag** (`"choice"` / `"noul"`),
+  matching the question asked. `decode_answer` derives the kind from the fields
+  present and only *checks* a string `type` when one is there, so a server that
+  omitted the tag would still parse — but the capture confirms this one does not
+  omit it.
+- **`model` echoes the full `-hf` spec** (`LiquidAI/d1-3B-GGUF:Q8_0`), not the
+  bare `d1-3b` label `ROUTER_MODEL` defaults to. It is ignored, which is why the
+  label is log-only.
+
+### Operational findings from the live run
+
+Both were only discoverable against a real model, and both are now in
+`AGENTS.md`:
+
+- **`ROUTER_TIMEOUT_MS=3000` is too tight for CPU inference.** Liquid's published
+  latencies are GPU figures. A d1-3B decision measured on an 8-core CPU takes
+  **2.4–3.3 s**, so every decision degrades to the general agent as
+  `router_unavailable` — a failure that reads as "routing never picks a
+  specialist" rather than as an error. Use `30000` without a GPU.
+- **`llama-server` does not listen on 8080 any more.** Recent llama.cpp defaults
+  to **9931**. Read the `listening on` line the server prints and point
+  `ROUTER_URL` at it.
+
+Both `tests/router_wire_tests.rs` (a real TCP listener driven by the real
+adapter) and the live run confirm the round trip: a specialist-flavoured prompt
+routes to `fudi::ops` and runs that agent's system prompt; a general-flavoured
+one routes to `fudi::fudi` with `reason: general_won`.
+
+## Superseded: Open verification
 
 **The response shape of llama.cpp's `POST /v1/systemone` is not documented.** The
 *request* shape is confirmed — Liquid's d1-3B page gives a complete `curl` against

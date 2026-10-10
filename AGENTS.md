@@ -38,9 +38,9 @@ Primary environment variables:
 - `RAG_ENABLED`: build/use RAG store at runtime, default `true`
 - `HISTORY_RETENTION_DAYS`: purge conversations older than this many days, default `90`. `0` disables purging.
 - `ROUTER_ENABLED`: enable agent routing, default `false`. Off by default so an update that only ships the router changes nothing.
-- `ROUTER_URL`: decision-model origin (the separate `llama-server`), default `http://127.0.0.1:8080`
+- `ROUTER_URL`: decision-model origin (the separate `llama-server`), default `http://127.0.0.1:8080`. **Check the port against your build.** Recent llama.cpp defaults to **9931**, not 8080 — read the `listening on` line the server prints and set this to match.
 - `ROUTER_MODEL`: model label for the decision router, default `d1-3b`. It reaches only the adapter's own log line: the body sent to `POST /v1/systemone` is `{state, questions}`, with no model field, because the model is chosen by which `llama-server` process is running.
-- `ROUTER_TIMEOUT_MS`: budget for one decision in milliseconds, default `3000`. `0` is rejected.
+- `ROUTER_TIMEOUT_MS`: budget for one decision in milliseconds, default `3000`. `0` is rejected. **Raise this on CPU-only inference.** Liquid's published latencies (8 ms on a 4090, 26 ms on a Jetson AGX Orin) are GPU figures; a d1-3B decision measured on an 8-core CPU takes **2.4–3.3 s**, so the default sits right at the edge and every decision degrades to the general agent as `router_unavailable`. Use `30000` for CPU. A decision past the budget is not fatal — it degrades — which is why this failure looks like "routing never picks a specialist" rather than an error.
 - `MIN_CONFIDENCE`: below this `Choice` confidence the request stays with the project's general agent, default `0.60`. Must be greater than `0.0` and at most `1.0`; `0` is rejected rather than clamped.
 - `MIN_SPECIALIZED`: below this specialisation score a specialist does not win over the general agent, default `0.50`. Same `(0.0, 1.0]` bounds as `MIN_CONFIDENCE`. The env name uses a `z`; the matching `router.toml` key is `min_specialised`.
 

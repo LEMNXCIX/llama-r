@@ -1,29 +1,43 @@
 # systemone_response.json
 
-NOT CAPTURED. `llama-server` was unavailable when this fixture was written.
-This is the hosted API's documented shape (docs.liquid.ai, decision-model
-guide), not an observation of the local server.
+**CAPTURED** from a real `llama-server`, not hand-written.
 
-Task 2's decode test passes either way, but only a captured fixture proves
-the local envelope. Re-capture with the `curl` in Task 2 Step 1 before
-trusting this adapter against a real `llama-server`.
+Captured from:
 
-## What is documented and what is invented
+    llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0
+    # llama.cpp, built from source at the commit this branch was tested against
+    # listening on http://127.0.0.1:9931
 
-The **field names** are documented; the **values** are not observations —
-they are plausible numbers for the example request in Task 2 Step 1 (state
-"me cobraron dos veces este mes"; `agent` is a choice over
-`fudi::ops`/`fudi::fudi`, `specialized` a noul).
+    curl -s http://127.0.0.1:9931/v1/systemone \
+      -H 'Content-Type: application/json' \
+      -d '{"state":"necesito cancelar el pedido 42 urgentemente",
+           "questions":{
+             "agent":{"type":"choice",
+                      "instructions":"Cual agente debe atender esta peticion? Elige el general si ninguna especializacion encaja.",
+                      "criteria":{
+                        "fudi::ops":"Fudi Ops — Cancela pedidos, gestiona el menu de Fudi y consulta el ERP. NO responde preguntas generales.",
+                        "fudi::fudi":"Fudi General — Asistente general de Fudi. Responde preguntas generales sobre el negocio."}},
+             "specialized":{"type":"noul",
+                             "instructions":"Esta peticion necesita un agente especializado?"}}}'
 
-- `answers.<name>.choice`, `answers.<name>.probabilities`,
-  `answers.<name>.confidence` — the documented Choice answer: the winning
-  label, the full distribution, and a confidence that need not equal the
-  top probability.
-- `answers.<name>.noul` — the documented Noul answer: a probability in
-  [0, 1].
-- `answers.<name>.type` — the documented per-answer discriminator.
-  `decode_response` cross-checks it against the body when present but does
-  not depend on it, so a local server that omits it still decodes.
-- `model` and `usage` — documented top-level fields; `decode_response`
-  ignores both. `usage.output_tokens` is `0` because d1 generates no
-  tokens.
+What this closes: the design doc listed the response envelope as its one open
+risk, because Liquid publishes the *request* shape but no example of a
+`llama-server` *response*. The fixture was therefore fitted to the hosted API's
+documented field names and could not be distinguished from a guess.
+
+It is now an observation. The fields `decode_response` reads — `answers.<name>.choice`,
+`.confidence`, `.probabilities` for a Choice and `.noul` for a Noul — are the
+ones the local server actually emits, so the adapter's structs are pinned by
+reality rather than by a cross-implementation inference.
+
+Two things worth keeping in mind about the shape:
+
+- Each answer carries an explicit `"type"` tag — `"choice"` or `"noul"` —
+  matching the question that was asked. `decode_answer` derives the kind from
+  the fields present and only *checks* a string `type` when one is present, so a
+  server that omitted the tag would still parse; this capture simply confirms
+  that it does not omit it.
+- `model` echoes the full `-hf` spec (`LiquidAI/d1-3B-GGUF:Q8_0`), not the bare
+  `d1-3b` label `ROUTER_MODEL` defaults to. `decode_response` ignores it — the
+  model is whatever the running server was started with, which is why the
+  label is log-only.
