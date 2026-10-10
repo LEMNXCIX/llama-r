@@ -817,6 +817,54 @@ async fn min_confidence_governs_the_confidence_gate_and_min_specialized_the_othe
     }
 }
 
+/// A request that cannot be answered must not be routed at all: `messages: []`
+/// answers the same `400` whatever the model would have chosen, so spending a
+/// decision on it buys nothing. Asserted through `execute_chat_stream` — the
+/// surface whose resolution order the check is otherwise invisible on.
+#[tokio::test]
+async fn a_request_with_no_messages_is_refused_without_spending_a_decision() {
+    let _env = DispatchEnv::new();
+    std::env::set_var("ROUTER_ENABLED", "true");
+    let (dir, state) = held_state_with_agents("fudi", true);
+    let provider = Arc::new(RecordingStreamProvider::default());
+    let routed_state = state_with_provider(&state.agent_registry, provider.clone());
+    let fake = FakeRouter::returning(choice_for("fudi::ops"));
+    *routed_state.router.write().unwrap() = Some(Arc::new(fake.with_call_counter()));
+
+    // `Err(..)` rather than `.unwrap_err()`: the `Ok` variant is a stream, which
+    // is not `Debug`, so the usual helper does not compile here.
+    let Err(err) = execute_chat_stream(
+        &routed_state,
+        ChatRequest {
+            model: "fallback-model".to_string(),
+            messages: vec![],
+            stream: true,
+        },
+        AgentSelection {
+            project_id: Some("fudi"),
+            agent_id: None,
+            conversation_id: None,
+            debug: false,
+        },
+    )
+    .await
+    else {
+        panic!("an empty message list must not produce a stream");
+    };
+
+    assert_eq!(
+        err.status_code(),
+        StatusCode::BAD_REQUEST,
+        "the empty-messages complaint must be unchanged"
+    );
+    assert!(err.to_string().contains("'messages' cannot be empty"));
+    assert!(
+        !fake.was_called(),
+        "an unanswerable request must not buy a decision: the outcome is known before the router is asked"
+    );
+    let _ = dir;
+}
+
 /// The streaming surface routes too. `execute_chat_stream` is a second entry
 /// point into the same dispatch, so "routing lives inside `execute_chat`" is
 /// a claim about one function until a test drives the other.

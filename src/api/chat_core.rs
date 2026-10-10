@@ -718,16 +718,23 @@ fn engine_events_to_chat_stream(
     })
 }
 
-async fn prepare_request(
-    state: &AppState,
-    mut payload: ChatRequest,
-    selection: &ResolvedSelection,
-) -> Result<ChatRequest, AppError> {
+/// The one complaint an empty message list gets, checked before resolution so
+/// a request that cannot be answered at all never spends a decision.
+fn require_messages(payload: &ChatRequest) -> Result<(), AppError> {
     if payload.messages.is_empty() {
         return Err(AppError::Validation(
             "Missing required field: 'messages' cannot be empty.".to_string(),
         ));
     }
+    Ok(())
+}
+
+async fn prepare_request(
+    state: &AppState,
+    mut payload: ChatRequest,
+    selection: &ResolvedSelection,
+) -> Result<ChatRequest, AppError> {
+    require_messages(&payload)?;
 
     // Read as `Option<&str>` so this function cannot tell a header-derived
     // selection from a routed one — it sees the same pair either way. With
@@ -890,7 +897,13 @@ pub async fn execute_chat(
     payload: ChatRequest,
     selection: AgentSelection<'_>,
 ) -> Result<ChatResponse, AppError> {
-    // Resolve first: from here on the selection is the router's answer or
+    // Before the decision, not after: a request with no messages answers this
+    // `400` whatever the router would have said, so resolving first spends a
+    // forward pass on an outcome that is already known. Same check, same
+    // words, one call earlier — `prepare_request` keeps it because it is the
+    // function that owns the field.
+    require_messages(&payload)?;
+    // Resolve next: from here on the selection is the router's answer or
     // the header's, in one shape, and every step below reads that shape.
     let resolved = resolve_selection(state, selection, &payload.messages).await?;
     let requested_model = resolved.requested_target(&payload.model);
@@ -982,8 +995,11 @@ pub async fn execute_chat_stream(
     selection: AgentSelection<'_>,
 ) -> Result<AppChatStream, AppError> {
     payload.stream = true;
-    // Same resolve-first shape as `execute_chat`: one selection type feeds
-    // `requested_target`, `engine_target` and `prepare_request` here too.
+    // Same ordering as `execute_chat`: the empty-messages `400` precedes the
+    // decision for the same reason, and then resolve-first — one selection
+    // type feeds `requested_target`, `engine_target` and `prepare_request`
+    // here too.
+    require_messages(&payload)?;
     let resolved = resolve_selection(state, selection, &payload.messages).await?;
     let requested_model = resolved.requested_target(&payload.model);
     let original_model = payload.model.clone();
