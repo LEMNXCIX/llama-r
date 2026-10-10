@@ -9,15 +9,18 @@
 //! [`derive_criteria_text`] writes the short description d1 scores each
 //! candidate against.
 //!
-//! Two decisions are worth knowing before editing. A blank description never
+//! Three decisions are worth knowing before editing. A blank description never
 //! removes a candidate: the agent id stands in for the missing name and
 //! description, the capability sections still follow it, and a warning is
 //! logged — because dropping the agent would turn a request that resolves
 //! the general agent today into a `400`: an agent with a weak description
 //! routes badly, an agent that cannot be routed at all is worse, and
-//! silently. And the list is sorted by key, because an unstable order hands
-//! d1 two different prompts for the same request, which makes a confidence
-//! threshold impossible to interpret.
+//! silently. `exclude` cannot remove a project's **own general agent** either,
+//! for the sharper version of the same reason: that agent is the one landing
+//! place every degrading rung of the ladder has, so excluding it fails the
+//! request instead of changing where it lands. And the list is sorted by key,
+//! because an unstable order hands d1 two different prompts for the same
+//! request, which makes a confidence threshold impossible to interpret.
 
 use crate::domain::agent::Agent;
 use crate::services::agent_registry::AgentRegistry;
@@ -44,6 +47,13 @@ pub struct RouteCandidate {
 /// agent plus every agent of that project, minus `exclude` (matched on agent
 /// id, the unit `RouterConfig::exclude` documents).
 ///
+/// The project's **own general agent is never excluded**: it is the only
+/// landing place every degrading rung of the ladder has, so dropping it turns
+/// a request that succeeds today into the `agent_not_found` `400` that a
+/// genuinely agentless project answers with — the same reasoning that keeps a
+/// description-less agent a candidate, and for a sharper reason: a weak
+/// description routes badly, a missing fallback fails.
+///
 /// The result is sorted by `key`. `registry.list()` walks a `HashMap`, so
 /// its order varies between calls; an unstable order would build the
 /// `Choice` criteria map differently for two identical requests, and a
@@ -60,7 +70,29 @@ pub fn build_candidates(
             Some(project) => project == project_id,
             None => true,
         })
-        .filter(|registered| !exclude.contains(&registered.agent.id))
+        .filter(|registered| {
+            // A project's *own* general agent is never removable. Every rung
+            // of the ladder degrades to it, so excluding it does not remove a
+            // preference — it removes the only safe landing place, and the
+            // request that would have degraded to it answers `400` instead,
+            // with the agent still sitting right there in
+            // `contextos/projects/<p>/agents/<p>.toml`. `exclude` is an
+            // operator's tuning list, and turning one into a request failure
+            // is not what it is for; a global whose id merely matches the
+            // project id is not this agent and stays excludable.
+            let is_own_general = registered.agent.project_id.as_deref() == Some(project_id)
+                && is_project_general(project_id, &registered.agent.id);
+            if is_own_general && exclude.contains(&registered.agent.id) {
+                tracing::warn!(
+                    project = %project_id,
+                    agent = %registered.agent.qualified_id(),
+                    "exclude names the project's own general agent; it stays a candidate \
+                     because every routing fallback degrades to it"
+                );
+                return true;
+            }
+            !exclude.contains(&registered.agent.id)
+        })
         .filter_map(|registered| {
             let agent = registered.agent;
 
@@ -428,6 +460,92 @@ mod tests {
         let (_dir, registry) = fudi_registry();
         let candidates = build_candidates(&registry, "fudi", &["ops".to_string()]);
         assert!(!candidates.iter().any(|c| c.agent_id == "ops"));
+    }
+
+    /// Finding I1: `exclude` is a routing preference, and the project's own
+    /// general agent is the one candidate it cannot be applied to. Dropping it
+    /// leaves the ladder with nowhere to degrade, and the request answers the
+    /// `agent_not_found` `400` that only a genuinely agentless project should
+    /// ever get — while `contextos/projects/fudi/agents/fudi.toml` sits right
+    /// there on disk.
+    ///
+    /// Selected by `key`, not by `is_project_general` alone: the guard has to
+    /// hold for the *excluded* case specifically, so the set must be the one
+    /// built with `fudi` in the exclude list.
+    #[test]
+    fn exclude_cannot_remove_the_projects_own_general_agent() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let (_dir, registry) = fudi_registry();
+        let candidates = build_candidates(&registry, "fudi", &["fudi".to_string()]);
+        let general = candidates
+            .iter()
+            .find(|c| c.key == "fudi::fudi")
+            .expect("the project's own general agent is not excludable");
+        assert!(
+            general.is_project_general,
+            "it must stay flagged as the fallback, not merely present"
+        );
+        // The rest of the list is still filtered: the guard protects one agent,
+        // not the whole exclude list.
+        assert!(candidates.iter().any(|c| c.key == "fudi::ops"));
+    }
+
+    /// The other half of that guard: a *global* agent whose id happens to
+    /// match the project's id is not the project's general agent, so it
+    /// remains excludable. The guard is keyed on the project, not on the id
+    /// alone — otherwise it would overreach into a global nobody asked to keep.
+    #[test]
+    fn a_global_sharing_the_projects_id_is_still_excludable() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let shared = "name = \"Fudi Global\"\nsystem_prompt = \"base\"\n\
+                      description = \"Asistente global.\"\n";
+        let (_dir, registry) = registry_with(&[
+            ("agents/fudi.toml", shared),
+            ("contextos/projects/fudi/agents/fudi.toml", GENERAL),
+        ]);
+        let candidates = build_candidates(&registry, "fudi", &["fudi".to_string()]);
+        assert_eq!(
+            candidates.iter().filter(|c| c.agent_id == "fudi").count(),
+            1,
+            "only the project agent survives the exclude list: {:?}",
+            candidates
+                .iter()
+                .map(|c| c.key.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(candidates.iter().any(|c| c.key == "fudi::fudi"));
+    }
+
+    /// Finding I4: the security property the design names — routing can never
+    /// cross projects. Another project's agent carries another project's
+    /// context, rules, `rag_sources` and `tools_override`, so offering it as a
+    /// candidate would hand it all of them on a request that named a different
+    /// project.
+    #[test]
+    fn another_projects_agents_are_never_candidates() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let secret = "name = \"Secretos\"\nsystem_prompt = \"base\"\n\
+                      description = \"Datos de otro proyecto.\"\n";
+        let (_dir, registry) = registry_with(&[
+            ("agents/ops.toml", GLOBAL_OPS),
+            ("contextos/projects/fudi/agents/fudi.toml", GENERAL),
+            ("contextos/projects/fudi/agents/ops.toml", NAMELESS_OPS),
+            ("contextos/projects/otro/agents/otro.toml", GENERAL),
+            ("contextos/projects/otro/agents/secretos.toml", secret),
+        ]);
+        let candidates = build_candidates(&registry, "fudi", &[]);
+        let keys: Vec<&str> = candidates.iter().map(|c| c.key.as_str()).collect();
+        assert!(
+            keys.contains(&"fudi::fudi") && keys.contains(&"fudi::ops"),
+            "the project's own agents must be offered: {keys:?}"
+        );
+        assert!(keys.contains(&"ops"), "globals are offered: {keys:?}");
+        for foreign in ["otro::otro", "otro::secretos"] {
+            assert!(
+                !keys.contains(&foreign),
+                "another project's agent must never be a candidate: {keys:?}"
+            );
+        }
     }
 
     #[test]
