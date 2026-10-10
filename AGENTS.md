@@ -18,6 +18,9 @@ This file documents the current developer workflows and commands for working on 
 - On first run, when `DEFAULT_MODEL` is missing **and** a terminal is available, the app enters interactive provider setup and persists the result to `.env`.
 - The provider being unreachable is **not** a startup failure. With `DEFAULT_MODEL` set, llama-r boots degraded and `GET /api/health` reports `"status":"degraded"` with the underlying cause; chat and RAG requests fail with a `502`/`500` naming the connection error. It recovers on its own once the provider is reachable.
 - Without a TTY (systemd, Docker, CI) llama-r never blocks on an interactive prompt: it boots and logs a warning.
+- Agent routing is **off by default** (`ROUTER_ENABLED=false`): an update that only ships the router changes nothing. When it is enabled, a chat request carrying `X-Project` but no `X-Agent` is routed to that project's most appropriate agent by a Liquid AI d1 decision model. d1 generates no tokens — it evaluates typed questions in one forward pass and returns calibrated probabilities — so Ollama cannot serve it (its endpoints are generative); it runs in a separate `llama-server` process (`llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0`, which serves `POST /v1/systemone`).
+- A missing or unreachable router is **not** a startup failure, mirroring the provider rule above: with `DEFAULT_MODEL` set llama-r boots and logs a warning, `GET /api/health` reports the router's state, and the requests that would have been routed degrade to the project's general agent — a project with no general agent to degrade to keeps failing with `400`, as it did before routing existed.
+- Routing lives inside the shared chat dispatch, so the HTTP chat endpoints and gRPC both inherit it (`src/api/grpc.rs` builds the same `AgentSelection` and calls the same `execute_chat`). The TUI does not route: it is a separate path, and there you pick an agent deliberately.
 - Agent configs are loaded from `agents/` and `contextos/projects/<project_id>/agents/`.
 - Project contexts are stored under `contextos/projects/<project_id>/`.
 - Hot reload watches the base Llama-R directory, so agent and context changes are picked up without restarting.
@@ -34,6 +37,18 @@ Primary environment variables:
 - `EMBEDDING_DIMENSIONS`: expected vector size, default `768`
 - `RAG_ENABLED`: build/use RAG store at runtime, default `true`
 - `HISTORY_RETENTION_DAYS`: purge conversations older than this many days, default `90`. `0` disables purging.
+- `ROUTER_ENABLED`: enable agent routing, default `false`. Off by default so an update that only ships the router changes nothing.
+- `ROUTER_URL`: decision-model origin (the separate `llama-server`), default `http://127.0.0.1:8080`. **Check the port against your build.** Recent llama.cpp defaults to **9931**, not 8080 — read the `listening on` line the server prints and set this to match.
+- `ROUTER_MODEL`: model label for the decision router, default `d1-3b`. It reaches only the adapter's own log line: the body sent to `POST /v1/systemone` is `{state, questions}`, with no model field, because the model is chosen by which `llama-server` process is running.
+- `ROUTER_TIMEOUT_MS`: budget for one decision in milliseconds, default `3000`. `0` is rejected. **Raise this on CPU-only inference.** Liquid's published latencies (8 ms on a 4090, 26 ms on a Jetson AGX Orin) are GPU figures; a d1-3B decision measured on an 8-core CPU takes **2.4–3.3 s**, so the default sits right at the edge and every decision degrades to the general agent as `router_unavailable`. Use `30000` for CPU. A decision past the budget is not fatal — it degrades — which is why this failure looks like "routing never picks a specialist" rather than an error.
+- `MIN_CONFIDENCE`: below this `Choice` confidence the request stays with the project's general agent, default `0.60`. Must be greater than `0.0` and at most `1.0`; `0` is rejected rather than clamped.
+- `MIN_SPECIALIZED`: below this specialisation score a specialist does not win over the general agent, default `0.50`. Same `(0.0, 1.0]` bounds as `MIN_CONFIDENCE`. The env name uses a `z`; the matching `router.toml` key is `min_specialised`.
+
+A malformed router value (bad number, timeout `0`, threshold outside `(0.0, 1.0]`) is a configuration error naming the variable and the value received, not a silent clamp. At boot that error is logged as a warning and the router falls back to the inert defaults (routing disabled) — like a bad `ROUTER_URL`, it never stops startup.
+
+An optional `router.toml` in the base directory overrides any of the values above (`enabled`, `url`, `model`, `timeout_ms`, `min_confidence`, `min_specialised`, and an `exclude` list of agent ids routing must never select): the environment provides the defaults and the file wins on the keys it actually sets. There is no env var for `exclude`. A missing file is fine; an unreadable or malformed one is a configuration error naming the path, and at boot it is logged and falls back to the inert defaults (routing disabled) rather than being silently ignored.
+
+`exclude` matches on the bare agent id and drops the agent from that project's candidate set. It cannot drop a project's **own general agent** (`contextos/projects/<p>/agents/<p>.toml`): that agent is the one landing place every degrading rung of the ladder has, so excluding it would fail the request with `agent_not_found` instead of changing where it lands. The exclusion is ignored for that one agent and logged as a warning. A *global* whose id matches the project id is a different agent and stays excludable.
 
 Recommended setup:
 
@@ -131,6 +146,8 @@ GET /health
 GET /api/health
 ```
 
+The response carries a `router` field: `{"enabled": bool, "healthy": bool, "url": …}`. `healthy` is a **last-known value**, not a live probe: it starts with a **TCP reachability check of the configured origin** at boot (a connect, not a request to `/v1/systemone`) and is then updated by the outcome of every decision. It means "something was listening at `ROUTER_URL`", **not** that `/v1/systemone` answers. A router that is switched off reports `healthy: false` (nothing has checked it), and `status` is `"ok"` only when the provider is healthy and the router is either disabled or healthy — an enabled-but-unreachable router reports `"degraded"`, for the same reason an unreachable provider does.
+
 ### Basic Endpoints
 ```text
 GET  /
@@ -151,6 +168,19 @@ POST /v1/chat/completions
 **Strict Validation:** If `X-Project` is provided, Llama-R **requires** a valid agent to be found within that project context. If the requested agent (or the project's default agent) is missing, the request will fail with a `400 Bad Request` error. This ensures that project-scoped requests never accidentally bypass the intended context and rules.
 
 If `X-Project` is sent without `X-Agent`, Llama-R loads the project general agent whose id matches the project id (e.g., `contextos/projects/my-project/agents/my-project.toml`).
+
+With routing enabled (`ROUTER_ENABLED=true`), one of the two behaviours above changes, and only then; with the router off (the default) both behave exactly as written:
+
+- `X-Project` without `X-Agent` no longer always resolves to the general agent: it is routed among that project's agents plus the global agents, keyed by the registry's scheme (`project::agent` for project agents, the bare id for globals). `X-Agent` still pins the target and never spends a decision.
+- The candidate set cannot cross projects — another project's agent is never offered, which is what keeps a routed request inside the authority its `X-Project` named. It *can* reach a **global**, and a global winner dispatches with `project_id: None`: answered outside the project, with none of that project's context, rules, `rag_sources` or `tools_override`. Precisely: never another project, sometimes no project at all.
+- Routing is **per request, not per conversation**. Each turn is a fresh decision, so the chosen agent can change between two messages of the same thread; there is no stickiness, and `X-Conversation-Id` is not read by the router.
+- A request whose answer is already known spends no decision: an empty `messages` array is refused before resolution, and a specialists-only project is refused before the router is consulted. Both `400`s are the ones that request already got.
+- A project with specialised agents but **no general agent still returns `400`** — it never routes. Every rung of the ladder degrades to the general agent, so `route` checks that one exists *before* it reads any answer, and the check runs before the decision is spent: such a request fails with the same `agent_not_found` `400` as always, without the decision model being consulted at all.
+- A project with no candidates left to route between (no project agents, and no global agents either after `exclude`) is not routed at all: resolution returns the request untouched and it fails validation exactly as it did before routing existed — also without spending a decision. Both cases answer the same `400` they always did; neither is a new kind of failure.
+
+When nothing fits, the destination is the project's **general agent** (`contextos/projects/<p>/agents/<p>.toml`), never a bare `DEFAULT_MODEL`: a request that named a project must be answered inside that project with its context and rules, and falling through to an unscoped model would drop exactly what the request asked for. When the project has no general agent there is nothing to fall back to, so — as the bullet above says — the request gets that `400` instead, and still never a bare model.
+
+Routing is not HTTP-only: it lives inside `execute_chat`, so gRPC inherits it because `src/api/grpc.rs` builds the same `AgentSelection` from the `x-project`/`x-agent` metadata and calls the same dispatch — there is no per-surface opt-out. The TUI does not route: it is a separate path, and there you pick an agent deliberately.
 
 ### Agent API
 ```text
@@ -195,6 +225,15 @@ POST /api/rag/delete-document
 
 Returns `403` without the header (checked before the body is parsed), and `501` when RAG is disabled (`RAG_ENABLED=false`).
 
+### Router (debug/admin — requires `X-Debug: true`)
+```text
+POST /api/route
+```
+
+Body: `{"project_id": "...", "prompt": "..."}`. It runs the routing decision for that prompt — same candidates, same two questions, same thresholds as a chat would use — and returns the evidence (candidates, raw response, derived decision and reason, both scores, the probability distribution, decision latency) **without executing the chat**. This is the tool for calibrating `MIN_CONFIDENCE`: a preview costs one decision-model forward pass instead of a full agent turn.
+
+Returns `403` without the header (checked before the body is parsed), `400` when the project has no candidates to route between or none to degrade to (the same `agent_not_found` the chat would answer), and `501` when routing is disabled. The same evidence is available on a real chat response as `debug_route` when `X-Debug: true` is sent.
+
 ## Developer Commands
 ```powershell
 cargo fmt
@@ -208,6 +247,7 @@ cargo test --target-dir target-tests
 - `contextos/projects/<project_id>/context/`: saved generated context
 - `data/lancedb/`: persistent RAG collections (gitignored; FileRagStore JSONL per `source_id`)
 - `data/history.db`: SQLite conversation history (gitignored)
+- `router.toml` (optional): router tuning — the two thresholds, `exclude`, and any of the `ROUTER_*` values; overrides the environment defaults
 - `logs/llama-r.log`: rolling application logs
 
 ## TUI
@@ -255,6 +295,11 @@ cargo test --target-dir target-tests
 - `dedent_code` skips languages where indentation is meaning (`python`, `yaml`, `toml`, …) and skips untagged blocks: an untagged block of Python is still Python.
 - A tool name that matches nothing used to be a silent no-op. `AgentRegistry` now warns with the unknown and the known names when it loads an agent, and the picker drops unknown names on save after showing them.
 - `optimize.enabled` follows the selection: the form used to write `true` unconditionally, producing configs that claimed to be optimising while running nothing.
+
+## Routing hints
+
+- `[routing]` in an agent TOML takes one field, `hint` (`AgentConfig.routing: Option<RoutingConfig>`). When non-blank it **replaces** the whole criteria text the router scores that agent against (`derive_criteria_text`) — one curated sentence instead of the derived `name — description` plus `Skills:`/`Tools:`/`Sources:` sections. It is the only curated lever on routing quality; nothing else in the manifest is read by the router except the id, the name and those sections.
+- The field is written by hand in the TOML and by nothing else. `build_agent_toml` (`src/api/agent_api.rs`) rewrites the manifest from `CreateAgentRequest`, which has no `routing` field, so **`PUT /api/agents/:id` erases a hand-written `hint`**. Curating a hint and then editing the agent through the API loses it.
 
 ## Skills
 

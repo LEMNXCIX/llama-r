@@ -480,7 +480,7 @@ pub struct RoutingConfig {
 
 `build_candidates` walks `registry.list()` (which returns `RegisteredAgent` with both the `Agent` and its resolved `AgentScope`), keeps those whose `agent.project_id` is `Some(project_id)` or `None`, drops any whose `agent_id` is in `exclude`, and **skips with a `tracing::warn!` any global agent whose id contains `::`** (Review Focus #2). The routing key is `format!("{project}::{agent}")` for project agents and the bare id for globals — the same scheme as `registry_key`, which is private to `agent_registry.rs`, so re-derive it here in one small function with a comment naming `registry_key` as the authority. Sort the result by `key` so the `Choice` criteria map is built in a stable order across calls; an unstable order makes two identical requests produce different prompts, which makes a confidence threshold impossible to interpret.
 
-`derive_criteria_text` returns `routing.hint` when it is a non-blank `Some`. Otherwise it assembles `name` + `description`, then `Skills:` from `skills` ∪ `auto_skills`, `Tools:` from `tools_override`, `Sources:` from `mcp_sources`, omitting empty sections and joining with `"\n"`. When both `name` and `description` are blank, return the agent id — never an empty string, because an empty `Choice` criterion is worse than a terse one.
+`derive_criteria_text` returns `routing.hint` when it is a non-blank `Some`. Otherwise it assembles `name` + `description`, then `Skills:` from `skills` ∪ `auto_skills`, `Tools:` from `tools_override`, `Sources:` from `mcp_sources`, omitting empty sections and joining with `"\n"`. When both `name` and `description` are blank, use the agent id **as the header and fall through**, so the sections still append — never an empty string, because an empty `Choice` criterion is worse than a terse one, and a bare id with no capability signal is worse still.
 
 - [ ] **Step 5: Run the tests**
 
@@ -1084,7 +1084,7 @@ Co-Authored-By: opencode <opencode@local>"
 Under Environment, add the six variables with their defaults from Task 3. Under "HTTP API Quick Reference", add `POST /api/route` with its `X-Debug` requirement. In the Chat Endpoints section, amend the `X-Project` paragraph with **both** behaviour changes from the spec's strict-validation section:
 
 - `X-Project` without `X-Agent` now routes among that project's agents plus global agents, instead of always loading the project's general agent.
-- A project with specialised agents but no general agent can now route; if no specialist is selected, it returns `400` as before.
+- A project with specialised agents but no general agent still returns `400` and never routes — the ladder checks for a general agent before it reads any answer. (This corrects an earlier draft of this plan, which claimed the case could route.)
 
 State that gRPC inherits the routing through the same dispatch, and that the TUI does not route.
 

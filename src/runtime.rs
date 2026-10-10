@@ -1,5 +1,6 @@
 use crate::adapters::mcp::{McpServerConfig, StaticMcpRegistry};
 use crate::adapters::rag::{FileRagStore, OllamaEmbeddings};
+use crate::adapters::router::LlamaCppRouter;
 use crate::api::agent_api::{
     create_agent, delete_agent, get_agent, get_agent_scope, list_agents_api, update_agent,
 };
@@ -16,6 +17,7 @@ use crate::api::history_api::{
 };
 use crate::api::observability::AppObservability;
 use crate::api::rag_api::{rag_delete_document, rag_ingest, rag_query};
+use crate::api::route_api::route_preview;
 use crate::api::skill_api::list_skills_api;
 use crate::config::Config;
 use crate::context::analyzer::ContextEnricher;
@@ -28,11 +30,13 @@ use crate::ports::engine::AgentEngine;
 use crate::ports::history::ConversationStore;
 use crate::ports::mcp::McpServerRegistry;
 use crate::ports::rag::{EmbeddingProvider, RagStore};
+use crate::ports::router::DecisionRouter;
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::agent_runtime::AgentRuntime;
 use crate::services::rag_ingest::RagIngestService;
+use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
 use axum::{
     routing::{get, post},
@@ -91,6 +95,38 @@ pub fn build_app_state(
         )),
     );
 
+    // Router configuration. `RouterConfig` deliberately does not load `.env`
+    // itself (that is `Config::from_env`'s job, which has already run on this
+    // boot path), so this reads deployment values from the environment plus
+    // the optional `router.toml` overlay. An unusable config must not stop a
+    // server that otherwise works: warn — the message names the offending
+    // variable — and fall back to the inert defaults, routing off.
+    let router_config = match RouterConfig::load() {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "Invalid router configuration; falling back to defaults (routing disabled)"
+            );
+            RouterConfig::default()
+        }
+    };
+    let router: Option<Arc<dyn DecisionRouter>> = if router_config.enabled {
+        tracing::info!(
+            url = %router_config.url,
+            model = %router_config.model,
+            "Decision router initialized"
+        );
+        Some(Arc::new(LlamaCppRouter::new(
+            router_config.url.clone(),
+            router_config.model.clone(),
+            router_config.timeout_ms,
+        )))
+    } else {
+        tracing::info!("Router disabled via ROUTER_ENABLED=false");
+        None
+    };
+
     Arc::new(AppState {
         provider,
         agent_registry,
@@ -109,6 +145,9 @@ pub fn build_app_state(
         rag_store,
         rag_ingest,
         history_store,
+        router: RwLock::new(router),
+        router_config: Arc::new(router_config),
+        router_healthy: AtomicBool::new(false),
     })
 }
 
@@ -158,6 +197,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/rag/ingest", post(rag_ingest))
         .route("/api/rag/query", post(rag_query))
         .route("/api/rag/delete-document", post(rag_delete_document))
+        .route("/api/route", post(route_preview))
         .route("/api/skills", get(list_skills_api))
         .route("/api/conversations", get(list_conversations_handler))
         .route(
@@ -374,6 +414,32 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
             config.embedding_dimensions,
         )),
     );
+
+    // One probe at startup, then last-known-value: the ladder updates the flag
+    // after every decision and `/api/health` never probes — the point of the
+    // design is exactly that no second round trip is added per health check.
+    // "Not yet probed" is a different fact from "unreachable", and an operator
+    // who switched the router on deserves "ok" from a working deployment on
+    // the first request, not after the first routed chat. Non-fatal either
+    // way: a router down at boot degrades the service, it does not stop it —
+    // the same posture `startup_plan` takes for the provider.
+    if state.router_config.enabled {
+        let url = state.router_config.url.clone();
+        let timeout_ms = state.router_config.timeout_ms;
+        let healthy = tokio::task::spawn_blocking(move || probe_router_origin(&url, timeout_ms))
+            .await
+            .unwrap_or(false);
+        state.record_router_health(healthy);
+        if healthy {
+            tracing::info!(url = %state.router_config.url, "Decision router reachable at startup");
+        } else {
+            tracing::warn!(
+                url = %state.router_config.url,
+                "Decision router unreachable at startup; /api/health reports degraded until it answers"
+            );
+        }
+    }
+
     let router = build_router(state.clone());
 
     Ok(Runtime {
@@ -383,6 +449,91 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         state,
         router,
     })
+}
+
+/// One-shot reachability probe of the decision model's origin.
+///
+/// A TCP connect, not an HTTP request: the probe answers "is something
+/// listening at the configured origin", and knowing *which* path says
+/// "healthy" on a llama-server is the adapter's URL knowledge
+/// (`src/adapters/router/llamacpp.rs`), not the runtime's. A semantic probe —
+/// one real decision — is the ladder's job on the first routed message.
+///
+/// Never fatal: an unreachable router at boot is a degraded service, not a
+/// failed start. A URL that cannot even be parsed counts as unreachable and
+/// warns, so a typo in `ROUTER_URL` is visible in the boot log either way.
+fn probe_router_origin(url: &str, timeout_ms: u64) -> bool {
+    let Some(origin) = router_origin(url) else {
+        tracing::warn!(
+            url,
+            "Router URL has no recognisable host; treating the router as unreachable"
+        );
+        return false;
+    };
+    use std::net::ToSocketAddrs;
+    let mut addrs = match origin.to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(err) => {
+            tracing::warn!(url, origin, error = %err, "Router origin does not resolve; treating the router as unreachable");
+            return false;
+        }
+    };
+    let Some(addr) = addrs.next() else {
+        tracing::warn!(
+            url,
+            origin,
+            "Router origin resolved to no address; treating the router as unreachable"
+        );
+        return false;
+    };
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+    match std::net::TcpStream::connect_timeout(&addr, timeout) {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(url, origin, error = %err, "Router origin did not accept a connection");
+            false
+        }
+    }
+}
+
+/// `http://host:port/…` → `host:port`, defaulting the port by scheme.
+///
+/// Deliberately not a URL parser: no dependency is pulled in for two fields,
+/// and every surprise (no authority, a non-numeric port) yields `None` so the
+/// caller reports "unreachable" rather than guessing. Userinfo before an `@`
+/// is stripped, and an IPv6 literal keeps its brackets, which is the spelling
+/// `ToSocketAddrs` accepts.
+fn router_origin(url: &str) -> Option<String> {
+    let (default_port, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (443, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (80, rest)
+    } else {
+        // A bare `host:port` still probes; a bare scheme-less path does not,
+        // because `ToSocketAddrs` will refuse it and the caller warns.
+        (80, url)
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(end) = authority.find(']') {
+        // IPv6 literal, e.g. `[::1]:8080`.
+        let host = &authority[..=end];
+        let port = authority[end + 1..]
+            .strip_prefix(':')
+            .and_then(|raw| raw.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Some(format!("{host}:{port}"));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, raw_port)) => raw_port
+            .parse::<u16>()
+            .ok()
+            .map(|port| format!("{host}:{port}")),
+        None => Some(format!("{authority}:{default_port}")),
+    }
 }
 
 pub async fn start_http_server(runtime: &Runtime) -> Result<tokio::task::JoinHandle<()>, AppError> {
@@ -612,4 +763,112 @@ pub fn start_grpc_server(runtime: &Runtime) -> tokio::task::JoinHandle<()> {
             tracing::error!(error = %err, addr = %grpc_addr, "gRPC server stopped unexpectedly");
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn router_origin_extracts_host_and_port() {
+        assert_eq!(
+            router_origin("http://127.0.0.1:8080").as_deref(),
+            Some("127.0.0.1:8080")
+        );
+        assert_eq!(
+            router_origin("http://127.0.0.1:8080/").as_deref(),
+            Some("127.0.0.1:8080"),
+            "a trailing slash is the documented spelling and must not leak into the origin"
+        );
+        assert_eq!(
+            router_origin("https://router.local").as_deref(),
+            Some("router.local:443")
+        );
+        assert_eq!(
+            router_origin("router.local:9000").as_deref(),
+            Some("router.local:9000"),
+            "a scheme-less host:port still probes"
+        );
+        assert_eq!(
+            router_origin("http://[::1]:8080/v1").as_deref(),
+            Some("[::1]:8080"),
+            "an IPv6 literal keeps its brackets, the spelling ToSocketAddrs accepts"
+        );
+        assert_eq!(
+            router_origin("http://user:pass@host:8080").as_deref(),
+            Some("host:8080")
+        );
+    }
+
+    #[test]
+    fn a_url_without_a_usable_authority_has_no_origin() {
+        assert_eq!(router_origin(""), None);
+        assert_eq!(router_origin("http://"), None);
+        assert_eq!(
+            router_origin("http://host:not-a-port"),
+            None,
+            "a non-numeric port is refused, not guessed"
+        );
+    }
+
+    /// Draw an ephemeral port, release the listener, and let the probe answer
+    /// whether the port is now closed. `true` means the probe DID report the
+    /// released port unreachable; `false` means every drawn port was grabbed
+    /// by another test before a probe could see it closed.
+    ///
+    /// The bind-drop-probe sequence is the retryable unit. A fresh port is
+    /// drawn per attempt because once a listener is dropped its port is
+    /// genuinely free — `adapters::rag::embeddings` tests bind ephemeral
+    /// listeners in this same lib binary and the kernel may hand them the
+    /// just-released port. Retrying the sequence instead of asserting on a
+    /// single draw is what keeps contention from ever failing this test.
+    fn released_port_probes_as_closed(attempts: u32) -> bool {
+        for _ in 0..attempts {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("the kernel hands out an ephemeral port on request");
+            let port = listener
+                .local_addr()
+                .expect("listener has an address")
+                .port();
+            drop(listener);
+            if !probe_router_origin(&format!("http://127.0.0.1:{port}"), 1000) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The probe must see a listener and must report a closed port as
+    /// unreachable rather than hang or panic.
+    ///
+    /// The held-listener half is uncontended by construction, not by luck:
+    /// the kernel never assigns a bound, listening port to another `:0` bind,
+    /// rebinding a live port needs `SO_REUSEPORT` (std and tokio set only
+    /// `SO_REUSEADDR`, which does not allow two live listeners), and no test
+    /// in this lib binary binds a fixed port. The probe connects to a port
+    /// this test exclusively owns for the whole half.
+    ///
+    /// The released-port half IS contended, so the observation that the probe
+    /// reports the port closed and the test's pass condition are one event:
+    /// a second, later probe of the same port would reopen exactly the race
+    /// window this replaces — another test could draw the port between the
+    /// two probes. Contention instead retries the whole sequence with a
+    /// fresh port (`released_port_probes_as_closed`), and only a bounded run
+    /// of collisions fails the test, with the port-acquisition message it
+    /// deserves rather than a misleading "probe saw a listener".
+    #[test]
+    fn the_probe_sees_a_listener_and_misses_a_closed_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(probe_router_origin(
+            &format!("http://127.0.0.1:{port}"),
+            1000
+        ));
+        drop(listener);
+        assert!(
+            released_port_probes_as_closed(8),
+            "could not observe a released port as closed in 8 attempts — \
+             ephemeral-port contention in this test binary never relented"
+        );
+    }
 }

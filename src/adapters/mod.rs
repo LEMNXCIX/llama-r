@@ -6,3 +6,4 @@ pub mod history;
 pub mod mcp;
 pub mod rag;
 pub mod rig_engine;
+pub mod router;
