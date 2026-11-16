@@ -89,6 +89,11 @@ pub fn get_history_db_path() -> PathBuf {
     get_data_dir().join("history.db")
 }
 
+/// Optional per-project router tuning: `{base}/router.toml`.
+pub fn get_router_config_path() -> PathBuf {
+    get_base_dir().join("router.toml")
+}
+
 /// Helper to ensure global directories exist
 pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(get_agents_dir())?;

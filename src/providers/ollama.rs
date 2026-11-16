@@ -117,6 +117,7 @@ impl LLMProvider for OllamaProvider {
             message: body.message,
             done: body.done,
             debug_prompt: None,
+            debug_route: None,
         })
     }
 

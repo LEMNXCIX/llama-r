@@ -71,6 +71,10 @@ pub struct AgentConfig {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub observability: AgentObservabilityConfig,
+    /// Curated routing text for the agent router. `None` (the default) means
+    /// the router derives the text from the rest of the manifest.
+    #[serde(default)]
+    pub routing: Option<RoutingConfig>,
 }
 
 impl Default for AgentConfig {
@@ -100,6 +104,7 @@ impl Default for AgentConfig {
             subagents: SubagentsConfig::default(),
             memory: MemoryConfig::default(),
             observability: AgentObservabilityConfig::default(),
+            routing: None,
         }
     }
 }
@@ -225,6 +230,13 @@ impl Default for AgentObservabilityConfig {
             log_tool_results: false,
         }
     }
+}
+
+/// Curated routing text. `hint` replaces the derived description when present.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct RoutingConfig {
+    #[serde(default)]
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Clone)]

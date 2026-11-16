@@ -30,6 +30,54 @@ fn test_lock() -> &'static Mutex<()> {
     TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Every variable `RouterConfig::load` reads. `LLAMA_R_DIR` is deliberately
+/// absent: `setup_app` sets it to its own temp dir and restores it itself.
+const ROUTER_ENV_VARS: &[&str] = &[
+    "ROUTER_ENABLED",
+    "ROUTER_URL",
+    "ROUTER_MODEL",
+    "ROUTER_TIMEOUT_MS",
+    "MIN_CONFIDENCE",
+    "MIN_SPECIALIZED",
+];
+
+/// Clears the router's environment for the duration of one test and puts back
+/// whatever was there when it drops — the same clear/restore discipline as
+/// `RouterConfig`'s own `RouterEnvGuard` (`src/services/router_config.rs`),
+/// which is `mod tests`-private and unreachable from here.
+///
+/// Without this, `build_app_state`'s `RouterConfig::load()` reads the
+/// *ambient* shell: `ROUTER_ENABLED=true cargo test` made this suite assert
+/// "ok" against a `router_config.enabled` state and fail. A suite's verdict
+/// must never depend on the developer's environment.
+struct RouterEnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl RouterEnvGuard {
+    fn cleared() -> Self {
+        let saved = ROUTER_ENV_VARS
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect();
+        for name in ROUTER_ENV_VARS {
+            std::env::remove_var(name);
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for RouterEnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 struct FakeProvider {
     models: Vec<ModelInfo>,
     fail_primary_once: AtomicBool,
@@ -113,6 +161,7 @@ impl LLMProvider for FakeProvider {
             },
             done: true,
             debug_prompt: None,
+            debug_route: None,
         })
     }
 
@@ -144,6 +193,13 @@ impl LLMProvider for FakeProvider {
 }
 
 struct TestApp {
+    // Drop order is load-bearing: fields drop in declaration order, and the
+    // env guard MUST restore the ambient `ROUTER_*` values while `TEST_LOCK`
+    // is still held. Declared the other way round, `_guard` releases the lock
+    // first and the next thread to take it can build its `AppState` against a
+    // half-restored environment — a low-frequency race that made
+    // `health_should_report_runtime_status` fail under `ROUTER_ENABLED=true`.
+    _router_env: RouterEnvGuard,
     _guard: MutexGuard<'static, ()>,
     temp_dir: TempDir,
     router: axum::Router,
@@ -155,6 +211,12 @@ fn setup_app() -> TestApp {
     let guard = test_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Clear the router's variables for the whole test: `build_app_state` reads
+    // ambient `ROUTER_*`/`MIN_*`, and this suite asserts what `/api/health`
+    // reports. `core::paths::lock_env_for_tests` is `#[cfg(test)]`-gated inside
+    // the lib and so is invisible to integration tests; `test_lock` — already
+    // held for the lifetime of every `TestApp` — is this file's equivalent.
+    let router_env = RouterEnvGuard::cleared();
     let temp_dir = tempfile::tempdir().unwrap();
     std::env::set_var("LLAMA_R_DIR", temp_dir.path());
     std::env::set_var("DEFAULT_MODEL", "fallback-model");
@@ -188,6 +250,7 @@ fn setup_app() -> TestApp {
     let grpc_service = GrpcService::new(state);
 
     TestApp {
+        _router_env: router_env,
         _guard: guard,
         temp_dir,
         router,
