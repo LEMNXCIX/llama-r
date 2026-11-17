@@ -9,6 +9,12 @@ pub struct AgentManager {
     agents: RwLock<HashMap<String, Agent>>,
 }
 
+impl Default for AgentManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AgentManager {
     pub fn new() -> Self {
         Self {

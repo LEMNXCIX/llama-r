@@ -571,7 +571,7 @@ impl ConversationStore for SqliteConversationStore {
                     }),
                 };
 
-                if let Ok(_) = rag_store.upsert_scoped(scope, vec![doc]).await {
+                if rag_store.upsert_scoped(scope, vec![doc]).await.is_ok() {
                     indexed = true;
                 }
             }

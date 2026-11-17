@@ -440,18 +440,10 @@ pub fn hints_for(target: KeyTarget) -> Vec<(&'static str, &'static str)> {
             // join of a list: elsewhere in the form every key types into the
             // field, so a hint about writing them somewhere else would be a lie
             // about a row that has no such row to go to.
-            .chain(
-                (field == RULES_FIELD)
-                    .then_some(("Ctrl+R", "edit rules"))
-                    .into_iter(),
-            )
+            .chain((field == RULES_FIELD).then_some(("Ctrl+R", "edit rules")))
             // Only on the tools row, for the same reason: the row is a one-line
             // join of a list, and elsewhere every key types into the field.
-            .chain(
-                (field == OPTIMIZE_FIELD)
-                    .then_some(("Ctrl+O", "edit tools"))
-                    .into_iter(),
-            )
+            .chain((field == OPTIMIZE_FIELD).then_some(("Ctrl+O", "edit tools")))
             .collect()
         }
         KeyTarget::View(CurrentView::Analysis) => {

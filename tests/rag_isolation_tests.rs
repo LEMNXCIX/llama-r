@@ -85,7 +85,12 @@ async fn file_store_reingest_shrunk_file_drops_stale_chunks() {
     std::fs::write(&file, "Refund policy detail sentence. ".repeat(120)).unwrap();
 
     let first = ingest
-        .ingest_files(&sc, "agent:demo/memory", &[file.clone()], Some(dir.path()))
+        .ingest_files(
+            &sc,
+            "agent:demo/memory",
+            std::slice::from_ref(&file),
+            Some(dir.path()),
+        )
         .await
         .expect("first ingest");
     assert!(first.chunks_written >= 4, "expected several chunks");
@@ -93,7 +98,12 @@ async fn file_store_reingest_shrunk_file_drops_stale_chunks() {
     // The same file, now much shorter.
     std::fs::write(&file, "Short updated policy.").unwrap();
     let second = ingest
-        .ingest_files(&sc, "agent:demo/memory", &[file.clone()], Some(dir.path()))
+        .ingest_files(
+            &sc,
+            "agent:demo/memory",
+            std::slice::from_ref(&file),
+            Some(dir.path()),
+        )
         .await
         .expect("second ingest");
     assert_eq!(second.chunks_written, 1);
@@ -128,14 +138,24 @@ async fn file_store_empty_file_does_not_wipe_index() {
     let file = dir.path().join("notes.md");
     std::fs::write(&file, "Refunds are allowed within 24 hours.").unwrap();
     ingest
-        .ingest_files(&sc, "agent:demo/memory", &[file.clone()], Some(dir.path()))
+        .ingest_files(
+            &sc,
+            "agent:demo/memory",
+            std::slice::from_ref(&file),
+            Some(dir.path()),
+        )
         .await
         .expect("ingest");
 
     // Truncate the file to nothing, as an interrupted write would.
     std::fs::write(&file, "").unwrap();
     let result = ingest
-        .ingest_files(&sc, "agent:demo/memory", &[file.clone()], Some(dir.path()))
+        .ingest_files(
+            &sc,
+            "agent:demo/memory",
+            std::slice::from_ref(&file),
+            Some(dir.path()),
+        )
         .await
         .expect("second ingest");
     assert_eq!(result.chunks_written, 0);

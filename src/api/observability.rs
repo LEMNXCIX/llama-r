@@ -90,11 +90,7 @@ impl AppObservability {
             grpc_errors: self.grpc_errors.load(Ordering::Relaxed),
             mcp_errors: self.mcp_errors.load(Ordering::Relaxed),
             chat_latency_ms_total: total_latency,
-            avg_chat_latency_ms: if completed == 0 {
-                0
-            } else {
-                total_latency / completed
-            },
+            avg_chat_latency_ms: total_latency.checked_div(completed).unwrap_or(0),
             routed_to_agent: self.routed_to_agent.load(Ordering::Relaxed),
             routed_to_general: self.routed_to_general.load(Ordering::Relaxed),
             router_errors: self.router_errors.load(Ordering::Relaxed),

@@ -71,6 +71,12 @@ fn insert_with_precedence(
     }
 }
 
+impl Default for SkillManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SkillManager {
     pub fn new() -> Self {
         let mut base_paths = Vec::new();

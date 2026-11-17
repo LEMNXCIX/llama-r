@@ -1345,43 +1345,41 @@ impl TuiApp {
                                     self.load_models().await;
                                 }
                             }
-                            KeyCode::Char('e') => {
+                            KeyCode::Char('e')
                                 if self.current_view == CurrentView::Projects
-                                    && !self.active_in_project_list
-                                {
-                                    let agents = self.project_agents();
-                                    if let Some(agent) = selected_agent(
-                                        self.project_list_bounds,
-                                        &agents,
-                                        self.agent_index,
-                                    ) {
-                                        self.form_id = agent.id.clone();
-                                        self.form_name = agent.config.name.clone();
-                                        self.form_model = agent.config.model.clone();
-                                        self.form_prompt = agent.config.system_prompt.clone();
-                                        self.form_rules = agent.config.rules.clone();
-                                        self.form_optimize_rules =
-                                            agent.config.optimize.rules.clone();
-                                        self.form_optimize_enabled = agent.config.optimize.enabled;
-                                        self.form_skills = agent.config.skills.join(", ");
-                                        self.form_project_id =
-                                            agent.project_id.clone().unwrap_or_default();
-                                        self.available_projects =
-                                            if let Some(ref pid) = agent.project_id {
-                                                vec![pid.clone()]
-                                            } else {
-                                                self.state
-                                                    .context_store
-                                                    .list_all_projects()
-                                                    .into_iter()
-                                                    .map(|c| c.project_id)
-                                                    .collect()
-                                            };
-                                        self.form_field_index = 0;
-                                        self.editing_agent = Some(agent.id.clone());
-                                        self.current_view = CurrentView::AgentForm;
-                                        self.load_models().await;
-                                    }
+                                    && !self.active_in_project_list =>
+                            {
+                                let agents = self.project_agents();
+                                if let Some(agent) = selected_agent(
+                                    self.project_list_bounds,
+                                    &agents,
+                                    self.agent_index,
+                                ) {
+                                    self.form_id = agent.id.clone();
+                                    self.form_name = agent.config.name.clone();
+                                    self.form_model = agent.config.model.clone();
+                                    self.form_prompt = agent.config.system_prompt.clone();
+                                    self.form_rules = agent.config.rules.clone();
+                                    self.form_optimize_rules = agent.config.optimize.rules.clone();
+                                    self.form_optimize_enabled = agent.config.optimize.enabled;
+                                    self.form_skills = agent.config.skills.join(", ");
+                                    self.form_project_id =
+                                        agent.project_id.clone().unwrap_or_default();
+                                    self.available_projects =
+                                        if let Some(ref pid) = agent.project_id {
+                                            vec![pid.clone()]
+                                        } else {
+                                            self.state
+                                                .context_store
+                                                .list_all_projects()
+                                                .into_iter()
+                                                .map(|c| c.project_id)
+                                                .collect()
+                                        };
+                                    self.form_field_index = 0;
+                                    self.editing_agent = Some(agent.id.clone());
+                                    self.current_view = CurrentView::AgentForm;
+                                    self.load_models().await;
                                 }
                             }
                             _ => {}

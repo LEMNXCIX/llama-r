@@ -77,10 +77,7 @@ impl rig_core::tool::ToolDyn for McpToolBridge {
                 serde_json::from_str(&args).map_err(rig_core::tool::ToolError::JsonError)?;
 
             let output = self.invoke_json(args_val).await.map_err(|e| {
-                rig_core::tool::ToolError::ToolCallError(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e,
-                )))
+                rig_core::tool::ToolError::ToolCallError(Box::new(std::io::Error::other(e)))
             })?;
 
             Ok(output)

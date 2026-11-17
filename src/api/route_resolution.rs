@@ -475,89 +475,87 @@ pub struct PeekedAnswer {
 /// rather than mistaken for a complete account.
 pub(crate) fn peeked_answer(response: &DecisionResponse, offered: usize) -> PeekedAnswer {
     let mut peeked = PeekedAnswer::default();
-    match response.answers.get(CHOICE_KEY) {
-        Some(Answer::Choice {
-            key,
-            confidence,
-            probabilities,
-        }) => {
-            peeked.winner = Some(key.clone());
-            peeked.confidence = confidence.is_finite().then_some(*confidence);
-            // The adapter never checks `probabilities` against the winner or
-            // the offered set, so the wire can carry a distribution that is
-            // empty, partial, or flatly contradictory. It is kept whenever
-            // it is informative — calibration is the preview's reason to
-            // exist — and withheld only when it is empty or contradicts the
-            // winner, with the note naming which case. The ladder still
-            // decides from the winner either way, and `raw` on the preview
-            // keeps exactly what the router answered: nothing is lost
-            // silently, only a misleading presentation is.
-            let top = probabilities
-                .values()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
-            match probabilities.get(key) {
-                // The winner is in its own distribution and top-scored (a
-                // tie at the top is not a contradiction): keep whatever the
-                // model offered, and say when it named only some candidates
-                // rather than letting a partial map read as a full account.
-                Some(score) if *score >= top => {
-                    if probabilities.len() < offered {
-                        peeked.probabilities_note = Some(format!(
-                            "the model's probabilities cover {} of {} candidates; \
-                             the partial distribution is attached",
-                            probabilities.len(),
-                            offered
-                        ));
-                    }
-                    peeked.probabilities = probabilities.clone();
+    if let Some(Answer::Choice {
+        key,
+        confidence,
+        probabilities,
+    }) = response.answers.get(CHOICE_KEY)
+    {
+        peeked.winner = Some(key.clone());
+        peeked.confidence = confidence.is_finite().then_some(*confidence);
+        // The adapter never checks `probabilities` against the winner or
+        // the offered set, so the wire can carry a distribution that is
+        // empty, partial, or flatly contradictory. It is kept whenever
+        // it is informative — calibration is the preview's reason to
+        // exist — and withheld only when it is empty or contradicts the
+        // winner, with the note naming which case. The ladder still
+        // decides from the winner either way, and `raw` on the preview
+        // keeps exactly what the router answered: nothing is lost
+        // silently, only a misleading presentation is.
+        let top = probabilities
+            .values()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        match probabilities.get(key) {
+            // The winner is in its own distribution and top-scored (a
+            // tie at the top is not a contradiction): keep whatever the
+            // model offered, and say when it named only some candidates
+            // rather than letting a partial map read as a full account.
+            Some(score) if *score >= top => {
+                if probabilities.len() < offered {
+                    peeked.probabilities_note = Some(format!(
+                        "the model's probabilities cover {} of {} candidates; \
+                         the partial distribution is attached",
+                        probabilities.len(),
+                        offered
+                    ));
                 }
-                // The winner is in the map but another candidate outscores
-                // it: the model contradicted its own choice. Withheld.
-                Some(_) => {
+                peeked.probabilities = probabilities.clone();
+            }
+            // The winner is in the map but another candidate outscores
+            // it: the model contradicted its own choice. Withheld.
+            Some(_) => {
+                tracing::warn!(
+                    winner = %key,
+                    "router probabilities score a candidate above the router's own winner; \
+                     withholding the distribution"
+                );
+                peeked.probabilities_note = Some(format!(
+                    "the model chose '{}' but its own probabilities score another \
+                     candidate higher; the distribution is withheld rather than \
+                     presented as an account of a choice it contradicts",
+                    key
+                ));
+            }
+            // The winner is absent from the map: either the model
+            // reported no distribution at all, or a non-empty one that
+            // does not contain its own winner. Both are said; only the
+            // second is a contradiction.
+            None => {
+                if probabilities.is_empty() {
                     tracing::warn!(
                         winner = %key,
-                        "router probabilities score a candidate above the router's own winner; \
+                        "router reported no probabilities beside its winner"
+                    );
+                    peeked.probabilities_note = Some(format!(
+                        "the model chose '{}' but reported no probabilities at all",
+                        key
+                    ));
+                } else {
+                    tracing::warn!(
+                        winner = %key,
+                        "router named a winner its own probabilities do not contain; \
                          withholding the distribution"
                     );
                     peeked.probabilities_note = Some(format!(
-                        "the model chose '{}' but its own probabilities score another \
-                         candidate higher; the distribution is withheld rather than \
-                         presented as an account of a choice it contradicts",
+                        "the model chose '{}' but its probabilities do not contain it; \
+                         the distribution is withheld rather than presented as an account \
+                         of a winner it does not explain",
                         key
                     ));
                 }
-                // The winner is absent from the map: either the model
-                // reported no distribution at all, or a non-empty one that
-                // does not contain its own winner. Both are said; only the
-                // second is a contradiction.
-                None => {
-                    if probabilities.is_empty() {
-                        tracing::warn!(
-                            winner = %key,
-                            "router reported no probabilities beside its winner"
-                        );
-                        peeked.probabilities_note = Some(format!(
-                            "the model chose '{}' but reported no probabilities at all",
-                            key
-                        ));
-                    } else {
-                        tracing::warn!(
-                            winner = %key,
-                            "router named a winner its own probabilities do not contain; \
-                             withholding the distribution"
-                        );
-                        peeked.probabilities_note = Some(format!(
-                            "the model chose '{}' but its probabilities do not contain it; \
-                             the distribution is withheld rather than presented as an account \
-                             of a winner it does not explain",
-                            key
-                        ));
-                    }
-                }
             }
         }
-        _ => {}
     }
     peeked.specialised = match response.answers.get(NOUL_KEY) {
         Some(Answer::Noul { value }) => value.is_finite().then_some(*value),

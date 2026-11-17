@@ -67,6 +67,10 @@ const GAP: usize = 2;
 /// used to receive the raw comma list, so it was both the data and the display,
 /// and a long catalogue ran past the value column with nothing to say it had
 /// been cut.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "stable render signature across the TUI redesign"
+)]
 pub fn render_agent_form(
     f: &mut Frame,
     body: Rect,

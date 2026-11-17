@@ -142,7 +142,7 @@ async fn apply_and_write(
         for (id_prefix, docs, vectors) in edits {
             // Drop chunks from a previous, longer version of this same document.
             updated.retain(|item| !item.id.starts_with(id_prefix.as_str()));
-            for (doc, embedding) in docs.into_iter().zip(vectors.into_iter()) {
+            for (doc, embedding) in docs.into_iter().zip(vectors) {
                 updated.push(StoredDoc {
                     id: doc.id,
                     text: doc.text,
@@ -317,7 +317,7 @@ impl RagStore for FileRagStore {
 
         // Group by source_id for batch disk writes.
         let mut by_source: HashMap<String, Vec<(RagUpsert, Vec<f32>)>> = HashMap::new();
-        for (doc, embedding) in docs.into_iter().zip(vectors.into_iter()) {
+        for (doc, embedding) in docs.into_iter().zip(vectors) {
             by_source
                 .entry(doc.source_id.clone())
                 .or_default()

@@ -5,6 +5,12 @@ pub struct TokenMetrics {
     total_tokens_processed: AtomicUsize,
 }
 
+impl Default for TokenMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TokenMetrics {
     pub fn new() -> Self {
         Self {

@@ -898,13 +898,18 @@ mod tests {
             .ingest_files(
                 &sc,
                 "agent:demo/memory",
-                &[nested.clone()],
+                std::slice::from_ref(&nested),
                 Some(dir.path()),
             )
             .await
             .unwrap();
         ingest
-            .ingest_files(&sc, "agent:demo/memory", &[flat.clone()], Some(dir.path()))
+            .ingest_files(
+                &sc,
+                "agent:demo/memory",
+                std::slice::from_ref(&flat),
+                Some(dir.path()),
+            )
             .await
             .unwrap();
 

@@ -1,3 +1,4 @@
+#![allow(clippy::await_holding_lock)] // env guard held deliberately across .await to serialise tests
 use super::{execute_chat, execute_chat_stream};
 use crate::adapters::mcp::StaticMcpRegistry;
 use crate::api::handlers::AppState;

@@ -10,7 +10,7 @@ pub fn spinner_frame(
     elapsed: std::time::Duration,
     frame_interval: std::time::Duration,
 ) -> &'static str {
-    let interval = frame_interval.as_millis().max(1) as u128;
+    let interval = frame_interval.as_millis().max(1);
     let index = (elapsed.as_millis() / interval) as usize % SPINNER_FRAMES.len();
     SPINNER_FRAMES[index]
 }
@@ -90,6 +90,10 @@ pub fn input_display(buffer: &str, width: u16) -> String {
 /// already carries them on every view, so repeating them inside chat is the
 /// duplication the redesign is removing. The parameters stay so the call
 /// signature is unchanged across the redesign.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "stable render signature across the TUI redesign"
+)]
 pub fn render_chat(
     f: &mut Frame,
     body: Rect,
@@ -480,7 +484,7 @@ mod tests {
     #[test]
     fn thinking_line_only_uses_spinner_glyphs() {
         for step in 0..40 {
-            let line = thinking_line(ms(SPINNER_INTERVAL.as_millis() as u128 * step));
+            let line = thinking_line(ms(SPINNER_INTERVAL.as_millis() * step));
             let glyph = line
                 .trim_start()
                 .chars()
