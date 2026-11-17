@@ -133,7 +133,9 @@ Update every doc comment in that test file that says hints live in `app.rs`: the
 
 - [ ] **Step 5: Prove the guards still fire (Review Focus #1, #5)**
 
-Temporarily add the literal `["Enter", "approve"]` inside a function body in `keys.rs` outside `hints_for`, and assert `no_view_hard_codes_a_key_hint` FAILS. Revert. Temporarily add `Borders::ALL` to `keys.rs` and assert `only_the_modals_draw_borders` FAILS. Revert. Confirm the working tree is byte-identical to before these probes.
+Temporarily add the literal `"[Enter] approve"` inside a function body in `keys.rs` outside `hints_for`, and assert `no_view_hard_codes_a_key_hint` FAILS. Revert. Temporarily add `Borders::ALL` to `keys.rs` and assert `only_the_modals_draw_borders` FAILS. Revert. Confirm the working tree is byte-identical to before these probes.
+
+Use `[Enter] approve`, not `["Enter", "approve"]`: `bracket_hint` caps bracket content at 12 characters, and the bracketed array literal is 18, so it does not trip the detector. This was discovered during Task 3 — the first probe shape returned green against a detector that was in fact working. The 12-character cap is deliberate in the detector (it keeps `chunks[2]` and `[&str; 7]` out), so change the probe, not the cap.
 
 - [ ] **Step 6: Verify and commit**
 
