@@ -1,8 +1,8 @@
 use super::{execute_chat, execute_chat_stream};
 use crate::adapters::mcp::StaticMcpRegistry;
-use crate::api::chat_core::AgentSelection;
 use crate::api::handlers::AppState;
 use crate::api::observability::AppObservability;
+use crate::api::route_resolution::AgentSelection;
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::{ContextStore, ProjectContext};
 use crate::domain::agent::{AgentConfig, OptimizeConfig};

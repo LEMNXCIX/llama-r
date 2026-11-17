@@ -12,11 +12,11 @@
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use llama_r::adapters::mcp::StaticMcpRegistry;
-use llama_r::api::chat_core::{
-    build_state_text, execute_chat_stream, resolve_selection, resolve_selection_with,
-    AgentSelection,
-};
+use llama_r::api::chat_core::execute_chat_stream;
 use llama_r::api::handlers::AppState;
+use llama_r::api::route_resolution::{
+    build_state_text, resolve_selection, resolve_selection_with, AgentSelection,
+};
 use llama_r::context::store::ContextStore;
 use llama_r::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
 use llama_r::error::AppError;
@@ -687,7 +687,7 @@ async fn a_router_naming_another_projects_agent_cannot_reach_it() {
 /// Finding I5: the two thresholds reach the ladder, each to its own gate.
 ///
 /// Swapping `min_confidence` and `min_specialised` at the call site
-/// (`src/api/chat_core.rs`) leaves the ladder's own unit tests green — they
+/// (`src/api/route_resolution.rs`) leaves the ladder's own unit tests green — they
 /// call `route` with literal arguments — so this is the only place the
 /// config-to-ladder hop is observed at all. Each threshold is exercised by
 /// holding the *other* one wide open, so the outcome can only be explained by

@@ -24,8 +24,9 @@
 
 use async_trait::async_trait;
 use llama_r::adapters::router::LlamaCppRouter;
-use llama_r::api::chat_core::{execute_chat, execute_chat_stream, AgentSelection};
+use llama_r::api::chat_core::{execute_chat, execute_chat_stream};
 use llama_r::api::handlers::AppState;
+use llama_r::api::route_resolution::AgentSelection;
 use llama_r::context::store::ContextStore;
 use llama_r::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
 use llama_r::ports::mcp::McpServerRegistry;

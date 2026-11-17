@@ -88,7 +88,7 @@ pub struct RoutedDebug {
     /// naming which case: none reported, partial (the map is attached), or
     /// contradicting the winner — absent from its own distribution, or
     /// outscored by another candidate (the map is withheld). One extractor
-    /// — `chat_core::peeked_answer` — feeds this field and the preview
+    /// — `route_resolution::peeked_answer` — feeds this field and the preview
     /// endpoint's twin, so the two surfaces describe the same answer the
     /// same way.
     #[serde(skip_serializing_if = "Option::is_none")]

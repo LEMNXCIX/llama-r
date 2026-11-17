@@ -17,12 +17,12 @@
 //! [`AppError::Unavailable`], which maps to `501` — a deliberately disabled
 //! feature is not a server fault.
 
-use crate::api::chat_core::{
-    agent_not_found, build_state_text, peeked_answer, recheck_winner,
-    skip_decision_without_a_fallback, PeekedAnswer, WinnerRecheck, ROUTE_STATE_BUDGET_CHARS,
-    STALE_WINNER,
-};
+use crate::api::chat_core::agent_not_found;
 use crate::api::handlers::AppState;
+use crate::api::route_resolution::{
+    build_state_text, peeked_answer, recheck_winner, skip_decision_without_a_fallback,
+    PeekedAnswer, WinnerRecheck, ROUTE_STATE_BUDGET_CHARS, STALE_WINNER,
+};
 use crate::domain::models::ChatMessage;
 use crate::error::AppError;
 use crate::ports::router::DecisionRequest;

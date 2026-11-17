@@ -13,12 +13,13 @@ use axum::extract::{FromRequest, State};
 use axum::http::{Request, StatusCode};
 use axum::Json;
 use llama_r::adapters::mcp::StaticMcpRegistry;
-use llama_r::api::chat_core::{execute_chat, AgentSelection};
+use llama_r::api::chat_core::execute_chat;
 use llama_r::api::docs::ApiDoc;
 use llama_r::api::handlers::AppState;
 use llama_r::api::route_api::{
     route_preview, GatedJson, RoutePreviewRequest, RoutePreviewResponse,
 };
+use llama_r::api::route_resolution::AgentSelection;
 use llama_r::context::store::ContextStore;
 use llama_r::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
 use llama_r::error::AppError;
