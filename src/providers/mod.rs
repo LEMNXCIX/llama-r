@@ -5,6 +5,8 @@ use std::pin::Pin;
 use tokio_stream::Stream;
 
 pub mod ollama;
+pub mod openai_compatible;
+pub mod opencode;
 
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
