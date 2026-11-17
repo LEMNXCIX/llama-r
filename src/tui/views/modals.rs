@@ -13,6 +13,10 @@ use crate::tui::chrome;
 use crate::tui::theme;
 use crate::tui::views::opt_tools::OptTools;
 use crate::tui::views::rule_editor::RuleEditor;
+use crate::tui::views::settings::{
+    Settings, SettingsStatus, APPLY_FIELD, CANCEL_FIELD, KEY_FIELD, MODEL_FIELD, PROVIDERS,
+    PROVIDER_FIELD,
+};
 use crate::tui::views::skill_picker::SkillPicker;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -67,6 +71,125 @@ pub fn render_confirm_delete(f: &mut Frame, body: Rect, confirm_type: &str, conf
     )
     .alignment(Alignment::Center);
     f.render_widget(dialog, horiz[1]);
+}
+
+/// Draw the provider settings dialog over `body`, over the dashboard.
+///
+/// A dialog, so it keeps a border like the others in this module — that is what
+/// separates it from the dashboard sitting behind it. The raw key is never
+/// drawn: [`Settings::masked_key`] is the only representation that reaches this
+/// function, so a shoulder-surfer (or a screenshot in a bug report) cannot read
+/// the secret. The key hints arrive from `KeyTarget::Settings` through
+/// `hints_for` and are laid out by `chrome::hints_line`, not a second footer;
+/// `app.rs` silences the chrome row while this dialog is up.
+pub fn render_settings(f: &mut Frame, body: Rect, settings: &Settings, hints: &[(&str, &str)]) {
+    // Wide enough for the legend, never wider than the screen: a fixed width
+    // would cut the tail of the hints, and the tail is where the way out lives.
+    let width = chrome::hints_width(hints)
+        .saturating_add(4)
+        .max(56)
+        .min(body.width);
+    let height = 11u16.min(body.height);
+    let area = centered(body, width, height);
+
+    let block = Block::default().borders(Borders::ALL).title(" Settings ");
+    let inner = block.inner(area);
+    // The block paints every cell of `area`, so it goes down before its text.
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(Paragraph::new(Vec::<Line>::new()).block(block), area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    let status = settings
+        .status
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or(SettingsStatus::Idle);
+    let lines: Vec<Line> = vec![
+        Line::from(Span::styled(status_line(&status), status_style(&status))),
+        Line::from(""),
+        field_line(
+            "Provider",
+            PROVIDERS
+                .get(settings.provider)
+                .copied()
+                .unwrap_or("Ollama"),
+            settings.focus == PROVIDER_FIELD,
+        ),
+        field_line(
+            "API key  ",
+            settings.masked_key(),
+            settings.focus == KEY_FIELD,
+        ),
+        field_line("Model    ", &settings.model, settings.focus == MODEL_FIELD),
+        Line::from(""),
+        Line::from(vec![
+            button("Apply", settings.focus == APPLY_FIELD),
+            Span::raw("   "),
+            button("Cancel", settings.focus == CANCEL_FIELD),
+        ]),
+    ];
+
+    f.render_widget(Paragraph::new(lines), rows[0]);
+    f.render_widget(Paragraph::new(chrome::hints_line(hints)), rows[1]);
+}
+
+/// The status row. It says only what happened, never any key material.
+fn status_line(status: &SettingsStatus) -> String {
+    match status {
+        SettingsStatus::Idle => "Change the provider and apply — takes effect at once".into(),
+        SettingsStatus::Applying => "Applying…".into(),
+        SettingsStatus::Applied(msg) => msg.clone(),
+        SettingsStatus::Error(msg) => format!("Error: {msg}"),
+    }
+}
+
+fn status_style(status: &SettingsStatus) -> ratatui::style::Style {
+    match status {
+        SettingsStatus::Idle => theme::chrome(),
+        SettingsStatus::Applying => theme::warn(),
+        SettingsStatus::Applied(_) => theme::ok(),
+        SettingsStatus::Error(_) => theme::error(),
+    }
+}
+
+/// One `label: value` row. The focused row wears `active`, the token for "the
+/// next keystroke lands here"; the unfocused one recedes to `content`.
+fn field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {label}: "),
+            if focused {
+                theme::active()
+            } else {
+                theme::chrome()
+            },
+        ),
+        Span::styled(
+            value.to_string(),
+            if focused {
+                theme::active()
+            } else {
+                theme::content()
+            },
+        ),
+    ])
+}
+
+/// An Apply/Cancel button. The focused one wears `active` for the same reason
+/// a focused field does: it is where the next `Enter` lands.
+fn button(label: &str, focused: bool) -> Span<'static> {
+    Span::styled(
+        format!("  {label}  "),
+        if focused {
+            theme::active()
+        } else {
+            theme::chrome()
+        },
+    )
 }
 
 /// Render the skill proposals awaiting approval, into `body`.

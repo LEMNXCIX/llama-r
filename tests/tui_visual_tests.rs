@@ -204,3 +204,70 @@ fn every_view_renders_into_the_chrome() {
     assert!(chat.contains("You:") && chat.contains("AI:") && chat.contains("Thinking"));
     assert!(chat.contains("> y dime el estado"));
 }
+
+/// The settings dialog is a modal over the dashboard, so it must keep the bar
+/// it sits under and must never show the raw key. It keeps a border (it is a
+/// dialog), so this cannot use `render`'s no-corners check — the check that
+/// matters here is the chrome surviving and the secret staying masked.
+#[test]
+fn the_settings_dialog_keeps_the_chrome_and_masks_the_key() {
+    let state = state();
+    let mut settings = llama_r::tui::views::settings::Settings::new(
+        llama_r::config::ProviderKind::OpenRouter,
+        "sk-super-secret-999",
+        "new-model",
+    );
+    settings.focus = llama_r::tui::views::settings::KEY_FIELD;
+    let hints = llama_r::tui::keys::hints_for(llama_r::tui::keys::KeyTarget::Settings);
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|f| {
+            let c = chrome::layout(f.area());
+            chrome::render_bar(
+                f,
+                c.bar,
+                &[
+                    "Dashboard",
+                    "Projects",
+                    "Agent",
+                    "Analysis",
+                    "Context",
+                    "Chat",
+                ],
+                0,
+                &llama_r::tui::chrome::Context::default(),
+                true,
+            );
+            render_dashboard(f, c.body, &state, 0);
+            llama_r::tui::views::modals::render_settings(f, c.body, &settings, &hints);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let text = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        text.starts_with("Llama-R │ Dashboard │ Projects │ Agent │ Analysis │ Context │ Chat"),
+        "the bar must survive the settings modal: {text}"
+    );
+    assert!(
+        !text.contains("sk-super-secret-999"),
+        "the raw key must never reach the screen: {text}"
+    );
+    assert!(text.contains("(set)"), "the key is shown as set: {text}");
+    assert!(text.contains("new-model"), "the model is editable: {text}");
+    for (key, meaning) in &hints {
+        assert!(
+            text.contains(&format!("{key}: {meaning}")),
+            "the dialog must show its own {key} hint: {text}"
+        );
+    }
+}

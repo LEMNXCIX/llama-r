@@ -7,6 +7,7 @@ pub mod modals;
 pub mod opt_tools;
 pub mod projects;
 pub mod rule_editor;
+pub mod settings;
 pub mod skill_picker;
 
 #[cfg(test)]

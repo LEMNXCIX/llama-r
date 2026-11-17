@@ -1,19 +1,25 @@
 use crate::api::handlers::AppState;
+use crate::config::{Config, ProviderKind};
 use crate::domain::models::ChatMessage;
 use crate::services::agent_runtime::RuntimeChatRequest;
 use crate::tui::chrome;
 use crate::tui::keys::{
     chat_input_action, focus_after_agent_delete, hints_for, key_target, may_move_list_focus,
     move_agent_selection, rule_editor_opening, selected_agent, AnalysisState, ChatAction,
-    CurrentView, ScreenState, OPTIMIZE_FIELD, RULES_FIELD, SKILLS_FIELD, VIEW_NAMES,
+    CurrentView, KeyTarget, ScreenState, OPTIMIZE_FIELD, RULES_FIELD, SKILLS_FIELD, VIEW_NAMES,
 };
 use crate::tui::views::chat::render_chat;
 use crate::tui::views::dashboard::render_dashboard;
 use crate::tui::views::modals::render_confirm_delete;
-use crate::tui::views::modals::{render_opt_tools, render_rule_editor, render_skill_picker};
+use crate::tui::views::modals::{
+    render_opt_tools, render_rule_editor, render_settings, render_skill_picker,
+};
 use crate::tui::views::opt_tools::{opt_tools_action, OptTools, OptToolsAction};
 use crate::tui::views::projects::ListBounds;
 use crate::tui::views::rule_editor::{rule_action, RuleAction};
+use crate::tui::views::settings::{
+    settings_action, Settings, SettingsAction, SettingsStatus, FIELD_COUNT, KEY_FIELD, MODEL_FIELD,
+};
 use crate::tui::views::skill_picker::{picker_action, PickerAction};
 use crate::tui::views::skill_picker::{InstalledSkill, SkillPicker};
 
@@ -136,6 +142,10 @@ pub struct TuiApp {
     rule_editor: Option<crate::tui::views::rule_editor::RuleEditor>,
     /// The optimization-tool picker, while it is up.
     opt_tools: Option<crate::tui::views::opt_tools::OptTools>,
+    /// The provider settings dialog, up over the dashboard. `None` is normal;
+    /// dropping it is how Cancel closes it. A successful Apply leaves it up so
+    /// the "Applied" status is readable until the user dismisses it.
+    settings: Option<Settings>,
     // Chat state
     chat_messages: Arc<Mutex<Vec<(String, String)>>>,
     chat_input: String,
@@ -180,6 +190,7 @@ impl TuiApp {
             form_skills: String::new(),
             rule_editor: None,
             opt_tools: None,
+            settings: None,
             form_project_id: String::new(),
             form_field_index: 0,
             available_projects: Vec::new(),
@@ -532,6 +543,7 @@ impl TuiApp {
             skill_picker: self.skill_picker.is_some(),
             rule_editor: self.rule_editor.is_some(),
             opt_tools: self.opt_tools.is_some(),
+            settings: self.settings.is_some(),
         }
     }
 
@@ -802,16 +814,24 @@ impl TuiApp {
                 if let Some((ref confirm_type, ref confirm_id)) = self.confirm_delete {
                     render_confirm_delete(f, c.body, confirm_type, confirm_id);
                 }
-                // Silent while the picker is up: the panel already draws these
-                // same hints, through the same renderer, next to the list they
-                // apply to. Saying them twice in one screen is how a footer stops
-                // being read.
-                let hints: &[(&str, &str)] =
-                    if self.skill_picker.is_some() || self.rule_editor.is_some() {
-                        &[]
-                    } else {
-                        &hints
-                    };
+                // The settings dialog sits over the dashboard; drawing it after
+                // the view keeps the bar and the dashboard behind it readable
+                // while its own panel takes the middle of the screen.
+                if let Some(settings) = &self.settings {
+                    render_settings(f, c.body, settings, &hints_for(KeyTarget::Settings));
+                }
+                // Silent while a dialog that draws its own legend is up: the
+                // panel already draws these same hints, through the same
+                // formatter, next to the fields they apply to. Saying them
+                // twice in one screen is how a footer stops being read.
+                let hints: &[(&str, &str)] = if self.skill_picker.is_some()
+                    || self.rule_editor.is_some()
+                    || self.settings.is_some()
+                {
+                    &[]
+                } else {
+                    &hints
+                };
                 chrome::render_footer(f, c.footer, hints);
             })?;
 
@@ -874,6 +894,53 @@ impl TuiApp {
     /// terminal and the event loop; this only decides what the key means, so
     /// the whole key map can be exercised without a TTY.
     fn dispatch(&mut self, key: event::KeyEvent) -> DispatchOutcome {
+        // Settings interception, above every other guard: the dialog takes every
+        // key while it is up, including `q` and `Tab` that the dashboard would
+        // otherwise answer. Below any view guard the keys would be eaten by the
+        // screen the dialog sits over — the same failure the skill picker had.
+        if self.settings.is_some() {
+            let action = settings_action(self.settings.as_ref().unwrap(), key);
+            match action {
+                SettingsAction::Apply => self.apply_settings(),
+                SettingsAction::Cancel => self.settings = None,
+                SettingsAction::NextField => {
+                    let settings = self.settings.as_mut().unwrap();
+                    settings.focus = (settings.focus + 1) % FIELD_COUNT;
+                }
+                SettingsAction::PrevField => {
+                    let settings = self.settings.as_mut().unwrap();
+                    settings.focus = (settings.focus + FIELD_COUNT - 1) % FIELD_COUNT;
+                }
+                SettingsAction::CycleProvider(delta) => {
+                    let settings = self.settings.as_mut().unwrap();
+                    let count = crate::tui::views::settings::PROVIDERS.len();
+                    settings.provider =
+                        (settings.provider as isize + delta).rem_euclid(count as isize) as usize;
+                }
+                SettingsAction::Edit(c) => {
+                    let settings = self.settings.as_mut().unwrap();
+                    match settings.focus {
+                        KEY_FIELD => settings.key.push(c),
+                        MODEL_FIELD => settings.model.push(c),
+                        _ => {}
+                    }
+                }
+                SettingsAction::Backspace => {
+                    let settings = self.settings.as_mut().unwrap();
+                    match settings.focus {
+                        KEY_FIELD => {
+                            settings.key.pop();
+                        }
+                        MODEL_FIELD => {
+                            settings.model.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                SettingsAction::None => {}
+            }
+            return DispatchOutcome::Continue;
+        }
         // Optimization tool picker interception
         //
         // Above the other dialogs for the same reason: the first guard to match
@@ -1338,6 +1405,11 @@ impl TuiApp {
                     self.current_view = CurrentView::ContextView;
                 }
             }
+            KeyCode::Char('s') => {
+                if self.current_view == CurrentView::Dashboard {
+                    self.open_settings();
+                }
+            }
             KeyCode::Char('d') => {
                 if self.current_view == CurrentView::Projects {
                     if self.active_in_project_list {
@@ -1507,6 +1579,76 @@ impl TuiApp {
     /// one row, and `Ctrl+R` is how the whole thing is seen and written.
     fn rules_line(rules: &[String]) -> String {
         rules.join(", ")
+    }
+
+    /// Open the settings dialog seeded with the currently configured provider,
+    /// its key and the default model. The key is copied into the dialog's raw
+    /// field but never drawn — see [`Settings::masked_key`].
+    fn open_settings(&mut self) {
+        let config = Config::from_env().ok();
+        let provider = config
+            .as_ref()
+            .map(|config| config.provider)
+            .unwrap_or_default();
+        let key = match provider {
+            ProviderKind::OpenRouter => config.as_ref().and_then(|c| c.openrouter_api_key.clone()),
+            ProviderKind::OpenCode => config.as_ref().and_then(|c| c.opencode_api_key.clone()),
+            ProviderKind::Ollama => None,
+        };
+        let model = config
+            .as_ref()
+            .map(|config| config.default_model.clone())
+            .unwrap_or_default();
+        self.settings = Some(Settings::new(
+            provider,
+            key.as_deref().unwrap_or(""),
+            &model,
+        ));
+    }
+
+    /// Validate and start an Apply. Returns immediately so the UI keeps
+    /// painting: the "Applying…" state is shared with the spawned task and is
+    /// visible on the next frame. A validation error is shown inline and no
+    /// stack is built, saved or swapped.
+    fn apply_settings(&mut self) {
+        let Some(settings) = self.settings.as_ref() else {
+            return;
+        };
+        let config = match settings.validated_config() {
+            Ok(config) => config,
+            Err(err) => {
+                *settings.status.lock().unwrap() = SettingsStatus::Error(err);
+                return;
+            }
+        };
+        *settings.status.lock().unwrap() = SettingsStatus::Applying;
+
+        let state = self.state.clone();
+        let status = settings.status.clone();
+        tokio::spawn(async move {
+            let outcome = Self::finish_apply(&state, config).await;
+            *status.lock().unwrap() = match outcome {
+                Ok(()) => SettingsStatus::Applied("Applied — active now, no restart".into()),
+                Err(err) => SettingsStatus::Error(err),
+            };
+        });
+    }
+
+    /// The async half of an Apply. Builds the whole provider stack off the UI
+    /// thread, then persists it and installs it. Nothing here runs on failure:
+    /// a bad build or a failed write leaves the old stack in place. Companion
+    /// services the builder does not construct (RAG, the agent engine) are
+    /// carried over so a hot swap does not silently disable them.
+    async fn finish_apply(state: &AppState, config: Config) -> Result<(), String> {
+        let mut stack =
+            crate::runtime::build_provider_stack(&config).map_err(|err| err.to_string())?;
+        let old = state.services_snapshot().await;
+        stack.agent_runtime = old.agent_runtime.clone();
+        stack.rag_store = old.rag_store.clone();
+        stack.rag_ingest = old.rag_ingest.clone();
+        config.save_to_env().map_err(|err| err.to_string())?;
+        state.replace_services(stack).await;
+        Ok(())
     }
 }
 

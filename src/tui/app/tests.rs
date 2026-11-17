@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)] // env guard held deliberately across .await to serialise tests
+
 // Test code only: the attribute below is the cut marker the source guards in
 // `tests/tui_chrome.rs` look for in every `.rs` file under `src/tui` —
 // `shipped()` keeps everything before the first one. Without it high on this
@@ -39,6 +41,7 @@ fn screen(view: &CurrentView, focus_on_projects: bool, bounds: ListBounds) -> Sc
         skill_picker: false,
         rule_editor: false,
         opt_tools: false,
+        settings: false,
     }
 }
 
@@ -81,6 +84,7 @@ fn every_footer_fits_one_row_at_eighty_columns() {
         KeyTarget::View(CurrentView::ContextView),
         KeyTarget::View(CurrentView::Chat),
         KeyTarget::DeleteConfirm,
+        KeyTarget::Settings,
     ];
     for field in 0..=crate::tui::views::agent_form::PROMPT_INDEX {
         targets.push(KeyTarget::AgentForm(field));
@@ -1392,4 +1396,168 @@ fn an_open_dialog_consumes_keys_the_form_would_handle() {
         assert_eq!(app.form_skills, skills, "{label} changed form_skills");
         assert_eq!(app.form_rules, rules, "{label} changed form_rules");
     }
+}
+
+/// A `TuiApp` on the dashboard, built without a terminal. Same fixture as the
+/// form helper — a real `AppState` over an inert provider — with the view set
+/// to the one the settings dialog opens over.
+fn app_on_dashboard() -> TuiApp {
+    let mut app = app_on_form_field(0);
+    app.current_view = CurrentView::Dashboard;
+    app
+}
+
+/// Clears every config env var and writes `.env` into a throwaway directory so
+/// an Apply test never touches the repository's real `.env` or process state.
+struct ApplyEnvGuard {
+    previous: Vec<(&'static str, Option<String>)>,
+    cwd: std::path::PathBuf,
+    _temp: tempfile::TempDir,
+}
+
+impl ApplyEnvGuard {
+    const VARS: &'static [&'static str] = &[
+        "PORT",
+        "OLLAMA_URL",
+        "DEFAULT_MODEL",
+        "PROVIDER",
+        "OPENROUTER_API_KEY",
+        "OPENCODE_API_KEY",
+        "OPENCODE_URL",
+        "OPENAI_BASE_URL",
+        "EMBEDDING_MODEL",
+        "EMBEDDING_DIMENSIONS",
+        "RAG_ENABLED",
+        "HISTORY_RETENTION_DAYS",
+    ];
+
+    fn fresh() -> Self {
+        let previous = Self::VARS
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect();
+        for name in Self::VARS {
+            std::env::remove_var(name);
+        }
+        let cwd = std::env::current_dir().expect("current dir");
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::env::set_current_dir(temp.path()).expect("enter temp dir");
+        Self {
+            previous,
+            cwd,
+            _temp: temp,
+        }
+    }
+}
+
+impl Drop for ApplyEnvGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.cwd).expect("restore cwd");
+        for (name, value) in &self.previous {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+/// An Apply builds the whole stack, persists it and swaps it in without a
+/// restart: the running state now answers on the new provider and model, and
+/// `.env` carries the new values (the key included, written by `save_to_env`).
+#[tokio::test]
+async fn settings_apply_swaps_the_provider_and_persists_it() {
+    let _guard = crate::core::paths::lock_env_for_tests();
+    let _env = ApplyEnvGuard::fresh();
+    let mut app = app_on_dashboard();
+    let mut settings = Settings::new(ProviderKind::Ollama, "", "old-model");
+    settings.provider = 1; // OpenRouter
+    settings.key = "sk-test-key".into();
+    settings.model = "new-model".into();
+    app.settings = Some(settings);
+
+    let config = app.settings.as_ref().unwrap().validated_config().unwrap();
+    TuiApp::finish_apply(&app.state, config).await.unwrap();
+
+    let services = app.state.services_snapshot().await;
+    assert_eq!(services.default_model, "new-model");
+    assert_eq!(
+        services.provider.get_base_url(),
+        "https://openrouter.ai/api/v1"
+    );
+    drop(services);
+    assert_eq!(std::env::var("PROVIDER").unwrap(), "openrouter");
+    assert_eq!(std::env::var("DEFAULT_MODEL").unwrap(), "new-model");
+    assert_eq!(std::env::var("OPENROUTER_API_KEY").unwrap(), "sk-test-key");
+}
+
+/// A keyed provider with no key is refused before a stack is built, a file is
+/// written or the running stack is swapped. The inline error names the key;
+/// the old stack is untouched.
+#[tokio::test]
+async fn settings_rejects_an_empty_openrouter_key_without_changing_the_stack() {
+    let _guard = crate::core::paths::lock_env_for_tests();
+    let _env = ApplyEnvGuard::fresh();
+    let mut app = app_on_dashboard();
+    let before = app.state.services_snapshot().await;
+    let provider_before = before.provider.get_base_url();
+    let model_before = before.default_model.clone();
+    drop(before);
+
+    app.settings = Some(Settings::new(ProviderKind::OpenRouter, "", "new-model"));
+    app.apply_settings();
+
+    let status = app
+        .settings
+        .as_ref()
+        .unwrap()
+        .status
+        .lock()
+        .unwrap()
+        .clone();
+    assert!(
+        matches!(&status, SettingsStatus::Error(msg) if msg.contains("key")),
+        "the error must name the missing key: {status:?}"
+    );
+    let after = app.state.services_snapshot().await;
+    assert_eq!(after.provider.get_base_url(), provider_before);
+    assert_eq!(after.default_model, model_before);
+}
+
+/// The settings dialog takes every key while it is up, including the
+/// dashboard's `q` and `Tab`. Its guard must sit above every view guard, or the
+/// dashboard consumes them and the dialog cannot be exited or navigated.
+#[test]
+fn the_settings_dialog_consumes_keys_the_dashboard_would_handle() {
+    let mut app = app_on_dashboard();
+    app.settings = Some(Settings::new(ProviderKind::Ollama, "", "m"));
+
+    app.dispatch(key(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert!(
+        app.settings.is_some(),
+        "q must not quit the app while settings is up"
+    );
+
+    let view = app.current_view.clone();
+    app.dispatch(key(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(app.current_view, view, "Tab must not leave the dashboard");
+    assert_eq!(
+        app.settings.as_ref().unwrap().focus,
+        crate::tui::views::settings::KEY_FIELD,
+        "Tab must advance the dialog's own field"
+    );
+}
+
+/// The dialog owns the footer while it is up: the dashboard row underneath
+/// would otherwise keep naming `s: settings` and `q: quit` over a screen where
+/// neither key means what the footer says.
+#[test]
+fn the_settings_dialog_owns_the_footer_while_it_is_up() {
+    let target = key_target(&ScreenState {
+        settings: true,
+        ..screen(&CurrentView::Dashboard, true, ListBounds::default())
+    });
+    assert_eq!(target, KeyTarget::Settings);
+    let row = footer_row(KeyTarget::Settings);
+    assert!(row.contains("cancel"), "the way out must be named: {row:?}");
 }

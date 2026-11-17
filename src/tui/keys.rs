@@ -102,6 +102,10 @@ pub enum KeyTarget {
     /// The agent form, at a given field. Two of its keys mean different things
     /// field by field, so the field index is part of what the row says.
     AgentForm(usize),
+    /// The provider settings dialog, over the dashboard. It takes every key
+    /// while it is up, so the dashboard row underneath would otherwise keep
+    /// naming `s: settings` over a screen where `s` now types into the key.
+    Settings,
 }
 
 #[derive(Debug, Clone)]
@@ -165,9 +169,18 @@ pub(super) struct ScreenState<'a> {
     pub(super) rule_editor: bool,
     /// The optimization-tool picker, up over the agent form.
     pub(super) opt_tools: bool,
+    /// The provider settings dialog, up over the dashboard.
+    pub(super) settings: bool,
 }
 
 pub(super) fn key_target(state: &ScreenState<'_>) -> KeyTarget {
+    // The settings dialog takes every key while it is up — including `q`, so
+    // the dashboard cannot quit underneath it — and sits over the dashboard,
+    // which is still the current view. Without this first check the dashboard
+    // row would keep naming keys the dialog has already swallowed.
+    if state.settings {
+        return KeyTarget::Settings;
+    }
     // Checked first because it outranks every axis below it: the handler in the
     // event loop takes every key while the confirmation is up and `continue`s, so
     // no keypress reaches the screen any other target here describes.
@@ -376,9 +389,12 @@ pub(super) fn rule_editor_opening(rules: &[String], first: Option<char>) -> Rule
 /// test without a terminal or an `AppState`.
 pub fn hints_for(target: KeyTarget) -> Vec<(&'static str, &'static str)> {
     match target {
-        KeyTarget::View(CurrentView::Dashboard) => {
-            vec![("Tab", "next view"), ("↑/↓", "scroll logs"), ("q", "quit")]
-        }
+        KeyTarget::View(CurrentView::Dashboard) => vec![
+            ("Tab", "next view"),
+            ("↑/↓", "scroll logs"),
+            ("s", "settings"),
+            ("q", "quit"),
+        ],
         // The project list. `Tab` switches *views*, not lists — it is `←/→`
         // that moves between this list and the agent list below it — so the
         // row says so where the key is named. `n` is the only hint named by
@@ -481,6 +497,16 @@ pub fn hints_for(target: KeyTarget) -> Vec<(&'static str, &'static str)> {
         // interception is before the quit binding too. Naming what answers
         // the question is what makes the footer and the behaviour agree.
         KeyTarget::DeleteConfirm => vec![("y", "delete"), ("n", "cancel"), ("Esc", "cancel")],
+        // The settings dialog owns every key while it is up. Its panel draws
+        // this same row inside its border, and `app.rs` silences the chrome
+        // footer, so the keys appear once, next to the fields they act on.
+        KeyTarget::Settings => vec![
+            ("↑/↓", "field"),
+            ("←/→", "provider"),
+            ("type", "key/model"),
+            ("^s", "apply"),
+            ("esc", "cancel"),
+        ],
         // Sized to fit 80 columns: a hint that does not fit is clipped from
         // the right, which takes `Esc: cancel` first.
         KeyTarget::SkillPicker => vec![

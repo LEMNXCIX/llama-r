@@ -74,14 +74,19 @@ pub(crate) fn agent_not_found(target: &str, project_id: &str) -> AppError {
     ))
 }
 
+/// Build the engine request from the caller's single stack snapshot.
+///
+/// `services` is the one snapshot the whole chat request took, threaded here
+/// rather than re-read: the engine's `default_model` and the provider used if
+/// the engine falls back must come from the same stack. A settings Apply that
+/// swaps both mid-request must not pair the old model with the new provider.
 async fn build_runtime_request(
-    state: &AppState,
+    services: &crate::services::provider_stack::ProviderStack,
     prepared: &ChatRequest,
     project_id: Option<String>,
     agent_id: Option<String>,
     conversation_id: Option<String>,
 ) -> Result<RuntimeChatRequest, AppError> {
-    let services = state.services_snapshot().await;
     let (system, history, user_message) = split_engine_messages(&prepared.messages)?;
     Ok(RuntimeChatRequest {
         project_id,
@@ -169,8 +174,11 @@ fn require_messages(payload: &ChatRequest) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Prepare a request, reading the engine-presence flag from the caller's single
+/// stack snapshot rather than taking another one. See `execute_chat`'s snapshot.
 async fn prepare_request(
     state: &AppState,
+    services: &crate::services::provider_stack::ProviderStack,
     mut payload: ChatRequest,
     selection: &ResolvedSelection,
 ) -> Result<ChatRequest, AppError> {
@@ -212,9 +220,9 @@ async fn prepare_request(
         // twice, and the second application is the kind of thing that stays
         // invisible until a tool turns out not to be idempotent.
         //
-        // The condition is the same field the dispatch below branches on, so the
-        // two cannot disagree about which engine is going to run.
-        let services = state.services_snapshot().await;
+        // The condition is the same field the dispatch below branches on — and
+        // both read the one snapshot the request took, so a hot swap cannot make
+        // them disagree about which engine is going to run.
         if services.agent_runtime.is_none() {
             let optimizer = TokenOptimizer::new(agent.config.optimize.clone());
             for message in prepared_messages.iter_mut() {
@@ -243,12 +251,14 @@ async fn prepare_request(
 
 async fn run_with_fallback(
     state: &AppState,
+    services: &crate::services::provider_stack::ProviderStack,
     mut request: ChatRequest,
     requested_model: &str,
 ) -> Result<ChatResponse, AppError> {
-    // One snapshot for the whole call: the primary attempt and its fallback
-    // must use the same provider, even if a hot swap lands between them.
-    let services = state.services_snapshot().await;
+    // `services` is the request's one snapshot: the primary attempt, its
+    // fallback and every field they read use the same stack, even if a hot
+    // swap lands mid-call. A settings Apply that changes provider *and* model
+    // together cannot pair the old model with the new provider.
     let fallback_model = services.default_model.clone();
     match services.provider.chat(request.clone()).await {
         Ok(response) => Ok(response),
@@ -285,12 +295,13 @@ async fn run_with_fallback(
 
 async fn run_stream_with_fallback(
     state: &AppState,
+    services: &crate::services::provider_stack::ProviderStack,
     mut request: ChatRequest,
     requested_model: &str,
 ) -> Result<AppChatStream, AppError> {
-    // One snapshot for the whole call — the primary attempt and its fallback
-    // must use the same provider, even if a hot swap lands between them.
-    let services = state.services_snapshot().await;
+    // `services` is the request's one snapshot (see `run_with_fallback`): the
+    // primary attempt and its fallback read the same stack, so a hot swap
+    // cannot mix the two providers or the two models mid-stream.
     let fallback_model = services.default_model.clone();
     match services.provider.chat_stream(request.clone()).await {
         Ok(stream) => Ok(Box::pin(stream.map(
@@ -359,6 +370,15 @@ pub async fn execute_chat(
     payload: ChatRequest,
     selection: AgentSelection<'_>,
 ) -> Result<ChatResponse, AppError> {
+    // ONE snapshot for the whole request. Every provider-dependent field below
+    // — the agent runtime, the engine's default model, the chat provider and
+    // its fallback model — is read from this single `Arc`. A settings Apply
+    // replaces provider *and* model together; without this a request that began
+    // before the swap and took several snapshots could straddle it (old model
+    // from one snapshot, new provider from the next) and answer incoherently.
+    // Taking it before resolution also keeps the router's own snapshot from
+    // racing ahead of the stack the answer is produced on.
+    let services = state.services_snapshot().await;
     // Before the decision, not after: a request with no messages answers this
     // `400` whatever the router would have said, so resolving first spends a
     // forward pass on an outcome that is already known. Same check, same
@@ -371,7 +391,7 @@ pub async fn execute_chat(
     let requested_model = resolved.requested_target(&payload.model);
     let original_model = payload.model.clone();
     let engine_ids = engine_target(state, &resolved, &original_model);
-    let prepared = prepare_request(state, payload, &resolved).await?;
+    let prepared = prepare_request(state, &services, payload, &resolved).await?;
 
     let debug_prompt = if selection.debug {
         Some(
@@ -396,12 +416,11 @@ pub async fn execute_chat(
     };
 
     // Use agent engine when headers or model resolve an agent and runtime is available.
-    let services = state.services_snapshot().await;
     if let Some((project_id, agent_id)) = engine_ids {
         if let Some(runtime) = &services.agent_runtime {
             let conversation_id = selection.conversation_id.map(|s| s.to_string());
             let rt_req =
-                build_runtime_request(state, &prepared, project_id, agent_id, conversation_id)
+                build_runtime_request(&services, &prepared, project_id, agent_id, conversation_id)
                     .await?;
             let started_at = Instant::now();
             match runtime.chat(rt_req).await {
@@ -435,7 +454,7 @@ pub async fn execute_chat(
     }
 
     let started_at = Instant::now();
-    let mut response = run_with_fallback(state, prepared, &requested_model).await?;
+    let mut response = run_with_fallback(state, &services, prepared, &requested_model).await?;
     response.debug_prompt = debug_prompt;
     // The decision rides here too — `None` unless `X-Debug: true` asked for
     // it, same as the engine path above. The streaming path has no field to
@@ -458,6 +477,9 @@ pub async fn execute_chat_stream(
     mut payload: ChatRequest,
     selection: AgentSelection<'_>,
 ) -> Result<AppChatStream, AppError> {
+    // The one snapshot for this request, for the same reason as `execute_chat`:
+    // every field the engine and fallback read comes from this single stack.
+    let services = state.services_snapshot().await;
     payload.stream = true;
     // Same ordering as `execute_chat`: the empty-messages `400` precedes the
     // decision for the same reason, and then resolve-first — one selection
@@ -468,15 +490,14 @@ pub async fn execute_chat_stream(
     let requested_model = resolved.requested_target(&payload.model);
     let original_model = payload.model.clone();
     let engine_ids = engine_target(state, &resolved, &original_model);
-    let prepared = prepare_request(state, payload, &resolved).await?;
+    let prepared = prepare_request(state, &services, payload, &resolved).await?;
     let started_at = Instant::now();
 
-    let services = state.services_snapshot().await;
     if let Some((project_id, agent_id)) = engine_ids {
         if let Some(runtime) = &services.agent_runtime {
             let conversation_id = selection.conversation_id.map(|s| s.to_string());
             let rt_req =
-                build_runtime_request(state, &prepared, project_id, agent_id, conversation_id)
+                build_runtime_request(&services, &prepared, project_id, agent_id, conversation_id)
                     .await?;
             match runtime.chat_stream(rt_req).await {
                 Ok(rx) => {
@@ -499,7 +520,7 @@ pub async fn execute_chat_stream(
         }
     }
 
-    let stream = run_stream_with_fallback(state, prepared, &requested_model).await?;
+    let stream = run_stream_with_fallback(state, &services, prepared, &requested_model).await?;
     state
         .observability
         .record_chat_request(started_at.elapsed().as_millis() as u64);

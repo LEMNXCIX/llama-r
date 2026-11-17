@@ -892,6 +892,163 @@ async fn an_unavailable_stream_error_stays_a_501_not_a_502() {
     assert_eq!(err.status_code(), axum::http::StatusCode::NOT_IMPLEMENTED);
 }
 
+/// A provider that identifies itself by the content it answers, so a test can
+/// tell which stack served a fallback without inspecting URLs.
+struct TagProvider(&'static str);
+
+#[async_trait]
+impl LLMProvider for TagProvider {
+    fn get_base_url(&self) -> String {
+        format!("http://provider-{}", self.0)
+    }
+    async fn health_check(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        Ok(())
+    }
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error + Send + Sync>> {
+        Ok(vec![])
+    }
+    async fn chat(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<ChatResponse, Box<dyn Error + Send + Sync>> {
+        Ok(ChatResponse {
+            model: "whatever".into(),
+            created_at: "now".into(),
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: self.0.into(),
+            },
+            done: true,
+            debug_prompt: None,
+            debug_route: None,
+        })
+    }
+    async fn chat_stream(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, Box<dyn Error + Send + Sync>>> + Send>>,
+        Box<dyn Error + Send + Sync>,
+    > {
+        Err("not used".into())
+    }
+}
+
+/// An engine that installs a replacement stack the first time it runs, then
+/// fails so dispatch falls back. The slot is filled after `AppState` exists, so
+/// the engine need not hold a strong reference to the state that owns it.
+struct SwapOnRunEngine {
+    state_slot: Arc<Mutex<Option<Arc<AppState>>>>,
+    replacement: Arc<Mutex<Option<ProviderStack>>>,
+}
+
+#[async_trait]
+impl AgentEngine for SwapOnRunEngine {
+    async fn run(&self, _req: AgentRunRequest) -> Result<AgentRunResult, String> {
+        let (state, stack) = {
+            let state = self.state_slot.lock().unwrap().clone();
+            let stack = self.replacement.lock().unwrap().take();
+            (state, stack)
+        };
+        if let (Some(state), Some(stack)) = (state, stack) {
+            // A settings Apply landing mid-request: provider AND model change
+            // together, while this one chat is still in flight.
+            state.replace_services(stack).await;
+        }
+        Err("engine failed on purpose".into())
+    }
+    async fn run_stream(
+        &self,
+        _req: AgentRunRequest,
+    ) -> Result<mpsc::Receiver<AgentRunEvent>, String> {
+        Err("engine failed on purpose".into())
+    }
+}
+
+/// A settings Apply mid-request cannot change the provider/model pair a single
+/// chat uses. The engine installs stack B before failing; the fallback must
+/// still answer from stack A, the snapshot the request took at entry. Without
+/// the one-snapshot discipline the fallback would take a fresh snapshot and
+/// answer with provider B — the old model from one snapshot, the new provider
+/// from the next, exactly the incoherence Task 7's hot swap can cause.
+#[tokio::test]
+async fn a_mid_request_swap_cannot_change_the_fallback_stack() {
+    let _guard = lock_env();
+    let state_slot: Arc<Mutex<Option<Arc<AppState>>>> = Arc::new(Mutex::new(None));
+    let replacement: Arc<Mutex<Option<ProviderStack>>> = Arc::new(Mutex::new(None));
+    let engine = Arc::new(SwapOnRunEngine {
+        state_slot: state_slot.clone(),
+        replacement: replacement.clone(),
+    });
+    let registry = Arc::new(AgentRegistry::new());
+    let runtime = Arc::new(AgentRuntime {
+        registry: registry.clone(),
+        engine,
+        history: None,
+        rag: None,
+        enricher: test_enricher(),
+    });
+    let (_dir, state) = test_state_with_runtime(Arc::new(TagProvider("A")), Some(runtime));
+
+    // The request's stack: provider A, default model "model-a".
+    {
+        let mut stack = (*state.services_snapshot().await).clone();
+        stack.default_model = "model-a".into();
+        state.replace_services(stack).await;
+    }
+    *state_slot.lock().unwrap() = Some(state.clone());
+    *replacement.lock().unwrap() = Some(ProviderStack::new(Arc::new(TagProvider("B")), "model-b"));
+
+    // An agent makes dispatch take the engine path; its model differs from the
+    // stack's default so the engine failure triggers the legacy fallback.
+    let config = AgentConfig {
+        name: "swap-agent".into(),
+        model: "agent-model".into(),
+        system_prompt: "You are helpful".into(),
+        context_project: Some("swap-proj".into()),
+        ..Default::default()
+    };
+    let dir = crate::core::paths::get_project_agents_dir("swap-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("swap-agent.toml"),
+        toml::to_string(&config).unwrap(),
+    )
+    .unwrap();
+    registry.reload_all(&[]).unwrap();
+
+    let response = execute_chat(
+        &state,
+        ChatRequest {
+            model: "fallback-model".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "question".into(),
+            }],
+            stream: false,
+        },
+        AgentSelection {
+            project_id: Some("swap-proj"),
+            agent_id: Some("swap-agent"),
+            conversation_id: None,
+            debug: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        response.message.content, "A",
+        "the fallback must use the stack the request snapshotted at entry, not the one \
+         a mid-request Apply installed: {response:?}"
+    );
+    // The swap did take effect for later requests — it just cannot reach back
+    // into one already in flight.
+    let after = state.services_snapshot().await;
+    assert_eq!(after.default_model, "model-b");
+    assert_eq!(after.provider.get_base_url(), "http://provider-B");
+}
+
 #[test]
 fn split_engine_messages_extracts_history() {
     let messages = vec![
