@@ -215,7 +215,7 @@ impl Default for AgentObservabilityConfig {
 }
 
 /// Curated routing text. `hint` replaces the derived description when present.
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, utoipa::ToSchema)]
 pub struct RoutingConfig {
     #[serde(default)]
     pub hint: Option<String>,

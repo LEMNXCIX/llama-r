@@ -307,7 +307,7 @@ cargo test --target-dir target-tests
 ## Routing hints
 
 - `[routing]` in an agent TOML takes one field, `hint` (`AgentConfig.routing: Option<RoutingConfig>`). When non-blank it **replaces** the whole criteria text the router scores that agent against (`derive_criteria_text`) — one curated sentence instead of the derived `name — description` plus `Skills:`/`Tools:`/`Sources:` sections. It is the only curated lever on routing quality; nothing else in the manifest is read by the router except the id, the name and those sections.
-- The field is written by hand in the TOML and by nothing else. `build_agent_toml` (`src/api/agent_api.rs`) rewrites the manifest from `CreateAgentRequest`, which has no `routing` field, so **`PUT /api/agents/:id` erases a hand-written `hint`**. Curating a hint and then editing the agent through the API loses it.
+- `CreateAgentRequest` carries `routing` and `description`, and `build_agent_toml` emits both, so **`PUT /api/agents/:id` preserves a curated hint and description**. `auto_skills` is deliberately absent from the request: it is system-managed and a client cannot set it.
 
 ## Skills
 

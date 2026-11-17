@@ -864,3 +864,76 @@ async fn context_reanalyze_endpoint_should_refresh_existing_context() {
 
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn a_put_preserves_a_curated_routing_hint_and_description() {
+    let app = setup_app();
+
+    let create = serde_json::json!({
+        "id": "curada",
+        "name": "Curada",
+        "model": "fallback-model",
+        "system_prompt": "Responde en una frase.",
+        "description": "Descripcion curada a mano.",
+        "project_id": "fudi"
+    });
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents")
+                .header("content-type", "application/json")
+                .body(Body::from(create.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // A hand-written hint is the only curated lever on routing quality: a PUT
+    // that drops it silently would destroy configuration the operator cannot
+    // regenerate from the rest of the manifest.
+    let path = app
+        .temp_dir
+        .path()
+        .join("contextos/projects/fudi/agents/curada.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let with_hint = format!("{original}\n[routing]\nhint = \"Solo facturacion.\"\n");
+    std::fs::write(&path, with_hint).unwrap();
+
+    let update = serde_json::json!({
+        "id": "curada",
+        "name": "Curada v2",
+        "model": "fallback-model",
+        "system_prompt": "Responde en una frase.",
+        "description": "Descripcion curada a mano.",
+        "project_id": "fudi",
+        "routing": { "hint": "Solo facturacion." }
+    });
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/agents/curada")
+                .header("content-type", "application/json")
+                .body(Body::from(update.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        saved.contains("Descripcion curada a mano."),
+        "PUT erased the description: {saved}"
+    );
+    assert!(
+        saved.contains("Solo facturacion."),
+        "PUT erased the routing hint: {saved}"
+    );
+}
