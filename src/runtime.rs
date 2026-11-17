@@ -285,10 +285,16 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     let skill_manager = Arc::new(SkillManager::new());
     skill_manager.scan_and_load();
 
+    // Probe with the provider the operator actually selected. The stack builder
+    // encapsulates the `PROVIDER` choice (chat, router and embeddings together),
+    // so reusing it here keeps the startup probe, the agent-model validation and
+    // the interactive-setup seed on the same provider the app will run on. The
+    // stack itself is rebuilt below with RAG/agent-runtime attached; only its
+    // chat provider is needed at this point.
     let mut provider_impl: Arc<dyn LLMProvider + Send + Sync> =
-        Arc::new(OllamaProvider::new(config.ollama_url.clone()));
+        build_provider_stack(&config)?.provider.clone();
 
-    tracing::info!(provider_url = %config.ollama_url, "Verifying LLM provider health");
+    tracing::info!(provider_url = %provider_impl.get_base_url(), "Verifying LLM provider health");
     let health_ok = provider_impl.health_check().await.is_ok();
     let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let plan = startup_plan::plan(startup_plan::PlanInput {
@@ -297,12 +303,18 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         is_terminal,
     });
 
+    // A completed interactive setup returns the fully built stack for the
+    // chosen provider. Hold it until the companion services (RAG, history,
+    // agent runtime) are attached below rather than rebuilding a second stack
+    // from config and risking the two disagreeing about the entered key.
+    let mut setup_stack: Option<ProviderStack> = None;
+
     match plan {
         startup_plan::StartupPlan::Proceed => {}
         startup_plan::StartupPlan::Degraded => {
             // Never fatal: serve the API and let /health report "degraded".
             tracing::warn!(
-                provider_url = %config.ollama_url,
+                provider_url = %provider_impl.get_base_url(),
                 "LLM provider is not reachable; starting degraded. \
                  /api/health will report degraded until it recovers."
             );
@@ -315,14 +327,16 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         }
         startup_plan::StartupPlan::InteractiveSetup => {
             println!("Welcome to Llama-R. Let's configure your default provider.");
-            match crate::cli::interactive::run_interactive_setup(config.ollama_url.clone()).await {
-                Ok((new_provider, selected_model)) => {
-                    config.ollama_url = new_provider.get_base_url();
+            // Setup mutates `config` with the chosen provider, credentials and
+            // model, then hands back the stack built from exactly those values.
+            match crate::cli::interactive::run_interactive_setup(&mut config).await {
+                Ok((stack, selected_model)) => {
                     config.default_model = selected_model;
                     if let Err(err) = config.save_to_env() {
                         tracing::error!(error = %err, "Failed to persist configuration to .env");
                     }
-                    provider_impl = new_provider;
+                    provider_impl = stack.provider.clone();
+                    setup_stack = Some(stack);
                 }
                 Err(err) => {
                     // Setup is a convenience, not a precondition. Keep serving.
@@ -393,10 +407,15 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         context_store.clone(),
         skill_manager.clone(),
     );
-    // One `PROVIDER` selects chat, the decision router and embeddings. The
-    // stack builder encapsulates that choice; RAG and the agent runtime are
-    // built here (they need paths and registry handles) and attached to it.
-    let mut stack = build_provider_stack(&config)?;
+    // One `PROVIDER` selects chat, the decision router and embeddings. A
+    // completed interactive setup already produced such a stack from the values
+    // the user entered; otherwise build one from the boot configuration. RAG
+    // and the agent runtime are built here (they need paths and registry
+    // handles) and attached to either stack.
+    let mut stack = match setup_stack {
+        Some(stack) => stack,
+        None => build_provider_stack(&config)?,
+    };
     stack.agent_runtime = agent_runtime;
     stack.rag_store = rag_store;
     stack.rag_ingest = rag_ingest;
