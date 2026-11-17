@@ -170,7 +170,7 @@ pub fn render_bar(
 /// is up the panel shows it and the chrome footer goes silent. One list, one
 /// formatter, one of the two on screen at a time.
 ///
-/// `hints_for` in `app.rs` remains the only place the pairs are written down.
+/// `hints_for` in `keys.rs` remains the only place the pairs are written down.
 pub fn hints_line<'a>(hints: &[(&'a str, &'a str)]) -> Line<'a> {
     let mut line = Line::default();
     for (index, (key, hint)) in hints.iter().enumerate() {

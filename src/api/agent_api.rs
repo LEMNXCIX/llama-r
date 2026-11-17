@@ -1,5 +1,5 @@
 use crate::api::handlers::AppState;
-use crate::domain::agent::{Agent, OptimizeConfig};
+use crate::domain::agent::{Agent, OptimizeConfig, RoutingConfig};
 use crate::domain::scope::AgentScope;
 use crate::error::AppError;
 use crate::services::validation::validate_identifier;
@@ -22,6 +22,12 @@ pub struct CreateAgentRequest {
     #[serde(default)]
     pub model: String,
     pub system_prompt: String,
+    #[serde(default)]
+    pub description: String,
+    /// Curated routing text. Without this, `PUT` rewrites the manifest and
+    /// silently erases a hand-written `[routing] hint`.
+    #[serde(default)]
+    pub routing: Option<RoutingConfig>,
     #[serde(default)]
     pub project_id: Option<String>,
     #[serde(default)]
@@ -444,6 +450,25 @@ fn build_agent_toml(req: &CreateAgentRequest, project_id: Option<&str>) -> Strin
     let context_project = req.context_project.as_deref().or(project_id);
     if let Some(project_id) = context_project {
         output.push_str(&format!("context_project = \"{}\"\n", project_id));
+    }
+
+    if !req.description.is_empty() {
+        output.push_str(&format!(
+            "description = \"{}\"\n",
+            req.description.replace('"', "\\\"")
+        ));
+    }
+
+    if let Some(hint) = req
+        .routing
+        .as_ref()
+        .and_then(|routing| routing.hint.as_deref())
+        .filter(|hint| !hint.trim().is_empty())
+    {
+        output.push_str(&format!(
+            "[routing]\nhint = \"{}\"\n",
+            hint.replace('"', "\\\"")
+        ));
     }
 
     if !req.context_files.is_empty() {

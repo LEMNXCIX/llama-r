@@ -65,8 +65,14 @@ pub struct AgentConfig {
     #[serde(default)]
     pub temperature: Option<f32>,
 
-    #[serde(default)]
-    pub subagents: SubagentsConfig,
+    /// Compatibility stub: old manifests may carry a `[subagents]` table, but
+    /// the runtime never read it. Accept and ignore it so those files still load.
+    ///
+    /// `pub` so test fixtures that build `AgentConfig` with a struct literal
+    /// (including integration crates) can leave it at `None`. It is never read
+    /// outside this module and never serialised.
+    #[serde(default, skip_serializing)]
+    pub subagents: Option<toml::Table>,
     #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
@@ -101,7 +107,7 @@ impl Default for AgentConfig {
             max_iterations: default_max_iterations(),
             timeout_secs: default_timeout_secs(),
             temperature: None,
-            subagents: SubagentsConfig::default(),
+            subagents: None,
             memory: MemoryConfig::default(),
             observability: AgentObservabilityConfig::default(),
             routing: None,
@@ -133,10 +139,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_subagent_depth() -> u8 {
-    2
-}
-
 fn default_summarize_every() -> u32 {
     10
 }
@@ -163,26 +165,6 @@ pub enum RagWritePolicy {
     OwnMemoryOnly,
     /// Any collection listed in `rag_sources`.
     Listed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubagentsConfig {
-    #[serde(default)]
-    pub allowed: Vec<String>,
-    #[serde(default)]
-    pub allow_global: bool,
-    #[serde(default = "default_subagent_depth")]
-    pub max_depth: u8,
-}
-
-impl Default for SubagentsConfig {
-    fn default() -> Self {
-        Self {
-            allowed: Vec::new(),
-            allow_global: false,
-            max_depth: default_subagent_depth(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,7 +215,7 @@ impl Default for AgentObservabilityConfig {
 }
 
 /// Curated routing text. `hint` replaces the derived description when present.
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, utoipa::ToSchema)]
 pub struct RoutingConfig {
     #[serde(default)]
     pub hint: Option<String>,
@@ -308,5 +290,24 @@ summary_collection = "agent:fudi_ops/memory"
         assert_eq!(cfg.rag_write, RagWritePolicy::OwnMemoryOnly);
         assert_eq!(cfg.max_tool_calls, 12);
         assert!(cfg.memory.index_summaries);
+    }
+
+    #[test]
+    fn a_manifest_with_subagents_still_deserialises() {
+        let toml = "name = \"Demo\"\nsystem_prompt = \"hi\"\n\
+                    [subagents]\nallowed = [\"one\"]\nallow_global = true\nmax_depth = 2\n";
+        let config: AgentConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.name, "Demo");
+        assert_eq!(config.system_prompt, "hi");
+    }
+
+    #[test]
+    fn the_subagents_stub_never_serialises() {
+        let config = AgentConfig::default();
+        let text = toml::to_string(&config).unwrap();
+        assert!(
+            !text.contains("subagents"),
+            "dead config must not leak back out: {text}"
+        );
     }
 }

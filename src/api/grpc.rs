@@ -1,5 +1,6 @@
-use crate::api::chat_core::{execute_chat, execute_chat_stream, AgentSelection};
+use crate::api::chat_core::{execute_chat, execute_chat_stream};
 use crate::api::handlers::AppState;
+use crate::api::route_resolution::AgentSelection;
 use crate::domain::models::{ChatMessage as DomainChatMessage, ChatRequest};
 use crate::error::AppError;
 use std::pin::Pin;

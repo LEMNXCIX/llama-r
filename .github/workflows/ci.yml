@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   check:
-    name: fmt, clippy, tests
+    name: fmt, audit, clippy, tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,13 +33,19 @@ jobs:
       - name: Formatting
         run: cargo fmt --check
 
-      # Report-only on purpose. This repo has 43 pre-existing clippy lints —
-      # 16 of them `MutexGuard` held across an await, which is a concurrency
-      # refactor, not a one-line cleanup. Making clippy a hard gate here would
-      # either block every PR or pressure a rushed mass-fix. The output is in
-      # the log so new lints are visible; the hard gates are fmt and tests.
-      - name: Clippy (report only)
-        run: cargo clippy --all-targets
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Security advisories
+        run: cargo audit
+
+      # All pre-existing lints were cleared when this gate was added: the
+      # mechanical ones with cargo clippy --fix, the too_many_arguments ones
+      # with documented allows on stable interfaces, and the 16
+      # await_holding_lock ones with an allow on the test modules that hold an
+      # env lock deliberately.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Tests
         run: cargo test --target-dir target-tests

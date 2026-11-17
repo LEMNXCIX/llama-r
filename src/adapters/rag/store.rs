@@ -135,7 +135,7 @@ impl RagStore for InMemoryRagStore {
         let mut collections = self.collections.write().await;
         let mut written = 0usize;
 
-        for (doc, embedding) in docs.into_iter().zip(vectors.into_iter()) {
+        for (doc, embedding) in docs.into_iter().zip(vectors) {
             if !scope.allows_rag_write(&doc.source_id) {
                 return Err(write_denied(&doc.source_id, &scope.agent_id));
             }

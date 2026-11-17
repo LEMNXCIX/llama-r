@@ -1,6 +1,7 @@
-use crate::api::chat_core::{execute_chat, execute_chat_stream, AgentSelection};
+use crate::api::chat_core::{execute_chat, execute_chat_stream};
 use crate::api::mcp_api;
 use crate::api::observability::AppObservability;
+use crate::api::route_resolution::AgentSelection;
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::ContextStore;
 use crate::domain::models::{

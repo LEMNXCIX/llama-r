@@ -58,6 +58,10 @@ pub struct Runtime {
     pub grpc_addr: SocketAddr,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "stable interface: called from five sites across the crate and tests"
+)]
 pub fn build_app_state(
     provider: Arc<dyn LLMProvider + Send + Sync>,
     agent_registry: Arc<AgentRegistry>,

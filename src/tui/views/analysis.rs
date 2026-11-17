@@ -1,4 +1,4 @@
-use crate::tui::app::AnalysisState;
+use crate::tui::keys::AnalysisState;
 use crate::tui::theme;
 use crate::tui::views::chat::{spinner_frame, SPINNER_INTERVAL};
 use crate::tui::views::modals::render_skill_proposals;

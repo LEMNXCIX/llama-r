@@ -752,7 +752,7 @@ mod tests {
     /// The row `needle` is on.
     fn row_of(buffer: &Buffer, needle: &str) -> u16 {
         (0..buffer.area.height)
-            .find(|y| row_text(&buffer, *y).contains(needle))
+            .find(|y| row_text(buffer, *y).contains(needle))
             .unwrap_or_else(|| panic!("{needle:?} is not on screen: {}", all_text(buffer)))
     }
 

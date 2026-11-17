@@ -378,7 +378,7 @@ impl ContextEnricher {
         let mut current_tokens = 0;
 
         // Sort sections by priority (highest first)
-        sections.sort_by(|a, b| b.1.cmp(&a.1));
+        sections.sort_by_key(|section| std::cmp::Reverse(section.1));
 
         for (content, _priority) in sections {
             let content_tokens = content.len() / 4; // Rough heuristic
@@ -444,7 +444,7 @@ impl ContextEnricher {
         for dropped in &selection.dropped {
             let score = ranked
                 .iter()
-                .find(|m| &m.id == &dropped.id)
+                .find(|m| m.id == dropped.id)
                 .map(|m| m.score)
                 .unwrap_or(f32::NAN);
             tracing::info!(
@@ -459,6 +459,7 @@ impl ContextEnricher {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::await_holding_lock)] // tests hold an env lock across .await to serialise access
     use super::ContextEnricher;
     use crate::context::store::{ContextStore, ProjectContext};
     use crate::domain::agent::{Agent, AgentConfig, OptimizeConfig};

@@ -7,8 +7,8 @@
 //!    A view that wraps itself in `Borders::ALL` renders corners, which its own
 //!    test would have to be written to expect; this checks the *sources* as
 //!    well as the chrome's own output, so the rule holds for every view.
-//! 2. **Hints live in one place.** `TuiApp::hints_for` is the only place a key
-//!    and what it does may be written down. A view that hard-codes `"Press 'a'
+//! 2. **Hints live in one place.** `hints_for`, in `src/tui/keys.rs`, is the only
+//!    place a key and what it does may be written down. A view that hard-codes `"Press 'a'
 //!    to analyze"` draws no box, so it passes every border test in the crate
 //!    while the shared footer says something else — which is exactly how the
 //!    skill-proposals modal lost the only mention of its approve keys.
@@ -92,8 +92,12 @@ fn view_modules() -> Vec<(String, String)> {
 /// looks for, and the guard would stop being a statement about boxes.
 const MODAL_MODULE: &str = "modals";
 
-/// The dispatch that owns the chrome and `hints_for`.
+/// The dispatch: it owns the chrome, `TuiApp::run` and the one call that draws
+/// the hints.
 const APP: &str = include_str!("../src/tui/app.rs");
+
+/// The keys module, which owns `hints_for` — the one place hint text may live.
+const KEYS: &str = include_str!("../src/tui/keys.rs");
 
 /// The keys that open a dialog must be reachable from the form, and the form's
 /// own keys must not swallow them.
@@ -196,19 +200,23 @@ fn every_dialog_is_intercepted_before_the_view_it_sits_over() {
 /// The module that draws the bar.
 const CHROME: &str = include_str!("../src/tui/chrome.rs");
 
-/// `app.rs` with `hints_for`'s body removed — the one place hint text is allowed
-/// to live, and the reason `app.rs` is otherwise in scope for the hint check.
+/// `keys.rs` with `hints_for`'s body removed — the one place hint text is
+/// allowed to live, and the reason `KEYS` is in scope for the hint check at all.
 ///
 /// Brace-balanced from the `fn` keyword, which is exact for a function whose
 /// strings contain no braces (this one does not) and keeps the doc comment above
 /// it, which may legitimately describe the hints.
-fn app_without_hint_text() -> String {
-    let Some(start) = APP.find("fn hints_for(") else {
-        panic!("app.rs no longer has hints_for — rename it and this exclusion with it");
+///
+/// `hints_for` moved out of `app.rs` into `keys.rs`, so the exclusion moved with
+/// it: `APP` is scanned unchanged now, with no exception at all — a
+/// strengthening, not a weakening.
+fn keys_without_hint_text() -> String {
+    let Some(start) = KEYS.find("fn hints_for(") else {
+        panic!("src/tui/keys.rs no longer has hints_for — rename it and this exclusion with it");
     };
     let mut depth = 0usize;
-    let mut end = APP.len();
-    for (offset, ch) in APP[start..].char_indices() {
+    let mut end = KEYS.len();
+    for (offset, ch) in KEYS[start..].char_indices() {
         match ch {
             '{' => depth += 1,
             '}' if depth > 0 => {
@@ -221,7 +229,7 @@ fn app_without_hint_text() -> String {
             _ => {}
         }
     }
-    format!("{}{}", &APP[..start], &APP[end..])
+    format!("{}{}", &KEYS[..start], &KEYS[end..])
 }
 
 /// The shipped code of a module: everything before its test module.
@@ -362,7 +370,7 @@ fn every_view_renders_inside_the_body_without_a_box() {
         (
             "analysis · idle",
             Box::new(|f: &mut Frame, body: Rect| {
-                render_analysis(f, body, &llama_r::tui::app::AnalysisState::Idle)
+                render_analysis(f, body, &llama_r::tui::keys::AnalysisState::Idle)
             }),
         ),
         (
@@ -371,7 +379,7 @@ fn every_view_renders_inside_the_body_without_a_box() {
                 render_analysis(
                     f,
                     body,
-                    &llama_r::tui::app::AnalysisState::Loading {
+                    &llama_r::tui::keys::AnalysisState::Loading {
                         started_at: std::time::Instant::now(),
                     },
                 )
@@ -383,7 +391,7 @@ fn every_view_renders_inside_the_body_without_a_box() {
                 render_analysis(
                     f,
                     body,
-                    &llama_r::tui::app::AnalysisState::Loaded(
+                    &llama_r::tui::keys::AnalysisState::Loaded(
                         "# Reglas\n- hablar en español\n- no inventar".to_string(),
                     ),
                 )
@@ -395,7 +403,7 @@ fn every_view_renders_inside_the_body_without_a_box() {
                 render_analysis(
                     f,
                     body,
-                    &llama_r::tui::app::AnalysisState::Error("se rompió el análisis".to_string()),
+                    &llama_r::tui::keys::AnalysisState::Error("se rompió el análisis".to_string()),
                 )
             }),
         ),
@@ -620,8 +628,8 @@ fn only_the_dispatch_draws_the_footer() {
     );
     assert!(
         calls[0].starts_with("src/tui/app.rs:"),
-        "the shared footer belongs to the dispatch, which is the only place \
-         `hints_for` is reachable from: {calls:?}"
+        "the shared footer belongs to the dispatch, which is the one caller that \
+         draws the hints: {calls:?}"
     );
 }
 
@@ -651,14 +659,15 @@ fn the_footer_check_spots_a_call_and_spares_the_declaration() {
     ));
 }
 
-/// Key hints live in `hints_for` and nowhere else — including in `app.rs`, which
+/// Key hints live in `hints_for` and nowhere else — including in `keys.rs`, which
 /// owns that function and could therefore grow a second copy of the text without
-/// any view being involved.
+/// any view being involved, and in `app.rs`, which calls it and could do the
+/// same.
 ///
 /// The file list is walked, not written down, so a module added tomorrow is
-/// guarded tomorrow; and `app.rs` is in scope with `hints_for`'s own body
-/// excluded, which is what makes the rule hold in the one file where a hint is
-/// legitimate.
+/// guarded tomorrow; `keys.rs` is in scope with `hints_for`'s own body excluded,
+/// which is what makes the rule hold in the one file where a hint is legitimate,
+/// and `app.rs` is in scope with no exception at all.
 #[test]
 fn no_view_hard_codes_a_key_hint() {
     let mut checked: Vec<String> = Vec::new();
@@ -672,7 +681,7 @@ fn no_view_hard_codes_a_key_hint() {
         }
         checked.push(format!("src/tui/views/{name}.rs"));
     }
-    for (number, line) in shipped(&app_without_hint_text()).lines().enumerate() {
+    for (number, line) in shipped(APP).lines().enumerate() {
         assert!(
             !names_a_key(line),
             "src/tui/app.rs:{} names a key outside `hints_for`: {line:?}",
@@ -680,6 +689,14 @@ fn no_view_hard_codes_a_key_hint() {
         );
     }
     checked.push("src/tui/app.rs".to_string());
+    for (number, line) in shipped(&keys_without_hint_text()).lines().enumerate() {
+        assert!(
+            !names_a_key(line),
+            "src/tui/keys.rs:{} names a key outside `hints_for`: {line:?}",
+            number + 1
+        );
+    }
+    checked.push("src/tui/keys.rs".to_string());
     println!("hint guard covers: {}", checked.join(", "));
 }
 
@@ -776,6 +793,12 @@ fn only_the_modals_draw_borders() {
         border_ask(shipped(APP)),
         None,
         "src/tui/app.rs asks for a border; the bar is `chrome::render_bar`"
+    );
+    assert_eq!(
+        border_ask(shipped(KEYS)),
+        None,
+        "src/tui/keys.rs asks for a border; the chrome's separators and `theme` \
+         carry structure instead"
     );
     let modals = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

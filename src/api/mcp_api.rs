@@ -1,5 +1,6 @@
-use crate::api::chat_core::{execute_chat, AgentSelection};
+use crate::api::chat_core::execute_chat;
 use crate::api::handlers::AppState;
+use crate::api::route_resolution::AgentSelection;
 use crate::context::analyzer::ProjectAnalyzer;
 use crate::domain::models::{ChatMessage, ChatRequest, JsonRpcRequest, JsonRpcResponse};
 use crate::error::AppError;

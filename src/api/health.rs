@@ -74,6 +74,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::await_holding_lock)] // tests hold an env lock across .await to serialise access
     use super::*;
     use crate::adapters::mcp::StaticMcpRegistry;
     use crate::api::observability::AppObservability;

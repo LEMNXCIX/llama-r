@@ -24,6 +24,12 @@ pub struct ContextStore {
     base_dir: PathBuf,
 }
 
+impl Default for ContextStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ContextStore {
     pub fn new() -> Self {
         let base_dir = crate::core::paths::get_contexts_dir();
