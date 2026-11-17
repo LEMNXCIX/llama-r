@@ -1,6 +1,6 @@
 use crate::adapters::mcp::{McpServerConfig, StaticMcpRegistry};
-use crate::adapters::rag::{FileRagStore, OllamaEmbeddings};
-use crate::adapters::router::LlamaCppRouter;
+use crate::adapters::rag::{FileRagStore, OllamaEmbeddings, OpenRouterEmbeddings};
+use crate::adapters::router::{LlamaCppRouter, OpenCodeRouter, OpenRouterRouter};
 use crate::api::agent_api::{
     create_agent, delete_agent, get_agent, get_agent_scope, list_agents_api, update_agent,
 };
@@ -19,7 +19,7 @@ use crate::api::observability::AppObservability;
 use crate::api::rag_api::{rag_delete_document, rag_ingest, rag_query};
 use crate::api::route_api::route_preview;
 use crate::api::skill_api::list_skills_api;
-use crate::config::Config;
+use crate::config::{Config, ProviderKind};
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::ContextStore;
 use crate::core::hot_reload::HotReloader;
@@ -30,7 +30,10 @@ use crate::ports::engine::AgentEngine;
 use crate::ports::history::ConversationStore;
 use crate::ports::mcp::McpServerRegistry;
 use crate::ports::rag::{EmbeddingProvider, RagStore};
+use crate::ports::router::DecisionRouter;
 use crate::providers::ollama::OllamaProvider;
+use crate::providers::openai_compatible::OpenAiCompatibleProvider;
+use crate::providers::opencode::OpenCodeProvider;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::agent_runtime::AgentRuntime;
@@ -390,21 +393,13 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         context_store.clone(),
         skill_manager.clone(),
     );
-    let embeddings: Arc<dyn EmbeddingProvider> = Arc::new(OllamaEmbeddings::new(
-        config.ollama_url.clone(),
-        config.embedding_model.clone(),
-        config.embedding_dimensions,
-    ));
-    let stack = ProviderStack {
-        provider: provider_impl,
-        agent_runtime,
-        rag_store,
-        rag_ingest,
-        embeddings: Some(embeddings),
-        router: None,
-        default_model: config.default_model.clone(),
-        provider_name: "ollama".to_string(),
-    };
+    // One `PROVIDER` selects chat, the decision router and embeddings. The
+    // stack builder encapsulates that choice; RAG and the agent runtime are
+    // built here (they need paths and registry handles) and attached to it.
+    let mut stack = build_provider_stack(&config)?;
+    stack.agent_runtime = agent_runtime;
+    stack.rag_store = rag_store;
+    stack.rag_ingest = rag_ingest;
     let state = build_app_state(
         stack,
         agent_registry.clone(),
@@ -603,6 +598,121 @@ pub mod startup_plan {
             StartupPlan::Degraded
         }
     }
+}
+
+/// Build the whole provider-dependent stack from the single `PROVIDER` choice.
+///
+/// One setting selects chat, the decision router and — where the upstream can
+/// serve them — embeddings; there is no per-service mix. Credentials are passed
+/// to each adapter as a separate argument and never placed in a URL, an error
+/// string or a log line. A capability an upstream cannot offer is reported as
+/// missing rather than faked, so health can degrade honestly.
+pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> {
+    const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+    // Routing is inert by default, mirroring the Ollama path in
+    // `build_app_state`. Its tuning lives in `RouterConfig`, not `Config`;
+    // loading it here is what gives the non-Ollama decision adapters the
+    // operator's `ROUTER_MODEL`/`ROUTER_TIMEOUT_MS` instead of hard-coded values.
+    // An unusable config is non-fatal, exactly as on the Ollama boot path.
+    let router_config = match RouterConfig::load() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "Invalid router configuration; falling back to defaults (routing disabled)"
+            );
+            RouterConfig::default()
+        }
+    };
+
+    let provider: Arc<dyn LLMProvider + Send + Sync>;
+    let embeddings: Option<Arc<dyn EmbeddingProvider>>;
+    let router: Option<Arc<dyn DecisionRouter>>;
+
+    match config.provider {
+        ProviderKind::Ollama => {
+            provider = Arc::new(OllamaProvider::new(config.ollama_url.clone()));
+            embeddings = Some(Arc::new(OllamaEmbeddings::new(
+                config.ollama_url.clone(),
+                config.embedding_model.clone(),
+                config.embedding_dimensions,
+            )));
+            // Left `None` so `build_app_state` builds `LlamaCppRouter` from the
+            // same `RouterConfig` as before — the default boot path is unchanged.
+            router = None;
+        }
+        ProviderKind::OpenRouter => {
+            let base_url = config
+                .openai_base_url
+                .clone()
+                .unwrap_or_else(|| OPENROUTER_BASE_URL.to_string());
+            provider = Arc::new(OpenAiCompatibleProvider::new(
+                base_url,
+                config.openrouter_api_key.clone().unwrap_or_default(),
+                config.default_model.clone(),
+            ));
+            embeddings = Some(Arc::new(OpenRouterEmbeddings::new(
+                config.openrouter_api_key.clone().unwrap_or_default(),
+                config.embedding_model.clone(),
+                config.embedding_dimensions,
+            )));
+            router = if router_config.enabled {
+                Some(Arc::new(OpenRouterRouter::new(
+                    config.openrouter_api_key.clone().unwrap_or_default(),
+                    router_config.model.clone(),
+                    router_config.timeout_ms,
+                )))
+            } else {
+                None
+            };
+        }
+        ProviderKind::OpenCode => {
+            provider = Arc::new(OpenCodeProvider::new(
+                config.opencode_url.clone(),
+                config.opencode_api_key.clone(),
+                config.default_model.clone(),
+            ));
+            // OpenCode serves no embeddings endpoint. Ollama can supply them,
+            // but only when a URL was configured: an empty OLLAMA_URL means no
+            // fallback exists, so report the capability as missing and say why.
+            embeddings = if config.ollama_url.trim().is_empty() {
+                tracing::warn!(
+                    "embeddings are disabled: the opencode provider does not serve them and OLLAMA_URL is empty"
+                );
+                None
+            } else {
+                Some(Arc::new(OllamaEmbeddings::new(
+                    config.ollama_url.clone(),
+                    config.embedding_model.clone(),
+                    config.embedding_dimensions,
+                )))
+            };
+            router = if router_config.enabled {
+                Some(Arc::new(OpenCodeRouter::new(
+                    config.opencode_url.clone(),
+                    config.opencode_api_key.clone(),
+                    router_config.model.clone(),
+                    router_config.timeout_ms,
+                )))
+            } else {
+                None
+            };
+        }
+    }
+
+    tracing::info!(provider = %config.provider, "Provider stack initialized");
+
+    Ok(ProviderStack {
+        provider,
+        agent_runtime: None,
+        rag_store: None,
+        rag_ingest: None,
+        embeddings,
+        router,
+        default_model: config.default_model.clone(),
+        provider_name: config.provider.to_string(),
+    })
 }
 
 /// Build embeddings + persistent RAG store when enabled.

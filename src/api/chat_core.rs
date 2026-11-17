@@ -288,8 +288,8 @@ async fn run_stream_with_fallback(
     mut request: ChatRequest,
     requested_model: &str,
 ) -> Result<AppChatStream, AppError> {
-    // One snapshot for the whole call — status mapping is intentionally left
-    // as-is here (a separate change owns that fix).
+    // One snapshot for the whole call — the primary attempt and its fallback
+    // must use the same provider, even if a hot swap lands between them.
     let services = state.services_snapshot().await;
     let fallback_model = services.default_model.clone();
     match services.provider.chat_stream(request.clone()).await {
@@ -299,6 +299,19 @@ async fn run_stream_with_fallback(
             },
         ))),
         Err(error) => {
+            // The non-Ollama adapters reject streaming with a deliberate
+            // `AppError::Unavailable` (501) before opening any connection.
+            // Preserve that status instead of flattening it into a 502 — the
+            // feature is unsupported, not a broken upstream. Ordinary errors
+            // keep the existing fallback/no-failover semantics unchanged.
+            let error: Box<dyn std::error::Error + Send + Sync> = match error.downcast::<AppError>()
+            {
+                Ok(app_error) if matches!(&*app_error, AppError::Unavailable(_)) => {
+                    return Err(*app_error);
+                }
+                Ok(app_error) => app_error,
+                Err(error) => error,
+            };
             state.observability.record_provider_error();
             let fallback_model = fallback_model.trim();
             if !fallback_model.is_empty()

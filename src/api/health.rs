@@ -18,6 +18,16 @@ pub struct RouterHealth {
     pub url: String,
 }
 
+/// Which upstream one `PROVIDER` selected and which of its capabilities are
+/// actually available. `reason` is `Some` only when a capability the operator
+/// would expect is missing — never a place for credentials.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProviderHealth {
+    pub name: String,
+    pub embeddings: bool,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
     pub status: &'static str,
@@ -30,6 +40,7 @@ pub struct HealthResponse {
     pub total_tokens_processed: usize,
     pub observability: ObservabilitySnapshot,
     pub router: RouterHealth,
+    pub provider: ProviderHealth,
 }
 
 #[utoipa::path(
@@ -46,6 +57,20 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
     let provider_healthy = services.provider.health_check().await.is_ok();
     let router_config = state.router_config.clone();
     let router_healthy = state.router_healthy.load(Ordering::SeqCst);
+    let provider = ProviderHealth {
+        name: services.provider_name.clone(),
+        embeddings: services.embeddings.is_some(),
+        // A stack without embeddings is a capability gap, not an ordinary
+        // state. Name it and explain why; no field here ever carries a key.
+        reason: if services.embeddings.is_some() {
+            None
+        } else {
+            Some(format!(
+                "embeddings are disabled: the '{}' provider does not serve them and no OLLAMA_URL fallback is configured",
+                services.provider_name
+            ))
+        },
+    };
     Json(HealthResponse {
         // A switched-off router must never degrade the service: `enabled` is
         // false by default, and that default has to keep reading "ok". A
@@ -70,6 +95,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
             healthy: router_healthy,
             url: router_config.url.clone(),
         },
+        provider,
     })
 }
 

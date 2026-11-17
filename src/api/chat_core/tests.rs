@@ -8,6 +8,7 @@ use crate::context::analyzer::ContextEnricher;
 use crate::context::store::{ContextStore, ProjectContext};
 use crate::domain::agent::{AgentConfig, OptimizeConfig};
 use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
+use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
 use crate::providers::LLMProvider;
@@ -824,6 +825,71 @@ async fn engine_used_when_model_is_global_agent_id() {
     .await
     .unwrap();
     assert!(response.message.content.contains("by-model"));
+}
+
+/// A provider that rejects streaming the way the non-Ollama adapters do:
+/// a deliberate `AppError::Unavailable`, decided before any I/O.
+struct UnavailableStreamProvider;
+
+#[async_trait]
+impl LLMProvider for UnavailableStreamProvider {
+    fn get_base_url(&self) -> String {
+        "http://unused".to_string()
+    }
+
+    async fn health_check(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error + Send + Sync>> {
+        Ok(Vec::new())
+    }
+
+    async fn chat(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<ChatResponse, Box<dyn Error + Send + Sync>> {
+        unreachable!("this test only streams")
+    }
+
+    async fn chat_stream(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, Box<dyn Error + Send + Sync>>> + Send>>,
+        Box<dyn Error + Send + Sync>,
+    > {
+        Err(Box::new(AppError::Unavailable(
+            "streaming is not supported by openrouter".to_string(),
+        )))
+    }
+}
+
+#[tokio::test]
+async fn an_unavailable_stream_error_stays_a_501_not_a_502() {
+    let _guard = lock_env();
+    let (_dir, state) = test_state(Arc::new(UnavailableStreamProvider));
+    let err = execute_chat_stream(
+        &state,
+        ChatRequest {
+            model: "fallback-model".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            stream: true,
+        },
+        AgentSelection::default(),
+    )
+    .await
+    .err()
+    .expect("streaming must be rejected");
+
+    assert!(
+        matches!(err, AppError::Unavailable(_)),
+        "a deliberate Unavailable must not be wrapped into Provider (502): {err:?}"
+    );
+    assert_eq!(err.status_code(), axum::http::StatusCode::NOT_IMPLEMENTED);
 }
 
 #[test]
