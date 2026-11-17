@@ -63,6 +63,43 @@ impl AgentEngine for FakeEngine {
     }
 }
 
+/// An engine that records whether its streaming entry point was used, so a
+/// test can prove the non-Ollama provider gate kept `chat_stream` out of the
+/// path. `run_stream` would produce a valid-looking Token+Completed stream if
+/// it were called — the pseudo-stream the design forbids for OpenRouter.
+struct StreamSpyEngine {
+    response: String,
+    stream_called: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl AgentEngine for StreamSpyEngine {
+    async fn run(&self, req: AgentRunRequest) -> Result<AgentRunResult, String> {
+        Ok(AgentRunResult {
+            text: format!("{}|{}", self.response, req.user_message),
+            tool_calls: 0,
+            iterations: 1,
+            model: req.model,
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        req: AgentRunRequest,
+    ) -> Result<mpsc::Receiver<AgentRunEvent>, String> {
+        self.stream_called.store(true, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel(4);
+        let result = self.run(req).await?;
+        let _ = tx
+            .send(AgentRunEvent::Token {
+                text: result.text.clone(),
+            })
+            .await;
+        let _ = tx.send(AgentRunEvent::Completed { result }).await;
+        Ok(rx)
+    }
+}
+
 fn lock_env() -> MutexGuard<'static, ()> {
     crate::core::paths::lock_env_for_tests()
 }
@@ -171,6 +208,14 @@ fn test_state_with_runtime(
     provider: Arc<dyn LLMProvider + Send + Sync>,
     agent_runtime: Option<Arc<AgentRuntime>>,
 ) -> (TempDir, Arc<AppState>) {
+    test_state_with_runtime_and_provider(provider, agent_runtime, "ollama")
+}
+
+fn test_state_with_runtime_and_provider(
+    provider: Arc<dyn LLMProvider + Send + Sync>,
+    agent_runtime: Option<Arc<AgentRuntime>>,
+    provider_name: &str,
+) -> (TempDir, Arc<AppState>) {
     let temp_dir = tempfile::tempdir().unwrap();
     std::env::set_var("LLAMA_R_DIR", temp_dir.path());
     let agent_registry = agent_runtime
@@ -186,6 +231,7 @@ fn test_state_with_runtime(
         "fallback-model".to_string(),
     ));
     let mut stack = ProviderStack::new(provider, "fallback-model");
+    stack.provider_name = provider_name.to_string();
     stack.agent_runtime = agent_runtime;
     // No test here consults the router; the routing ladder is injected into the
     // stack by the tests that do.
@@ -890,6 +936,141 @@ async fn an_unavailable_stream_error_stays_a_501_not_a_502() {
         "a deliberate Unavailable must not be wrapped into Provider (502): {err:?}"
     );
     assert_eq!(err.status_code(), axum::http::StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn non_ollama_engine_stream_is_rejected_with_501_without_calling_engine() {
+    let _guard = lock_env();
+    let stream_called = Arc::new(AtomicBool::new(false));
+    let engine = Arc::new(StreamSpyEngine {
+        response: "or-spy".to_string(),
+        stream_called: stream_called.clone(),
+    });
+    let registry = Arc::new(AgentRegistry::new());
+    let runtime = Arc::new(AgentRuntime {
+        registry: registry.clone(),
+        engine,
+        history: None,
+        rag: None,
+        enricher: test_enricher(),
+    });
+    // A non-Ollama provider whose chat_stream rejects streaming the way the
+    // OpenRouter/OpenCode adapters do.
+    let (_dir, state) = test_state_with_runtime_and_provider(
+        Arc::new(UnavailableStreamProvider),
+        Some(runtime),
+        "openrouter",
+    );
+
+    let config = AgentConfig {
+        name: "or-agent".to_string(),
+        model: "agent-model".to_string(),
+        system_prompt: "You are helpful".to_string(),
+        context_project: Some("or-proj".to_string()),
+        ..Default::default()
+    };
+    let dir = crate::core::paths::get_project_agents_dir("or-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("or-agent.toml"), toml::to_string(&config).unwrap()).unwrap();
+    registry.reload_all(&[]).unwrap();
+
+    let err = execute_chat_stream(
+        &state,
+        ChatRequest {
+            model: "fallback-model".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            stream: true,
+        },
+        AgentSelection {
+            project_id: Some("or-proj"),
+            agent_id: Some("or-agent"),
+            conversation_id: None,
+            debug: false,
+        },
+    )
+    .await
+    .err()
+    .expect("a non-Ollama provider must reject streaming with Unavailable");
+
+    assert!(
+        matches!(err, AppError::Unavailable(_)),
+        "an engine pseudo-stream must not turn a 501 into a 200: {err:?}"
+    );
+    assert_eq!(err.status_code(), axum::http::StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        !stream_called.load(Ordering::SeqCst),
+        "the engine's chat_stream must not be called for a non-Ollama provider"
+    );
+}
+
+#[tokio::test]
+async fn ollama_engine_stream_is_still_taken() {
+    let _guard = lock_env();
+    let stream_called = Arc::new(AtomicBool::new(false));
+    let engine = Arc::new(StreamSpyEngine {
+        response: "ollama-spy".to_string(),
+        stream_called: stream_called.clone(),
+    });
+    let registry = Arc::new(AgentRegistry::new());
+    let runtime = Arc::new(AgentRuntime {
+        registry: registry.clone(),
+        engine,
+        history: None,
+        rag: None,
+        enricher: test_enricher(),
+    });
+    let (_dir, state) = test_state_with_runtime_and_provider(
+        Arc::new(UnavailableStreamProvider),
+        Some(runtime),
+        "ollama",
+    );
+
+    let config = AgentConfig {
+        name: "ol-agent".to_string(),
+        model: "agent-model".to_string(),
+        system_prompt: "You are helpful".to_string(),
+        context_project: Some("ol-proj".to_string()),
+        ..Default::default()
+    };
+    let dir = crate::core::paths::get_project_agents_dir("ol-proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ol-agent.toml"), toml::to_string(&config).unwrap()).unwrap();
+    registry.reload_all(&[]).unwrap();
+
+    let mut stream = execute_chat_stream(
+        &state,
+        ChatRequest {
+            model: "fallback-model".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            stream: true,
+        },
+        AgentSelection {
+            project_id: Some("ol-proj"),
+            agent_id: Some("ol-agent"),
+            conversation_id: None,
+            debug: false,
+        },
+    )
+    .await
+    .expect("an Ollama provider must keep the engine streaming path");
+
+    let mut saw_engine = false;
+    while let Some(item) = stream.next().await {
+        if item.unwrap().message.content.contains("ollama-spy") {
+            saw_engine = true;
+        }
+    }
+    assert!(saw_engine, "Ollama stream should contain engine text");
+    assert!(
+        stream_called.load(Ordering::SeqCst),
+        "the engine's chat_stream must be called for an Ollama provider"
+    );
 }
 
 /// A provider that identifies itself by the content it answers, so a test can

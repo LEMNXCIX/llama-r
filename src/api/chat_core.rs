@@ -515,7 +515,15 @@ pub async fn execute_chat_stream(
     let prepared = prepare_request(state, &services, payload, &resolved).await?;
     let started_at = Instant::now();
 
-    if let Some((project_id, agent_id)) = engine_ids {
+    // Streaming from a non-Ollama provider is a documented non-goal: the
+    // engine's `run_stream` is a full completion dressed up as Token+Completed,
+    // so taking this branch for OpenRouter/OpenCode would answer `stream: true`
+    // with a 200 pseudo-stream instead of the required 501. Gate the engine on
+    // the selected provider so those requests fall through to
+    // `run_stream_with_fallback`, whose `chat_stream()` returns
+    // `AppError::Unavailable` and whose 501-preserving downcast stays intact.
+    if let Some((project_id, agent_id)) = engine_ids.filter(|_| services.provider_name == "ollama")
+    {
         if let Some(runtime) = &services.agent_runtime {
             let conversation_id = selection.conversation_id.map(|s| s.to_string());
             let rt_req =
