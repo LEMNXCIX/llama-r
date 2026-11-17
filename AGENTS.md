@@ -300,6 +300,7 @@ cargo test --target-dir target-tests
 - `apply_rule`'s old AST round-trip is gone. A tool is handed the text and returns the text; it locates what it cares about with `fenced_blocks` and splices the **original** bytes. Re-emitting every node re-tagged untagged JSON blocks as ```` ```json ````, and made the text outside blocks one opaque node that no tool could touch.
 - `compress_code` strips comments per language family. `#` is a comment in Python and a preprocessor directive in C, so a block whose language is not in the table has **nothing** stripped — which is what stopped it deleting `#!/bin/bash`. A shebang is never stripped.
 - `dedent_code` skips languages where indentation is meaning (`python`, `yaml`, `toml`, …) and skips untagged blocks: an untagged block of Python is still Python.
+- `[subagents]` in an agent TOML is accepted but ignored. The schema declared `allowed` / `allow_global` / `max_depth` and no code ever read them; they are now a compatibility stub so old manifests keep loading. New manifests must not use the table.
 - A tool name that matches nothing used to be a silent no-op. `AgentRegistry` now warns with the unknown and the known names when it loads an agent, and the picker drops unknown names on save after showing them.
 - `optimize.enabled` follows the selection: the form used to write `true` unconditionally, producing configs that claimed to be optimising while running nothing.
 
