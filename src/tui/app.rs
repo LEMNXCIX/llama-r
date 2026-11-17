@@ -155,6 +155,12 @@ pub struct TuiApp {
     chat_messages_rect: ratatui::layout::Rect,
 }
 
+/// What a single key dispatch asks the event loop to do.
+pub(super) enum DispatchOutcome {
+    Continue,
+    Quit,
+}
+
 impl TuiApp {
     pub fn new(state: Arc<AppState>) -> Self {
         Self {
@@ -225,6 +231,18 @@ impl TuiApp {
             Err(_) => {
                 self.available_models = Vec::new();
             }
+        }
+    }
+
+    /// Load the model list from a synchronous key handler.
+    ///
+    /// `load_models` is async only because the provider call is. Key dispatch
+    /// is synchronous so a plain test can inject a key, so the future is
+    /// driven on the current runtime from a blocking thread — the models are
+    /// in place before the key handler returns, exactly as before.
+    fn load_models_blocking(&mut self) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| handle.block_on(self.load_models()));
         }
     }
 
@@ -800,634 +818,8 @@ impl TuiApp {
                         if key.kind != event::KeyEventKind::Press {
                             continue;
                         }
-                        // Optimization tool picker interception
-                        //
-                        // Above the other dialogs for the same reason: the first guard to match
-                        // swallows the key, and this one opens from the agent form like
-                        // the rest of them.
-                        if self.opt_tools.is_some() {
-                            let Some(picker) = self.opt_tools.as_mut() else {
-                                unreachable!("guarded on is_some above");
-                            };
-                            match opt_tools_action(picker, key.code) {
-                                OptToolsAction::Applied => {}
-                                OptToolsAction::Save { tools, enabled } => {
-                                    self.opt_tools = None;
-                                    self.form_optimize_rules = tools;
-                                    self.form_optimize_enabled = enabled;
-                                }
-                                OptToolsAction::Cancel => self.opt_tools = None,
-                            }
-                            continue;
-                        }
-                        // Rule editor interception
-                        //
-                        // Above the skill picker's guard, not below it: both open
-                        // from the agent form, and the order between two dialogs
-                        // matters for the same reason it matters between a dialog
-                        // and a view — whichever guard comes first swallows the key.
-                        if self.rule_editor.is_some() {
-                            let Some(editor) = self.rule_editor.as_mut() else {
-                                unreachable!("guarded on is_some above");
-                            };
-                            match rule_action(editor, key) {
-                                RuleAction::Applied => {}
-                                RuleAction::Done(rules) => {
-                                    self.rule_editor = None;
-                                    self.form_rules = rules;
-                                }
-                            }
-                            continue;
-                        }
-                        // Delete confirmation interception
-                        if self.confirm_delete.is_some() {
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Enter => {
-                                    let action = self.confirm_delete.take();
-                                    if let Some((ref confirm_type, ref confirm_id)) = action {
-                                        match confirm_type.as_str() {
-                                            "project" => {
-                                                let _ = self
-                                                    .state
-                                                    .context_store
-                                                    .delete_context(confirm_id);
-                                                self.project_index = 0;
-                                            }
-                                            "agent" => {
-                                                let agents =
-                                                    self.state.agent_registry.list_agents();
-                                                if let Some(agent) =
-                                                    agents.iter().find(|a| a.id == *confirm_id)
-                                                {
-                                                    let path = if let Some(ref pid) =
-                                                        agent.project_id
-                                                    {
-                                                        crate::core::paths::get_project_agents_dir(
-                                                            pid,
-                                                        )
-                                                        .join(format!("{}.toml", agent.id))
-                                                    } else {
-                                                        crate::core::paths::get_agents_dir()
-                                                            .join(format!("{}.toml", agent.id))
-                                                    };
-                                                    let _ = std::fs::remove_file(path);
-                                                    let _ =
-                                                        self.state.agent_registry.reload_all(&[]);
-                                                }
-                                                self.agent_index = 0;
-                                                // Not just the index: the focus has
-                                                // to leave a list that may now be
-                                                // empty, or the footer keeps
-                                                // naming the agent keys over rows
-                                                // that are gone.
-                                                self.active_in_project_list =
-                                                    focus_after_agent_delete();
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('n') | KeyCode::Esc => {
-                                    self.confirm_delete = None;
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-                        // Skill picker interception
-                        if self.skill_picker.is_some() {
-                            let Some(picker) = self.skill_picker.as_mut() else {
-                                unreachable!("guarded on is_some above");
-                            };
-                            // The key map lives in `picker_action` so it can be
-                            // tested: this arm used to spell the rules out inline,
-                            // where no test could reach them — and where, written
-                            // below the form's own guard, none of them ran.
-                            match picker_action(picker, key.code) {
-                                PickerAction::Applied => {}
-                                PickerAction::Save(ids) => {
-                                    self.skill_picker = None;
-                                    self.form_skills = ids.join(", ");
-                                }
-                                PickerAction::Cancel => self.skill_picker = None,
-                            }
-                            continue;
-                        }
-                        if self.current_view == CurrentView::AgentForm {
-                            match key.code {
-                                KeyCode::Esc => self.current_view = CurrentView::Projects,
-                                KeyCode::Tab | KeyCode::Down => {
-                                    self.form_field_index = (self.form_field_index + 1) % 8
-                                }
-                                KeyCode::BackTab | KeyCode::Up => {
-                                    self.form_field_index = if self.form_field_index == 0 {
-                                        7
-                                    } else {
-                                        self.form_field_index - 1
-                                    }
-                                }
-                                KeyCode::Left | KeyCode::Right => {
-                                    if self.form_field_index == 2
-                                        && !self.available_models.is_empty()
-                                    {
-                                        let current_idx = self
-                                            .available_models
-                                            .iter()
-                                            .position(|m| m == &self.form_model)
-                                            .unwrap_or(0);
-                                        let next_idx = if key.code == KeyCode::Right {
-                                            (current_idx + 1) % self.available_models.len()
-                                        } else {
-                                            if current_idx == 0 {
-                                                self.available_models.len() - 1
-                                            } else {
-                                                current_idx - 1
-                                            }
-                                        };
-                                        self.form_model = self.available_models[next_idx].clone();
-                                    } else if self.form_field_index == 3
-                                        && !self.available_projects.is_empty()
-                                    {
-                                        let current_idx = self
-                                            .available_projects
-                                            .iter()
-                                            .position(|p| p == &self.form_project_id)
-                                            .unwrap_or(0);
-                                        let next_idx = if key.code == KeyCode::Right {
-                                            (current_idx + 1) % self.available_projects.len()
-                                        } else {
-                                            if current_idx == 0 {
-                                                self.available_projects.len() - 1
-                                            } else {
-                                                current_idx - 1
-                                            }
-                                        };
-                                        self.form_project_id =
-                                            self.available_projects[next_idx].clone();
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    if self.form_field_index == 7 {
-                                        self.form_prompt.push('\n');
-                                    } else {
-                                        self.form_field_index = (self.form_field_index + 1) % 8;
-                                    }
-                                }
-                                KeyCode::Char('s')
-                                    if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                                {
-                                    // Save agent
-                                    let project_id = &self.form_project_id;
-                                    // Already a list. It used to be joined with
-                                    // commas and split here, which is what made a
-                                    // rule containing a comma silently become two
-                                    // rules with nothing on screen saying so.
-                                    let rules_vec: Vec<String> = self.form_rules.clone();
-                                    // Already a list. It used to be joined with commas
-                                    // and split here, which is what made a tool name
-                                    // containing a comma indistinguishable from two
-                                    // tools — and a name matching no tool was already
-                                    // a silent no-op, so the split only added ways to
-                                    // get one by accident.
-                                    let opt_rules_vec: Vec<String> =
-                                        self.form_optimize_rules.clone();
-                                    let skills_vec: Vec<String> = self
-                                        .form_skills
-                                        .split(',')
-                                        .map(|s| s.trim().to_string())
-                                        .filter(|s| !s.is_empty())
-                                        .collect();
-
-                                    let rules_str = if rules_vec.is_empty() {
-                                        "[]".to_string()
-                                    } else {
-                                        format!("{:?}", rules_vec)
-                                    };
-                                    let opt_rules_str = if opt_rules_vec.is_empty() {
-                                        "[]".to_string()
-                                    } else {
-                                        format!("{:?}", opt_rules_vec)
-                                    };
-                                    let skills_str = if skills_vec.is_empty() {
-                                        "[]".to_string()
-                                    } else {
-                                        format!("{:?}", skills_vec)
-                                    };
-
-                                    let toml_content = format!(
-                                    "name = \"{}\"\nmodel = \"{}\"\nsystem_prompt = \"\"\"\n{}\n\"\"\"\ncontext_project = \"{}\"\nrules = {}\nskills = {}\n\n[optimize]\nenabled = {}\nrules = {}\n",
-                                    self.form_name, self.form_model, self.form_prompt, project_id, rules_str, skills_str, self.form_optimize_enabled, opt_rules_str
-                                );
-                                    let path =
-                                        crate::core::paths::get_project_agents_dir(project_id)
-                                            .join(format!("{}.toml", self.form_id));
-                                    let _ = std::fs::write(path, toml_content);
-                                    let _ = self.state.agent_registry.reload_all(&[]);
-                                    self.current_view = CurrentView::Projects;
-                                }
-                                // The skills field is not typed into. `s` opens
-                                // the picker instead, because `Enter` already
-                                // means "next field" here and cannot be freed.
-                                KeyCode::Char('s') if self.form_field_index == SKILLS_FIELD => {
-                                    self.skill_picker =
-                                        Some(self.skill_picker_over(&self.form_project_id));
-                                }
-                                // Opens the tool picker. Modified, because `o` is a
-                                // letter the user would otherwise type into the field.
-                                KeyCode::Char('o')
-                                    if self.form_field_index == OPTIMIZE_FIELD
-                                        && key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                                {
-                                    self.open_opt_tools_with(None);
-                                }
-                                // Opens the rule editor over the list this field
-                                // joins into a line. Modified, because a bare letter
-                                // here would be a letter the user could not type into
-                                // their own rules.
-                                KeyCode::Char('r')
-                                    if self.form_field_index == RULES_FIELD
-                                        && key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                                {
-                                    self.open_rule_editor_with(None);
-                                }
-                                KeyCode::Char(c) => match self.form_field_index {
-                                    0 => self.form_id.push(c),
-                                    1 => self.form_name.push(c),
-                                    2 => self.form_model.push(c),
-                                    3 => {} // Project is handled by arrows
-                                    // The rules row is a one-line join of a list, so
-                                    // there is nothing here to append to. Swallowing
-                                    // the key would make the row look editable and
-                                    // do nothing — the field that looked broken when
-                                    // the picker shipped inert. Typing here opens the
-                                    // editor and lands the character in it.
-                                    4 => self.open_rule_editor_with(Some(c)),
-                                    5 => self.open_opt_tools_with(Some(c)),
-                                    6 => {} // Skills is chosen in the picker
-                                    7 => self.form_prompt.push(c),
-                                    _ => {}
-                                },
-                                KeyCode::Backspace => match self.form_field_index {
-                                    0 => {
-                                        self.form_id.pop();
-                                    }
-                                    1 => {
-                                        self.form_name.pop();
-                                    }
-                                    2 => {
-                                        self.form_model.pop();
-                                    }
-                                    4 => {
-                                        // Opens the editor and deletes nothing.
-                                        // Backspacing the join is ambiguous — the
-                                        // last character may belong to the last
-                                        // rule, or it may be the separator — and
-                                        // the editor is where a deletion can be
-                                        // seen before it happens.
-                                        self.open_rule_editor_with(None);
-                                    }
-                                    5 => self.open_opt_tools_with(None),
-                                    6 => {
-                                        self.form_skills.pop();
-                                    }
-                                    7 => {
-                                        self.form_prompt.pop();
-                                    }
-                                    _ => {}
-                                },
-                                _ => {}
-                            }
-                            continue;
-                        }
-
-                        // Confirm delete interception
-
-                        // Chat view handling
-                        if self.current_view == CurrentView::Chat {
-                            // Composing the message comes first, and it is
-                            // routed by `chat_input_action` so the Enter vs
-                            // Shift+Enter rule is testable without a terminal.
-                            match chat_input_action(key, self.chat_loading.load(Ordering::SeqCst)) {
-                                ChatAction::Edit(c) => self.chat_input.push(c),
-                                ChatAction::Backspace => {
-                                    self.chat_input.pop();
-                                }
-                                ChatAction::Newline => self.chat_input.push('\n'),
-                                ChatAction::Send => self.send_chat_message(),
-                                ChatAction::Other => {}
-                            }
-
-                            // Everything below needs app state: navigation,
-                            // agent cycling, and scrolling the messages.
-                            match key.code {
-                                KeyCode::Esc => {
-                                    self.current_view = CurrentView::Projects;
-                                }
-                                KeyCode::Tab | KeyCode::BackTab => {
-                                    // Let Tab fall through to main navigation
-                                }
-                                KeyCode::Left => {
-                                    self.refresh_available_agents();
-                                    let count = self.available_agents.len();
-                                    if count > 0 {
-                                        self.chat_agent_index = if self.chat_agent_index == 0 {
-                                            count - 1
-                                        } else {
-                                            self.chat_agent_index - 1
-                                        };
-                                        self.update_chat_selected_agent();
-                                    }
-                                }
-                                KeyCode::Right => {
-                                    self.refresh_available_agents();
-                                    let count = self.available_agents.len();
-                                    if count > 0 {
-                                        self.chat_agent_index = (self.chat_agent_index + 1) % count;
-                                        self.update_chat_selected_agent();
-                                    }
-                                }
-                                KeyCode::Up => {
-                                    if self.chat_auto_scroll {
-                                        // Jumping out of follow mode puts us at
-                                        // the bottom, so one step up = last row.
-                                        self.chat_scroll = self.chat_scroll_max;
-                                        self.chat_auto_scroll = false;
-                                    } else if self.chat_scroll > 0 {
-                                        self.chat_scroll -= 1;
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    self.chat_auto_scroll = false;
-                                    if self.chat_scroll >= self.chat_scroll_max {
-                                        // Reached the bottom: re-arm follow mode
-                                        // so new messages keep flowing in.
-                                        self.chat_auto_scroll = true;
-                                    } else {
-                                        self.chat_scroll = self.chat_scroll.saturating_add(1);
-                                    }
-                                }
-                                KeyCode::PageUp => {
-                                    if self.chat_auto_scroll {
-                                        // Start paging up from the bottom.
-                                        self.chat_scroll = self.chat_scroll_max;
-                                    }
-                                    self.chat_auto_scroll = false;
-                                    self.chat_scroll =
-                                        self.chat_scroll.saturating_sub(self.page_step());
-                                }
-                                KeyCode::PageDown => {
-                                    self.chat_auto_scroll = false;
-                                    self.chat_scroll =
-                                        self.chat_scroll.saturating_add(self.page_step());
-                                    if self.chat_scroll >= self.chat_scroll_max {
-                                        self.chat_scroll = self.chat_scroll_max;
-                                        self.chat_auto_scroll = true;
-                                    }
-                                }
-                                KeyCode::Home => {
-                                    self.chat_auto_scroll = false;
-                                    self.chat_scroll = 0;
-                                }
-                                KeyCode::End => {
-                                    self.chat_auto_scroll = true;
-                                    self.chat_scroll = usize::MAX;
-                                }
-                                _ => {}
-                            }
-                            if key.code != KeyCode::Tab && key.code != KeyCode::BackTab {
-                                continue;
-                            }
-                        }
-
-                        match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Tab => {
-                                self.current_view = match self.current_view {
-                                    CurrentView::Dashboard => CurrentView::Projects,
-                                    CurrentView::Projects => CurrentView::Chat,
-                                    CurrentView::Chat => CurrentView::Dashboard,
-                                    _ => self.current_view.clone(),
-                                };
-                                if self.current_view == CurrentView::Chat {
-                                    self.refresh_available_agents();
-                                    self.chat_auto_scroll = true;
-                                }
-                            }
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                if self.current_view == CurrentView::Projects {
-                                    if self.active_in_project_list {
-                                        let count =
-                                            self.state.context_store.list_all_projects().len();
-                                        if count > 0 {
-                                            self.project_index = (self.project_index + 1) % count;
-                                            self.agent_index = 0;
-                                        }
-                                    } else {
-                                        self.agent_index = move_agent_selection(
-                                            self.project_list_bounds,
-                                            self.agent_index,
-                                            self.project_agents().len(),
-                                            1,
-                                        );
-                                    }
-                                } else if self.current_view == CurrentView::Dashboard {
-                                    self.log_scroll = self.log_scroll.saturating_add(1);
-                                } else if self.current_view == CurrentView::ContextView {
-                                    self.context_scroll = self.context_scroll.saturating_add(1);
-                                }
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                if self.current_view == CurrentView::Projects {
-                                    if self.active_in_project_list {
-                                        let count =
-                                            self.state.context_store.list_all_projects().len();
-                                        if count > 0 {
-                                            self.project_index = if self.project_index == 0 {
-                                                count - 1
-                                            } else {
-                                                self.project_index - 1
-                                            };
-                                            self.agent_index = 0;
-                                        }
-                                    } else {
-                                        self.agent_index = move_agent_selection(
-                                            self.project_list_bounds,
-                                            self.agent_index,
-                                            self.project_agents().len(),
-                                            -1,
-                                        );
-                                    }
-                                } else if self.current_view == CurrentView::Dashboard {
-                                    self.log_scroll = self.log_scroll.saturating_sub(1);
-                                } else if self.current_view == CurrentView::ContextView {
-                                    self.context_scroll = self.context_scroll.saturating_sub(1);
-                                }
-                            }
-                            // Focus moves between the two lists the projects view draws: the project
-                            // rows and the agent rows below them. Which way it may go depends on
-                            // where the focus is now — see `may_move_list_focus`, which is the
-                            // whole of the rule.
-                            KeyCode::Char('l')
-                            | KeyCode::Right
-                            | KeyCode::Char('h')
-                            | KeyCode::Left => {
-                                if self.current_view == CurrentView::Projects
-                                    && may_move_list_focus(
-                                        self.project_list_bounds,
-                                        self.active_in_project_list,
-                                    )
-                                {
-                                    self.active_in_project_list = !self.active_in_project_list;
-                                }
-                            }
-                            KeyCode::Char('a') => {
-                                if self.current_view == CurrentView::Projects {
-                                    let projects = self.state.context_store.list_all_projects();
-                                    if let Some(project) = projects.get(self.project_index) {
-                                        let project_id = project.project_id.clone();
-                                        let project_path = project.path.clone();
-                                        self.trigger_analysis(project_id, project_path);
-                                        self.current_view = CurrentView::Analysis;
-                                    }
-                                }
-                            }
-                            KeyCode::Char('v') => {
-                                if self.current_view == CurrentView::Projects {
-                                    self.current_view = CurrentView::ContextView;
-                                }
-                            }
-                            KeyCode::Char('d') => {
-                                if self.current_view == CurrentView::Projects {
-                                    if self.active_in_project_list {
-                                        let projects = self.state.context_store.list_all_projects();
-                                        if let Some(project) = projects.get(self.project_index) {
-                                            self.confirm_delete = Some((
-                                                "project".to_string(),
-                                                project.project_id.clone(),
-                                            ));
-                                        }
-                                    } else if let Some(agent) = selected_agent(
-                                        self.project_list_bounds,
-                                        &self.project_agents(),
-                                        self.agent_index,
-                                    ) {
-                                        self.confirm_delete =
-                                            Some(("agent".to_string(), agent.id.clone()));
-                                    }
-                                }
-                            }
-                            KeyCode::Char('n') => {
-                                if self.current_view == CurrentView::Projects {
-                                    self.form_id = String::new();
-                                    self.form_name = String::new();
-                                    self.form_model = String::new();
-                                    self.form_prompt = String::new();
-                                    self.form_rules = Vec::new();
-                                    self.form_optimize_rules = Vec::new();
-                                    self.form_optimize_enabled = false;
-                                    self.form_skills = String::new();
-                                    self.available_projects = self
-                                        .state
-                                        .context_store
-                                        .list_all_projects()
-                                        .into_iter()
-                                        .map(|c| c.project_id)
-                                        .collect();
-                                    if let Some(p) = self.available_projects.get(self.project_index)
-                                    {
-                                        self.form_project_id = p.clone();
-                                    } else {
-                                        self.form_project_id = String::new();
-                                    }
-                                    self.form_field_index = 0;
-                                    self.editing_agent = None;
-                                    self.current_view = CurrentView::AgentForm;
-                                    self.load_models().await;
-                                }
-                            }
-                            KeyCode::Char('e')
-                                if self.current_view == CurrentView::Projects
-                                    && !self.active_in_project_list =>
-                            {
-                                let agents = self.project_agents();
-                                if let Some(agent) = selected_agent(
-                                    self.project_list_bounds,
-                                    &agents,
-                                    self.agent_index,
-                                ) {
-                                    self.form_id = agent.id.clone();
-                                    self.form_name = agent.config.name.clone();
-                                    self.form_model = agent.config.model.clone();
-                                    self.form_prompt = agent.config.system_prompt.clone();
-                                    self.form_rules = agent.config.rules.clone();
-                                    self.form_optimize_rules = agent.config.optimize.rules.clone();
-                                    self.form_optimize_enabled = agent.config.optimize.enabled;
-                                    self.form_skills = agent.config.skills.join(", ");
-                                    self.form_project_id =
-                                        agent.project_id.clone().unwrap_or_default();
-                                    self.available_projects =
-                                        if let Some(ref pid) = agent.project_id {
-                                            vec![pid.clone()]
-                                        } else {
-                                            self.state
-                                                .context_store
-                                                .list_all_projects()
-                                                .into_iter()
-                                                .map(|c| c.project_id)
-                                                .collect()
-                                        };
-                                    self.form_field_index = 0;
-                                    self.editing_agent = Some(agent.id.clone());
-                                    self.current_view = CurrentView::AgentForm;
-                                    self.load_models().await;
-                                }
-                            }
-                            _ => {}
-                        }
-
-                        // Handle Analysis view keys
-                        if self.current_view == CurrentView::Analysis {
-                            match key.code {
-                                KeyCode::Esc | KeyCode::Tab => {
-                                    self.current_view = CurrentView::Projects
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    self.move_proposal_selection(-1)
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    self.move_proposal_selection(1)
-                                }
-                                KeyCode::Enter => self.approve_selected_proposal(),
-                                KeyCode::Char('a') => self.approve_all_proposals(),
-                                KeyCode::Char('d') => self.discard_selected_proposal(),
-                                KeyCode::Char('r') => {
-                                    // Re-analyze current project
-                                    let projects = self.state.context_store.list_all_projects();
-                                    if let Some(project) = projects.get(self.project_index) {
-                                        let project_id = project.project_id.clone();
-                                        let project_path = project.path.clone();
-                                        self.trigger_analysis(project_id, project_path);
-                                    }
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-
-                        // Handle ContextView keys
-                        if self.current_view == CurrentView::ContextView {
-                            match key.code {
-                                KeyCode::Esc => self.current_view = CurrentView::Projects,
-                                KeyCode::Tab => self.current_view = CurrentView::Projects,
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    self.context_scroll = self.context_scroll.saturating_sub(1);
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    self.context_scroll = self.context_scroll.saturating_add(1);
-                                }
-                                _ => {}
-                            }
-                            continue;
+                        if let DispatchOutcome::Quit = self.dispatch(key) {
+                            break;
                         }
                     }
                     Event::Mouse(mouse) => {
@@ -1473,6 +865,595 @@ impl TuiApp {
         terminal.show_cursor()?;
 
         Ok(())
+    }
+
+    /// One key press, handled against the current screen. `run` owns the
+    /// terminal and the event loop; this only decides what the key means, so
+    /// the whole key map can be exercised without a TTY.
+    fn dispatch(&mut self, key: event::KeyEvent) -> DispatchOutcome {
+        // Optimization tool picker interception
+        //
+        // Above the other dialogs for the same reason: the first guard to match
+        // swallows the key, and this one opens from the agent form like
+        // the rest of them.
+        if self.opt_tools.is_some() {
+            let Some(picker) = self.opt_tools.as_mut() else {
+                unreachable!("guarded on is_some above");
+            };
+            match opt_tools_action(picker, key.code) {
+                OptToolsAction::Applied => {}
+                OptToolsAction::Save { tools, enabled } => {
+                    self.opt_tools = None;
+                    self.form_optimize_rules = tools;
+                    self.form_optimize_enabled = enabled;
+                }
+                OptToolsAction::Cancel => self.opt_tools = None,
+            }
+            return DispatchOutcome::Continue;
+        }
+        // Rule editor interception
+        //
+        // Above the skill picker's guard, not below it: both open
+        // from the agent form, and the order between two dialogs
+        // matters for the same reason it matters between a dialog
+        // and a view — whichever guard comes first swallows the key.
+        if self.rule_editor.is_some() {
+            let Some(editor) = self.rule_editor.as_mut() else {
+                unreachable!("guarded on is_some above");
+            };
+            match rule_action(editor, key) {
+                RuleAction::Applied => {}
+                RuleAction::Done(rules) => {
+                    self.rule_editor = None;
+                    self.form_rules = rules;
+                }
+            }
+            return DispatchOutcome::Continue;
+        }
+        // Delete confirmation interception
+        if self.confirm_delete.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let action = self.confirm_delete.take();
+                    if let Some((ref confirm_type, ref confirm_id)) = action {
+                        match confirm_type.as_str() {
+                            "project" => {
+                                let _ = self.state.context_store.delete_context(confirm_id);
+                                self.project_index = 0;
+                            }
+                            "agent" => {
+                                let agents = self.state.agent_registry.list_agents();
+                                if let Some(agent) = agents.iter().find(|a| a.id == *confirm_id) {
+                                    let path = if let Some(ref pid) = agent.project_id {
+                                        crate::core::paths::get_project_agents_dir(pid)
+                                            .join(format!("{}.toml", agent.id))
+                                    } else {
+                                        crate::core::paths::get_agents_dir()
+                                            .join(format!("{}.toml", agent.id))
+                                    };
+                                    let _ = std::fs::remove_file(path);
+                                    let _ = self.state.agent_registry.reload_all(&[]);
+                                }
+                                self.agent_index = 0;
+                                // Not just the index: the focus has
+                                // to leave a list that may now be
+                                // empty, or the footer keeps
+                                // naming the agent keys over rows
+                                // that are gone.
+                                self.active_in_project_list = focus_after_agent_delete();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.confirm_delete = None;
+                }
+                _ => {}
+            }
+            return DispatchOutcome::Continue;
+        }
+        // Skill picker interception
+        if self.skill_picker.is_some() {
+            let Some(picker) = self.skill_picker.as_mut() else {
+                unreachable!("guarded on is_some above");
+            };
+            // The key map lives in `picker_action` so it can be
+            // tested: this arm used to spell the rules out inline,
+            // where no test could reach them — and where, written
+            // below the form's own guard, none of them ran.
+            match picker_action(picker, key.code) {
+                PickerAction::Applied => {}
+                PickerAction::Save(ids) => {
+                    self.skill_picker = None;
+                    self.form_skills = ids.join(", ");
+                }
+                PickerAction::Cancel => self.skill_picker = None,
+            }
+            return DispatchOutcome::Continue;
+        }
+        if self.current_view == CurrentView::AgentForm {
+            match key.code {
+                KeyCode::Esc => self.current_view = CurrentView::Projects,
+                KeyCode::Tab | KeyCode::Down => {
+                    self.form_field_index = (self.form_field_index + 1) % 8
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.form_field_index = if self.form_field_index == 0 {
+                        7
+                    } else {
+                        self.form_field_index - 1
+                    }
+                }
+                KeyCode::Left | KeyCode::Right => {
+                    if self.form_field_index == 2 && !self.available_models.is_empty() {
+                        let current_idx = self
+                            .available_models
+                            .iter()
+                            .position(|m| m == &self.form_model)
+                            .unwrap_or(0);
+                        let next_idx = if key.code == KeyCode::Right {
+                            (current_idx + 1) % self.available_models.len()
+                        } else {
+                            if current_idx == 0 {
+                                self.available_models.len() - 1
+                            } else {
+                                current_idx - 1
+                            }
+                        };
+                        self.form_model = self.available_models[next_idx].clone();
+                    } else if self.form_field_index == 3 && !self.available_projects.is_empty() {
+                        let current_idx = self
+                            .available_projects
+                            .iter()
+                            .position(|p| p == &self.form_project_id)
+                            .unwrap_or(0);
+                        let next_idx = if key.code == KeyCode::Right {
+                            (current_idx + 1) % self.available_projects.len()
+                        } else {
+                            if current_idx == 0 {
+                                self.available_projects.len() - 1
+                            } else {
+                                current_idx - 1
+                            }
+                        };
+                        self.form_project_id = self.available_projects[next_idx].clone();
+                    }
+                }
+                KeyCode::Enter => {
+                    if self.form_field_index == 7 {
+                        self.form_prompt.push('\n');
+                    } else {
+                        self.form_field_index = (self.form_field_index + 1) % 8;
+                    }
+                }
+                KeyCode::Char('s') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                    // Save agent
+                    let project_id = &self.form_project_id;
+                    // Already a list. It used to be joined with
+                    // commas and split here, which is what made a
+                    // rule containing a comma silently become two
+                    // rules with nothing on screen saying so.
+                    let rules_vec: Vec<String> = self.form_rules.clone();
+                    // Already a list. It used to be joined with commas
+                    // and split here, which is what made a tool name
+                    // containing a comma indistinguishable from two
+                    // tools — and a name matching no tool was already
+                    // a silent no-op, so the split only added ways to
+                    // get one by accident.
+                    let opt_rules_vec: Vec<String> = self.form_optimize_rules.clone();
+                    let skills_vec: Vec<String> = self
+                        .form_skills
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+
+                    let rules_str = if rules_vec.is_empty() {
+                        "[]".to_string()
+                    } else {
+                        format!("{:?}", rules_vec)
+                    };
+                    let opt_rules_str = if opt_rules_vec.is_empty() {
+                        "[]".to_string()
+                    } else {
+                        format!("{:?}", opt_rules_vec)
+                    };
+                    let skills_str = if skills_vec.is_empty() {
+                        "[]".to_string()
+                    } else {
+                        format!("{:?}", skills_vec)
+                    };
+
+                    let toml_content = format!(
+                    "name = \"{}\"\nmodel = \"{}\"\nsystem_prompt = \"\"\"\n{}\n\"\"\"\ncontext_project = \"{}\"\nrules = {}\nskills = {}\n\n[optimize]\nenabled = {}\nrules = {}\n",
+                    self.form_name, self.form_model, self.form_prompt, project_id, rules_str, skills_str, self.form_optimize_enabled, opt_rules_str
+                );
+                    let path = crate::core::paths::get_project_agents_dir(project_id)
+                        .join(format!("{}.toml", self.form_id));
+                    let _ = std::fs::write(path, toml_content);
+                    let _ = self.state.agent_registry.reload_all(&[]);
+                    self.current_view = CurrentView::Projects;
+                }
+                // The skills field is not typed into. `s` opens
+                // the picker instead, because `Enter` already
+                // means "next field" here and cannot be freed.
+                KeyCode::Char('s') if self.form_field_index == SKILLS_FIELD => {
+                    self.skill_picker = Some(self.skill_picker_over(&self.form_project_id));
+                }
+                // Opens the tool picker. Modified, because `o` is a
+                // letter the user would otherwise type into the field.
+                KeyCode::Char('o')
+                    if self.form_field_index == OPTIMIZE_FIELD
+                        && key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                {
+                    self.open_opt_tools_with(None);
+                }
+                // Opens the rule editor over the list this field
+                // joins into a line. Modified, because a bare letter
+                // here would be a letter the user could not type into
+                // their own rules.
+                KeyCode::Char('r')
+                    if self.form_field_index == RULES_FIELD
+                        && key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                {
+                    self.open_rule_editor_with(None);
+                }
+                KeyCode::Char(c) => match self.form_field_index {
+                    0 => self.form_id.push(c),
+                    1 => self.form_name.push(c),
+                    2 => self.form_model.push(c),
+                    3 => {} // Project is handled by arrows
+                    // The rules row is a one-line join of a list, so
+                    // there is nothing here to append to. Swallowing
+                    // the key would make the row look editable and
+                    // do nothing — the field that looked broken when
+                    // the picker shipped inert. Typing here opens the
+                    // editor and lands the character in it.
+                    4 => self.open_rule_editor_with(Some(c)),
+                    5 => self.open_opt_tools_with(Some(c)),
+                    6 => {} // Skills is chosen in the picker
+                    7 => self.form_prompt.push(c),
+                    _ => {}
+                },
+                KeyCode::Backspace => match self.form_field_index {
+                    0 => {
+                        self.form_id.pop();
+                    }
+                    1 => {
+                        self.form_name.pop();
+                    }
+                    2 => {
+                        self.form_model.pop();
+                    }
+                    4 => {
+                        // Opens the editor and deletes nothing.
+                        // Backspacing the join is ambiguous — the
+                        // last character may belong to the last
+                        // rule, or it may be the separator — and
+                        // the editor is where a deletion can be
+                        // seen before it happens.
+                        self.open_rule_editor_with(None);
+                    }
+                    5 => self.open_opt_tools_with(None),
+                    6 => {
+                        self.form_skills.pop();
+                    }
+                    7 => {
+                        self.form_prompt.pop();
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+            return DispatchOutcome::Continue;
+        }
+
+        // Confirm delete interception
+
+        // Chat view handling
+        if self.current_view == CurrentView::Chat {
+            // Composing the message comes first, and it is
+            // routed by `chat_input_action` so the Enter vs
+            // Shift+Enter rule is testable without a terminal.
+            match chat_input_action(key, self.chat_loading.load(Ordering::SeqCst)) {
+                ChatAction::Edit(c) => self.chat_input.push(c),
+                ChatAction::Backspace => {
+                    self.chat_input.pop();
+                }
+                ChatAction::Newline => self.chat_input.push('\n'),
+                ChatAction::Send => self.send_chat_message(),
+                ChatAction::Other => {}
+            }
+
+            // Everything below needs app state: navigation,
+            // agent cycling, and scrolling the messages.
+            match key.code {
+                KeyCode::Esc => {
+                    self.current_view = CurrentView::Projects;
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    // Let Tab fall through to main navigation
+                }
+                KeyCode::Left => {
+                    self.refresh_available_agents();
+                    let count = self.available_agents.len();
+                    if count > 0 {
+                        self.chat_agent_index = if self.chat_agent_index == 0 {
+                            count - 1
+                        } else {
+                            self.chat_agent_index - 1
+                        };
+                        self.update_chat_selected_agent();
+                    }
+                }
+                KeyCode::Right => {
+                    self.refresh_available_agents();
+                    let count = self.available_agents.len();
+                    if count > 0 {
+                        self.chat_agent_index = (self.chat_agent_index + 1) % count;
+                        self.update_chat_selected_agent();
+                    }
+                }
+                KeyCode::Up => {
+                    if self.chat_auto_scroll {
+                        // Jumping out of follow mode puts us at
+                        // the bottom, so one step up = last row.
+                        self.chat_scroll = self.chat_scroll_max;
+                        self.chat_auto_scroll = false;
+                    } else if self.chat_scroll > 0 {
+                        self.chat_scroll -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    self.chat_auto_scroll = false;
+                    if self.chat_scroll >= self.chat_scroll_max {
+                        // Reached the bottom: re-arm follow mode
+                        // so new messages keep flowing in.
+                        self.chat_auto_scroll = true;
+                    } else {
+                        self.chat_scroll = self.chat_scroll.saturating_add(1);
+                    }
+                }
+                KeyCode::PageUp => {
+                    if self.chat_auto_scroll {
+                        // Start paging up from the bottom.
+                        self.chat_scroll = self.chat_scroll_max;
+                    }
+                    self.chat_auto_scroll = false;
+                    self.chat_scroll = self.chat_scroll.saturating_sub(self.page_step());
+                }
+                KeyCode::PageDown => {
+                    self.chat_auto_scroll = false;
+                    self.chat_scroll = self.chat_scroll.saturating_add(self.page_step());
+                    if self.chat_scroll >= self.chat_scroll_max {
+                        self.chat_scroll = self.chat_scroll_max;
+                        self.chat_auto_scroll = true;
+                    }
+                }
+                KeyCode::Home => {
+                    self.chat_auto_scroll = false;
+                    self.chat_scroll = 0;
+                }
+                KeyCode::End => {
+                    self.chat_auto_scroll = true;
+                    self.chat_scroll = usize::MAX;
+                }
+                _ => {}
+            }
+            if key.code != KeyCode::Tab && key.code != KeyCode::BackTab {
+                return DispatchOutcome::Continue;
+            }
+        }
+
+        match key.code {
+            KeyCode::Char('q') => return DispatchOutcome::Quit,
+            KeyCode::Tab => {
+                self.current_view = match self.current_view {
+                    CurrentView::Dashboard => CurrentView::Projects,
+                    CurrentView::Projects => CurrentView::Chat,
+                    CurrentView::Chat => CurrentView::Dashboard,
+                    _ => self.current_view.clone(),
+                };
+                if self.current_view == CurrentView::Chat {
+                    self.refresh_available_agents();
+                    self.chat_auto_scroll = true;
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.current_view == CurrentView::Projects {
+                    if self.active_in_project_list {
+                        let count = self.state.context_store.list_all_projects().len();
+                        if count > 0 {
+                            self.project_index = (self.project_index + 1) % count;
+                            self.agent_index = 0;
+                        }
+                    } else {
+                        self.agent_index = move_agent_selection(
+                            self.project_list_bounds,
+                            self.agent_index,
+                            self.project_agents().len(),
+                            1,
+                        );
+                    }
+                } else if self.current_view == CurrentView::Dashboard {
+                    self.log_scroll = self.log_scroll.saturating_add(1);
+                } else if self.current_view == CurrentView::ContextView {
+                    self.context_scroll = self.context_scroll.saturating_add(1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.current_view == CurrentView::Projects {
+                    if self.active_in_project_list {
+                        let count = self.state.context_store.list_all_projects().len();
+                        if count > 0 {
+                            self.project_index = if self.project_index == 0 {
+                                count - 1
+                            } else {
+                                self.project_index - 1
+                            };
+                            self.agent_index = 0;
+                        }
+                    } else {
+                        self.agent_index = move_agent_selection(
+                            self.project_list_bounds,
+                            self.agent_index,
+                            self.project_agents().len(),
+                            -1,
+                        );
+                    }
+                } else if self.current_view == CurrentView::Dashboard {
+                    self.log_scroll = self.log_scroll.saturating_sub(1);
+                } else if self.current_view == CurrentView::ContextView {
+                    self.context_scroll = self.context_scroll.saturating_sub(1);
+                }
+            }
+            // Focus moves between the two lists the projects view draws: the project
+            // rows and the agent rows below them. Which way it may go depends on
+            // where the focus is now — see `may_move_list_focus`, which is the
+            // whole of the rule.
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('h') | KeyCode::Left => {
+                if self.current_view == CurrentView::Projects
+                    && may_move_list_focus(self.project_list_bounds, self.active_in_project_list)
+                {
+                    self.active_in_project_list = !self.active_in_project_list;
+                }
+            }
+            KeyCode::Char('a') => {
+                if self.current_view == CurrentView::Projects {
+                    let projects = self.state.context_store.list_all_projects();
+                    if let Some(project) = projects.get(self.project_index) {
+                        let project_id = project.project_id.clone();
+                        let project_path = project.path.clone();
+                        self.trigger_analysis(project_id, project_path);
+                        self.current_view = CurrentView::Analysis;
+                    }
+                }
+            }
+            KeyCode::Char('v') => {
+                if self.current_view == CurrentView::Projects {
+                    self.current_view = CurrentView::ContextView;
+                }
+            }
+            KeyCode::Char('d') => {
+                if self.current_view == CurrentView::Projects {
+                    if self.active_in_project_list {
+                        let projects = self.state.context_store.list_all_projects();
+                        if let Some(project) = projects.get(self.project_index) {
+                            self.confirm_delete =
+                                Some(("project".to_string(), project.project_id.clone()));
+                        }
+                    } else if let Some(agent) = selected_agent(
+                        self.project_list_bounds,
+                        &self.project_agents(),
+                        self.agent_index,
+                    ) {
+                        self.confirm_delete = Some(("agent".to_string(), agent.id.clone()));
+                    }
+                }
+            }
+            KeyCode::Char('n') => {
+                if self.current_view == CurrentView::Projects {
+                    self.form_id = String::new();
+                    self.form_name = String::new();
+                    self.form_model = String::new();
+                    self.form_prompt = String::new();
+                    self.form_rules = Vec::new();
+                    self.form_optimize_rules = Vec::new();
+                    self.form_optimize_enabled = false;
+                    self.form_skills = String::new();
+                    self.available_projects = self
+                        .state
+                        .context_store
+                        .list_all_projects()
+                        .into_iter()
+                        .map(|c| c.project_id)
+                        .collect();
+                    if let Some(p) = self.available_projects.get(self.project_index) {
+                        self.form_project_id = p.clone();
+                    } else {
+                        self.form_project_id = String::new();
+                    }
+                    self.form_field_index = 0;
+                    self.editing_agent = None;
+                    self.current_view = CurrentView::AgentForm;
+                    self.load_models_blocking();
+                }
+            }
+            KeyCode::Char('e')
+                if self.current_view == CurrentView::Projects && !self.active_in_project_list =>
+            {
+                let agents = self.project_agents();
+                if let Some(agent) =
+                    selected_agent(self.project_list_bounds, &agents, self.agent_index)
+                {
+                    self.form_id = agent.id.clone();
+                    self.form_name = agent.config.name.clone();
+                    self.form_model = agent.config.model.clone();
+                    self.form_prompt = agent.config.system_prompt.clone();
+                    self.form_rules = agent.config.rules.clone();
+                    self.form_optimize_rules = agent.config.optimize.rules.clone();
+                    self.form_optimize_enabled = agent.config.optimize.enabled;
+                    self.form_skills = agent.config.skills.join(", ");
+                    self.form_project_id = agent.project_id.clone().unwrap_or_default();
+                    self.available_projects = if let Some(ref pid) = agent.project_id {
+                        vec![pid.clone()]
+                    } else {
+                        self.state
+                            .context_store
+                            .list_all_projects()
+                            .into_iter()
+                            .map(|c| c.project_id)
+                            .collect()
+                    };
+                    self.form_field_index = 0;
+                    self.editing_agent = Some(agent.id.clone());
+                    self.current_view = CurrentView::AgentForm;
+                    self.load_models_blocking();
+                }
+            }
+            _ => {}
+        }
+
+        // Handle Analysis view keys
+        if self.current_view == CurrentView::Analysis {
+            match key.code {
+                KeyCode::Esc | KeyCode::Tab => self.current_view = CurrentView::Projects,
+                KeyCode::Up | KeyCode::Char('k') => self.move_proposal_selection(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.move_proposal_selection(1),
+                KeyCode::Enter => self.approve_selected_proposal(),
+                KeyCode::Char('a') => self.approve_all_proposals(),
+                KeyCode::Char('d') => self.discard_selected_proposal(),
+                KeyCode::Char('r') => {
+                    // Re-analyze current project
+                    let projects = self.state.context_store.list_all_projects();
+                    if let Some(project) = projects.get(self.project_index) {
+                        let project_id = project.project_id.clone();
+                        let project_path = project.path.clone();
+                        self.trigger_analysis(project_id, project_path);
+                    }
+                }
+                _ => {}
+            }
+            return DispatchOutcome::Continue;
+        }
+
+        // Handle ContextView keys
+        if self.current_view == CurrentView::ContextView {
+            match key.code {
+                KeyCode::Esc => self.current_view = CurrentView::Projects,
+                KeyCode::Tab => self.current_view = CurrentView::Projects,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.context_scroll = self.context_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.context_scroll = self.context_scroll.saturating_add(1);
+                }
+                _ => {}
+            }
+            return DispatchOutcome::Continue;
+        }
+        DispatchOutcome::Continue
     }
 
     /// The editor to open for `rules`, with `first` already typed into the focused
