@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# A stale PR run should never mask the state of the current head.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # The repo links against OpenSSL and needs pkg-config headers for
+      # openssl-sys on a fresh runner.
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      # Report-only on purpose. This repo has 43 pre-existing clippy lints —
+      # 16 of them `MutexGuard` held across an await, which is a concurrency
+      # refactor, not a one-line cleanup. Making clippy a hard gate here would
+      # either block every PR or pressure a rushed mass-fix. The output is in
+      # the log so new lints are visible; the hard gates are fmt and tests.
+      - name: Clippy (report only)
+        run: cargo clippy --all-targets
+
+      - name: Tests
+        run: cargo test --target-dir target-tests

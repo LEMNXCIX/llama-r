@@ -17,7 +17,7 @@ This file documents the current developer workflows and commands for working on 
 - `cargo run` starts the full application: TUI, HTTP API, and gRPC server.
 - On first run, when `DEFAULT_MODEL` is missing **and** a terminal is available, the app enters interactive provider setup and persists the result to `.env`.
 - The provider being unreachable is **not** a startup failure. With `DEFAULT_MODEL` set, llama-r boots degraded and `GET /api/health` reports `"status":"degraded"` with the underlying cause; chat and RAG requests fail with a `502`/`500` naming the connection error. It recovers on its own once the provider is reachable.
-- Without a TTY (systemd, Docker, CI) llama-r never blocks on an interactive prompt: it boots and logs a warning.
+- Without a TTY (systemd, Docker, CI) run `llama-r --server-only` (also accepted as `llama-r run --server-only`): the HTTP and gRPC servers start and stay up until Ctrl-C/SIGTERM, with no TUI. Without that flag the interactive default still starts the TUI — and because `main` aborts both servers when `tui.run()` returns, a headless host without the flag tears them down immediately. `tests/headless_server_tests.rs` pins this: it spawns the real binary with no TTY and polls the real API.
 - Agent routing is **off by default** (`ROUTER_ENABLED=false`): an update that only ships the router changes nothing. When it is enabled, a chat request carrying `X-Project` but no `X-Agent` is routed to that project's most appropriate agent by a Liquid AI d1 decision model. d1 generates no tokens — it evaluates typed questions in one forward pass and returns calibrated probabilities — so Ollama cannot serve it (its endpoints are generative); it runs in a separate `llama-server` process (`llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0`, which serves `POST /v1/systemone`).
 - A missing or unreachable router is **not** a startup failure, mirroring the provider rule above: with `DEFAULT_MODEL` set llama-r boots and logs a warning, `GET /api/health` reports the router's state, and the requests that would have been routed degrade to the project's general agent — a project with no general agent to degrade to keeps failing with `400`, as it did before routing existed.
 - Routing lives inside the shared chat dispatch, so the HTTP chat endpoints and gRPC both inherit it (`src/api/grpc.rs` builds the same `AgentSelection` and calls the same `execute_chat`). The TUI does not route: it is a separate path, and there you pick an agent deliberately.
@@ -68,6 +68,13 @@ Explicit subcommand form:
 
 ```powershell
 cargo run -- run
+```
+
+Headless (systemd, Docker, CI) — no TTY needed, servers stay up until Ctrl-C:
+
+```powershell
+cargo run -- --server-only
+# or: cargo run -- run --server-only
 ```
 
 ### Show CLI Help
