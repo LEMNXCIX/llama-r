@@ -1453,7 +1453,7 @@ impl TuiApp {
             }
             return DispatchOutcome::Continue;
         }
-        return DispatchOutcome::Continue;
+        DispatchOutcome::Continue
     }
 
     /// The editor to open for `rules`, with `first` already typed into the focused

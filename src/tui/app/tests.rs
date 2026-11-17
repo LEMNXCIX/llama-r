@@ -1341,7 +1341,8 @@ fn the_rules_opener_is_not_typed_into_the_form() {
 /// below the form's, the form advances the field and the case names that dialog.
 #[test]
 fn an_open_dialog_consumes_keys_the_form_would_handle() {
-    let cases: Vec<(&str, Box<dyn Fn(&mut TuiApp)>)> = vec![
+    type DialogOpener = Box<dyn Fn(&mut TuiApp)>;
+    let cases: Vec<(&str, DialogOpener)> = vec![
         (
             "the skill picker",
             Box::new(|app| {
