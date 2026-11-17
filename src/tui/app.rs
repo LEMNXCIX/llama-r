@@ -2721,7 +2721,6 @@ mod tests {
     /// from the prompt would swallow a character the user is typing.
     #[test]
     fn only_the_skills_field_opens_the_picker() {
-        let idle = AnalysisState::Idle;
         let drawn = drawn_bounds();
 
         for field in 0..SKILLS_FIELD {
@@ -2744,7 +2743,6 @@ mod tests {
     /// the projects view stays current underneath, so `key_target` has to be told.
     #[test]
     fn the_delete_confirmation_owns_the_footer_while_it_is_up() {
-        let idle = AnalysisState::Idle;
         let drawn = drawn_bounds();
         // Only the projects view opens it, but the check cannot know that: it has to
         // answer `DeleteConfirm` whichever view it is asked about, and over both

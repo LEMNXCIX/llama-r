@@ -6,8 +6,20 @@ use std::path::Path;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Llama-R: High-Performance Personal AI Gateway", long_about = None)]
 pub struct Cli {
+    /// Run the HTTP and gRPC servers without the TUI. For systemd, Docker
+    /// and CI, where there is no terminal for the TUI to take over.
+    #[arg(long, global = true)]
+    pub server_only: bool,
     #[command(subcommand)]
     pub command: Option<Commands>,
+}
+
+/// What `handle_cli` decided: either it ran a one-shot subcommand and the
+/// caller should exit, or it should serve, with or without the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliOutcome {
+    Handled,
+    Serve { server_only: bool },
 }
 
 #[derive(Subcommand, Debug)]
@@ -50,18 +62,18 @@ fn default_server_url() -> String {
     format!("http://localhost:{}", port)
 }
 
-pub async fn handle_cli() -> bool {
+pub async fn handle_cli() -> CliOutcome {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
 
     match &cli.command {
         Some(Commands::Init) => {
             init_default_agent().await;
-            true
+            CliOutcome::Handled
         }
         Some(Commands::InitAgent { name }) => {
             init_named_agent(name).await;
-            true
+            CliOutcome::Handled
         }
         Some(Commands::Analyze {
             path,
@@ -71,12 +83,12 @@ pub async fn handle_cli() -> bool {
         }) => {
             let server = server.clone().unwrap_or_else(default_server_url);
             run_analyze(path, id.as_deref(), agent.as_deref(), &server).await;
-            true
+            CliOutcome::Handled
         }
         Some(Commands::Reanalyze { project_id, server }) => {
             let server = server.clone().unwrap_or_else(default_server_url);
             run_reanalyze(project_id, &server).await;
-            true
+            CliOutcome::Handled
         }
         Some(Commands::ExportRules {
             project_id,
@@ -84,9 +96,11 @@ pub async fn handle_cli() -> bool {
             format,
         }) => {
             run_export_rules(project_id, path, format).await;
-            true
+            CliOutcome::Handled
         }
-        Some(Commands::Run) | None => false,
+        Some(Commands::Run) | None => CliOutcome::Serve {
+            server_only: cli.server_only,
+        },
     }
 }
 

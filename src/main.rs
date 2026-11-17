@@ -1,4 +1,4 @@
-use llama_r::cli::commands::handle_cli;
+use llama_r::cli::commands::{handle_cli, CliOutcome};
 use llama_r::runtime::{build_runtime, start_grpc_server, start_http_server};
 use llama_r::tui::app::TuiApp;
 use std::collections::VecDeque;
@@ -53,9 +53,10 @@ impl<'a> tracing::field::Visit for LogVisitor<'a> {
 
 #[tokio::main]
 async fn main() {
-    if handle_cli().await {
-        return;
-    }
+    let server_only = match handle_cli().await {
+        CliOutcome::Handled => return,
+        CliOutcome::Serve { server_only } => server_only,
+    };
 
     let logs_buffer = Arc::new(Mutex::new(VecDeque::new()));
 
@@ -109,9 +110,20 @@ async fn main() {
     };
     let grpc_server = start_grpc_server(&runtime);
 
-    let mut tui = TuiApp::new(runtime.state.clone());
-    if let Err(err) = tui.run().await {
-        tracing::error!(error = %err, "TUI exited with error");
+    if server_only {
+        // Without a terminal there is no TUI to run. Previously the TUI was
+        // started unconditionally, failed on a headless host, and the abort
+        // below took both servers down with it — so the documented
+        // systemd/Docker/CI path could not actually serve anything.
+        tracing::info!("Running without a TUI; press Ctrl-C to stop");
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %err, "Failed to listen for Ctrl-C");
+        }
+    } else {
+        let mut tui = TuiApp::new(runtime.state.clone());
+        if let Err(err) = tui.run().await {
+            tracing::error!(error = %err, "TUI exited with error");
+        }
     }
 
     http_server.abort();

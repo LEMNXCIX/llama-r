@@ -140,14 +140,14 @@ fn every_dialog_is_intercepted_before_the_view_it_sits_over() {
         .nth(1)
         .expect("src/tui/app.rs no longer has TuiApp::run");
 
-    /// The guard that owns `body_marker`: the nearest `guard` at or above it.
-    ///
-    /// Searching backwards from something unique *inside* each guard, rather than
-    /// forwards for the `if`. Every field name here also appears earlier in `run` —
-    /// the expression that silences the chrome footer while a dialog is up mentions
-    /// all three — and a forward `find` was silently pinning the footer expression
-    /// instead of the guard, which made this test pass with the guards in exactly
-    /// the wrong order.
+    // The guard that owns `body_marker`: the nearest `guard` at or above it.
+    //
+    // Searching backwards from something unique *inside* each guard, rather than
+    // forwards for the `if`. Every field name here also appears earlier in `run` —
+    // the expression that silences the chrome footer while a dialog is up mentions
+    // all three — and a forward `find` was silently pinning the footer expression
+    // instead of the guard, which made this test pass with the guards in exactly
+    // the wrong order.
     let guard_of = |body_marker: &str, guard: &str| -> usize {
         let body = loop_body
             .find(body_marker)
