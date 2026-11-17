@@ -29,7 +29,7 @@ pub struct AgentSelection<'a> {
 ///
 /// The pair is deliberately the same one [`AgentSelection`] would have
 /// carried — routing fills the hole `X-Agent` would have filled and nothing
-/// else — so [`engine_target`] cannot tell a routed request from a
+/// else — so `engine_target` in the chat module cannot tell a routed request from a
 /// header-pinned one, and nothing downstream of it knows routing exists.
 /// `routed` is `None` on every path that did not consult the router, which
 /// is how the debug surface hangs off dispatch without touching it.
