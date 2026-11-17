@@ -1244,3 +1244,152 @@ fn the_bar_marks_whichever_view_is_active() {
         );
     }
 }
+
+/// A `TuiApp` on the agent form with its caret at `field`, built without a
+/// terminal.
+///
+/// `TuiApp::new` never touches the terminal, and none of the keys these tests
+/// inject reach `load_models_blocking`, so a plain `#[test]` is enough. A real
+/// `AppState` (over an inert provider) rather than a hand-built struct means the
+/// picker's opener can resolve its project and the dialog constructors see the
+/// same registry the shipped app uses.
+fn app_on_form_field(field: usize) -> TuiApp {
+    use crate::adapters::mcp::StaticMcpRegistry;
+    use crate::context::store::ContextStore;
+    use crate::ports::mcp::McpServerRegistry;
+    use crate::providers::ollama::OllamaProvider;
+    use crate::runtime::build_app_state;
+    use crate::services::agent_registry::AgentRegistry;
+    use crate::services::skill_manager::SkillManager;
+    use std::collections::VecDeque;
+
+    let state = build_app_state(
+        Arc::new(OllamaProvider::new("http://localhost:11434".to_string())),
+        Arc::new(AgentRegistry::new()),
+        Arc::new(SkillManager::new()),
+        Arc::new(ContextStore::new()),
+        "llama3".to_string(),
+        Arc::new(Mutex::new(VecDeque::new())),
+        Vec::new(),
+        Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut app = TuiApp::new(state);
+    app.current_view = CurrentView::AgentForm;
+    app.form_field_index = field;
+    app
+}
+
+/// `s` on the skills field opens the picker rather than being swallowed by the
+/// form's catch-all typing arm.
+///
+/// The two assertions distinguish the two outcomes: with the opener above the
+/// typing arm the picker is up and no skill id was typed, while with the arms
+/// swapped the catch-all claims the `s` (field 6 is a no-op there) and no picker
+/// opens. This is the behaviour `a_dialog_opener_outranks_the_typing_arm` used
+/// to check by source position.
+#[test]
+fn the_picker_opener_is_not_typed_into_the_form() {
+    let mut app = app_on_form_field(SKILLS_FIELD);
+    assert!(app.skill_picker.is_none(), "no picker up before the key");
+
+    app.dispatch(key(KeyCode::Char('s'), KeyModifiers::NONE));
+
+    assert_eq!(app.form_skills, "", "the skills field is not typed into");
+    assert!(
+        app.skill_picker.is_some(),
+        "`s` on the skills field must open the picker, not fall through to the typing arm"
+    );
+}
+
+/// `Ctrl+R` on the rules field opens the editor with nothing pre-typed, rather
+/// than reaching the form's catch-all typing arm.
+///
+/// The editor's contents are asserted as well as its presence: if the typing
+/// arm were moved above the opener it would still open an editor, but with an
+/// `r` typed into it — a rule the user never wrote. That is the observable
+/// difference the source-position guard could only infer from arm order.
+#[test]
+fn the_rules_opener_is_not_typed_into_the_form() {
+    let mut app = app_on_form_field(RULES_FIELD);
+    assert!(app.rule_editor.is_none(), "no editor up before the key");
+
+    app.dispatch(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+
+    assert!(app.form_rules.is_empty(), "the rules list is untouched");
+    let editor = app
+        .rule_editor
+        .as_ref()
+        .expect("Ctrl+R on the rules field must open the editor");
+    assert!(
+        editor.rules.is_empty(),
+        "the opener passes no character through; a typing arm would have put `r` in: \
+         {:?}",
+        editor.rules
+    );
+}
+
+/// Every dialog owns `Tab` while it is up, even over the agent form.
+///
+/// The form's `Tab` advances `form_field_index`; each dialog swallows it. One
+/// case per dialog mirrors the four source checks `every_dialog_is_intercepted_
+/// before_the_view_it_sits_over` used to make. If any dialog's guard ever sits
+/// below the form's, the form advances the field and the case names that dialog.
+#[test]
+fn an_open_dialog_consumes_keys_the_form_would_handle() {
+    let cases: Vec<(&str, Box<dyn Fn(&mut TuiApp)>)> = vec![
+        (
+            "the skill picker",
+            Box::new(|app| {
+                app.skill_picker = Some(SkillPicker::for_agent(vec![], &[], &[]));
+            }),
+        ),
+        (
+            "the rule editor",
+            Box::new(|app| {
+                app.rule_editor = Some(rule_editor_opening(&[], None));
+            }),
+        ),
+        (
+            "the optimization-tool picker",
+            Box::new(|app| {
+                app.opt_tools = Some(OptTools::for_agent(&[]));
+            }),
+        ),
+        (
+            "the delete confirmation",
+            Box::new(|app| {
+                app.confirm_delete = Some(("agent".to_string(), "ops".to_string()));
+            }),
+        ),
+    ];
+
+    for (label, open) in cases {
+        let mut app = app_on_form_field(0);
+        open(&mut app);
+        let field = app.form_field_index;
+        let view = app.current_view.clone();
+        let skills = app.form_skills.clone();
+        let rules = app.form_rules.clone();
+
+        let outcome = app.dispatch(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(
+            matches!(outcome, DispatchOutcome::Continue),
+            "{label} kept the key inside the dialog, so the loop continues"
+        );
+        assert_eq!(
+            app.form_field_index, field,
+            "{label} let Tab reach the form's field navigation"
+        );
+        assert_eq!(
+            app.current_view, view,
+            "{label} changed the view underneath"
+        );
+        assert_eq!(app.form_skills, skills, "{label} changed form_skills");
+        assert_eq!(app.form_rules, rules, "{label} changed form_rules");
+    }
+}
