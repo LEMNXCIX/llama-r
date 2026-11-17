@@ -82,19 +82,16 @@ fn state() -> Arc<AppState> {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("LLAMA_R_DIR", dir.path());
     std::mem::forget(dir); // keep the path valid for the whole test
+    let stack =
+        llama_r::services::provider_stack::ProviderStack::new(Arc::new(FakeProvider), "fallback");
     llama_r::runtime::build_app_state(
-        Arc::new(FakeProvider),
+        stack,
         Arc::new(llama_r::services::agent_registry::AgentRegistry::new()),
         Arc::new(llama_r::services::skill_manager::SkillManager::new()),
         Arc::new(llama_r::context::store::ContextStore::new()),
-        "fallback".to_string(),
         Arc::new(std::sync::Mutex::new(VecDeque::new())),
         Vec::new(),
         Arc::new(StaticMcpRegistry::new()) as Arc<dyn llama_r::ports::mcp::McpServerRegistry>,
-        None,
-        None,
-        None,
-        None,
         None,
     )
 }

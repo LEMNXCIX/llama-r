@@ -89,19 +89,18 @@ fn free_addr() -> SocketAddr {
 async fn a_real_grpc_chat_round_trip_uses_the_generated_codec() {
     let addr = free_addr();
 
-    let state: Arc<AppState> = build_app_state(
+    let stack = llama_r::services::provider_stack::ProviderStack::new(
         Arc::new(EchoProvider) as Arc<dyn LLMProvider + Send + Sync>,
+        "fallback-model",
+    );
+    let state: Arc<AppState> = build_app_state(
+        stack,
         Arc::new(AgentRegistry::new()),
         Arc::new(SkillManager::new()),
         Arc::new(ContextStore::new()),
-        "fallback-model".to_string(),
         Arc::new(Mutex::new(VecDeque::new())),
         Vec::new(),
         Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
-        None,
-        None,
-        None,
-        None,
         None,
     );
 

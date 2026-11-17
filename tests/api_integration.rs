@@ -231,19 +231,15 @@ fn setup_app() -> TestApp {
     let provider = Arc::new(FakeProvider::new());
     let logs = Arc::new(Mutex::new(VecDeque::new()));
     let mcp_registry: Arc<dyn McpServerRegistry> = Arc::new(StaticMcpRegistry::new());
+    let stack = llama_r::services::provider_stack::ProviderStack::new(provider, "fallback-model");
     let state = build_app_state(
-        provider,
+        stack,
         agent_registry.clone(),
         skill_manager,
         context_store,
-        "fallback-model".to_string(),
         logs,
         Vec::new(),
         mcp_registry,
-        None,
-        None,
-        None,
-        None,
         None,
     );
     let router = build_router(state.clone());
@@ -935,5 +931,152 @@ async fn a_put_preserves_a_curated_routing_hint_and_description() {
     assert!(
         saved.contains("Solo facturacion."),
         "PUT erased the routing hint: {saved}"
+    );
+}
+
+/// A provider whose `chat` call is observable (`started`) and, for provider A,
+/// slow enough that a stack swap lands while the request is in flight.
+struct SwapProvider {
+    tag: &'static str,
+    started: Arc<AtomicBool>,
+    delay_ms: u64,
+}
+
+#[async_trait]
+impl LLMProvider for SwapProvider {
+    fn get_base_url(&self) -> String {
+        format!("http://swap-{}", self.tag)
+    }
+
+    async fn health_check(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error + Send + Sync>> {
+        Ok(vec![ModelInfo {
+            name: "swap-model".to_string(),
+            modified_at: "2026-11-17T00:00:00Z".to_string(),
+            size: 1,
+        }])
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<ChatResponse, Box<dyn Error + Send + Sync>> {
+        self.started.store(true, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        Ok(ChatResponse {
+            model: request.model,
+            created_at: "2026-11-17T00:00:00Z".to_string(),
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: self.tag.to_string(),
+            },
+            done: true,
+            debug_prompt: None,
+            debug_route: None,
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, Box<dyn Error + Send + Sync>>> + Send>>,
+        Box<dyn Error + Send + Sync>,
+    > {
+        Err("streaming not used by the swap test".into())
+    }
+}
+
+// The std env lock is held deliberately across the awaits: it serialises this
+// suite's `ROUTER_*`/`LLAMA_R_DIR` access across the shared test runtime, the
+// same discipline `TestApp` uses for every other test in this file.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_provider_swap_does_not_disturb_requests_already_in_flight() {
+    let _guard = test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _router_env = RouterEnvGuard::cleared();
+    let temp_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("LLAMA_R_DIR", temp_dir.path());
+    std::env::set_var("DEFAULT_MODEL", "swap-model");
+
+    let started = Arc::new(AtomicBool::new(false));
+    let provider_a = Arc::new(SwapProvider {
+        tag: "A",
+        started: started.clone(),
+        delay_ms: 250,
+    });
+    let provider_b = Arc::new(SwapProvider {
+        tag: "B",
+        started: Arc::new(AtomicBool::new(false)),
+        delay_ms: 0,
+    });
+
+    let stack_a = llama_r::services::provider_stack::ProviderStack::new(provider_a, "swap-model");
+    let state = build_app_state(
+        stack_a,
+        Arc::new(AgentRegistry::new()),
+        Arc::new(SkillManager::new()),
+        Arc::new(ContextStore::new()),
+        Arc::new(Mutex::new(VecDeque::new())),
+        Vec::new(),
+        Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
+        None,
+    );
+    let router = build_router(state.clone());
+
+    let chat_body = |content: &str| {
+        serde_json::json!({
+            "model": "swap-model",
+            "messages": [{ "role": "user", "content": content }],
+            "stream": false
+        })
+        .to_string()
+    };
+    let send = |r: axum::Router, body: String| async move {
+        let response = r
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        body_json(response).await
+    };
+
+    // A begins first and is slow enough that the swap lands mid-chat.
+    let in_flight = tokio::spawn(send(router.clone(), chat_body("first")));
+    while !started.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+
+    // Replace the whole stack while A is still answering. A's in-flight request
+    // holds a cloned Arc to the old stack and must finish on provider A.
+    state
+        .replace_services(llama_r::services::provider_stack::ProviderStack::new(
+            provider_b,
+            "swap-model",
+        ))
+        .await;
+
+    let first = in_flight.await.unwrap();
+    assert_eq!(
+        first["message"]["content"], "A",
+        "a request already in flight must finish on the old stack"
+    );
+
+    // A request that starts after the swap sees provider B.
+    let second = send(router.clone(), chat_body("second")).await;
+    assert_eq!(
+        second["message"]["content"], "B",
+        "a request started after the swap must use the new stack"
     );
 }

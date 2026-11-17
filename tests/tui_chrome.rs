@@ -431,19 +431,18 @@ fn fixture_state(dir: &std::path::Path) -> std::sync::Arc<llama_r::api::handlers
     }
     agent_registry.reload_all(&[]).unwrap();
 
-    build_app_state(
+    let stack = llama_r::services::provider_stack::ProviderStack::new(
         Arc::new(OllamaProvider::new("http://localhost:11434".to_string())),
+        "llama3",
+    );
+    build_app_state(
+        stack,
         agent_registry,
         Arc::new(SkillManager::new()),
         context_store,
-        "llama3".to_string(),
         Arc::new(Mutex::new(VecDeque::new())),
         Vec::new(),
         Arc::new(StaticMcpRegistry::new()),
-        None,
-        None,
-        None,
-        None,
         None,
     )
 }

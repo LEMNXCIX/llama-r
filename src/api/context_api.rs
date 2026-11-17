@@ -108,7 +108,7 @@ pub async fn create_context(
     }
 
     if req.auto_analyze {
-        let provider = state.provider.clone();
+        let provider = state.services_snapshot().await.provider.clone();
         let responder = move |prompt: String| {
             let provider = provider.clone();
             Box::pin(async move {
@@ -255,7 +255,7 @@ pub async fn analyze_project(
         .get_context(&id)
         .ok_or_else(|| AppError::NotFound(format!("Context '{}' not found", id)))?;
 
-    let provider = state.provider.clone();
+    let provider = state.services_snapshot().await.provider.clone();
     let path = existing.path.clone();
     let responder = move |prompt: String| {
         let provider = provider.clone();

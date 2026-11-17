@@ -45,6 +45,16 @@ use tokio_stream::{Stream, StreamExt};
 
 static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// Swap only the decision router in a state's provider stack. Every other
+/// handle in the stack is an `Arc`, so cloning and replacing the whole stack
+/// leaves the rest of the fixture untouched. The accessors drop their guard
+/// before returning, so no lock is held across the awaits here.
+async fn install_router(state: &Arc<AppState>, router: Option<Arc<dyn DecisionRouter>>) {
+    let mut stack = (*state.services_snapshot().await).clone();
+    stack.router = router;
+    state.replace_services(stack).await;
+}
+
 const ROUTER_ENV_VARS: &[&str] = &[
     "ROUTER_ENABLED",
     "ROUTER_URL",
@@ -380,19 +390,18 @@ fn state_pointed_at(url: &str, min_confidence: &str, min_specialised: &str) -> F
     registry.reload_all(&[]).unwrap();
     let provider = Arc::new(RecordingProvider::new("respuesta"));
 
-    let state = build_app_state(
+    let stack = llama_r::services::provider_stack::ProviderStack::new(
         provider.clone() as Arc<dyn LLMProvider + Send + Sync>,
+        "fallback-model",
+    );
+    let state = build_app_state(
+        stack,
         Arc::new(registry),
         Arc::new(SkillManager::new()),
         Arc::new(ContextStore::new()),
-        "fallback-model".to_string(),
         Arc::new(Mutex::new(VecDeque::new())),
         Vec::new(),
         Arc::new(llama_r::adapters::mcp::StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
-        None,
-        None,
-        None,
-        None,
         None,
     );
 
@@ -835,8 +844,11 @@ async fn a_disabled_router_is_never_contacted_over_the_wire() {
     // is exactly the state a future refactor of `build_app_state` could produce.
     std::env::set_var("ROUTER_ENABLED", "false");
     let state = rebuild_with_config(&f);
-    *state.router.write().unwrap() =
-        Some(Arc::new(LlamaCppRouter::new(server.url(), "d1-3b", 3000)));
+    install_router(
+        &state,
+        Some(Arc::new(LlamaCppRouter::new(server.url(), "d1-3b", 3000))),
+    )
+    .await;
     assert!(
         !state.router_config.enabled,
         "the config must say routing is off for this test to mean anything"
@@ -956,19 +968,18 @@ async fn the_adapter_alone_parses_a_documented_shape_response() {
 fn rebuild_with_config(fixture: &Fixture) -> Arc<AppState> {
     let registry = AgentRegistry::new();
     registry.reload_all(&[]).unwrap();
-    build_app_state(
+    let stack = llama_r::services::provider_stack::ProviderStack::new(
         fixture.provider.clone() as Arc<dyn LLMProvider + Send + Sync>,
+        "fallback-model",
+    );
+    build_app_state(
+        stack,
         Arc::new(registry),
         Arc::new(SkillManager::new()),
         Arc::new(ContextStore::new()),
-        "fallback-model".to_string(),
         Arc::new(Mutex::new(VecDeque::new())),
         Vec::new(),
         Arc::new(llama_r::adapters::mcp::StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
-        None,
-        None,
-        None,
-        None,
         None,
     )
 }

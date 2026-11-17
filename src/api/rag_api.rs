@@ -149,10 +149,11 @@ pub async fn rag_ingest(
 ) -> Result<impl IntoResponse, AppError> {
     state.observability.record_http_request();
 
-    let store = state.rag_store.as_ref().ok_or_else(|| {
+    let services = state.services_snapshot().await;
+    let store = services.rag_store.as_ref().ok_or_else(|| {
         AppError::Unavailable("RAG is disabled (RAG_ENABLED=false or unavailable)".into())
     })?;
-    let ingest = state
+    let ingest = services
         .rag_ingest
         .clone()
         .unwrap_or_else(|| Arc::new(RagIngestService::new(store.clone())));
@@ -231,7 +232,8 @@ pub async fn rag_delete_document(
 ) -> Result<impl IntoResponse, AppError> {
     state.observability.record_http_request();
 
-    let ingest = state
+    let services = state.services_snapshot().await;
+    let ingest = services
         .rag_ingest
         .clone()
         .ok_or_else(|| AppError::Unavailable("RAG is disabled (RAG_ENABLED=false)".into()))?;
@@ -256,7 +258,8 @@ pub async fn rag_query(
 ) -> Result<impl IntoResponse, AppError> {
     state.observability.record_http_request();
 
-    let store = state.rag_store.as_ref().ok_or_else(|| {
+    let services = state.services_snapshot().await;
+    let store = services.rag_store.as_ref().ok_or_else(|| {
         AppError::Unavailable("RAG is disabled (RAG_ENABLED=false or unavailable)".into())
     })?;
 

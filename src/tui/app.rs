@@ -221,7 +221,8 @@ impl TuiApp {
     }
 
     async fn load_models(&mut self) {
-        match self.state.provider.list_models().await {
+        let services = self.state.services_snapshot().await;
+        match services.provider.list_models().await {
             Ok(models) => {
                 self.available_models = models.into_iter().map(|m| m.name).collect();
                 if !self.available_models.is_empty() && self.form_model.is_empty() {
@@ -259,7 +260,7 @@ impl TuiApp {
         });
 
         tokio::spawn(async move {
-            let provider = state.provider.clone();
+            let provider = state.services_snapshot().await.provider.clone();
             let responder = move |prompt: String| {
                 let provider = provider.clone();
                 Box::pin(async move {
@@ -300,9 +301,10 @@ impl TuiApp {
                     log::info!("TUI Analysis complete for {}", project_id);
 
                     // Propose skills; the user decides whether anything is written.
+                    let services = state.services_snapshot().await;
                     let proposals = crate::services::skill_generation::generate_proposals(
-                        state.provider.clone(),
-                        &state.default_model,
+                        services.provider.clone(),
+                        &services.default_model,
                         &project_id,
                         &project_type,
                         &context_excerpt,
@@ -598,8 +600,9 @@ impl TuiApp {
         });
 
         tokio::spawn(async move {
+            let services = state.services_snapshot().await;
             let result = if let Some(ref aid) = agent_id {
-                if let Some(runtime) = &state.agent_runtime {
+                if let Some(runtime) = &services.agent_runtime {
                     // Prior turns already in the UI buffer (excluding the just-appended user msg).
                     let history: Vec<ChatMessage> = {
                         let msgs = messages.lock().unwrap();
@@ -624,7 +627,7 @@ impl TuiApp {
                             history,
                             model_override: None,
                             system_prompt: None,
-                            default_model: state.default_model.clone(),
+                            default_model: services.default_model.clone(),
                         })
                         .await
                         .map_err(|e| e.to_string())
@@ -633,14 +636,14 @@ impl TuiApp {
                 }
             } else {
                 let req = crate::domain::models::ChatRequest {
-                    model: state.default_model.clone(),
+                    model: services.default_model.clone(),
                     messages: vec![ChatMessage {
                         role: "user".to_string(),
                         content: input,
                     }],
                     stream: false,
                 };
-                match state.provider.chat(req).await {
+                match services.provider.chat(req).await {
                     Ok(resp) => Ok(resp.message.content),
                     Err(e) => Err(e.to_string()),
                 }

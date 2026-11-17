@@ -42,7 +42,8 @@ pub struct HealthResponse {
 )]
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     state.observability.record_http_request();
-    let provider_healthy = state.provider.health_check().await.is_ok();
+    let services = state.services_snapshot().await;
+    let provider_healthy = services.provider.health_check().await.is_ok();
     let router_config = state.router_config.clone();
     let router_healthy = state.router_healthy.load(Ordering::SeqCst);
     Json(HealthResponse {
@@ -84,6 +85,7 @@ mod tests {
     use crate::optimizer::metrics::TokenMetrics;
     use crate::providers::LLMProvider;
     use crate::services::agent_registry::AgentRegistry;
+    use crate::services::provider_stack::ProviderStack;
     use crate::services::router_config::RouterConfig;
     use crate::services::skill_manager::SkillManager;
     use async_trait::async_trait;
@@ -92,6 +94,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex, RwLock};
     use tempfile::TempDir;
+    use tokio::sync::RwLock as TokioRwLock;
     use tokio_stream::Stream;
 
     /// A provider that answers `health_check` so the *router's* contribution
@@ -150,8 +153,9 @@ mod tests {
         std::env::set_var("LLAMA_R_DIR", temp_dir.path());
         let context_store = Arc::new(ContextStore::new());
         let skill_manager = Arc::new(SkillManager::new());
+        let stack = ProviderStack::new(Arc::new(HealthyProvider), "fallback-model");
         let state = Arc::new(AppState {
-            provider: Arc::new(HealthyProvider),
+            services: Arc::new(TokioRwLock::new(Arc::new(stack))),
             agent_registry: Arc::new(AgentRegistry::new()),
             context_enricher: Arc::new(ContextEnricher::new(
                 context_store.clone(),
@@ -162,17 +166,12 @@ mod tests {
             context_store,
             metrics: Arc::new(TokenMetrics::new()),
             observability: Arc::new(AppObservability::new()),
-            default_model: "fallback-model".to_string(),
             api_running: AtomicBool::new(false),
             grpc_running: AtomicBool::new(false),
             logs: Arc::new(Mutex::new(VecDeque::new())),
             known_mcp_servers: RwLock::new(Vec::new()),
             mcp_registry: Arc::new(StaticMcpRegistry::new()),
-            agent_runtime: None,
-            rag_store: None,
-            rag_ingest: None,
             history_store: None,
-            router: RwLock::new(None),
             router_config: Arc::new(router_config),
             router_healthy: AtomicBool::new(router_healthy),
         });

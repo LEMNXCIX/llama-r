@@ -1263,19 +1263,18 @@ fn app_on_form_field(field: usize) -> TuiApp {
     use crate::services::skill_manager::SkillManager;
     use std::collections::VecDeque;
 
-    let state = build_app_state(
+    let stack = crate::services::provider_stack::ProviderStack::new(
         Arc::new(OllamaProvider::new("http://localhost:11434".to_string())),
+        "llama3",
+    );
+    let state = build_app_state(
+        stack,
         Arc::new(AgentRegistry::new()),
         Arc::new(SkillManager::new()),
         Arc::new(ContextStore::new()),
-        "llama3".to_string(),
         Arc::new(Mutex::new(VecDeque::new())),
         Vec::new(),
         Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
-        None,
-        None,
-        None,
-        None,
         None,
     );
     let mut app = TuiApp::new(state);

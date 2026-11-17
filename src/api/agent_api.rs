@@ -368,7 +368,8 @@ async fn validate_model(state: &AppState, model: &str) -> Result<(), AppError> {
         return Ok(());
     }
 
-    let models = state
+    let services = state.services_snapshot().await;
+    let models = services
         .provider
         .list_models()
         .await

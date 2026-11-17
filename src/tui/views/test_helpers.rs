@@ -105,19 +105,18 @@ pub(super) fn state_with(
     }
     agent_registry.reload_all(&[]).unwrap();
 
-    let state = build_app_state(
+    let stack = crate::services::provider_stack::ProviderStack::new(
         Arc::new(OllamaProvider::new("http://localhost:11434".to_string())),
+        "llama3",
+    );
+    let state = build_app_state(
+        stack,
         agent_registry,
         Arc::new(SkillManager::new()),
         context_store,
-        "llama3".to_string(),
         Arc::new(Mutex::new(VecDeque::new())),
         Vec::new(),
         Arc::new(StaticMcpRegistry::new()),
-        None,
-        None,
-        None,
-        None,
         None,
     );
     (temp_dir, state)

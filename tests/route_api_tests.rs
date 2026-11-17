@@ -42,6 +42,16 @@ use utoipa::OpenApi;
 
 static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// Swap only the decision router in a state's provider stack. Every other
+/// handle in the stack is an `Arc`, so cloning and replacing the whole stack
+/// leaves the rest of the fixture untouched. The accessors drop their guard
+/// before returning, so no lock is held across the awaits here.
+async fn install_router(state: &Arc<AppState>, router: Option<Arc<dyn DecisionRouter>>) {
+    let mut stack = (*state.services_snapshot().await).clone();
+    stack.router = router;
+    state.replace_services(stack).await;
+}
+
 /// Every variable `RouterConfig::load` reads. `LLAMA_R_DIR` is deliberately
 /// absent: `state_with` points it at its own temp dir, exactly as
 /// `router_dispatch_tests.rs` does.
@@ -395,24 +405,23 @@ fn state_with_agents(
     let registry = Arc::new(AgentRegistry::new());
     registry.reload_all(&[]).unwrap();
 
+    let mut stack =
+        llama_r::services::provider_stack::ProviderStack::new(provider, "fallback-model");
+    // Install the fake on the stack before building: this helper is
+    // synchronous, and `build_app_state` keeps a router the caller supplied.
+    if let Some(fake) = fake {
+        stack.router = Some(Arc::new(fake));
+    }
     let state = build_app_state(
-        provider,
+        stack,
         registry,
         Arc::new(SkillManager::new()),
         Arc::new(ContextStore::new()),
-        "fallback-model".to_string(),
         Arc::new(Mutex::new(VecDeque::new())),
         Vec::new(),
         Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
         None,
-        None,
-        None,
-        None,
-        None,
     );
-    if let Some(fake) = fake {
-        *state.router.write().unwrap() = Some(Arc::new(fake));
-    }
     (dir, state)
 }
 
@@ -652,7 +661,7 @@ async fn a_winner_absent_from_the_probabilities_is_said_rather_than_shown() {
 /// Ask the preview once with the given reply, swapping the fake router in
 /// first — how the tests below walk several answers through one state.
 async fn preview_with(state: &Arc<AppState>, reply: DecisionResponse) -> RoutePreviewResponse {
-    *state.router.write().unwrap() = Some(Arc::new(FakeRouter::returning(reply)));
+    install_router(state, Some(Arc::new(FakeRouter::returning(reply)))).await;
     call_preview(state, &preview_json("fudi", "cancela el pedido 42"), true)
         .await
         .unwrap()
@@ -734,17 +743,21 @@ async fn the_preview_reports_a_stale_winner_the_way_the_chat_would() {
     // manifest is deleted and the registry reloaded during `decide`, so the
     // re-check after it finds `fudi::ops` gone — and `fudi` (the general)
     // still there, as the fallback the chat would take.
-    *state.router.write().unwrap() = Some(Arc::new(VanishingWinnerRouter {
-        winner_manifest: dir
-            .path()
-            .join("contextos")
-            .join("projects")
-            .join("fudi")
-            .join("agents")
-            .join("ops.toml"),
-        registry: state.agent_registry.clone(),
-        reply: choice_for("fudi::ops"),
-    }));
+    install_router(
+        &state,
+        Some(Arc::new(VanishingWinnerRouter {
+            winner_manifest: dir
+                .path()
+                .join("contextos")
+                .join("projects")
+                .join("fudi")
+                .join("agents")
+                .join("ops.toml"),
+            registry: state.agent_registry.clone(),
+            reply: choice_for("fudi::ops"),
+        })),
+    )
+    .await;
     let body = call_preview(&state, &preview_json("fudi", "cancela el pedido 42"), true)
         .await
         .unwrap();

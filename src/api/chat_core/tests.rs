@@ -13,6 +13,7 @@ use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRun
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::agent_runtime::AgentRuntime;
+use crate::services::provider_stack::ProviderStack;
 use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
 use async_trait::async_trait;
@@ -22,7 +23,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use tempfile::TempDir;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock as TokioRwLock};
 use tokio_stream::{Stream, StreamExt};
 
 struct FakeEngine {
@@ -183,27 +184,24 @@ fn test_state_with_runtime(
         skill_manager.clone(),
         "fallback-model".to_string(),
     ));
+    let mut stack = ProviderStack::new(provider, "fallback-model");
+    stack.agent_runtime = agent_runtime;
+    // No test here consults the router; the routing ladder is injected into the
+    // stack by the tests that do.
     let state = Arc::new(AppState {
-        provider,
+        services: Arc::new(TokioRwLock::new(Arc::new(stack))),
         agent_registry,
         skill_manager,
         context_store,
         context_enricher,
         metrics: Arc::new(TokenMetrics::new()),
         observability: Arc::new(AppObservability::new()),
-        default_model: "fallback-model".to_string(),
         api_running: AtomicBool::new(false),
         grpc_running: AtomicBool::new(false),
         logs: Arc::new(Mutex::new(VecDeque::new())),
         known_mcp_servers: RwLock::new(Vec::new()),
         mcp_registry: Arc::new(StaticMcpRegistry::new()),
-        agent_runtime,
-        rag_store: None,
-        rag_ingest: None,
         history_store: None,
-        // No test here consults the router; the routing ladder is injected
-        // through these fields by the tests that do.
-        router: RwLock::new(None),
         router_config: Arc::new(RouterConfig::default()),
         router_healthy: AtomicBool::new(false),
     });

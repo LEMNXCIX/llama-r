@@ -30,11 +30,11 @@ use crate::ports::engine::AgentEngine;
 use crate::ports::history::ConversationStore;
 use crate::ports::mcp::McpServerRegistry;
 use crate::ports::rag::{EmbeddingProvider, RagStore};
-use crate::ports::router::DecisionRouter;
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::agent_runtime::AgentRuntime;
+use crate::services::provider_stack::ProviderStack;
 use crate::services::rag_ingest::RagIngestService;
 use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
@@ -47,6 +47,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::RwLock as TokioRwLock;
 use tonic::transport::Server as TonicServer;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -60,43 +61,33 @@ pub struct Runtime {
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "stable interface: called from five sites across the crate and tests"
+    reason = "stable interface: called from fourteen sites across the crate and tests"
 )]
 pub fn build_app_state(
-    provider: Arc<dyn LLMProvider + Send + Sync>,
+    mut stack: ProviderStack,
     agent_registry: Arc<AgentRegistry>,
     skill_manager: Arc<SkillManager>,
     context_store: Arc<ContextStore>,
-    default_model: String,
     logs: Arc<Mutex<VecDeque<String>>>,
     known_mcp_servers: Vec<String>,
     mcp_registry: Arc<dyn McpServerRegistry>,
-    agent_runtime: Option<Arc<AgentRuntime>>,
-    rag_store: Option<Arc<dyn RagStore>>,
-    rag_ingest: Option<Arc<RagIngestService>>,
     history_store: Option<Arc<dyn ConversationStore>>,
-    // Embedding settings for semantic skill ranking: (url, model, dims).
-    embeddings: Option<(String, String, usize)>,
 ) -> Arc<AppState> {
     let metrics = Arc::new(TokenMetrics::new());
+    let default_model = stack.default_model.clone();
+    // Semantic skill ranking. Without embeddings every declared skill is used,
+    // so this is an improvement and never a requirement. A stack that does not
+    // carry an embedding provider keeps the historical Ollama default.
+    let embeddings: Arc<dyn EmbeddingProvider> = stack.embeddings.clone().unwrap_or_else(|| {
+        Arc::new(OllamaEmbeddings::new(
+            "http://localhost:11434",
+            "nomic-embed-text",
+            768,
+        ))
+    });
     let context_enricher = Arc::new(
-        ContextEnricher::new(
-            context_store.clone(),
-            skill_manager.clone(),
-            default_model.clone(),
-        )
-        // Semantic skill ranking. Without embeddings every declared skill is used,
-        // so this is an improvement and never a requirement.
-        .with_embeddings(embeddings.as_ref().map_or_else(
-            || {
-                Arc::new(OllamaEmbeddings::new(
-                    "http://localhost:11434",
-                    "nomic-embed-text",
-                    768,
-                ))
-            },
-            |(url, model, dims)| Arc::new(OllamaEmbeddings::new(url, model, *dims)) as Arc<_>,
-        )),
+        ContextEnricher::new(context_store.clone(), skill_manager.clone(), default_model)
+            .with_embeddings(embeddings),
     );
 
     // Router configuration. `RouterConfig` deliberately does not load `.env`
@@ -115,41 +106,41 @@ pub fn build_app_state(
             RouterConfig::default()
         }
     };
-    let router: Option<Arc<dyn DecisionRouter>> = if router_config.enabled {
-        tracing::info!(
-            url = %router_config.url,
-            model = %router_config.model,
-            "Decision router initialized"
-        );
-        Some(Arc::new(LlamaCppRouter::new(
-            router_config.url.clone(),
-            router_config.model.clone(),
-            router_config.timeout_ms,
-        )))
-    } else {
-        tracing::info!("Router disabled via ROUTER_ENABLED=false");
-        None
-    };
+    // The stack carries the decision router. Callers that already installed one
+    // (a test fake, or a future settings-driven build) keep theirs; otherwise the
+    // default Ollama-compatible router is built from the boot configuration.
+    if stack.router.is_none() {
+        stack.router = if router_config.enabled {
+            tracing::info!(
+                url = %router_config.url,
+                model = %router_config.model,
+                "Decision router initialized"
+            );
+            Some(Arc::new(LlamaCppRouter::new(
+                router_config.url.clone(),
+                router_config.model.clone(),
+                router_config.timeout_ms,
+            )))
+        } else {
+            tracing::info!("Router disabled via ROUTER_ENABLED=false");
+            None
+        };
+    }
 
     Arc::new(AppState {
-        provider,
+        services: Arc::new(TokioRwLock::new(Arc::new(stack))),
         agent_registry,
         skill_manager,
         context_store,
         context_enricher,
         metrics,
         observability: Arc::new(AppObservability::new()),
-        default_model,
         api_running: AtomicBool::new(false),
         grpc_running: AtomicBool::new(false),
         logs,
         known_mcp_servers: RwLock::new(known_mcp_servers),
         mcp_registry,
-        agent_runtime,
-        rag_store,
-        rag_ingest,
         history_store,
-        router: RwLock::new(router),
         router_config: Arc::new(router_config),
         router_healthy: AtomicBool::new(false),
     })
@@ -399,24 +390,30 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         context_store.clone(),
         skill_manager.clone(),
     );
-    let state = build_app_state(
-        provider_impl,
-        agent_registry.clone(),
-        skill_manager,
-        context_store,
-        config.default_model.clone(),
-        logs,
-        known_mcp_servers,
-        mcp_registry,
+    let embeddings: Arc<dyn EmbeddingProvider> = Arc::new(OllamaEmbeddings::new(
+        config.ollama_url.clone(),
+        config.embedding_model.clone(),
+        config.embedding_dimensions,
+    ));
+    let stack = ProviderStack {
+        provider: provider_impl,
         agent_runtime,
         rag_store,
         rag_ingest,
+        embeddings: Some(embeddings),
+        router: None,
+        default_model: config.default_model.clone(),
+        provider_name: "ollama".to_string(),
+    };
+    let state = build_app_state(
+        stack,
+        agent_registry.clone(),
+        skill_manager,
+        context_store,
+        logs,
+        known_mcp_servers,
+        mcp_registry,
         history_store,
-        Some((
-            config.ollama_url.clone(),
-            config.embedding_model.clone(),
-            config.embedding_dimensions,
-        )),
     );
 
     // One probe at startup, then last-known-value: the ladder updates the flag

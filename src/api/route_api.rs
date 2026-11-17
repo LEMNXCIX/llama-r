@@ -180,10 +180,10 @@ pub async fn route_preview(
     // The `Arc` leaves the lock before any `.await`: a guard held across the
     // decision would stall every other reader for the length of one call.
     let router = state
+        .services_snapshot()
+        .await
         .router
-        .read()
-        .ok()
-        .and_then(|guard| (*guard).clone())
+        .clone()
         .ok_or_else(|| AppError::Unavailable("no decision router is installed".into()))?;
 
     let config = &state.router_config;

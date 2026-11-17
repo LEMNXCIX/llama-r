@@ -333,10 +333,11 @@ async fn select_skills_for_agent(
         manifest,
     );
 
-    let response = state
+    let services = state.services_snapshot().await;
+    let response = services
         .provider
         .chat(ChatRequest {
-            model: state.default_model.clone(),
+            model: services.default_model.clone(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: prompt,

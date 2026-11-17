@@ -10,12 +10,8 @@ use crate::domain::models::{
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::mcp::McpServerRegistry;
-use crate::ports::rag::RagStore;
-use crate::ports::router::DecisionRouter;
-use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
-use crate::services::agent_runtime::AgentRuntime;
-use crate::services::rag_ingest::RagIngestService;
+use crate::services::provider_stack::ProviderStack;
 use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
 use axum::{
@@ -30,19 +26,23 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::RwLock as TokioRwLock;
 use tokio_stream::StreamExt as _;
 
 use crate::ports::history::ConversationStore;
 
 pub struct AppState {
-    pub provider: Arc<dyn LLMProvider + Send + Sync>,
+    /// The provider-dependent services, behind an `RwLock` so a new provider can
+    /// be installed in the running process without rebuilding `AppState`. Every
+    /// read clones the inner `Arc` before any `.await`; a snapshot taken before a
+    /// swap keeps the old stack alive until the last in-flight request finishes.
+    pub services: Arc<TokioRwLock<Arc<ProviderStack>>>,
     pub agent_registry: Arc<AgentRegistry>,
     pub skill_manager: Arc<SkillManager>,
     pub context_store: Arc<ContextStore>,
     pub context_enricher: Arc<ContextEnricher>,
     pub metrics: Arc<TokenMetrics>,
     pub observability: Arc<AppObservability>,
-    pub default_model: String,
     pub api_running: AtomicBool,
     pub grpc_running: AtomicBool,
     pub logs: Arc<Mutex<VecDeque<String>>>,
@@ -50,19 +50,8 @@ pub struct AppState {
     pub known_mcp_servers: RwLock<Vec<String>>,
     /// Runtime MCP server registry for tool discovery and execution.
     pub mcp_registry: Arc<dyn McpServerRegistry>,
-    /// Agent runtime (Rig engine) for agent-scoped chat. None when feature is off.
-    pub agent_runtime: Option<Arc<AgentRuntime>>,
-    /// Segmented RAG vector store. None when RAG is disabled.
-    pub rag_store: Option<Arc<dyn RagStore>>,
-    /// Ingest pipeline for admin API / analyze hooks.
-    pub rag_ingest: Option<Arc<RagIngestService>>,
     /// Conversation history store. None when feature is off or uninitialized.
     pub history_store: Option<Arc<dyn ConversationStore>>,
-    /// Decision router. `RwLock` rather than a plain field so tests can swap in a
-    /// fake without `build_app_state` — which five call sites construct — growing
-    /// a parameter. Mirrors the existing `known_mcp_servers` field. `None` while
-    /// `ROUTER_ENABLED` is off, so the default deployment builds nothing.
-    pub router: RwLock<Option<Arc<dyn DecisionRouter>>>,
     /// Router configuration loaded at boot (env, then `router.toml`).
     pub router_config: Arc<RouterConfig>,
     /// Last known router reachability, set by the ladder. Deliberately not a live
@@ -71,6 +60,20 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Clone the current `ProviderStack` handle. The read guard is dropped
+    /// before returning, so no lock is held across an await by the caller.
+    pub async fn services_snapshot(&self) -> Arc<ProviderStack> {
+        let guard = self.services.read().await;
+        Arc::clone(&*guard)
+    }
+
+    /// Replace the whole provider stack. The write guard is released as soon as
+    /// the value is installed; it is never held across an await.
+    pub async fn replace_services(&self, new: ProviderStack) {
+        let mut guard = self.services.write().await;
+        *guard = Arc::new(new);
+    }
+
     pub fn mcp_server_ids(&self) -> Vec<String> {
         self.known_mcp_servers
             .read()
@@ -104,7 +107,8 @@ pub async fn list_models(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, AppError> {
     state.observability.record_http_request();
-    let models = state.provider.list_models().await.map_err(|error| {
+    let services = state.services_snapshot().await;
+    let models = services.provider.list_models().await.map_err(|error| {
         state.observability.record_provider_error();
         AppError::Provider(error.to_string())
     })?;

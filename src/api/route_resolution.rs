@@ -195,7 +195,7 @@ pub async fn resolve_selection_with(
     // The Arc leaves the lock before the `.await`: a guard held across the
     // decision's network call would stall every other reader — including
     // the next chat — for the length of one decision.
-    let router = state.router.read().ok().and_then(|guard| (*guard).clone());
+    let router = state.services_snapshot().await.router.clone();
     let Some(router) = router else {
         return Ok(ResolvedSelection::from_selection(&selection));
     };

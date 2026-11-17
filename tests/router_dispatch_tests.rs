@@ -111,6 +111,16 @@ impl DispatchEnv {
     }
 }
 
+/// Swap only the decision router in a state's provider stack. Every other
+/// handle in the stack is an `Arc`, so cloning and replacing the whole stack
+/// leaves the rest of the fixture untouched. The accessors drop their guard
+/// before returning, so no lock is held across the awaits here.
+async fn install_router(state: &Arc<AppState>, router: Option<Arc<dyn DecisionRouter>>) {
+    let mut stack = (*state.services_snapshot().await).clone();
+    stack.router = router;
+    state.replace_services(stack).await;
+}
+
 /// Records the model it was asked for, so a *dispatch target* is observable
 /// on the streaming surface — which carries no `debug_route` by design, so
 /// the resolved agent can only be read back through what it was asked to run.
@@ -184,19 +194,18 @@ fn state_with_provider(
     registry: &Arc<AgentRegistry>,
     provider: Arc<RecordingStreamProvider>,
 ) -> Arc<AppState> {
-    build_app_state(
+    let stack = llama_r::services::provider_stack::ProviderStack::new(
         provider as Arc<dyn LLMProvider>,
+        "fallback-model",
+    );
+    build_app_state(
+        stack,
         registry.clone(),
         Arc::new(SkillManager::new()),
         Arc::new(ContextStore::new()),
-        "fallback-model".to_string(),
         Arc::new(Mutex::new(VecDeque::new())),
         Vec::new(),
         Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
-        None,
-        None,
-        None,
-        None,
         None,
     )
 }
@@ -418,19 +427,18 @@ fn write_manifests_and_build(
     let registry = AgentRegistry::new();
     registry.reload_all(&[]).unwrap();
 
-    build_app_state(
+    let stack = llama_r::services::provider_stack::ProviderStack::new(
         Arc::new(InertProvider),
+        "fallback-model",
+    );
+    build_app_state(
+        stack,
         Arc::new(registry),
         Arc::new(SkillManager::new()),
         Arc::new(ContextStore::new()),
-        "fallback-model".to_string(),
         Arc::new(Mutex::new(VecDeque::new())),
         Vec::new(),
         Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
-        None,
-        None,
-        None,
-        None,
         None,
     )
 }
@@ -504,7 +512,7 @@ async fn an_installed_router_is_never_consulted_while_routing_is_disabled() {
     // the *default* configuration, and the only thing keeping the fake out.
     let state = state_with_project_agent("fudi");
     let fake = FakeRouter::returning(choice_for("fudi::ops"));
-    *state.router.write().unwrap() = Some(Arc::new(fake.with_call_counter()));
+    install_router(&state, Some(Arc::new(fake.with_call_counter()))).await;
     assert!(
         !state.router_config.enabled,
         "the fixture must be in the disabled configuration for this to test anything"
@@ -559,7 +567,7 @@ async fn excluding_the_projects_general_agent_still_routes_and_still_degrades_to
     // (1) A specialist still wins: the exclusion governs specialists, not the
     // candidate set as a whole.
     let fake = FakeRouter::returning(choice_for("fudi::ops"));
-    *state.router.write().unwrap() = Some(Arc::new(fake.clone()));
+    install_router(&state, Some(Arc::new(fake.clone()))).await;
     let resolved = resolve_selection(
         &state,
         AgentSelection {
@@ -583,7 +591,7 @@ async fn excluding_the_projects_general_agent_still_routes_and_still_degrades_to
     // (2) And when nothing wins, the fallback is still that agent. This is the
     // 400: without the guard the ladder has no landing place and answers
     // `agent_not_found` for a project that resolves today.
-    *state.router.write().unwrap() = Some(Arc::new(FakeRouter::failing()));
+    install_router(&state, Some(Arc::new(FakeRouter::failing()))).await;
     let resolved = resolve_selection(
         &state,
         AgentSelection {
@@ -646,7 +654,7 @@ async fn a_router_naming_another_projects_agent_cannot_reach_it() {
     // The candidate set must not contain it, and the router must not be able
     // to reach it anyway.
     let fake = FakeRouter::returning(choice_for("otro::secretos"));
-    *state.router.write().unwrap() = Some(Arc::new(fake.clone()));
+    install_router(&state, Some(Arc::new(fake.clone()))).await;
     let resolved = resolve_selection(
         &state,
         AgentSelection {
@@ -719,11 +727,15 @@ async fn min_confidence_governs_the_confidence_gate_and_min_specialized_the_othe
         std::env::set_var("MIN_CONFIDENCE", "0.90");
         std::env::set_var("MIN_SPECIALIZED", "0.10");
         let state = state_with_project_agent("fudi");
-        *state.router.write().unwrap() = Some(Arc::new(FakeRouter::returning(answer(
-            "fudi::ops",
-            0.70,
-            0.90,
-        ))));
+        install_router(
+            &state,
+            Some(Arc::new(FakeRouter::returning(answer(
+                "fudi::ops",
+                0.70,
+                0.90,
+            )))),
+        )
+        .await;
         let resolved = resolve_selection(
             &state,
             AgentSelection {
@@ -755,11 +767,15 @@ async fn min_confidence_governs_the_confidence_gate_and_min_specialized_the_othe
         std::env::set_var("MIN_CONFIDENCE", "0.10");
         std::env::set_var("MIN_SPECIALIZED", "0.10");
         let state = state_with_project_agent("fudi");
-        *state.router.write().unwrap() = Some(Arc::new(FakeRouter::returning(answer(
-            "fudi::ops",
-            0.70,
-            0.90,
-        ))));
+        install_router(
+            &state,
+            Some(Arc::new(FakeRouter::returning(answer(
+                "fudi::ops",
+                0.70,
+                0.90,
+            )))),
+        )
+        .await;
         let resolved = resolve_selection(
             &state,
             AgentSelection {
@@ -787,11 +803,15 @@ async fn min_confidence_governs_the_confidence_gate_and_min_specialized_the_othe
         std::env::set_var("MIN_CONFIDENCE", "0.10");
         std::env::set_var("MIN_SPECIALIZED", "0.95");
         let state = state_with_project_agent("fudi");
-        *state.router.write().unwrap() = Some(Arc::new(FakeRouter::returning(answer(
-            "fudi::ops",
-            0.99,
-            0.90,
-        ))));
+        install_router(
+            &state,
+            Some(Arc::new(FakeRouter::returning(answer(
+                "fudi::ops",
+                0.99,
+                0.90,
+            )))),
+        )
+        .await;
         let resolved = resolve_selection(
             &state,
             AgentSelection {
@@ -829,7 +849,7 @@ async fn a_request_with_no_messages_is_refused_without_spending_a_decision() {
     let provider = Arc::new(RecordingStreamProvider::default());
     let routed_state = state_with_provider(&state.agent_registry, provider.clone());
     let fake = FakeRouter::returning(choice_for("fudi::ops"));
-    *routed_state.router.write().unwrap() = Some(Arc::new(fake.with_call_counter()));
+    install_router(&routed_state, Some(Arc::new(fake.with_call_counter()))).await;
 
     // `Err(..)` rather than `.unwrap_err()`: the `Ok` variant is a stream, which
     // is not `Debug`, so the usual helper does not compile here.
@@ -898,7 +918,7 @@ async fn a_streaming_project_request_is_routed_to_the_chosen_agent() {
     let provider = Arc::new(RecordingStreamProvider::default());
     let routed_state = state_with_provider(&state.agent_registry, provider.clone());
     let fake = FakeRouter::returning(choice_for("fudi::ops"));
-    *routed_state.router.write().unwrap() = Some(Arc::new(fake.with_call_counter()));
+    install_router(&routed_state, Some(Arc::new(fake.with_call_counter()))).await;
 
     let mut stream = execute_chat_stream(
         &routed_state,
@@ -954,7 +974,7 @@ async fn a_streaming_request_that_routes_nowhere_keeps_the_general_agent() {
     state.agent_registry.reload_all(&[]).unwrap();
     let provider = Arc::new(RecordingStreamProvider::default());
     let routed_state = state_with_provider(&state.agent_registry, provider.clone());
-    *routed_state.router.write().unwrap() = Some(Arc::new(FakeRouter::failing()));
+    install_router(&routed_state, Some(Arc::new(FakeRouter::failing()))).await;
 
     let mut stream = execute_chat_stream(
         &routed_state,
@@ -989,7 +1009,7 @@ async fn an_explicit_agent_header_is_never_routed() {
     std::env::set_var("ROUTER_ENABLED", "true");
     let state = state_with_project_agent("fudi");
     let fake = FakeRouter::returning(choice_for("fudi::ops"));
-    *state.router.write().unwrap() = Some(Arc::new(fake.with_call_counter()));
+    install_router(&state, Some(Arc::new(fake.with_call_counter()))).await;
     let resolved = resolve_selection(
         &state,
         AgentSelection {
@@ -1015,7 +1035,7 @@ async fn a_project_request_without_an_agent_reaches_the_router() {
     std::env::set_var("ROUTER_ENABLED", "true");
     let state = state_with_project_agent("fudi");
     let fake = FakeRouter::returning(choice_for("fudi::ops"));
-    *state.router.write().unwrap() = Some(Arc::new(fake.clone()));
+    install_router(&state, Some(Arc::new(fake.clone()))).await;
     let resolved = resolve_selection(
         &state,
         AgentSelection {
@@ -1046,7 +1066,7 @@ async fn a_specialists_only_project_is_refused_without_spending_a_decision() {
     std::env::set_var("ROUTER_ENABLED", "true");
     let state = state_with_agents("fudi", false);
     let fake = FakeRouter::returning(choice_for("fudi::ops"));
-    *state.router.write().unwrap() = Some(Arc::new(fake.with_call_counter()));
+    install_router(&state, Some(Arc::new(fake.with_call_counter()))).await;
 
     let err = resolve_selection(
         &state,
@@ -1091,7 +1111,7 @@ async fn a_global_winner_dispatches_without_a_project() {
     // The global's bare key, not `fudi::ops`: a choice keyed to the
     // project's same-named specialist would never enter this branch.
     let fake = FakeRouter::returning(choice_for("ops"));
-    *state.router.write().unwrap() = Some(Arc::new(fake.clone()));
+    install_router(&state, Some(Arc::new(fake.clone()))).await;
     let resolved = resolve_selection(
         &state,
         AgentSelection {
@@ -1130,7 +1150,11 @@ async fn a_global_winner_passes_the_hot_reload_recheck() {
     let _env = DispatchEnv::new();
     std::env::set_var("ROUTER_ENABLED", "true");
     let state = state_with_project_agent("fudi");
-    *state.router.write().unwrap() = Some(Arc::new(FakeRouter::returning(choice_for("ops"))));
+    install_router(
+        &state,
+        Some(Arc::new(FakeRouter::returning(choice_for("ops")))),
+    )
+    .await;
     let reloaded = global_only_registry();
     let resolved = resolve_selection_with(
         &state,
@@ -1165,7 +1189,7 @@ async fn a_request_with_no_project_header_is_never_routed() {
     std::env::set_var("ROUTER_ENABLED", "true");
     let state = state_with_project_agent("fudi");
     let fake = FakeRouter::returning(choice_for("fudi::ops"));
-    *state.router.write().unwrap() = Some(Arc::new(fake.clone()));
+    install_router(&state, Some(Arc::new(fake.clone()))).await;
     let resolved = resolve_selection(
         &state,
         AgentSelection {
@@ -1189,7 +1213,7 @@ async fn a_down_router_leaves_the_project_general_agent_in_place() {
     // llama-server does — and every rung must land on the general agent.
     std::env::set_var("ROUTER_ENABLED", "true");
     let state = state_with_project_agent("fudi");
-    *state.router.write().unwrap() = Some(Arc::new(FakeRouter::failing()));
+    install_router(&state, Some(Arc::new(FakeRouter::failing()))).await;
     let resolved = resolve_selection(
         &state,
         AgentSelection {
@@ -1287,7 +1311,11 @@ async fn an_agent_removed_by_a_reload_between_decision_and_use_degrades() {
     std::env::set_var("ROUTER_ENABLED", "true");
     // `state` has fudi::ops and fudi::fudi registered; the router picks ops.
     let state = state_with_project_agent("fudi");
-    *state.router.write().unwrap() = Some(Arc::new(FakeRouter::returning(choice_for("fudi::ops"))));
+    install_router(
+        &state,
+        Some(Arc::new(FakeRouter::returning(choice_for("fudi::ops")))),
+    )
+    .await;
 
     // Resolution against a registry that no longer holds the winner, as after
     // a hot reload. `AgentRegistry::new()` starts empty, which is enough.

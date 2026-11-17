@@ -464,7 +464,7 @@ async fn create_context_tool(
         );
     }
     let canonical_path = canonicalize_project_path(project_path)?;
-    let provider = state.provider.clone();
+    let provider = state.services_snapshot().await.provider.clone();
     let responder = move |prompt: String| {
         let provider = provider.clone();
         Box::pin(async move {

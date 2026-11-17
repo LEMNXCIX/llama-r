@@ -95,19 +95,18 @@ fn write_skill(dir: &Path, id: &str, name: &str, description: &str) {
 fn state_with(manager: SkillManager, store: ContextStore) -> axum::Router {
     let agent_registry = Arc::new(AgentRegistry::new());
     agent_registry.reload_all(&[]).unwrap();
-    let state = build_app_state(
+    let stack = llama_r::services::provider_stack::ProviderStack::new(
         Arc::new(InertProvider),
+        "fallback-model",
+    );
+    let state = build_app_state(
+        stack,
         agent_registry,
         Arc::new(manager),
         Arc::new(store),
-        "fallback-model".to_string(),
         Arc::new(Mutex::new(VecDeque::new())),
         Vec::new(),
         Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
-        None,
-        None,
-        None,
-        None,
         None,
     );
     build_router(state)
