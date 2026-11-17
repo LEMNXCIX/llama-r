@@ -38,9 +38,33 @@ En el primer arranque, si falta `DEFAULT_MODEL`, Llama-R abre un setup interacti
 | Variable | Default | Descripción |
 |---|---|---|
 | `PORT` | `3000` | Puerto HTTP |
-| `OLLAMA_URL` | `http://localhost:11434` | URL del provider Ollama |
+| `PROVIDER` | `ollama` | Provider único para chat, enrutado y embeddings: `ollama` \| `openrouter` \| `opencode` |
+| `OLLAMA_URL` | `http://localhost:11434` | URL del provider Ollama (también fallback de embeddings con OpenCode) |
+| `OPENROUTER_API_KEY` | — | Clave Bearer de OpenRouter; se guarda en `.env` (modo `0600`), nunca en URLs/logs/health/pantalla |
+| `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` | Base OpenAI-compatible para OpenRouter y el motor Rig |
+| `OPENCODE_API_KEY` | — | Contraseña del servidor OpenCode (HTTP basic auth); misma regla de secreto que las demás claves |
+| `OPENCODE_URL` | `http://127.0.0.1:4096` | Origen de los endpoints generate/decisión de OpenCode |
 | `DEFAULT_MODEL` | — | Modelo por defecto (obligatorio) |
 | `LLAMA_R_DIR` | — | Directorio base override para datos |
+
+## Providers
+
+Una sola variable `PROVIDER` elige el upstream para **todos** los servicios (chat, router de decisión y, donde existe, embeddings); no se puede mezclar por servicio. Valores: `ollama` (por defecto), `openrouter` y `opencode`. Las credenciales viven en `.env` (modo `0600` en Unix) y nunca aparecen en URLs, logs, `/api/health` ni en la TUI. El provider se elige en el setup interactivo del primer arranque y se puede cambiar en caliente desde el modal Settings de la TUI (sobre el Dashboard): Apply persiste en `.env` y reconstruye el stack y sus companion services (motor, RAG) sin reiniciar. Salvedad: el embedder de ranking de skills del `context_enricher` conserva el valor que tenía al arrancar tras un Apply.
+
+| Capacidad | Ollama | OpenRouter | OpenCode |
+|---|---|---|---|
+| Chat no-streaming | sí | sí | sí |
+| `stream: true` | sí | `501 Unavailable` | `501 Unavailable` |
+| Embeddings / RAG | sí | sí | no (salvo fallback Ollama) |
+| Router de decisión d1 | sí | sí | sí |
+| Motor de agentes (Rig) | `rig-core` ollama | `rig-core` openrouter (tools/RAG/MCP) | no |
+
+- **Streaming:** `stream: true` con OpenRouter u OpenCode devuelve `501 Unavailable`, también en peticiones con agente (`X-Project`/`X-Agent`), no solo en chat directo; solo Ollama hace streaming.
+- **Embeddings/RAG:** Ollama y OpenRouter tienen adaptador de embeddings; OpenCode no. Con `PROVIDER=opencode` y sin `OLLAMA_URL`, RAG queda desactivado y `/api/rag/*` responde un `501` explícito que nombra los embeddings (no un `500`). Si se define `OLLAMA_URL`, los embeddings de Ollama pueden servir de fallback para OpenCode.
+- **Router:** los tres providers tienen adaptador de decisión para el modelo d1. El enrutado sigue **desactivado por defecto** (`ROUTER_ENABLED=false`) y no cambia cuando está off.
+- **Motor de agentes:** Ollama usa `rig-core` ollama y OpenRouter usa `rig-core` openrouter, conservando herramientas, RAG y MCP. OpenCode no tiene motor: las peticiones con agente degradan a un chat directo del provider con un aviso explícito (tools/RAG/MCP no disponibles). Ese estado se reporta en `/api/health` como `provider.agent_engine: false` junto a `provider.agent_engine_reason`.
+
+`/api/health` expone el objeto `provider`: `{ "name", "embeddings": bool, "reason": null|string, "agent_engine": bool, "agent_engine_reason": null|string }`. Ningún campo contiene claves; `reason` nombra la carencia de embeddings y `agent_engine_reason` usa el mismo texto que el aviso de degradación del chat.
 
 ## CLI
 
