@@ -6,6 +6,10 @@ use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 
+/// Default OpenRouter endpoint. Shared by the chat provider and the Rig engine
+/// so the two cannot drift to different origins.
+pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
 /// Which upstream serves chat, the decision model and (where supported)
 /// embeddings. One value selects every service; there is no per-service mix.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

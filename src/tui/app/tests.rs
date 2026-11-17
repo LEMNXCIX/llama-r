@@ -1429,6 +1429,7 @@ impl ApplyEnvGuard {
         "EMBEDDING_DIMENSIONS",
         "RAG_ENABLED",
         "HISTORY_RETENTION_DAYS",
+        "LLAMA_R_DIR",
     ];
 
     fn fresh() -> Self {
@@ -1442,6 +1443,7 @@ impl ApplyEnvGuard {
         let cwd = std::env::current_dir().expect("current dir");
         let temp = tempfile::tempdir().expect("temp dir");
         std::env::set_current_dir(temp.path()).expect("enter temp dir");
+        std::env::set_var("LLAMA_R_DIR", temp.path());
         Self {
             previous,
             cwd,
@@ -1560,4 +1562,82 @@ fn the_settings_dialog_owns_the_footer_while_it_is_up() {
     assert_eq!(target, KeyTarget::Settings);
     let row = footer_row(KeyTarget::Settings);
     assert!(row.contains("cancel"), "the way out must be named: {row:?}");
+}
+
+/// An Apply must rebuild the provider-dependent companions from the NEW stack,
+/// not carry the old Ollama engine/RAG store over: a hot swap that leaves the
+/// engine pointing at the boot-time upstream answers with the wrong provider.
+#[tokio::test]
+async fn apply_rebuilds_companions_from_the_new_stack() {
+    use crate::adapters::rig_engine::EngineTargetKind;
+    use crate::runtime::{build_companions_for_state, build_provider_stack};
+
+    let _guard = crate::core::paths::lock_env_for_tests();
+    let _env = ApplyEnvGuard::fresh();
+    let mut app = app_on_dashboard();
+
+    // Give the starting Ollama stack real companions.
+    let cfg = Config {
+        port: 3000,
+        provider: ProviderKind::Ollama,
+        ollama_url: "http://localhost:11434".to_string(),
+        default_model: "old-model".to_string(),
+        embedding_model: "nomic-embed-text".to_string(),
+        embedding_dimensions: 768,
+        rag_enabled: true,
+        history_retention_days: 90,
+        openrouter_api_key: None,
+        opencode_api_key: None,
+        opencode_url: "http://127.0.0.1:4096".to_string(),
+        openai_base_url: None,
+    };
+    let mut stack = build_provider_stack(&cfg).expect("ollama stack with embeddings");
+    build_companions_for_state(&app.state, &cfg, &mut stack);
+    app.state.replace_services(stack).await;
+
+    let before = app.state.services_snapshot().await;
+    assert!(
+        before.agent_runtime.is_some(),
+        "boot Ollama stack must have an engine"
+    );
+    assert_eq!(before.engine_target, Some(EngineTargetKind::Ollama));
+    let old_runtime = before.agent_runtime.clone().unwrap();
+    let old_rag = before.rag_store.clone().unwrap();
+    drop(before);
+
+    // Apply: Ollama -> OpenRouter.
+    let mut settings = Settings::new(ProviderKind::Ollama, "", "old-model");
+    settings.provider = 1; // OpenRouter
+    settings.key = "sk-test-key".into();
+    settings.model = "new-model".into();
+    app.settings = Some(settings);
+    let config = app.settings.as_ref().unwrap().validated_config().unwrap();
+    TuiApp::finish_apply(&app.state, config).await.unwrap();
+
+    let after = app.state.services_snapshot().await;
+    assert_eq!(after.provider_name, "openrouter");
+    assert_eq!(after.default_model, "new-model");
+    assert_eq!(after.engine_target, Some(EngineTargetKind::OpenRouter));
+
+    let new_runtime = after
+        .agent_runtime
+        .as_ref()
+        .expect("OpenRouter has a Rig engine target");
+    assert!(
+        !Arc::ptr_eq(&old_runtime, new_runtime),
+        "agent runtime must be freshly built for the new provider"
+    );
+    let new_rag = after
+        .rag_store
+        .as_ref()
+        .expect("OpenRouter has a RAG store");
+    assert!(
+        !Arc::ptr_eq(&old_rag, new_rag),
+        "RAG store must be freshly built for the new provider"
+    );
+    drop(after);
+
+    assert_eq!(std::env::var("PROVIDER").unwrap(), "openrouter");
+    assert_eq!(std::env::var("DEFAULT_MODEL").unwrap(), "new-model");
+    assert_eq!(std::env::var("OPENROUTER_API_KEY").unwrap(), "sk-test-key");
 }

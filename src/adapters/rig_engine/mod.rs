@@ -6,6 +6,7 @@ pub mod limits;
 #[cfg(feature = "rig-engine")]
 pub mod tools;
 
+use crate::config::{Config, ProviderKind, OPENROUTER_BASE_URL};
 use crate::domain::scope::AgentScope;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
 use crate::ports::mcp::{McpCallRequest, McpClient, McpServerRegistry, McpToolDef};
@@ -15,6 +16,55 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Which upstream the Rig engine talks to.
+///
+/// The key lives only inside the `OpenRouter` variant. This type deliberately
+/// has **no** `Debug` implementation: an engine target must never be logged or
+/// formatted into a response, because doing so would leak the API key. Use
+/// [`EngineTarget::kind`] for any diagnostic that does not need the secret.
+#[derive(Clone)]
+pub enum EngineTarget {
+    Ollama { url: String },
+    OpenRouter { api_key: String, base_url: String },
+}
+
+/// Non-secret discriminator for a target, safe to log and to put in health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineTargetKind {
+    Ollama,
+    OpenRouter,
+}
+
+impl EngineTarget {
+    pub fn kind(&self) -> EngineTargetKind {
+        match self {
+            EngineTarget::Ollama { .. } => EngineTargetKind::Ollama,
+            EngineTarget::OpenRouter { .. } => EngineTargetKind::OpenRouter,
+        }
+    }
+}
+
+/// Select the engine target from the single `PROVIDER` choice.
+///
+/// Ollama and OpenRouter both have a rig-core completion provider; OpenCode
+/// does not, so it gets **no engine** (and an agent-scoped chat degrades with an
+/// explicit warning rather than calling the wrong upstream).
+pub fn engine_target_for(config: &Config) -> Option<EngineTarget> {
+    match config.provider {
+        ProviderKind::Ollama => Some(EngineTarget::Ollama {
+            url: config.ollama_url.clone(),
+        }),
+        ProviderKind::OpenRouter => Some(EngineTarget::OpenRouter {
+            api_key: config.openrouter_api_key.clone().unwrap_or_default(),
+            base_url: config
+                .openai_base_url
+                .clone()
+                .unwrap_or_else(|| OPENROUTER_BASE_URL.to_string()),
+        }),
+        ProviderKind::OpenCode => None,
+    }
+}
 
 /// MCP tool already filtered by scope, re-checked on every invoke.
 pub struct ScopedMcpTool {
@@ -54,24 +104,68 @@ impl ScopedMcpTool {
     }
 }
 
-/// Engine implementation backed by rig-core Ollama provider.
+/// Engine implementation backed by a rig-core completion provider. The target
+/// decides which provider that is; the Ollama-only original was hardwired to
+/// `rig_core::providers::ollama`, which made an agent-scoped chat on another
+/// provider call the wrong upstream and then silently fall back to a direct
+/// chat (losing tools, RAG context and MCP).
 pub struct RigAgentEngine {
-    pub ollama_url: String,
+    pub target: EngineTarget,
     pub mcp_registry: Arc<dyn McpServerRegistry>,
     pub rag: Option<Arc<dyn RagStore>>,
 }
 
 impl RigAgentEngine {
+    /// Ergonomic Ollama constructor, kept for existing call sites.
     pub fn new(
         ollama_url: impl Into<String>,
         mcp_registry: Arc<dyn McpServerRegistry>,
         rag: Option<Arc<dyn RagStore>>,
     ) -> Self {
+        Self::from_target(
+            EngineTarget::Ollama {
+                url: ollama_url.into(),
+            },
+            mcp_registry,
+            rag,
+        )
+    }
+
+    /// Build an engine targeting OpenRouter. `base_url` overrides the default
+    /// endpoint for a compatible gateway; `None` uses rig-core's default.
+    pub fn with_openrouter(
+        api_key: impl Into<String>,
+        base_url: Option<impl Into<String>>,
+        mcp_registry: Arc<dyn McpServerRegistry>,
+        rag: Option<Arc<dyn RagStore>>,
+    ) -> Self {
+        Self::from_target(
+            EngineTarget::OpenRouter {
+                api_key: api_key.into(),
+                base_url: base_url
+                    .map(Into::into)
+                    .unwrap_or_else(|| OPENROUTER_BASE_URL.to_string()),
+            },
+            mcp_registry,
+            rag,
+        )
+    }
+
+    pub fn from_target(
+        target: EngineTarget,
+        mcp_registry: Arc<dyn McpServerRegistry>,
+        rag: Option<Arc<dyn RagStore>>,
+    ) -> Self {
         Self {
-            ollama_url: ollama_url.into(),
+            target,
             mcp_registry,
             rag,
         }
+    }
+
+    /// Non-secret target discriminator, safe for logs and health.
+    pub fn target_kind(&self) -> EngineTargetKind {
+        self.target.kind()
     }
 
     /// Prepare scoped tools and optional RAG context for a run.
@@ -123,7 +217,21 @@ impl RigAgentEngine {
 
         #[cfg(feature = "rig-engine")]
         {
-            return builder::run_with_rig(&self.ollama_url, req, system, tools).await;
+            match &self.target {
+                EngineTarget::Ollama { url } => {
+                    builder::run_with_rig(url, req, system, tools).await
+                }
+                EngineTarget::OpenRouter { api_key, base_url } => {
+                    builder::run_with_openrouter(
+                        api_key,
+                        Some(base_url.as_str()),
+                        req,
+                        system,
+                        tools,
+                    )
+                    .await
+                }
+            }
         }
 
         #[cfg(not(feature = "rig-engine"))]
@@ -149,14 +257,16 @@ impl AgentEngine for RigAgentEngine {
         req: AgentRunRequest,
     ) -> Result<mpsc::Receiver<AgentRunEvent>, String> {
         let (tx, rx) = mpsc::channel(32);
-        let ollama_url = self.ollama_url.clone();
+        // Clone the whole target, not just a URL: the spawned task must target
+        // the same provider (with its key) as the engine it came from.
+        let target = self.target.clone();
         let mcp_registry = self.mcp_registry.clone();
         let rag = self.rag.clone();
         let timeout_secs = req.scope.timeout_secs.max(1);
 
         tokio::spawn(async move {
             let engine = RigAgentEngine {
-                ollama_url,
+                target,
                 mcp_registry,
                 rag,
             };

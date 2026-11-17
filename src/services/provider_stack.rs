@@ -1,3 +1,4 @@
+use crate::adapters::rig_engine::EngineTargetKind;
 use crate::ports::rag::{EmbeddingProvider, RagStore};
 use crate::ports::router::DecisionRouter;
 use crate::providers::LLMProvider;
@@ -23,6 +24,11 @@ pub struct ProviderStack {
     pub router: Option<Arc<dyn DecisionRouter>>,
     pub default_model: String,
     pub provider_name: String,
+    /// Non-secret mirror of the engine's provider target, recorded when the
+    /// companions are built. Lets health and tests see which upstream the
+    /// engine was built for without downcasting `agent_runtime`'s trait object.
+    /// `None` when the selected provider has no engine (e.g. OpenCode).
+    pub engine_target: Option<EngineTargetKind>,
 }
 
 impl ProviderStack {
@@ -43,6 +49,7 @@ impl ProviderStack {
             router: None,
             default_model: default_model.into(),
             provider_name: "ollama".to_string(),
+            engine_target: None,
         }
     }
 }

@@ -11,6 +11,16 @@ use tokio_stream::{Stream, StreamExt};
 
 pub type AppChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, AppError>> + Send>>;
 
+/// The one description of the agent-engine capability gap, shared by the
+/// chat-time warning and the health field so the two can never disagree about
+/// what is lost. It names the provider and the lost capabilities, and never a
+/// key. A direct-answer fallback must never be silent.
+pub fn agent_engine_unavailable_message(provider: &str) -> String {
+    format!(
+        "no agent engine for the '{provider}' provider: tools, RAG context and MCP are unavailable; agent-scoped chats degrade to a direct chat answer"
+    )
+}
+
 /// Split prepared messages into system prompt, prior turns, and current user message.
 fn split_engine_messages(
     messages: &[ChatMessage],
@@ -391,6 +401,12 @@ pub async fn execute_chat(
     let requested_model = resolved.requested_target(&payload.model);
     let original_model = payload.model.clone();
     let engine_ids = engine_target(state, &resolved, &original_model);
+    if engine_ids.is_some() && services.agent_runtime.is_none() {
+        tracing::warn!(
+            "{}",
+            agent_engine_unavailable_message(&services.provider_name)
+        );
+    }
     let prepared = prepare_request(state, &services, payload, &resolved).await?;
 
     let debug_prompt = if selection.debug {
@@ -490,6 +506,12 @@ pub async fn execute_chat_stream(
     let requested_model = resolved.requested_target(&payload.model);
     let original_model = payload.model.clone();
     let engine_ids = engine_target(state, &resolved, &original_model);
+    if engine_ids.is_some() && services.agent_runtime.is_none() {
+        tracing::warn!(
+            "{}",
+            agent_engine_unavailable_message(&services.provider_name)
+        );
+    }
     let prepared = prepare_request(state, &services, payload, &resolved).await?;
     let started_at = Instant::now();
 

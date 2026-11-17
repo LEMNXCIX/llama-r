@@ -19,7 +19,7 @@ use crate::api::observability::AppObservability;
 use crate::api::rag_api::{rag_delete_document, rag_ingest, rag_query};
 use crate::api::route_api::route_preview;
 use crate::api::skill_api::list_skills_api;
-use crate::config::{Config, ProviderKind};
+use crate::config::{Config, ProviderKind, OPENROUTER_BASE_URL};
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::ContextStore;
 use crate::core::hot_reload::HotReloader;
@@ -36,6 +36,7 @@ use crate::providers::openai_compatible::OpenAiCompatibleProvider;
 use crate::providers::opencode::OpenCodeProvider;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
+#[cfg(feature = "rig-engine")]
 use crate::services::agent_runtime::AgentRuntime;
 use crate::services::provider_stack::ProviderStack;
 use crate::services::rag_ingest::RagIngestService;
@@ -78,20 +79,15 @@ pub fn build_app_state(
 ) -> Arc<AppState> {
     let metrics = Arc::new(TokenMetrics::new());
     let default_model = stack.default_model.clone();
-    // Semantic skill ranking. Without embeddings every declared skill is used,
-    // so this is an improvement and never a requirement. A stack that does not
-    // carry an embedding provider keeps the historical Ollama default.
-    let embeddings: Arc<dyn EmbeddingProvider> = stack.embeddings.clone().unwrap_or_else(|| {
-        Arc::new(OllamaEmbeddings::new(
-            "http://localhost:11434",
-            "nomic-embed-text",
-            768,
-        ))
-    });
-    let context_enricher = Arc::new(
-        ContextEnricher::new(context_store.clone(), skill_manager.clone(), default_model)
-            .with_embeddings(embeddings),
-    );
+    // Semantic skill ranking uses the SELECTED stack's embedder. Without one,
+    // every declared skill is used (best effort) — never a broken Ollama
+    // embedder pointed at localhost for a non-Ollama provider.
+    let mut enricher =
+        ContextEnricher::new(context_store.clone(), skill_manager.clone(), default_model);
+    if let Some(embeddings) = &stack.embeddings {
+        enricher = enricher.with_embeddings(embeddings.clone());
+    }
+    let context_enricher = Arc::new(enricher);
 
     // Router configuration. `RouterConfig` deliberately does not load `.env`
     // itself (that is `Config::from_env`'s job, which has already run on this
@@ -370,9 +366,9 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     }
 
     let context_store = Arc::new(ContextStore::new());
-
-    let (rag_store, rag_ingest) = build_rag(&config);
-    let history_store = build_history_store(&config);
+    // The summarizer speaks the Ollama `/api/chat` wire format, so it is only
+    // installed for providers that can serve it. See `build_history_store`.
+    let history_store = build_history_store(&config, config.provider);
 
     if let Some(history_arc) = history_store.clone() {
         let retention = config.history_retention_days;
@@ -398,27 +394,25 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         });
     }
 
-    let agent_runtime = build_agent_runtime(
-        &config,
-        mcp_registry_inner.clone(),
-        agent_registry.clone(),
-        rag_store.clone(),
-        history_store.clone(),
-        context_store.clone(),
-        skill_manager.clone(),
-    );
     // One `PROVIDER` selects chat, the decision router and embeddings. A
     // completed interactive setup already produced such a stack from the values
-    // the user entered; otherwise build one from the boot configuration. RAG
-    // and the agent runtime are built here (they need paths and registry
-    // handles) and attached to either stack.
+    // the user entered; otherwise build one from the boot configuration.
     let mut stack = match setup_stack {
         Some(stack) => stack,
         None => build_provider_stack(&config)?,
     };
-    stack.agent_runtime = agent_runtime;
-    stack.rag_store = rag_store;
-    stack.rag_ingest = rag_ingest;
+    // Build the companions FROM THE SELECTED STACK. Doing it from `config` (the
+    // old behaviour) meant a non-Ollama provider got a broken Ollama embedder
+    // and an engine hardwired to Ollama. One helper serves boot and hot Apply,
+    // so the two cannot disagree about which upstream the engine targets.
+    let handles = CompanionHandles {
+        mcp_registry: mcp_registry.clone(),
+        agent_registry: agent_registry.clone(),
+        skill_manager: skill_manager.clone(),
+        context_store: context_store.clone(),
+        history_store: history_store.clone(),
+    };
+    build_companions(&handles, &config, &mut stack);
     let state = build_app_state(
         stack,
         agent_registry.clone(),
@@ -627,8 +621,6 @@ pub mod startup_plan {
 /// string or a log line. A capability an upstream cannot offer is reported as
 /// missing rather than faked, so health can degrade honestly.
 pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> {
-    const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
-
     // Routing is inert by default, mirroring the Ollama path in
     // `build_app_state`. Its tuning lives in `RouterConfig`, not `Config`;
     // loading it here is what gives the non-Ollama decision adapters the
@@ -731,23 +723,32 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
         router,
         default_model: config.default_model.clone(),
         provider_name: config.provider.to_string(),
+        engine_target: None,
     })
 }
 
 /// Build embeddings + persistent RAG store when enabled.
 ///
 /// Always compiled; `RAG_ENABLED` decides at runtime whether a store is built.
-fn build_rag(config: &Config) -> (Option<Arc<dyn RagStore>>, Option<Arc<RagIngestService>>) {
+/// `embeddings` is the SELECTED stack's provider. Without one there is no
+/// embedder to build a store around: RAG stays off and the debug endpoints give
+/// their explicit `Unavailable` reason instead of a 500 from a broken embedder.
+fn build_rag(
+    config: &Config,
+    embeddings: Option<Arc<dyn EmbeddingProvider>>,
+) -> (Option<Arc<dyn RagStore>>, Option<Arc<RagIngestService>>) {
     if !config.rag_enabled {
         tracing::info!("RAG disabled via RAG_ENABLED=false");
         return (None, None);
     }
 
-    let embeddings: Arc<dyn EmbeddingProvider> = Arc::new(OllamaEmbeddings::new(
-        config.ollama_url.clone(),
-        config.embedding_model.clone(),
-        config.embedding_dimensions,
-    ));
+    let Some(embeddings) = embeddings else {
+        tracing::warn!(
+            "RAG unavailable: the selected provider exposes no embeddings and no OLLAMA_URL fallback is configured"
+        );
+        return (None, None);
+    };
+
     let dir = crate::core::paths::get_lancedb_dir();
     if let Err(err) = std::fs::create_dir_all(&dir) {
         tracing::warn!(path = %dir.display(), error = %err, "failed to create RAG data dir");
@@ -764,17 +765,31 @@ fn build_rag(config: &Config) -> (Option<Arc<dyn RagStore>>, Option<Arc<RagInges
 }
 
 /// Build history store (SQLite) when feature is enabled.
-fn build_history_store(config: &Config) -> Option<Arc<dyn ConversationStore>> {
+///
+/// The summarizer POSTs an Ollama-wire `/api/chat`, so it is only configured for
+/// the Ollama provider. Other providers still persist conversations; only the
+/// best-effort summaries are disabled (with a warning), never pointed at a
+/// wrong/empty URL. This is a boot-time decision: history lives on `AppState`,
+/// not on the hot-swapped stack.
+fn build_history_store(
+    config: &Config,
+    provider: ProviderKind,
+) -> Option<Arc<dyn ConversationStore>> {
     #[cfg(feature = "history")]
     {
         use crate::adapters::history::SqliteConversationStore;
 
         let path = crate::core::paths::get_history_db_path();
-        match SqliteConversationStore::open(
-            &path,
-            config.ollama_url.clone(),
-            config.default_model.clone(),
-        ) {
+        let summarizer = if provider == ProviderKind::Ollama {
+            Some((config.ollama_url.clone(), config.default_model.clone()))
+        } else {
+            tracing::warn!(
+                provider = %provider,
+                "history summaries disabled: the summarizer speaks the Ollama wire format; conversations still persist"
+            );
+            None
+        };
+        match SqliteConversationStore::open_with_summarizer(&path, summarizer) {
             Ok(store) => {
                 tracing::info!(path = %path.display(), "History store (SQLite) initialized");
                 Some(Arc::new(store))
@@ -788,60 +803,103 @@ fn build_history_store(config: &Config) -> Option<Arc<dyn ConversationStore>> {
 
     #[cfg(not(feature = "history"))]
     {
-        let _ = config;
+        let _ = (config, provider);
         tracing::info!("History feature disabled at compile time");
         None
     }
 }
 
-/// Build the agent runtime (Rig engine) when the feature is enabled.
-fn build_agent_runtime(
-    config: &Config,
-    mcp_registry: Arc<StaticMcpRegistry>,
-    agent_registry: Arc<AgentRegistry>,
-    rag: Option<Arc<dyn RagStore>>,
-    history_store: Option<Arc<dyn ConversationStore>>,
-    context_store: Arc<ContextStore>,
-    skill_manager: Arc<SkillManager>,
-) -> Option<Arc<AgentRuntime>> {
-    #[cfg(feature = "rig-engine")]
-    {
-        use crate::adapters::rig_engine::RigAgentEngine;
+/// Handles from `AppState` that the provider-dependent companions need. Kept as
+/// a struct so the SAME builder runs at boot (before `AppState` exists) and on a
+/// settings Apply (from a live `AppState`) without either path building a stack
+/// twice or swapping a half-built stack into the running process.
+#[derive(Clone)]
+pub struct CompanionHandles {
+    pub mcp_registry: Arc<dyn McpServerRegistry>,
+    pub agent_registry: Arc<AgentRegistry>,
+    pub skill_manager: Arc<SkillManager>,
+    pub context_store: Arc<ContextStore>,
+    pub history_store: Option<Arc<dyn ConversationStore>>,
+}
 
-        let engine: Arc<dyn AgentEngine> = Arc::new(RigAgentEngine::new(
-            config.ollama_url.clone(),
-            mcp_registry,
-            rag.clone(),
-        ));
-
-        Some(Arc::new(AgentRuntime {
-            registry: agent_registry,
-            engine,
-            history: history_store,
-            rag,
-            // A second `ContextEnricher`, configured identically to the one
-            // `build_app_state` makes. That is safe because the enricher holds no
-            // mutable state — two shared handles, a string and the embedding
-            // provider — so two of them cannot disagree about anything. It is built
-            // here rather than threaded from `build_app_state` only because that
-            // would change a public signature four test files call, for no
-            // behavioural gain.
-            enricher: Arc::new(
-                ContextEnricher::new(context_store, skill_manager, config.default_model.clone())
-                    .with_embeddings(Arc::new(OllamaEmbeddings::new(
-                        config.ollama_url.clone(),
-                        config.embedding_model.clone(),
-                        config.embedding_dimensions,
-                    )) as Arc<dyn EmbeddingProvider>),
-            ),
-        }))
+impl CompanionHandles {
+    pub fn from_state(state: &AppState) -> Self {
+        Self {
+            mcp_registry: state.mcp_registry.clone(),
+            agent_registry: state.agent_registry.clone(),
+            skill_manager: state.skill_manager.clone(),
+            context_store: state.context_store.clone(),
+            history_store: state.history_store.clone(),
+        }
     }
+}
+
+/// Build the provider-dependent companions onto `stack` from the selected
+/// provider. Called once at boot and once per settings Apply. RAG uses the
+/// stack's embedder (or is absent), and the Rig engine targets the selected
+/// provider — Ollama for Ollama, OpenRouter for OpenRouter, none for OpenCode.
+/// A capability the provider cannot offer is reported, never silently faked.
+pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut ProviderStack) {
+    let (rag_store, rag_ingest) = build_rag(config, stack.embeddings.clone());
+
+    #[cfg(feature = "rig-engine")]
+    let agent_runtime = {
+        use crate::adapters::rig_engine::{engine_target_for, RigAgentEngine};
+
+        let engine_target = engine_target_for(config);
+        stack.engine_target = engine_target.as_ref().map(|target| target.kind());
+        engine_target.map(|target| {
+            let engine: Arc<dyn AgentEngine> = Arc::new(RigAgentEngine::from_target(
+                target,
+                handles.mcp_registry.clone(),
+                rag_store.clone(),
+            ));
+            // ContextEnricher built from the selected stack's embedder. Without
+            // one, all declared skills are used (best effort) rather than a
+            // broken Ollama embedder being attached.
+            let mut enricher = ContextEnricher::new(
+                handles.context_store.clone(),
+                handles.skill_manager.clone(),
+                config.default_model.clone(),
+            );
+            if let Some(embeddings) = &stack.embeddings {
+                enricher = enricher.with_embeddings(embeddings.clone());
+            }
+            Arc::new(AgentRuntime {
+                registry: handles.agent_registry.clone(),
+                engine,
+                history: handles.history_store.clone(),
+                rag: rag_store.clone(),
+                enricher: Arc::new(enricher),
+            })
+        })
+    };
 
     #[cfg(not(feature = "rig-engine"))]
-    {
-        let _ = (config, mcp_registry, agent_registry, rag, history_store);
+    let agent_runtime = {
+        let _ = handles;
+        stack.engine_target = None;
         None
+    };
+
+    if agent_runtime.is_none() {
+        // Capability loss is never silent: name the provider and what is lost.
+        tracing::warn!(
+            provider = %config.provider,
+            "no agent engine for this provider: agent tools, RAG context and MCP are unavailable; agent-scoped chats degrade to a direct chat answer"
+        );
     }
+
+    stack.agent_runtime = agent_runtime;
+    stack.rag_store = rag_store;
+    stack.rag_ingest = rag_ingest;
+}
+
+/// Convenience: build companions using the handles on a live `AppState`. Used
+/// by a settings Apply and by tests that install companions onto a running
+/// state; boot uses [`build_companions`] directly (no `AppState` yet).
+pub fn build_companions_for_state(state: &AppState, config: &Config, stack: &mut ProviderStack) {
+    build_companions(&CompanionHandles::from_state(state), config, stack);
 }
 
 /// Load MCP server configs from the `mcp-servers/` directory.

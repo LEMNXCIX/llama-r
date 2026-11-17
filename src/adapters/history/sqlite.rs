@@ -16,16 +16,28 @@ use uuid::Uuid;
 
 pub struct SqliteConversationStore {
     conn: Mutex<Connection>,
-    ollama_url: String,
-    summarizer_model: String,
+    /// `(url, model)` for the Ollama-wire summarizer. `None` when the selected
+    /// provider cannot speak that wire format: summaries are best-effort and
+    /// gated by `index_summaries`, so disabling them is honest, whereas POSTing
+    /// to a wrong/empty URL is not. Conversations still persist either way.
+    summarizer: Option<(String, String)>,
 }
 
 impl SqliteConversationStore {
-    /// Open or create the database at `path`, run migrations, and return store instance.
+    /// Open with an Ollama-wire summarizer. Kept for existing callers/tests.
     pub fn open(
         path: impl AsRef<Path>,
         ollama_url: impl Into<String>,
         summarizer_model: impl Into<String>,
+    ) -> Result<Self, String> {
+        Self::open_with_summarizer(path, Some((ollama_url.into(), summarizer_model.into())))
+    }
+
+    /// Open with an optional summarizer endpoint. Pass `None` when no provider
+    /// can serve the Ollama `/api/chat` wire format.
+    pub fn open_with_summarizer(
+        path: impl AsRef<Path>,
+        summarizer: Option<(String, String)>,
     ) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("failed to open history db: {e}"))?;
 
@@ -34,8 +46,7 @@ impl SqliteConversationStore {
 
         let store = Self {
             conn: Mutex::new(conn),
-            ollama_url: ollama_url.into(),
-            summarizer_model: summarizer_model.into(),
+            summarizer,
         };
 
         store.run_migrations()?;
@@ -438,6 +449,15 @@ impl ConversationStore for SqliteConversationStore {
             return Ok(None);
         }
 
+        // No upstream that speaks the Ollama wire format: summaries are
+        // best-effort, so skip them rather than call a wrong/empty URL.
+        let Some((ollama_url, summarizer_model)) = &self.summarizer else {
+            tracing::warn!(
+                "history summaries are disabled: no provider serves the Ollama summarizer endpoint"
+            );
+            return Ok(None);
+        };
+
         let qid = agent.qualified_id();
         let interval = agent.config.memory.summarize_every_n_turns.max(1);
 
@@ -500,14 +520,14 @@ impl ConversationStore for SqliteConversationStore {
             prompt.push_str(&format!("{}: {}\n", m.role, m.content));
         }
 
-        let url = if self.ollama_url.ends_with('/') {
-            format!("{}api/chat", self.ollama_url)
+        let url = if ollama_url.ends_with('/') {
+            format!("{}api/chat", ollama_url)
         } else {
-            format!("{}/api/chat", self.ollama_url)
+            format!("{}/api/chat", ollama_url)
         };
 
         let body = serde_json::json!({
-            "model": self.summarizer_model,
+            "model": summarizer_model,
             "messages": [
                 { "role": "user", "content": prompt }
             ],

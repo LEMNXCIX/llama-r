@@ -1628,24 +1628,25 @@ impl TuiApp {
         tokio::spawn(async move {
             let outcome = Self::finish_apply(&state, config).await;
             *status.lock().unwrap() = match outcome {
-                Ok(()) => SettingsStatus::Applied("Applied — active now, no restart".into()),
+                Ok(()) => SettingsStatus::Applied(
+                    "Applied — chat provider active; agent tools/RAG require a supported provider"
+                        .into(),
+                ),
                 Err(err) => SettingsStatus::Error(err),
             };
         });
     }
 
-    /// The async half of an Apply. Builds the whole provider stack off the UI
-    /// thread, then persists it and installs it. Nothing here runs on failure:
-    /// a bad build or a failed write leaves the old stack in place. Companion
-    /// services the builder does not construct (RAG, the agent engine) are
-    /// carried over so a hot swap does not silently disable them.
+    /// The async half of an Apply. Builds the whole provider stack AND its
+    /// companions off the UI thread, then persists it and installs it in one
+    /// swap. Nothing here runs on failure: a bad build or a failed write leaves
+    /// the old stack in place. Companions are rebuilt from the NEW stack —
+    /// carrying the old Ollama engine/RAG store over left the engine pointing
+    /// at the boot-time upstream after a provider switch.
     async fn finish_apply(state: &AppState, config: Config) -> Result<(), String> {
         let mut stack =
             crate::runtime::build_provider_stack(&config).map_err(|err| err.to_string())?;
-        let old = state.services_snapshot().await;
-        stack.agent_runtime = old.agent_runtime.clone();
-        stack.rag_store = old.rag_store.clone();
-        stack.rag_ingest = old.rag_ingest.clone();
+        crate::runtime::build_companions_for_state(state, &config, &mut stack);
         config.save_to_env().map_err(|err| err.to_string())?;
         state.replace_services(stack).await;
         Ok(())

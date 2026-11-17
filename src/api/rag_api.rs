@@ -29,6 +29,15 @@ fn require_debug(headers: &HeaderMap) -> Result<(), AppError> {
     }
 }
 
+/// One explicit 501 reason for a missing RAG store. Names the likely cause so a
+/// caller can tell "feature off" from "provider has no embeddings" — never a
+/// 500 from an embedder pointed at an empty/unsupported URL.
+fn rag_unavailable() -> AppError {
+    AppError::Unavailable(
+        "RAG is unavailable: RAG_ENABLED=false, or the selected provider exposes no embeddings (with no OLLAMA_URL fallback)".into(),
+    )
+}
+
 /// Parse a JSON body *after* the debug gate has passed.
 ///
 /// Implemented as a custom extractor so the ordering is enforced by the type
@@ -150,9 +159,7 @@ pub async fn rag_ingest(
     state.observability.record_http_request();
 
     let services = state.services_snapshot().await;
-    let store = services.rag_store.as_ref().ok_or_else(|| {
-        AppError::Unavailable("RAG is disabled (RAG_ENABLED=false or unavailable)".into())
-    })?;
+    let store = services.rag_store.as_ref().ok_or_else(rag_unavailable)?;
     let ingest = services
         .rag_ingest
         .clone()
@@ -233,10 +240,7 @@ pub async fn rag_delete_document(
     state.observability.record_http_request();
 
     let services = state.services_snapshot().await;
-    let ingest = services
-        .rag_ingest
-        .clone()
-        .ok_or_else(|| AppError::Unavailable("RAG is disabled (RAG_ENABLED=false)".into()))?;
+    let ingest = services.rag_ingest.clone().ok_or_else(rag_unavailable)?;
 
     let scope = resolve_scope(&state, body.project_id.as_deref(), body.agent_id.as_deref())?;
 
@@ -259,9 +263,7 @@ pub async fn rag_query(
     state.observability.record_http_request();
 
     let services = state.services_snapshot().await;
-    let store = services.rag_store.as_ref().ok_or_else(|| {
-        AppError::Unavailable("RAG is disabled (RAG_ENABLED=false or unavailable)".into())
-    })?;
+    let store = services.rag_store.as_ref().ok_or_else(rag_unavailable)?;
 
     if body.query.trim().is_empty() {
         return Err(AppError::Validation("query must not be empty".into()));

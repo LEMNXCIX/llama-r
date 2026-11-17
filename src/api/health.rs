@@ -25,7 +25,15 @@ pub struct RouterHealth {
 pub struct ProviderHealth {
     pub name: String,
     pub embeddings: bool,
+    /// Whether a Rig engine is actually attached for this provider. `false`
+    /// for providers rig-core cannot serve (e.g. OpenCode).
+    pub agent_engine: bool,
+    /// Embeddings capability explanation (kept separate from the engine one so
+    /// a stack that simply has no engine attached is not conflated with a
+    /// provider that exposes no embeddings at all).
     pub reason: Option<String>,
+    /// Names the lost capabilities (tools/RAG/MCP) when no engine is attached.
+    pub agent_engine_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -57,9 +65,11 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
     let provider_healthy = services.provider.health_check().await.is_ok();
     let router_config = state.router_config.clone();
     let router_healthy = state.router_healthy.load(Ordering::SeqCst);
+    let has_engine = services.agent_runtime.is_some();
     let provider = ProviderHealth {
         name: services.provider_name.clone(),
         embeddings: services.embeddings.is_some(),
+        agent_engine: has_engine,
         // A stack without embeddings is a capability gap, not an ordinary
         // state. Name it and explain why; no field here ever carries a key.
         reason: if services.embeddings.is_some() {
@@ -68,6 +78,15 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
             Some(format!(
                 "embeddings are disabled: the '{}' provider does not serve them and no OLLAMA_URL fallback is configured",
                 services.provider_name
+            ))
+        },
+        // The engine gap uses the same message chat_core logs on degradation,
+        // so health and the warning can never disagree about what is lost.
+        agent_engine_reason: if has_engine {
+            None
+        } else {
+            Some(crate::api::chat_core::agent_engine_unavailable_message(
+                &services.provider_name,
             ))
         },
     };
