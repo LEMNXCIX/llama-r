@@ -1,4 +1,6 @@
-use crate::domain::models::{ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
+use crate::config::ProviderKind;
+use crate::domain::models::{ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo, Usage};
+use crate::providers::capabilities::capabilities_for;
 use crate::providers::LLMProvider;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -34,6 +36,30 @@ struct OllamaChatResponseInternal {
     created_at: String,
     message: crate::domain::models::ChatMessage,
     done: bool,
+    /// Ollama reports counts on the final (non-streaming) response. Missing in
+    /// streamed chunks and on older builds, so both default to zero and the
+    /// absence is signalled by `usage: None` at the call site.
+    #[serde(default)]
+    prompt_eval_count: u64,
+    #[serde(default)]
+    eval_count: u64,
+}
+
+impl OllamaChatResponseInternal {
+    /// Counts are only trustworthy on a completed response; Ollama's streamed
+    /// chunks carry `done: false` and no counts, so those yield no usage.
+    fn usage(&self) -> Option<Usage> {
+        if !self.done || (self.prompt_eval_count == 0 && self.eval_count == 0) {
+            return None;
+        }
+        let caps = capabilities_for(ProviderKind::Ollama, &self.model);
+        Some(Usage::from_counts(
+            self.prompt_eval_count,
+            self.eval_count,
+            caps.cost_per_1m_input,
+            caps.cost_per_1m_output,
+        ))
+    }
 }
 
 #[derive(Deserialize)]
@@ -110,12 +136,15 @@ impl LLMProvider for OllamaProvider {
         }
 
         let body: OllamaChatResponseInternal = resp.json().await?;
+        let usage = body.usage();
 
         Ok(ChatResponse {
             model: body.model,
             created_at: body.created_at,
             message: body.message,
             done: body.done,
+            usage,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })

@@ -6,6 +6,18 @@ use crate::services::agent_runtime::AgentRuntime;
 use crate::services::rag_ingest::RagIngestService;
 use std::sync::Arc;
 
+/// The single upstream tried when the primary chat provider errors.
+///
+/// Held in the stack so a request's fallback comes from the same snapshot as its
+/// primary (a settings Apply cannot pair the old primary with the new fallback).
+/// `name` is a `providers.toml` profile name — a secret-free label used only for
+/// logging and for `ChatResponse::served_by`; the key stays inside the adapter.
+#[derive(Clone)]
+pub struct FallbackProvider {
+    pub name: String,
+    pub provider: Arc<dyn LLMProvider + Send + Sync>,
+}
+
 /// The provider-dependent half of `AppState`.
 ///
 /// Held behind `Arc<RwLock<ProviderStack>>` so a running process can install a
@@ -22,6 +34,10 @@ pub struct ProviderStack {
     pub rag_ingest: Option<Arc<RagIngestService>>,
     pub embeddings: Option<Arc<dyn EmbeddingProvider>>,
     pub router: Option<Arc<dyn DecisionRouter>>,
+    /// At most one upstream to try after the primary and its DEFAULT_MODEL
+    /// retry both fail. The chain is deliberately bounded here: one field, one
+    /// attempt, no unbounded profile walk mid-request.
+    pub fallback_provider: Option<FallbackProvider>,
     pub default_model: String,
     pub provider_name: String,
     /// Non-secret mirror of the engine's provider target, recorded when the
@@ -47,6 +63,7 @@ impl ProviderStack {
             rag_ingest: None,
             embeddings: None,
             router: None,
+            fallback_provider: None,
             default_model: default_model.into(),
             provider_name: "ollama".to_string(),
             engine_target: None,

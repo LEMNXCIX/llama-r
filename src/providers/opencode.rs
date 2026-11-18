@@ -168,6 +168,8 @@ impl LLMProvider for OpenCodeProvider {
                 content: extract_text(&value)?,
             },
             done: true,
+            usage: None,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })

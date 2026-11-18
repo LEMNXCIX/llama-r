@@ -173,6 +173,8 @@ impl LLMProvider for FakeProvider {
                     .unwrap_or_default(),
             },
             done: true,
+            usage: None,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })
@@ -1113,6 +1115,8 @@ impl LLMProvider for TagProvider {
                 content: self.0.into(),
             },
             done: true,
+            usage: None,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })

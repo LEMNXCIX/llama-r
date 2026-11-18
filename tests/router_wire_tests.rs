@@ -315,6 +315,8 @@ impl LLMProvider for RecordingProvider {
                 content: self.reply.clone(),
             },
             done: true,
+            usage: None,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })

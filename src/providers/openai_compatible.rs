@@ -6,8 +6,12 @@
 //! unsupported: a 501 ("Unavailable") is more honest than pretending a
 //! non-streaming upstream can stream.
 
-use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
+use crate::config::ProviderKind;
+use crate::domain::models::{
+    ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo, Usage,
+};
 use crate::error::AppError;
+use crate::providers::capabilities::capabilities_for;
 use crate::providers::LLMProvider;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -81,6 +85,17 @@ struct ChatCompletionRequest<'a> {
 struct ChatCompletionResponse {
     model: String,
     choices: Vec<Choice>,
+    /// OpenAI-compatible usage is optional: a compatible gateway may omit it.
+    #[serde(default)]
+    usage: Option<TokenUsage>,
+}
+
+#[derive(Deserialize)]
+struct TokenUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -173,6 +188,19 @@ impl LLMProvider for OpenAiCompatibleProvider {
             return Err(format!("OpenAI-compatible error: {status} - {text}").into());
         }
         let body: ChatCompletionResponse = resp.json().await?;
+        let usage = body.usage.as_ref().map(|tokens| {
+            let kind = self
+                .provider_name
+                .parse::<ProviderKind>()
+                .unwrap_or(ProviderKind::OpenAiCompatible);
+            let caps = capabilities_for(kind, &body.model);
+            Usage::from_counts(
+                tokens.prompt_tokens,
+                tokens.completion_tokens,
+                caps.cost_per_1m_input,
+                caps.cost_per_1m_output,
+            )
+        });
         let choice = body.choices.into_iter().next().ok_or_else(|| {
             AppError::Provider("chat-completions response contained no choices".into())
         })?;
@@ -181,6 +209,8 @@ impl LLMProvider for OpenAiCompatibleProvider {
             created_at: chrono::Utc::now().to_rfc3339(),
             message: choice.message,
             done: true,
+            usage,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })

@@ -16,12 +16,63 @@ pub struct ChatRequest {
     pub stream: bool,
 }
 
+/// Per-response token accounting, when the upstream reports it.
+///
+/// `cost_usd` is computed from the per-million token prices attached to the
+/// resolved model's capabilities. It is `None` unless **both** the token counts
+/// above and both price figures are present — a missing price is never silently
+/// replaced by a guess (today every catalog price is `None`, so a real response
+/// carries counts but no fabricated cost).
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+impl Usage {
+    /// Build usage from upstream counts and the model's per-million prices.
+    /// Passing the prices separately keeps `domain` free of a dependency on the
+    /// provider capability module — the caller reads them off `ModelCapabilities`.
+    pub fn from_counts(
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_per_1m_input: Option<f64>,
+        cost_per_1m_output: Option<f64>,
+    ) -> Self {
+        let cost_usd = match (cost_per_1m_input, cost_per_1m_output) {
+            (Some(input_rate), Some(output_rate)) => Some(
+                (input_tokens as f64 * input_rate + output_tokens as f64 * output_rate)
+                    / 1_000_000.0,
+            ),
+            // One absent price is enough: never fabricate a partial cost.
+            _ => None,
+        };
+        Self {
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct ChatResponse {
     pub model: String,
     pub created_at: String,
     pub message: ChatMessage,
     pub done: bool,
+    /// Token counts reported by the upstream, when it reported any. Optional:
+    /// an upstream with no usage in its response leaves this `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    /// The configured profile that actually answered, when a fallback was used.
+    /// A **profile name**, never a key value: it exists so a degraded answer can
+    /// be attributed to the upstream that produced it without disclosing a
+    /// credential. `None` when the primary answered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_by: Option<String>,
     /// Optional: the full expanded prompt used for this request (only if requested via headers)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_prompt: Option<String>,
@@ -178,4 +229,50 @@ fn default_skill_scope() -> SkillScope {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListSkillsResponse {
     pub skills: Vec<Skill>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_computes_cost_from_both_prices() {
+        let usage = Usage::from_counts(2_000_000, 1_000_000, Some(3.0), Some(6.0));
+        assert_eq!(usage.input_tokens, 2_000_000);
+        assert_eq!(usage.output_tokens, 1_000_000);
+        assert_eq!(usage.cost_usd, Some(12.0), "2m*3 + 1m*6 = 12 USD");
+    }
+
+    #[test]
+    fn usage_never_fabricates_a_cost_from_a_missing_price() {
+        let no_input = Usage::from_counts(10, 10, None, Some(6.0));
+        let no_output = Usage::from_counts(10, 10, Some(3.0), None);
+        let neither = Usage::from_counts(10, 10, None, None);
+        assert_eq!(no_input.cost_usd, None);
+        assert_eq!(no_output.cost_usd, None);
+        assert_eq!(neither.cost_usd, None);
+        // Counts are still reported even when no price is known.
+        assert_eq!(neither.input_tokens, 10);
+        assert_eq!(neither.output_tokens, 10);
+    }
+
+    #[test]
+    fn optional_usage_fields_are_absent_from_json_when_none() {
+        let response = ChatResponse {
+            model: "m".into(),
+            created_at: "now".into(),
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: "hi".into(),
+            },
+            done: true,
+            usage: None,
+            served_by: None,
+            debug_prompt: None,
+            debug_route: None,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json.get("usage").is_none());
+        assert!(json.get("served_by").is_none());
+    }
 }

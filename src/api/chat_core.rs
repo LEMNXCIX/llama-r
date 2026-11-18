@@ -11,6 +11,14 @@ use tokio_stream::{Stream, StreamExt};
 
 pub type AppChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, AppError>> + Send>>;
 
+/// The raw stream a `LLMProvider` returns, before its errors are mapped into
+/// `AppError`. Named so the fallback's stream type stays readable.
+type ProviderChatStream = Pin<
+    Box<
+        dyn Stream<Item = Result<ChatStreamEvent, Box<dyn std::error::Error + Send + Sync>>> + Send,
+    >,
+>;
+
 /// The one description of the agent-engine capability gap, shared by the
 /// chat-time warning and the health field so the two can never disagree about
 /// what is lost. It names the provider and the lost capabilities, and never a
@@ -265,120 +273,176 @@ async fn prepare_request(
     Ok(payload)
 }
 
+/// Map an upstream stream's boxed errors into `AppError` at the boundary. Both
+/// the primary and the (at most one) fallback stream go through here so a
+/// provider error is reported the same way whichever answered.
+fn map_provider_stream(stream: ProviderChatStream) -> AppChatStream {
+    Box::pin(stream.map(|event| event.map_err(|error| AppError::Provider(error.to_string()))))
+}
+
 async fn run_with_fallback(
     state: &AppState,
     services: &crate::services::provider_stack::ProviderStack,
-    mut request: ChatRequest,
+    request: ChatRequest,
     requested_model: &str,
 ) -> Result<ChatResponse, AppError> {
     // `services` is the request's one snapshot: the primary attempt, its
-    // fallback and every field they read use the same stack, even if a hot
-    // swap lands mid-call. A settings Apply that changes provider *and* model
-    // together cannot pair the old model with the new provider.
+    // DEFAULT_MODEL retry, the one provider fallback and every field they read
+    // use the same stack, even if a hot swap lands mid-call. A settings Apply
+    // that changes provider *and* model together cannot pair the old model with
+    // the new provider.
     let fallback_model = services.default_model.clone();
-    match services.provider.chat(request.clone()).await {
-        Ok(response) => Ok(response),
+    let fallback_model = fallback_model.trim();
+    let model_retry_available = !fallback_model.is_empty()
+        && requested_model != fallback_model
+        && request.model != fallback_model;
+
+    let mut error = match services.provider.chat(request.clone()).await {
+        Ok(response) => return Ok(response),
         Err(error) => {
             state.observability.record_provider_error();
-            let fallback_model = fallback_model.trim();
-            if !fallback_model.is_empty()
-                && requested_model != fallback_model
-                && request.model != fallback_model
-            {
-                tracing::warn!(
-                    requested_model = %requested_model,
-                    attempted_model = %request.model,
-                    fallback_model = %fallback_model,
-                    error = %error,
-                    "Primary chat attempt failed; retrying with DEFAULT_MODEL"
-                );
-                state.observability.record_fallback();
-                request.model = fallback_model.to_string();
-                services
-                    .provider
-                    .chat(request)
-                    .await
-                    .map_err(|fallback_error| {
-                        state.observability.record_provider_error();
-                        AppError::Provider(format!("Fallback also failed: {}", fallback_error))
-                    })
-            } else {
-                Err(AppError::Provider(error.to_string()))
+            error
+        }
+    };
+
+    // Rung 1 (pre-existing): retry the SAME provider with DEFAULT_MODEL.
+    if model_retry_available {
+        tracing::warn!(
+            requested_model = %requested_model,
+            attempted_model = %request.model,
+            fallback_model = %fallback_model,
+            error = %error,
+            "Primary chat attempt failed; retrying with DEFAULT_MODEL"
+        );
+        state.observability.record_fallback();
+        let mut retry_request = request.clone();
+        retry_request.model = fallback_model.to_string();
+        match services.provider.chat(retry_request).await {
+            Ok(response) => return Ok(response),
+            Err(retry_error) => {
+                state.observability.record_provider_error();
+                error = retry_error;
             }
         }
     }
+
+    // Rung 2 (new): try the ONE next configured profile held by the stack. The
+    // bound is structural — a single field, a single attempt — so a chain of
+    // broken profiles can never turn one request into an unbounded walk. The
+    // profile name is secret-free; it is the only provider identity recorded.
+    if let Some(fallback) = &services.fallback_provider {
+        tracing::warn!(
+            provider = %fallback.name,
+            error = %error,
+            "Primary provider failed; trying the next configured profile"
+        );
+        state.observability.record_fallback();
+        match fallback.provider.chat(request).await {
+            Ok(mut response) => {
+                tracing::info!(provider = %fallback.name, "Fallback profile answered");
+                response.served_by = Some(fallback.name.clone());
+                return Ok(response);
+            }
+            Err(fallback_error) => {
+                state.observability.record_provider_error();
+                return Err(AppError::Provider(format!(
+                    "Fallback also failed: {}",
+                    fallback_error
+                )));
+            }
+        }
+    }
+
+    Err(AppError::Provider(error.to_string()))
 }
 
 async fn run_stream_with_fallback(
     state: &AppState,
     services: &crate::services::provider_stack::ProviderStack,
-    mut request: ChatRequest,
+    request: ChatRequest,
     requested_model: &str,
 ) -> Result<AppChatStream, AppError> {
-    // `services` is the request's one snapshot (see `run_with_fallback`): the
-    // primary attempt and its fallback read the same stack, so a hot swap
-    // cannot mix the two providers or the two models mid-stream.
+    // `services` is the request's one snapshot (see `run_with_fallback`): every
+    // attempt reads the same stack, so a hot swap cannot mix providers or models
+    // mid-stream. Failover happens only while *opening* a stream — once events
+    // have been yielded the provider is fixed for the life of that stream.
     let fallback_model = services.default_model.clone();
-    match services.provider.chat_stream(request.clone()).await {
-        Ok(stream) => Ok(Box::pin(stream.map(
-            |event: Result<ChatStreamEvent, Box<dyn std::error::Error + Send + Sync>>| {
-                event.map_err(|error| AppError::Provider(error.to_string()))
-            },
-        ))),
+    let fallback_model = fallback_model.trim();
+    let model_retry_available = !fallback_model.is_empty()
+        && requested_model != fallback_model
+        && request.model != fallback_model;
+
+    // The non-Ollama adapters reject streaming with a deliberate
+    // `AppError::Unavailable` (501) before opening any connection. Preserve
+    // that status instead of trying another rung: the feature is unsupported,
+    // not a broken upstream. Ordinary errors keep the fallback semantics.
+    fn preserve_unavailable(
+        error: Box<dyn std::error::Error + Send + Sync>,
+    ) -> Result<Box<dyn std::error::Error + Send + Sync>, AppError> {
+        match error.downcast::<AppError>() {
+            Ok(app_error) if matches!(&*app_error, AppError::Unavailable(_)) => Err(*app_error),
+            Ok(app_error) => Ok(app_error),
+            Err(error) => Ok(error),
+        }
+    }
+
+    let mut error = match services.provider.chat_stream(request.clone()).await {
+        Ok(stream) => return Ok(map_provider_stream(stream)),
         Err(error) => {
-            // The non-Ollama adapters reject streaming with a deliberate
-            // `AppError::Unavailable` (501) before opening any connection.
-            // Preserve that status instead of flattening it into a 502 — the
-            // feature is unsupported, not a broken upstream. Ordinary errors
-            // keep the existing fallback/no-failover semantics unchanged.
-            let error: Box<dyn std::error::Error + Send + Sync> = match error.downcast::<AppError>()
-            {
-                Ok(app_error) if matches!(&*app_error, AppError::Unavailable(_)) => {
-                    return Err(*app_error);
-                }
-                Ok(app_error) => app_error,
-                Err(error) => error,
-            };
+            let error = preserve_unavailable(error)?;
             state.observability.record_provider_error();
-            let fallback_model = fallback_model.trim();
-            if !fallback_model.is_empty()
-                && requested_model != fallback_model
-                && request.model != fallback_model
-            {
-                tracing::warn!(
-                    requested_model = %requested_model,
-                    attempted_model = %request.model,
-                    fallback_model = %fallback_model,
-                    error = %error,
-                    "Primary streaming chat attempt failed; retrying with DEFAULT_MODEL"
-                );
-                state.observability.record_fallback();
-                request.model = fallback_model.to_string();
-                services
-                    .provider
-                    .chat_stream(request)
-                    .await
-                    .map(|stream| {
-                        Box::pin(stream.map(
-                            |event: Result<
-                                ChatStreamEvent,
-                                Box<dyn std::error::Error + Send + Sync>,
-                            >| {
-                                event.map_err(|stream_error| {
-                                    AppError::Provider(stream_error.to_string())
-                                })
-                            },
-                        )) as AppChatStream
-                    })
-                    .map_err(|fallback_error| {
-                        state.observability.record_provider_error();
-                        AppError::Provider(format!("Fallback also failed: {}", fallback_error))
-                    })
-            } else {
-                Err(AppError::Provider(error.to_string()))
+            error
+        }
+    };
+
+    // Rung 1 (pre-existing): the same provider with DEFAULT_MODEL.
+    if model_retry_available {
+        tracing::warn!(
+            requested_model = %requested_model,
+            attempted_model = %request.model,
+            fallback_model = %fallback_model,
+            error = %error,
+            "Primary streaming chat attempt failed; retrying with DEFAULT_MODEL"
+        );
+        state.observability.record_fallback();
+        let mut retry_request = request.clone();
+        retry_request.model = fallback_model.to_string();
+        match services.provider.chat_stream(retry_request).await {
+            Ok(stream) => return Ok(map_provider_stream(stream)),
+            Err(retry_error) => {
+                let retry_error = preserve_unavailable(retry_error)?;
+                state.observability.record_provider_error();
+                error = retry_error;
             }
         }
     }
+
+    // Rung 2 (new): the ONE next configured profile. Only a failure to *open*
+    // the stream reaches here, so this never switches providers mid-stream.
+    if let Some(fallback) = &services.fallback_provider {
+        tracing::warn!(
+            provider = %fallback.name,
+            error = %error,
+            "Primary provider failed; trying the next configured profile for streaming"
+        );
+        state.observability.record_fallback();
+        match fallback.provider.chat_stream(request).await {
+            Ok(stream) => {
+                tracing::info!(provider = %fallback.name, "Fallback profile answered (streaming)");
+                return Ok(map_provider_stream(stream));
+            }
+            Err(fallback_error) => {
+                let fallback_error = preserve_unavailable(fallback_error)?;
+                state.observability.record_provider_error();
+                return Err(AppError::Provider(format!(
+                    "Fallback also failed: {}",
+                    fallback_error
+                )));
+            }
+        }
+    }
+
+    Err(AppError::Provider(error.to_string()))
 }
 
 pub async fn execute_chat(
@@ -455,6 +519,9 @@ pub async fn execute_chat(
                             content: text,
                         },
                         done: true,
+                        // The engine path has no token accounting surface yet.
+                        usage: None,
+                        served_by: None,
                         debug_prompt,
                         debug_route,
                     };

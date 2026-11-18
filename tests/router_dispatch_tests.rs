@@ -162,6 +162,8 @@ impl LLMProvider for RecordingStreamProvider {
                 content: "ok".to_string(),
             },
             done: true,
+            usage: None,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })

@@ -6,8 +6,12 @@
 //! rather than a message role, and the answer is a list of content blocks.
 //! This module owns all of that so `domain::models` never sees it.
 
-use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
+use crate::config::ProviderKind;
+use crate::domain::models::{
+    ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo, Usage,
+};
 use crate::error::AppError;
+use crate::providers::capabilities::capabilities_for;
 use crate::providers::LLMProvider;
 use async_trait::async_trait;
 use reqwest::{Client, RequestBuilder};
@@ -90,6 +94,16 @@ struct WireMessage<'a> {
 struct MessagesResponse {
     content: Vec<ContentBlock>,
     model: Option<String>,
+    #[serde(default)]
+    usage: Option<TokenUsage>,
+}
+
+#[derive(Deserialize)]
+struct TokenUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -207,6 +221,15 @@ impl LLMProvider for AnthropicProvider {
             return Err(format!("Anthropic error: {status} - {text}").into());
         }
         let body: MessagesResponse = response.json().await?;
+        let caps = capabilities_for(ProviderKind::Anthropic, model);
+        let usage = body.usage.as_ref().map(|tokens| {
+            Usage::from_counts(
+                tokens.input_tokens,
+                tokens.output_tokens,
+                caps.cost_per_1m_input,
+                caps.cost_per_1m_output,
+            )
+        });
         let content = body
             .content
             .into_iter()
@@ -222,6 +245,8 @@ impl LLMProvider for AnthropicProvider {
                 content,
             },
             done: true,
+            usage,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })

@@ -44,7 +44,7 @@ use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 #[cfg(feature = "rig-engine")]
 use crate::services::agent_runtime::AgentRuntime;
-use crate::services::provider_stack::ProviderStack;
+use crate::services::provider_stack::{FallbackProvider, ProviderStack};
 use crate::services::rag_ingest::RagIngestService;
 use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
@@ -698,6 +698,61 @@ fn profile_api_key(profile: &ProviderProfile) -> String {
         .unwrap_or_default()
 }
 
+/// Build a chat provider from a profile's public fields, for the one fallback
+/// rung. The key is read by *variable name* from `api_key_env` and handed straight
+/// to the adapter: it never enters a URL, a log line or an error string. Only the
+/// fields on `ProviderProfile` are used — never a key value.
+fn chat_provider_from_profile(
+    profile: &ProviderProfile,
+    model: &str,
+) -> Arc<dyn LLMProvider + Send + Sync> {
+    let key = profile_api_key(profile);
+    let base_url = profile.base_url.clone();
+    match profile.kind {
+        ProviderKind::Ollama => Arc::new(OllamaProvider::new(
+            base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+        )),
+        ProviderKind::OpenRouter => Arc::new(OpenAiCompatibleProvider::new(
+            base_url.unwrap_or_else(|| OPENROUTER_BASE_URL.to_string()),
+            key,
+            model.to_string(),
+        )),
+        ProviderKind::OpenCode => Arc::new(OpenCodeProvider::new(
+            base_url.unwrap_or_else(|| "http://127.0.0.1:4096".to_string()),
+            if key.is_empty() { None } else { Some(key) },
+            model.to_string(),
+        )),
+        ProviderKind::OpenAiCompatible => Arc::new(OpenAiCompatibleProvider::with_provider_name(
+            base_url.unwrap_or_else(|| "https://api.openai.com".to_string()),
+            key,
+            model.to_string(),
+            profile.name.clone(),
+        )),
+        ProviderKind::Anthropic => {
+            Arc::new(AnthropicProvider::new(base_url, key, model.to_string()))
+        }
+        ProviderKind::Gemini => Arc::new(GeminiProvider::new(base_url, key, model.to_string())),
+    }
+}
+
+/// The single next profile after the primary, from the registry's deterministic
+/// (`ProviderRegistry::ordered`) order. Returning one `Option` is the bound: a
+/// request can fail over to at most one other upstream, never walk a chain.
+fn build_fallback_provider(
+    registry: &ProviderRegistry,
+    config: &Config,
+) -> Option<FallbackProvider> {
+    let primary = config.provider.to_string();
+    registry
+        .ordered()
+        .into_iter()
+        .find(|profile| profile.name != primary)
+        .map(|profile| FallbackProvider {
+            name: profile.name.clone(),
+            provider: chat_provider_from_profile(profile, &config.default_model),
+        })
+}
+
 /// Ollama can supply embeddings to a provider that has no endpoint of its own.
 /// An empty `OLLAMA_URL` means there is no fallback, so the capability is
 /// reported as missing rather than pointed at a default localhost that is not
@@ -749,6 +804,10 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
     // direct adapters below, so a custom `api_key_env` or `base_url` reaches
     // the selected provider and its embeddings instead of a built-in guess.
     let registry = load_provider_registry();
+    // One bounded fallback upstream, chosen deterministically from the same
+    // registry the primary was built from. Built before the match so every arm
+    // shares it; embeddings and router stay on the primary (no per-service mix).
+    let fallback_provider = build_fallback_provider(&registry, config);
 
     let provider: Arc<dyn LLMProvider + Send + Sync>;
     let embeddings: Option<Arc<dyn EmbeddingProvider>>;
@@ -879,6 +938,7 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
         rag_ingest: None,
         embeddings,
         router,
+        fallback_provider,
         default_model: config.default_model.clone(),
         provider_name: config.provider.to_string(),
         engine_target: None,

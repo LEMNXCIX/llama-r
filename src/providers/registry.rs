@@ -67,6 +67,20 @@ impl ProviderRegistry {
         self.profiles.get(name)
     }
 
+    /// All profiles in a deterministic order (profile name, ascending).
+    ///
+    /// The backing store is a `HashMap`, whose iteration order is randomized per
+    /// process. Anything that picks "the next profile" — notably fallback — must
+    /// not depend on that seed, so this is the single ordered view callers use.
+    /// Sorting by name rather than by file position keeps the order stable even
+    /// though the parsed file is itself a `BTreeMap`: the result is identical
+    /// between two loads of the same file, which is what determinism requires.
+    pub fn ordered(&self) -> Vec<&ProviderProfile> {
+        let mut profiles: Vec<_> = self.profiles.values().collect();
+        profiles.sort_by(|a, b| a.name.cmp(&b.name));
+        profiles
+    }
+
     fn from_toml(raw: &str, path: &Path) -> Result<Self, AppError> {
         let file: RegistryFile = toml::from_str(raw).map_err(|err| {
             AppError::Config(format!("{} is not valid TOML: {}", path.display(), err))
@@ -319,6 +333,24 @@ base_url = "http://example.test:9000/v1"
         );
         assert_eq!(profile.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
         assert_eq!(profile.timeout_ms, DEFAULT_PROVIDER_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn ordered_returns_every_profile_once_in_name_order() {
+        let _lock = crate::core::paths::lock_env_for_tests();
+        let _env = BaseDirGuard::fresh();
+
+        let registry = ProviderRegistry::load().expect("builtins with no file");
+        let ordered = registry.ordered();
+        assert_eq!(ordered.len(), registry.profiles.len());
+        let names: Vec<_> = ordered.iter().map(|p| p.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "ordered() must be sorted by profile name");
+        // Distinctness: no profile may be skipped or duplicated.
+        let mut distinct = names.clone();
+        distinct.dedup();
+        assert_eq!(distinct.len(), names.len());
     }
 
     #[test]

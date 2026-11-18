@@ -6,8 +6,12 @@
 //! field, assistant turns use the role `model`, and the answer lives in
 //! `candidates[].content.parts[].text`. This module owns all of that.
 
-use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
+use crate::config::ProviderKind;
+use crate::domain::models::{
+    ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo, Usage,
+};
 use crate::error::AppError;
+use crate::providers::capabilities::capabilities_for;
 use crate::providers::LLMProvider;
 use async_trait::async_trait;
 use reqwest::{Client, RequestBuilder};
@@ -104,6 +108,16 @@ struct GenerateResponse {
     candidates: Vec<Candidate>,
     #[serde(rename = "modelVersion")]
     model_version: Option<String>,
+    #[serde(rename = "usageMetadata", default)]
+    usage_metadata: Option<TokenUsage>,
+}
+
+#[derive(Deserialize)]
+struct TokenUsage {
+    #[serde(rename = "promptTokenCount", default)]
+    prompt_tokens: u64,
+    #[serde(rename = "candidatesTokenCount", default)]
+    completion_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -230,6 +244,15 @@ impl LLMProvider for GeminiProvider {
             return Err(format!("Gemini error: {status} - {text}").into());
         }
         let body: GenerateResponse = response.json().await?;
+        let caps = capabilities_for(ProviderKind::Gemini, model);
+        let usage = body.usage_metadata.as_ref().map(|tokens| {
+            Usage::from_counts(
+                tokens.prompt_tokens,
+                tokens.completion_tokens,
+                caps.cost_per_1m_input,
+                caps.cost_per_1m_output,
+            )
+        });
         let content = body
             .candidates
             .into_iter()
@@ -249,6 +272,8 @@ impl LLMProvider for GeminiProvider {
                 content,
             },
             done: true,
+            usage,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })

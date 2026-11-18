@@ -160,6 +160,8 @@ impl LLMProvider for LocalProvider {
                 content: self.answer.clone(),
             },
             done: true,
+            usage: None,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })

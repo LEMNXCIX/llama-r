@@ -160,6 +160,8 @@ impl LLMProvider for FakeProvider {
                 content,
             },
             done: true,
+            usage: None,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })
@@ -974,6 +976,8 @@ impl LLMProvider for SwapProvider {
                 content: self.tag.to_string(),
             },
             done: true,
+            usage: None,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })

@@ -151,6 +151,8 @@ impl LLMProvider for EchoProvider {
                 content: "echo".to_string(),
             },
             done: true,
+            usage: None,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })

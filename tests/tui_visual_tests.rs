@@ -52,6 +52,8 @@ impl llama_r::providers::LLMProvider for FakeProvider {
                 content: "ok".into(),
             },
             done: true,
+            usage: None,
+            served_by: None,
             debug_prompt: None,
             debug_route: None,
         })
