@@ -64,6 +64,14 @@ fn api_key_from_env(name: &str) -> String {
     std::env::var(name).unwrap_or_default()
 }
 
+/// Turn a possibly-empty configured base URL into an optional override. The
+/// Anthropic and Gemini targets carry an empty string to mean "use rig's
+/// native endpoint", so it must reach the wrapper as `None`, not `Some("")`.
+#[cfg(feature = "rig-engine")]
+fn optional_base_url(url: &str) -> Option<&str> {
+    (!url.is_empty()).then_some(url)
+}
+
 /// Select the engine target from the single `PROVIDER` choice at boot.
 ///
 /// Only the three kinds that had a rig client before this change are selected
@@ -294,13 +302,36 @@ impl RigAgentEngine {
                     )
                     .await
                 }
-                // The client wrappers for these land in Task 5. Fail loudly
-                // here instead of opening a connection to the wrong upstream.
-                EngineTarget::OpenAiCompatible { .. } => {
-                    Err("engine not wired for openai-compatible".to_string())
+                EngineTarget::OpenAiCompatible { api_key, base_url } => {
+                    builder::run_with_openai_compatible(
+                        api_key,
+                        optional_base_url(base_url),
+                        req,
+                        system,
+                        tools,
+                    )
+                    .await
                 }
-                EngineTarget::Anthropic { .. } => Err("engine not wired for anthropic".to_string()),
-                EngineTarget::Gemini { .. } => Err("engine not wired for gemini".to_string()),
+                EngineTarget::Anthropic { api_key, base_url } => {
+                    builder::run_with_anthropic(
+                        api_key,
+                        optional_base_url(base_url),
+                        req,
+                        system,
+                        tools,
+                    )
+                    .await
+                }
+                EngineTarget::Gemini { api_key, base_url } => {
+                    builder::run_with_gemini(
+                        api_key,
+                        optional_base_url(base_url),
+                        req,
+                        system,
+                        tools,
+                    )
+                    .await
+                }
             }
         }
 
