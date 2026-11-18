@@ -18,6 +18,18 @@ use rig_core::tool::ToolDyn;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
+/// Scrub an API key from an error before it reaches a caller. An empty key must
+/// be a no-op: `str::replace("", …)` would insert the marker between every byte
+/// and corrupt the whole message — exactly what a target built with an unset
+/// key now produces.
+fn redact(message: String, api_key: &str) -> String {
+    if api_key.is_empty() {
+        message
+    } else {
+        message.replace(api_key, "[redacted]")
+    }
+}
+
 /// Convert llama-r chat history into Rig completion messages.
 /// System messages are skipped (preamble already carries the system prompt).
 pub fn to_rig_history(history: &[ChatMessage]) -> Vec<Message> {
@@ -317,7 +329,7 @@ pub async fn run_with_openrouter(
     let result = run_agent(&client, &model_name, req, system, tools).await;
     // Safety net: nothing from the upstream may carry the key back to a caller.
     match result {
-        Err(message) => Err(message.replace(api_key, "[redacted]")),
+        Err(message) => Err(redact(message, api_key)),
         ok => ok,
     }
 }
@@ -353,7 +365,7 @@ pub async fn run_with_openai_compatible(
 
     let result = run_agent(&client, &model_name, req, system, tools).await;
     match result {
-        Err(message) => Err(message.replace(api_key, "[redacted]")),
+        Err(message) => Err(redact(message, api_key)),
         ok => ok,
     }
 }
@@ -393,7 +405,7 @@ pub async fn run_with_anthropic(
     )
     .await;
     match result {
-        Err(message) => Err(message.replace(api_key, "[redacted]")),
+        Err(message) => Err(redact(message, api_key)),
         ok => ok,
     }
 }
@@ -427,7 +439,7 @@ pub async fn run_with_gemini(
 
     let result = run_agent(&client, &model_name, req, system, tools).await;
     match result {
-        Err(message) => Err(message.replace(api_key, "[redacted]")),
+        Err(message) => Err(redact(message, api_key)),
         ok => ok,
     }
 }
@@ -489,7 +501,7 @@ pub async fn stream_with_openai_compatible(
 
     let result = run_agent_stream(&client, &model_name, req, system, tools, tx, None).await;
     match result {
-        Err(message) => Err(message.replace(api_key, "[redacted]")),
+        Err(message) => Err(redact(message, api_key)),
         ok => ok,
     }
 }
@@ -529,7 +541,7 @@ pub async fn stream_with_anthropic(
     )
     .await;
     match result {
-        Err(message) => Err(message.replace(api_key, "[redacted]")),
+        Err(message) => Err(redact(message, api_key)),
         ok => ok,
     }
 }
@@ -561,7 +573,7 @@ pub async fn stream_with_gemini(
 
     let result = run_agent_stream(&client, &model_name, req, system, tools, tx, None).await;
     match result {
-        Err(message) => Err(message.replace(api_key, "[redacted]")),
+        Err(message) => Err(redact(message, api_key)),
         ok => ok,
     }
 }
@@ -612,6 +624,19 @@ mod tests {
             "{label} borrowed a fallback: {err}"
         );
         assert!(!err.contains(key), "{label} leaked the key: {err}");
+    }
+
+    /// An unset key must leave the error text byte-for-byte intact: the old
+    /// unconditional `replace("", …)` inserted `[redacted]` between every byte.
+    #[test]
+    fn redacting_an_empty_key_is_a_no_op() {
+        let message = "agent chat failed: upstream returned 500";
+        assert_eq!(redact(message.to_string(), ""), message);
+        assert_eq!(
+            redact("bad key k here".to_string(), "k"),
+            "bad [redacted]ey [redacted] here",
+            "a non-empty key is still scrubbed everywhere"
+        );
     }
 
     #[test]

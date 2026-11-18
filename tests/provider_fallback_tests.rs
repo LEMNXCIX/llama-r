@@ -9,12 +9,12 @@
 #![allow(clippy::await_holding_lock)] // the env lock is held for the whole test by design
 
 use llama_r::adapters::mcp::StaticMcpRegistry;
-use llama_r::api::chat_core::execute_chat;
+use llama_r::api::chat_core::{execute_chat, execute_chat_stream};
 use llama_r::api::handlers::AppState;
 use llama_r::api::route_resolution::AgentSelection;
 use llama_r::config::{Config, ProviderKind};
 use llama_r::context::store::ContextStore;
-use llama_r::domain::models::{ChatMessage, ChatRequest};
+use llama_r::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent};
 use llama_r::ports::mcp::McpServerRegistry;
 use llama_r::providers::openai_compatible::OpenAiCompatibleProvider;
 use llama_r::providers::registry::ProviderRegistry;
@@ -24,6 +24,7 @@ use llama_r::services::provider_stack::{FallbackProvider, ProviderStack};
 use llama_r::services::skill_manager::SkillManager;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -419,4 +420,160 @@ fn registry_order_is_deterministic() {
     let mut sorted = names_a.clone();
     sorted.sort();
     assert_eq!(names_a, sorted, "ordered() must be in name order");
+}
+
+/// A provider that records the model it was asked to run. `fail` makes both
+/// `chat` and `chat_stream` fail with an ordinary error, so the fallback rung is
+/// reached on both paths without needing a real upstream.
+struct RecordingProvider {
+    fail: bool,
+    models: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl llama_r::providers::LLMProvider for RecordingProvider {
+    fn get_base_url(&self) -> String {
+        "http://recording.invalid".to_string()
+    }
+
+    async fn health_check(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn list_models(
+        &self,
+    ) -> Result<Vec<llama_r::domain::models::ModelInfo>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Ok(Vec::new())
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<ChatResponse, Box<dyn std::error::Error + Send + Sync>> {
+        self.models.lock().unwrap().push(request.model.clone());
+        if self.fail {
+            return Err("primary down".into());
+        }
+        Ok(ChatResponse {
+            model: request.model,
+            created_at: "now".into(),
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: "answered".into(),
+            },
+            done: true,
+            usage: None,
+            served_by: None,
+            debug_prompt: None,
+            debug_route: None,
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        request: ChatRequest,
+    ) -> Result<
+        Pin<
+            Box<
+                dyn tokio_stream::Stream<
+                        Item = Result<ChatStreamEvent, Box<dyn std::error::Error + Send + Sync>>,
+                    > + Send,
+            >,
+        >,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.models.lock().unwrap().push(request.model.clone());
+        if self.fail {
+            return Err("primary stream down".into());
+        }
+        let event = ChatStreamEvent {
+            model: request.model,
+            created_at: "now".into(),
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: "answered".into(),
+            },
+            done: true,
+        };
+        Ok(Box::pin(tokio_stream::iter(vec![Ok(event)])))
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn recording_stack() -> (
+    ProviderStack,
+    Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<Vec<String>>>,
+) {
+    let primary_models = Arc::new(Mutex::new(Vec::new()));
+    let fallback_models = Arc::new(Mutex::new(Vec::new()));
+    let mut stack = ProviderStack::new(
+        Arc::new(RecordingProvider {
+            fail: true,
+            models: Arc::clone(&primary_models),
+        }),
+        "default-model",
+    );
+    stack.fallback_provider = Some(FallbackProvider {
+        name: "fallback".into(),
+        provider: Arc::new(RecordingProvider {
+            fail: false,
+            models: Arc::clone(&fallback_models),
+        }),
+    });
+    (stack, primary_models, fallback_models)
+}
+
+/// The fallback must be asked for DEFAULT_MODEL, never the primary's model:
+/// adapters prefer a non-empty request model over their own default, so a
+/// different catalog on the fallback would otherwise fail with model-not-found.
+#[tokio::test]
+async fn a_fallback_is_asked_for_the_default_model_not_the_primary_model() {
+    let _lock = test_lock();
+    let (stack, primary_models, fallback_models) = recording_stack();
+    let state = state_for(stack);
+
+    let response = execute_chat(&state, chat("hello"), selection())
+        .await
+        .expect("fallback should answer");
+    assert_eq!(response.served_by.as_deref(), Some("fallback"));
+
+    // Rung 1 retries the SAME provider with DEFAULT_MODEL; rung 2 uses the
+    // fallback provider, also with DEFAULT_MODEL — never "requested-model".
+    assert_eq!(
+        primary_models.lock().unwrap().as_slice(),
+        &["requested-model", "default-model"]
+    );
+    assert_eq!(
+        fallback_models.lock().unwrap().as_slice(),
+        &["default-model"]
+    );
+}
+
+/// The streaming path applies the same rule when only opening a stream.
+#[tokio::test]
+async fn a_streaming_fallback_is_asked_for_the_default_model() {
+    let _lock = test_lock();
+    let (stack, primary_models, fallback_models) = recording_stack();
+    let state = state_for(stack);
+
+    let mut stream = execute_chat_stream(&state, chat("hello"), selection())
+        .await
+        .expect("fallback stream should open");
+    use tokio_stream::StreamExt;
+    let mut saw_done = false;
+    while let Some(event) = stream.next().await {
+        saw_done |= event.expect("stream event").done;
+    }
+    assert!(saw_done, "the fallback stream must complete");
+
+    assert_eq!(
+        primary_models.lock().unwrap().as_slice(),
+        &["requested-model", "default-model"]
+    );
+    assert_eq!(
+        fallback_models.lock().unwrap().as_slice(),
+        &["default-model"]
+    );
 }

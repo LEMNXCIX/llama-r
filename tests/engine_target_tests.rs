@@ -186,7 +186,7 @@ fn a_target_never_implements_debug() {
 }
 
 /// OpenCode has no rig completion client, on either the request path or the
-/// legacy boot path.
+/// boot path.
 #[test]
 fn opencode_still_has_no_engine_target() {
     let cfg = config(ProviderKind::OpenCode);
@@ -194,29 +194,28 @@ fn opencode_still_has_no_engine_target() {
     assert!(engine_target_for_resolved(&cfg, &agent).is_none());
     assert!(
         engine_target_for(&cfg).is_none(),
-        "the legacy boot path is unchanged"
+        "OpenCode is the one kind with no boot engine"
     );
 }
 
-/// `engine_target_for` keeps selecting Ollama/OpenRouter from the global
-/// provider and still returns `None` for the three not-yet-wired kinds.
+/// Every kind with a completion client gets an engine at boot, so an agent can
+/// override the boot provider in TOML alone. The boot target is only a starting
+/// point — per-request selection happens in `run_inner`/`stream_inner`.
 #[test]
-fn legacy_engine_target_selection_is_unchanged() {
-    let ollama = engine_target_for(&config(ProviderKind::Ollama)).expect("ollama engine");
-    assert_eq!(ollama.kind(), EngineTargetKind::Ollama);
-
-    let openrouter =
-        engine_target_for(&config(ProviderKind::OpenRouter)).expect("openrouter engine");
-    assert_eq!(openrouter.kind(), EngineTargetKind::OpenRouter);
-
-    for provider in [
-        ProviderKind::OpenAiCompatible,
-        ProviderKind::Anthropic,
-        ProviderKind::Gemini,
-    ] {
-        assert!(
-            engine_target_for(&config(provider)).is_none(),
-            "{provider} is wired by Task 5, not by the boot-time selector"
-        );
+fn boot_engine_is_attached_for_every_kind_with_a_rig_client() {
+    let expected = [
+        (ProviderKind::Ollama, EngineTargetKind::Ollama),
+        (ProviderKind::OpenRouter, EngineTargetKind::OpenRouter),
+        (
+            ProviderKind::OpenAiCompatible,
+            EngineTargetKind::OpenAiCompatible,
+        ),
+        (ProviderKind::Anthropic, EngineTargetKind::Anthropic),
+        (ProviderKind::Gemini, EngineTargetKind::Gemini),
+    ];
+    for (provider, kind) in expected {
+        let target = engine_target_for(&config(provider))
+            .unwrap_or_else(|| panic!("{provider} must get a boot engine"));
+        assert_eq!(target.kind(), kind);
     }
 }

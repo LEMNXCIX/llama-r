@@ -74,23 +74,20 @@ fn optional_base_url(url: &str) -> Option<&str> {
 
 /// Select the engine target from the single `PROVIDER` choice at boot.
 ///
-/// Only the three kinds that had a rig client before this change are selected
-/// here; the three new native clients are wired by Task 5, so the boot-time
-/// choice deliberately still returns `None` for them. Ollama and OpenRouter
-/// keep the exact target they had, OpenCode keeps none.
+/// Every kind with a Rig completion client gets a target here, including the
+/// three native clients added later (OpenAI-compatible, Anthropic, Gemini).
+/// This is only the *starting* target: each request rebuilds it from its own
+/// resolved provider in `run_inner`/`stream_inner`, so an agent may select a
+/// different upstream than the one that booted. OpenCode is the sole kind with
+/// no Rig client and therefore keeps `None`.
 pub fn engine_target_for(config: &Config) -> Option<EngineTarget> {
-    match config.provider {
-        ProviderKind::Ollama | ProviderKind::OpenRouter | ProviderKind::OpenCode => {
-            // The global provider *is* the resolved one for a boot-time target.
-            let resolved = ResolvedModel {
-                provider: config.provider,
-                model: config.default_model.clone(),
-                capabilities: capabilities_for(config.provider, &config.default_model),
-            };
-            engine_target_for_resolved(config, &resolved)
-        }
-        ProviderKind::OpenAiCompatible | ProviderKind::Anthropic | ProviderKind::Gemini => None,
-    }
+    // The global provider *is* the resolved one for a boot-time target.
+    let resolved = ResolvedModel {
+        provider: config.provider,
+        model: config.default_model.clone(),
+        capabilities: capabilities_for(config.provider, &config.default_model),
+    };
+    engine_target_for_resolved(config, &resolved)
 }
 
 /// Select the engine target for one resolved request.
@@ -126,12 +123,16 @@ pub fn engine_target_for_resolved(
         }),
         ProviderKind::Anthropic => Some(EngineTarget::Anthropic {
             api_key: api_key_from_env("ANTHROPIC_API_KEY"),
-            // Anthropic's rig client has a native endpoint; no config URL.
-            base_url: String::new(),
+            // An empty base URL uses rig's native Anthropic endpoint; a
+            // configured OPENAI_BASE_URL points the client at a compatible
+            // gateway instead (also what makes the wire testable locally).
+            base_url: config.openai_base_url.clone().unwrap_or_default(),
         }),
         ProviderKind::Gemini => Some(EngineTarget::Gemini {
             api_key: api_key_from_env("GEMINI_API_KEY"),
-            base_url: String::new(),
+            // Same compatible-gateway override as Anthropic; empty means rig's
+            // native endpoint.
+            base_url: config.openai_base_url.clone().unwrap_or_default(),
         }),
         ProviderKind::OpenCode => None,
     }
@@ -184,6 +185,11 @@ pub struct RigAgentEngine {
     pub target: EngineTarget,
     pub mcp_registry: Arc<dyn McpServerRegistry>,
     pub rag: Option<Arc<dyn RagStore>>,
+    /// Boot-time configuration, kept so each request can rebuild its target
+    /// from the provider resolved *for that request* (`engine_target_for_resolved`).
+    /// Holds credentials, so it is never logged, formatted or exposed through a
+    /// `Debug` derive: use `target_kind()` for any non-secret diagnostic.
+    pub config: Config,
 }
 
 impl RigAgentEngine {
@@ -192,6 +198,7 @@ impl RigAgentEngine {
         ollama_url: impl Into<String>,
         mcp_registry: Arc<dyn McpServerRegistry>,
         rag: Option<Arc<dyn RagStore>>,
+        config: Config,
     ) -> Self {
         Self::from_target(
             EngineTarget::Ollama {
@@ -199,6 +206,7 @@ impl RigAgentEngine {
             },
             mcp_registry,
             rag,
+            config,
         )
     }
 
@@ -209,6 +217,7 @@ impl RigAgentEngine {
         base_url: Option<impl Into<String>>,
         mcp_registry: Arc<dyn McpServerRegistry>,
         rag: Option<Arc<dyn RagStore>>,
+        config: Config,
     ) -> Self {
         Self::from_target(
             EngineTarget::OpenRouter {
@@ -219,6 +228,7 @@ impl RigAgentEngine {
             },
             mcp_registry,
             rag,
+            config,
         )
     }
 
@@ -226,11 +236,13 @@ impl RigAgentEngine {
         target: EngineTarget,
         mcp_registry: Arc<dyn McpServerRegistry>,
         rag: Option<Arc<dyn RagStore>>,
+        config: Config,
     ) -> Self {
         Self {
             target,
             mcp_registry,
             rag,
+            config,
         }
     }
 
@@ -298,12 +310,19 @@ impl RigAgentEngine {
     }
 
     /// Full run body (prepare + Rig prompt). Wrapped by timeout at the trait boundary.
+    ///
+    /// The client is chosen from the provider resolved for *this* request, not
+    /// from `self.target` (the boot-time target). Using the boot target made an
+    /// agent that names a different provider send its model to the wrong
+    /// upstream; the engine is attached at boot regardless of `PROVIDER`, so the
+    /// boot target is only a starting point, not the per-request answer.
     async fn run_inner(&self, req: AgentRunRequest) -> Result<AgentRunResult, String> {
         let (tools, system) = self.prepare(&req).await?;
 
         #[cfg(feature = "rig-engine")]
         {
-            match &self.target {
+            let target = self.target_for_request(&req)?;
+            match &target {
                 EngineTarget::Ollama { url } => {
                     builder::run_with_rig(url, req, system, tools).await
                 }
@@ -357,6 +376,27 @@ impl RigAgentEngine {
         }
     }
 
+    /// Build the engine target from the provider/capabilities resolved for one
+    /// request. `None` means the resolved provider has no Rig completion client
+    /// (OpenCode), which is a clear error rather than a silent boot-client call.
+    #[cfg(feature = "rig-engine")]
+    fn target_for_request(&self, req: &AgentRunRequest) -> Result<EngineTarget, String> {
+        engine_target_for_resolved(
+            &self.config,
+            &ResolvedModel {
+                provider: req.provider,
+                model: req.model.clone(),
+                capabilities: req.capabilities.clone(),
+            },
+        )
+        .ok_or_else(|| {
+            format!(
+                "no Rig engine client for provider '{}': it has no completion client (OpenCode); an agent using it cannot run through the engine",
+                req.provider
+            )
+        })
+    }
+
     /// Streaming body: prepare scoped tools/context, then drive the real Rig
     /// streaming client for the resolved target. Wrapped by a timeout at the
     /// `AgentEngine` boundary. A target with no streaming model is refused with
@@ -371,7 +411,8 @@ impl RigAgentEngine {
 
         #[cfg(feature = "rig-engine")]
         {
-            match &self.target {
+            let target = self.target_for_request(&req)?;
+            match &target {
                 EngineTarget::Ollama { url } => {
                     builder::stream_with_rig(url, req, system, tools, &tx).await
                 }
@@ -435,9 +476,11 @@ impl AgentEngine for RigAgentEngine {
         req: AgentRunRequest,
     ) -> Result<mpsc::Receiver<AgentRunEvent>, String> {
         let (tx, rx) = mpsc::channel(32);
-        // Clone the whole target, not just a URL: the spawned task must target
-        // the same provider (with its key) as the engine it came from.
+        // Clone the boot target and config: the spawned task rebuilds the real
+        // target from the request's resolved provider. The config is cloned too
+        // so that per-request target selection sees the same credentials.
         let target = self.target.clone();
+        let config = self.config.clone();
         let mcp_registry = self.mcp_registry.clone();
         let rag = self.rag.clone();
         let timeout_secs = req.scope.timeout_secs.max(1);
@@ -447,6 +490,7 @@ impl AgentEngine for RigAgentEngine {
                 target,
                 mcp_registry,
                 rag,
+                config,
             };
             // The timeout covers the whole stream lifecycle, not just a single
             // completion, and stays at the trait boundary as before.

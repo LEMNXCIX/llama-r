@@ -337,7 +337,13 @@ async fn run_with_fallback(
             "Primary provider failed; trying the next configured profile"
         );
         state.observability.record_fallback();
-        match fallback.provider.chat(request).await {
+        // Adapters prefer a non-empty `request.model` over their own default,
+        // so the primary's model must not leak into the fallback rung: a
+        // credentialed fallback with a different catalog would otherwise fail
+        // with model-not-found. Send the stack's DEFAULT_MODEL instead.
+        let mut fallback_request = request.clone();
+        fallback_request.model = fallback_model.to_string();
+        match fallback.provider.chat(fallback_request).await {
             Ok(mut response) => {
                 tracing::info!(provider = %fallback.name, "Fallback profile answered");
                 response.served_by = Some(fallback.name.clone());
@@ -426,7 +432,11 @@ async fn run_stream_with_fallback(
             "Primary provider failed; trying the next configured profile for streaming"
         );
         state.observability.record_fallback();
-        match fallback.provider.chat_stream(request).await {
+        // Same as the blocking path: never send the primary's model to the
+        // fallback, even when only opening a stream.
+        let mut fallback_request = request.clone();
+        fallback_request.model = fallback_model.to_string();
+        match fallback.provider.chat_stream(fallback_request).await {
             Ok(stream) => {
                 tracing::info!(provider = %fallback.name, "Fallback profile answered (streaming)");
                 return Ok(map_provider_stream(stream));

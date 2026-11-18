@@ -12,7 +12,7 @@ use llama_r::adapters::rig_engine::{EngineTarget, RigAgentEngine};
 use llama_r::api::chat_core::execute_chat_stream;
 use llama_r::api::handlers::AppState;
 use llama_r::api::route_resolution::AgentSelection;
-use llama_r::config::ProviderKind;
+use llama_r::config::{Config, ProviderKind};
 use llama_r::context::store::ContextStore;
 use llama_r::domain::agent::{Agent, AgentConfig, RagWritePolicy};
 use llama_r::domain::models::{ChatMessage, ChatRequest};
@@ -168,6 +168,26 @@ fn run_request(model: &str, provider: ProviderKind) -> AgentRunRequest {
     }
 }
 
+/// A minimal config for building an engine in tests. Holds no keys. The URL is
+/// the fake server's, because the per-request target now rebuilds Ollama from
+/// `config.ollama_url` rather than reusing the engine's boot target.
+fn test_config(ollama_url: &str) -> Config {
+    Config {
+        port: 3000,
+        provider: ProviderKind::Ollama,
+        ollama_url: ollama_url.to_string(),
+        default_model: "llama3.2".to_string(),
+        embedding_model: "nomic-embed-text".to_string(),
+        embedding_dimensions: 768,
+        rag_enabled: true,
+        history_retention_days: 90,
+        openrouter_api_key: None,
+        opencode_api_key: None,
+        opencode_url: "http://127.0.0.1:4096".to_string(),
+        openai_base_url: None,
+    }
+}
+
 /// Drive the real engine against the fake Ollama server and collect the events.
 async fn collect_engine_stream() -> (Vec<String>, Option<AgentRunResult>) {
     let server = OllamaStreamServer::start().await;
@@ -175,6 +195,7 @@ async fn collect_engine_stream() -> (Vec<String>, Option<AgentRunResult>) {
         EngineTarget::Ollama { url: server.url() },
         Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
         None,
+        test_config(&server.url()),
     );
     let mut rx = engine
         .run_stream(run_request("llama3.2", ProviderKind::Ollama))

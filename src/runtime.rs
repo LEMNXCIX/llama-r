@@ -1066,8 +1066,10 @@ impl CompanionHandles {
 
 /// Build the provider-dependent companions onto `stack` from the selected
 /// provider. Called once at boot and once per settings Apply. RAG uses the
-/// stack's embedder (or is absent), and the Rig engine targets the selected
-/// provider — Ollama for Ollama, OpenRouter for OpenRouter, none for OpenCode.
+/// stack's embedder (or is absent), and the Rig engine is attached for every
+/// provider with a completion client (all but OpenCode). The boot target is a
+/// starting point: each request rebuilds it from its resolved provider, so an
+/// agent may override `PROVIDER` with its own `provider` in TOML.
 /// A capability the provider cannot offer is reported, never silently faked.
 pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut ProviderStack) {
     let (rag_store, rag_ingest) = build_rag(config, stack.embeddings.clone());
@@ -1083,6 +1085,7 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
                 target,
                 handles.mcp_registry.clone(),
                 rag_store.clone(),
+                config.clone(),
             ));
             Arc::new(AgentRuntime {
                 registry: handles.agent_registry.clone(),

@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use llama_r::adapters::rig_engine::RigAgentEngine;
-use llama_r::config::ProviderKind;
+use llama_r::config::{Config, ProviderKind};
 use llama_r::domain::agent::{Agent, AgentConfig, RagWritePolicy};
 use llama_r::domain::scope::{AgentScope, ToolsAllow};
 use llama_r::ports::engine::AgentRunRequest;
@@ -102,6 +102,24 @@ fn request(capabilities: ModelCapabilities, model: &str) -> AgentRunRequest {
     }
 }
 
+/// A minimal config for building an engine in tests. Holds no keys.
+fn test_config() -> Config {
+    Config {
+        port: 3000,
+        provider: ProviderKind::Ollama,
+        ollama_url: "http://localhost:11434".to_string(),
+        default_model: "llama3.2".to_string(),
+        embedding_model: "nomic-embed-text".to_string(),
+        embedding_dimensions: 768,
+        rag_enabled: true,
+        history_retention_days: 90,
+        openrouter_api_key: None,
+        opencode_api_key: None,
+        opencode_url: "http://127.0.0.1:4096".to_string(),
+        openai_base_url: None,
+    }
+}
+
 /// Build an engine with a fake registry and return it together with the counter
 /// that records whether tool discovery was attempted.
 fn engine() -> (RigAgentEngine, Arc<AtomicUsize>) {
@@ -110,7 +128,12 @@ fn engine() -> (RigAgentEngine, Arc<AtomicUsize>) {
         tool: tool_def(),
         discover_calls: Arc::clone(&calls),
     };
-    let engine = RigAgentEngine::new("http://localhost:11434", Arc::new(registry), None);
+    let engine = RigAgentEngine::new(
+        "http://localhost:11434",
+        Arc::new(registry),
+        None,
+        test_config(),
+    );
     (engine, calls)
 }
 
