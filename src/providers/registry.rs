@@ -83,7 +83,10 @@ impl ProviderRegistry {
         Ok(Self { profiles })
     }
 
-    fn builtins() -> Self {
+    /// The six built-in profiles. Exposed so a stack builder that could not
+    /// read `providers.toml` still has the canonical env names and endpoints to
+    /// fall back to, instead of an empty registry.
+    pub fn builtins() -> Self {
         let definitions: [(&str, ProviderKind, Option<&str>); 6] = [
             ("ollama", ProviderKind::Ollama, None),
             (

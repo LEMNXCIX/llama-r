@@ -29,22 +29,44 @@ pub struct OpenAiCompatibleProvider {
     /// (matching `OllamaProvider`); this is the fallback and the stack's
     /// identity.
     model: String,
+    /// Name used in the streaming refusal. Kept per instance so the same wire
+    /// adapter can serve OpenRouter and a generic OpenAI-compatible upstream
+    /// without one of them naming the other in its error.
+    provider_name: String,
 }
 
 impl OpenAiCompatibleProvider {
     pub fn new(base_url: String, api_key: String, model: String) -> Self {
+        Self::with_provider_name(base_url, api_key, model, PROVIDER_NAME)
+    }
+
+    /// Same wire, a different label. Used for the direct OpenAI-compatible
+    /// provider and for compatible gateways (Groq/Mistral/DeepSeek/xAI).
+    pub fn with_provider_name(
+        base_url: impl Into<String>,
+        api_key: String,
+        model: String,
+        provider_name: impl Into<String>,
+    ) -> Self {
         Self {
             client: Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
             model,
+            provider_name: provider_name.into(),
         }
     }
 
     /// Join like `LlamaCppRouter::endpoint`: a trailing `/` in the configured
-    /// base must not produce `/v1//chat/completions`.
+    /// base must not produce `/v1//chat/completions`. `OPENAI_BASE_URL` (and
+    /// OpenRouter's built-in default) is conventionally given *with* `/v1`, so
+    /// a base that already carries that prefix must not double it either.
     fn endpoint(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url)
+        if self.base_url.ends_with("/v1") && path.starts_with("/v1") {
+            format!("{}{}", self.base_url, &path[3..])
+        } else {
+            format!("{}{path}", self.base_url)
+        }
     }
 }
 
@@ -173,7 +195,8 @@ impl LLMProvider for OpenAiCompatibleProvider {
     > {
         // No connection is opened: the error is decided before any I/O.
         Err(Box::new(AppError::Unavailable(format!(
-            "streaming is not supported by {PROVIDER_NAME}"
+            "streaming is not supported by {}",
+            self.provider_name
         ))))
     }
 }

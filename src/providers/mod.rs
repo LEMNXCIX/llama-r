@@ -4,7 +4,9 @@ use std::error::Error;
 use std::pin::Pin;
 use tokio_stream::Stream;
 
+pub mod anthropic;
 pub mod capabilities;
+pub mod gemini;
 pub mod ollama;
 pub mod openai_compatible;
 pub mod opencode;

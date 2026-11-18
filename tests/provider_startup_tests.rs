@@ -6,13 +6,19 @@
 #![allow(clippy::await_holding_lock)] // the env lock is held for the whole test by design
 
 use async_trait::async_trait;
-use axum::{body::Body, extract::State, http::Request, http::StatusCode};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{Request, StatusCode},
+    response::IntoResponse,
+    Json, Router,
+};
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::api::handlers::AppState;
 use llama_r::api::health::health;
 use llama_r::config::{Config, ProviderKind};
 use llama_r::context::store::ContextStore;
-use llama_r::domain::models::{ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
+use llama_r::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
 use llama_r::ports::mcp::McpServerRegistry;
 use llama_r::providers::LLMProvider;
 use llama_r::runtime::{build_app_state, build_provider_stack, build_router};
@@ -46,19 +52,30 @@ const ROUTER_ENV_VARS: &[&str] = &[
     "MIN_SPECIALIZED",
 ];
 
+/// Credentials the new direct adapters read by *variable name* from their
+/// profile. Cleared so a stack test cannot accidentally pick up the developer's
+/// shell keys, and restored on drop.
+const KEY_ENV_VARS: &[&str] = &[
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "LLAMA_R_TEST_CUSTOM_KEY",
+];
+
 struct EnvGuard {
     saved: Vec<(&'static str, Option<String>)>,
     prev_dir: Option<String>,
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 impl EnvGuard {
     fn fresh() -> Self {
         let saved = ROUTER_ENV_VARS
             .iter()
+            .chain(KEY_ENV_VARS.iter())
             .map(|name| (*name, std::env::var(name).ok()))
             .collect();
-        for name in ROUTER_ENV_VARS {
+        for name in ROUTER_ENV_VARS.iter().chain(KEY_ENV_VARS.iter()) {
             std::env::remove_var(name);
         }
         let prev_dir = std::env::var("LLAMA_R_DIR").ok();
@@ -67,8 +84,14 @@ impl EnvGuard {
         Self {
             saved,
             prev_dir,
-            _dir: dir,
+            dir,
         }
+    }
+
+    /// Write a `providers.toml` into the isolated base directory.
+    fn write_providers(&self, contents: &str) {
+        std::fs::write(self.dir.path().join("providers.toml"), contents)
+            .expect("write providers.toml");
     }
 }
 
@@ -291,4 +314,270 @@ async fn streaming_with_a_non_ollama_provider_returns_501_not_502() {
         StatusCode::NOT_IMPLEMENTED,
         "an unsupported capability is 501, not a 502 provider failure"
     );
+}
+
+// --- Direct adapters + registry overlays ------------------------------------
+
+fn direct_chat_request() -> ChatRequest {
+    ChatRequest {
+        model: String::new(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Hello".to_string(),
+        }],
+        stream: false,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SeenRequest {
+    path: String,
+    auth: String,
+    body: serde_json::Value,
+}
+
+/// A real listener that answers every path with a reply carrying all three
+/// chat-envelope shapes and records what each adapter actually sent. Serving a
+/// union of shapes is deliberate: the assertions are on path/auth/body, so a
+/// wrong endpoint still fails loudly on `path` rather than a parse error.
+async fn recording_server() -> (String, Arc<Mutex<Vec<SeenRequest>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let app = Router::new().fallback(move |req: Request<Body>| {
+        let sink = sink.clone();
+        async move {
+            let path = req.uri().path().to_string();
+            let auth = req
+                .headers()
+                .get("authorization")
+                .or_else(|| req.headers().get("x-api-key"))
+                .or_else(|| req.headers().get("x-goog-api-key"))
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+            let body = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap_or(serde_json::Value::Null);
+            let is_embeddings = req_is_embeddings_path(&path);
+            sink.lock().unwrap().push(SeenRequest {
+                path,
+                auth,
+                body,
+            });
+
+            let reply = if is_embeddings {
+                serde_json::json!({
+                    "model": "text-embedding-3-small",
+                    "data": [{ "object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3] }],
+                    "embeddings": [{ "values": [0.1, 0.2, 0.3] }]
+                })
+            } else {
+                serde_json::json!({
+                    "model": "test-model",
+                    "choices": [{ "message": { "role": "assistant", "content": "ok" } }],
+                    "content": [{ "type": "text", "text": "ok" }],
+                    "candidates": [{ "content": { "role": "model", "parts": [{ "text": "ok" }] }, "finishReason": "STOP" }]
+                })
+            };
+            (StatusCode::OK, Json(reply)).into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake upstream");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), seen)
+}
+
+fn req_is_embeddings_path(path: &str) -> bool {
+    path.contains("embeddings") || path.contains("embedContent")
+}
+
+fn health_response(
+    stack: llama_r::services::provider_stack::ProviderStack,
+) -> llama_r::api::health::HealthResponse {
+    let mut stack = stack;
+    stack.provider = Arc::new(LocalHealthProvider);
+    let state = state_for(stack);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async { health(State(state)).await.0 })
+}
+
+#[test]
+fn all_six_provider_kinds_build_a_stack_without_a_network() {
+    let _lock = test_lock();
+    let _env = EnvGuard::fresh();
+
+    for kind in [
+        ProviderKind::Ollama,
+        ProviderKind::OpenRouter,
+        ProviderKind::OpenCode,
+        ProviderKind::OpenAiCompatible,
+        ProviderKind::Anthropic,
+        ProviderKind::Gemini,
+    ] {
+        let stack = build_provider_stack(&config(kind))
+            .unwrap_or_else(|err| panic!("{kind} must build a stack: {err}"));
+        assert_eq!(stack.provider_name, kind.to_string());
+        assert_eq!(stack.default_model, "test-model");
+        assert!(stack.router.is_none(), "{kind}: routing is off by default");
+    }
+}
+
+#[test]
+fn direct_provider_capabilities_are_honest_and_keys_never_leak() {
+    let _lock = test_lock();
+    let _env = EnvGuard::fresh();
+
+    // OpenAI-compatible and Gemini document an embeddings endpoint; their
+    // stacks carry an adapter for it.
+    for kind in [ProviderKind::OpenAiCompatible, ProviderKind::Gemini] {
+        let stack = build_provider_stack(&config(kind)).expect("stack");
+        assert!(stack.embeddings.is_some(), "{kind} serves embeddings");
+        let response = health_response(stack);
+        assert!(response.provider.embeddings, "{kind}");
+        assert_eq!(response.provider.reason, None, "{kind}");
+        let all = serde_json::to_string(&response).expect("serialize health");
+        assert!(!all.contains("sk-secret-never-exposed"), "{kind}: {all}");
+    }
+
+    // Anthropic publishes no embeddings endpoint. With OLLAMA_URL empty there
+    // is no fallback, so the gap is reported instead of faked.
+    let stack = build_provider_stack(&config(ProviderKind::Anthropic)).expect("stack");
+    assert!(stack.embeddings.is_none());
+    let response = health_response(stack);
+    assert!(!response.provider.embeddings);
+    assert_eq!(response.provider.name, "anthropic");
+    let reason = response
+        .provider
+        .reason
+        .as_deref()
+        .expect("a missing capability must be explained");
+    assert!(reason.contains("embeddings"), "{reason}");
+    assert!(
+        reason.contains("OLLAMA_URL") && reason.contains("anthropic"),
+        "{reason}"
+    );
+    let all = serde_json::to_string(&response).expect("serialize health");
+    assert!(!all.contains("sk-secret-never-exposed"), "{all}");
+}
+
+#[tokio::test]
+async fn a_custom_profile_overrides_the_direct_chat_and_embeddings_endpoints() {
+    let _lock = test_lock();
+    let _env = EnvGuard::fresh();
+    let (url, seen) = recording_server().await;
+    _env.write_providers(&format!(
+        "[providers.openai-compatible]\nbase_url = \"{url}\"\napi_key_env = \"LLAMA_R_TEST_CUSTOM_KEY\"\n"
+    ));
+    std::env::set_var("LLAMA_R_TEST_CUSTOM_KEY", "custom-key-value");
+    std::env::set_var("OPENAI_API_KEY", "builtin-key-must-not-be-used");
+
+    let mut cfg = config(ProviderKind::OpenAiCompatible);
+    cfg.embedding_dimensions = 3;
+    let stack = build_provider_stack(&cfg).expect("stack");
+    assert_eq!(
+        stack.provider.get_base_url(),
+        url,
+        "the profile base_url reaches the direct adapter"
+    );
+    stack
+        .provider
+        .chat(direct_chat_request())
+        .await
+        .expect("chat");
+    stack
+        .embeddings
+        .expect("embeddings")
+        .embed(&["hello".to_string()])
+        .await
+        .expect("embed");
+
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "one chat and one embeddings request");
+    let chat = requests
+        .iter()
+        .find(|request| request.path.contains("chat/completions"))
+        .expect("chat request");
+    assert_eq!(chat.auth, "Bearer custom-key-value");
+    assert_eq!(chat.body["model"], "test-model");
+    assert_eq!(chat.body["messages"][0]["content"], "Hello");
+    let embeddings = requests
+        .iter()
+        .find(|request| request.path.contains("embeddings"))
+        .expect("embeddings request");
+    assert_eq!(embeddings.auth, "Bearer custom-key-value");
+    assert_eq!(embeddings.body["input"][0], "hello");
+    assert_eq!(embeddings.body["model"], "nomic-embed-text");
+    let all = format!("{requests:?}");
+    assert!(!all.contains("builtin-key-must-not-be-used"), "{all}");
+}
+
+#[tokio::test]
+async fn enabling_routing_installs_the_default_decision_router_for_direct_providers() {
+    let _lock = test_lock();
+    let _env = EnvGuard::fresh();
+    std::env::set_var("ROUTER_ENABLED", "true");
+
+    // None of the three direct providers exposes a d1 decisions endpoint, so
+    // the stack itself carries no router — but enabling routing must still
+    // install the separate llama.cpp decision model, exactly as on Ollama.
+    let stack = build_provider_stack(&config(ProviderKind::Anthropic)).expect("stack");
+    assert!(stack.router.is_none());
+    let state = state_for(stack);
+    assert!(state.router_config.enabled);
+    let services = state.services_snapshot().await;
+    assert!(
+        services.router.is_some(),
+        "build_app_state must install the llama.cpp router when routing is enabled"
+    );
+}
+
+#[tokio::test]
+async fn native_direct_adapters_use_their_built_in_key_variable_names() {
+    let _lock = test_lock();
+    let _env = EnvGuard::fresh();
+    let (url, seen) = recording_server().await;
+    _env.write_providers(&format!(
+        "[providers.anthropic]\nbase_url = \"{url}\"\n\n[providers.gemini]\nbase_url = \"{url}\"\n"
+    ));
+    std::env::set_var("ANTHROPIC_API_KEY", "anthropic-builtin-key");
+    std::env::set_var("GEMINI_API_KEY", "gemini-builtin-key");
+
+    let anthropic = build_provider_stack(&config(ProviderKind::Anthropic)).expect("stack");
+    anthropic
+        .provider
+        .chat(direct_chat_request())
+        .await
+        .expect("anthropic chat");
+    let gemini = build_provider_stack(&config(ProviderKind::Gemini)).expect("stack");
+    gemini
+        .provider
+        .chat(direct_chat_request())
+        .await
+        .expect("gemini chat");
+
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    let anthropic = requests
+        .iter()
+        .find(|request| request.path.contains("messages"))
+        .expect("anthropic request");
+    assert_eq!(anthropic.auth, "anthropic-builtin-key");
+    assert_eq!(anthropic.body["max_tokens"], 4096);
+    assert_eq!(anthropic.body["messages"][0]["content"], "Hello");
+    let gemini = requests
+        .iter()
+        .find(|request| request.path.contains("generateContent"))
+        .expect("gemini request");
+    assert_eq!(gemini.auth, "gemini-builtin-key");
+    assert_eq!(gemini.body["contents"][0]["parts"][0]["text"], "Hello");
 }

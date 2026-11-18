@@ -9,11 +9,15 @@
 pub mod chunker;
 pub mod embeddings;
 pub mod file_store;
+pub mod gemini_embeddings;
 pub mod namespace;
+pub mod openai_compatible_embeddings;
 pub mod openrouter_embeddings;
 pub mod store;
 
 pub use embeddings::OllamaEmbeddings;
 pub use file_store::FileRagStore;
+pub use gemini_embeddings::GeminiEmbeddings;
+pub use openai_compatible_embeddings::OpenAiCompatibleEmbeddings;
 pub use openrouter_embeddings::OpenRouterEmbeddings;
 pub use store::{HashEmbeddingProvider, InMemoryRagStore};

@@ -16,6 +16,10 @@ const EMBEDDINGS_PATH: &str = "/api/v1/embeddings";
 
 pub struct OpenRouterEmbeddings {
     base_url: String,
+    /// The request path, shared by every OpenAI-wire embeddings endpoint.
+    /// OpenRouter uses `/api/v1/embeddings`; a plain OpenAI-compatible
+    /// upstream uses `/v1/embeddings`. Only the path differs.
+    path: String,
     api_key: String,
     model: String,
     dimensions: usize,
@@ -36,12 +40,26 @@ impl OpenRouterEmbeddings {
         model: String,
         dimensions: usize,
     ) -> Self {
+        Self::with_path(base_url, EMBEDDINGS_PATH, api_key, model, dimensions)
+    }
+
+    /// Same bearer-auth + `data[].embedding` wire at a different path. This is
+    /// what lets the OpenAI-compatible adapter reuse this client instead of
+    /// duplicating the strict parsing and dimension checks.
+    pub fn with_path(
+        base_url: impl Into<String>,
+        path: impl Into<String>,
+        api_key: String,
+        model: String,
+        dimensions: usize,
+    ) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
             .unwrap_or_else(|_| Client::new());
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            path: path.into(),
             api_key,
             model,
             dimensions: dimensions.max(1),
@@ -50,7 +68,7 @@ impl OpenRouterEmbeddings {
     }
 
     fn endpoint(&self) -> String {
-        format!("{}{EMBEDDINGS_PATH}", self.base_url)
+        format!("{}{}", self.base_url, self.path)
     }
 }
 

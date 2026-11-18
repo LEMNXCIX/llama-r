@@ -14,6 +14,8 @@
 
 use llama_r::domain::models::{ChatMessage, ChatRequest};
 use llama_r::error::AppError;
+use llama_r::providers::anthropic::AnthropicProvider;
+use llama_r::providers::gemini::GeminiProvider;
 use llama_r::providers::openai_compatible::OpenAiCompatibleProvider;
 use llama_r::providers::opencode::OpenCodeProvider;
 use llama_r::providers::LLMProvider;
@@ -374,4 +376,281 @@ async fn opencode_accepts_a_legacy_text_envelope() {
 
     let response = provider.chat(chat_request("Hello")).await.unwrap();
     assert_eq!(response.message.content, "legacy answer");
+}
+
+// --- Direct adapters for the three provider kinds added in Phase 1 ----------
+
+fn anthropic_reply(content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": content }],
+        "model": "claude-3-5-sonnet",
+        "stop_reason": "end_turn"
+    })
+}
+
+fn gemini_reply(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "candidates": [{
+            "content": { "role": "model", "parts": [{ "text": text }] },
+            "finishReason": "STOP"
+        }],
+        "modelVersion": "gemini-1.5-pro"
+    })
+}
+
+#[tokio::test]
+async fn anthropic_posts_to_messages_with_x_api_key() {
+    let server = FakeChatServer::start(&[("/v1/messages", anthropic_reply("Hola!"))]).await;
+    let provider = AnthropicProvider::new(
+        Some(server.url()),
+        "sk-ant-ABC123".to_string(),
+        "claude-3-5-sonnet".to_string(),
+    );
+
+    let response = provider.chat(chat_request("Hello")).await.unwrap();
+    assert_eq!(response.message.content, "Hola!");
+    assert_eq!(response.message.role, "assistant");
+    assert_eq!(response.model, "claude-3-5-sonnet");
+    assert!(response.done);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.path, "/v1/messages");
+    // Anthropic sends its key in `x-api-key`, never Bearer and never in the URL.
+    assert_eq!(header(&request.headers, "x-api-key"), Some("sk-ant-ABC123"));
+    assert_eq!(
+        header(&request.headers, "anthropic-version"),
+        Some("2023-06-01")
+    );
+    assert!(header(&request.headers, "authorization").is_none());
+    let request_line = request.headers.lines().next().unwrap();
+    assert!(!request_line.contains("sk-ant-ABC123"), "{request_line}");
+
+    assert_eq!(request.body["model"], "claude-3-5-sonnet");
+    assert_eq!(request.body["max_tokens"], 4096);
+    assert_eq!(request.body["messages"][0]["role"], "user");
+    assert_eq!(request.body["messages"][0]["content"], "Hello");
+    assert!(!provider.get_base_url().contains("sk-ant-ABC123"));
+}
+
+#[tokio::test]
+async fn anthropic_moves_system_messages_to_the_top_level_field() {
+    let server = FakeChatServer::start(&[("/v1/messages", anthropic_reply("ok"))]).await;
+    let provider = AnthropicProvider::new(Some(server.url()), "key".into(), "claude".into());
+    let request = ChatRequest {
+        model: String::new(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "Be brief.".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "Earlier answer".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hello".into(),
+            },
+        ],
+        stream: false,
+    };
+
+    provider.chat(request).await.unwrap();
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let body = &requests[0].body;
+    assert_eq!(body["system"], "Be brief.");
+    assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(body["messages"][0]["role"], "assistant");
+    assert_eq!(body["messages"][1]["role"], "user");
+}
+
+#[tokio::test]
+async fn gemini_posts_to_generate_content_with_the_key_in_a_header() {
+    let server = FakeChatServer::start(&[(
+        "/models/gemini-1.5-pro:generateContent",
+        gemini_reply("Hi there!"),
+    )])
+    .await;
+    let provider = GeminiProvider::new(
+        Some(server.url()),
+        "gem-key-ABC123".to_string(),
+        "gemini-1.5-pro".to_string(),
+    );
+
+    let response = provider.chat(chat_request("Hello")).await.unwrap();
+    assert_eq!(response.message.content, "Hi there!");
+    assert_eq!(response.message.role, "assistant");
+    assert_eq!(response.model, "gemini-1.5-pro");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.path, "/models/gemini-1.5-pro:generateContent");
+    // The key is a `x-goog-api-key` header — never in the URL, never Bearer.
+    assert_eq!(
+        header(&request.headers, "x-goog-api-key"),
+        Some("gem-key-ABC123")
+    );
+    let request_line = request.headers.lines().next().unwrap();
+    assert!(!request_line.contains("gem-key-ABC123"), "{request_line}");
+
+    assert_eq!(request.body["contents"][0]["role"], "user");
+    assert_eq!(request.body["contents"][0]["parts"][0]["text"], "Hello");
+    assert!(request.body.get("systemInstruction").is_none());
+    assert!(!provider.get_base_url().contains("gem-key-ABC123"));
+}
+
+#[tokio::test]
+async fn gemini_maps_roles_and_system_instruction() {
+    let server =
+        FakeChatServer::start(&[("/models/gemini-1.5-pro:generateContent", gemini_reply("ok"))])
+            .await;
+    let provider = GeminiProvider::new(Some(server.url()), "key".into(), "gemini-1.5-pro".into());
+    let request = ChatRequest {
+        model: String::new(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "Be brief.".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "Earlier answer".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hello".into(),
+            },
+        ],
+        stream: false,
+    };
+
+    provider.chat(request).await.unwrap();
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let body = &requests[0].body;
+    assert_eq!(body["systemInstruction"]["parts"][0]["text"], "Be brief.");
+    assert_eq!(body["contents"][0]["role"], "model");
+    assert_eq!(body["contents"][1]["role"], "user");
+}
+
+#[tokio::test]
+async fn direct_adapters_list_models_and_health_on_their_documented_paths() {
+    let anthropic = FakeChatServer::start(&[(
+        "/v1/models",
+        serde_json::json!({ "data": [{"id": "claude-3-5-sonnet"}] }),
+    )])
+    .await;
+    let anthropic_provider = AnthropicProvider::new(
+        Some(anthropic.url()),
+        "sk-ant-key".into(),
+        "claude-3-5-sonnet".into(),
+    );
+    anthropic_provider.health_check().await.unwrap();
+    assert_eq!(
+        anthropic_provider.list_models().await.unwrap()[0].name,
+        "claude-3-5-sonnet"
+    );
+    for request in anthropic.requests() {
+        assert_eq!(request.path, "/v1/models");
+        assert_eq!(header(&request.headers, "x-api-key"), Some("sk-ant-key"));
+    }
+
+    let gemini = FakeChatServer::start(&[(
+        "/models",
+        serde_json::json!({ "models": [{"name": "models/gemini-1.5-pro"}] }),
+    )])
+    .await;
+    let gemini_provider = GeminiProvider::new(
+        Some(gemini.url()),
+        "gem-key".into(),
+        "gemini-1.5-pro".into(),
+    );
+    gemini_provider.health_check().await.unwrap();
+    assert_eq!(
+        gemini_provider.list_models().await.unwrap()[0].name,
+        "gemini-1.5-pro"
+    );
+    for request in gemini.requests() {
+        assert_eq!(request.path, "/models");
+        assert_eq!(header(&request.headers, "x-goog-api-key"), Some("gem-key"));
+        assert!(!request.headers.lines().next().unwrap().contains("gem-key"));
+    }
+}
+
+#[tokio::test]
+async fn a_base_url_ending_in_v1_does_not_duplicate_the_version_prefix() {
+    // `OPENAI_BASE_URL` is conventionally given with `/v1` (the built-in
+    // OpenRouter profile does exactly that). The adapter must not turn it into
+    // `/v1/v1/chat/completions`.
+    let server = FakeChatServer::start(&[("/v1/chat/completions", openai_chat_reply("ok"))]).await;
+    let provider = OpenAiCompatibleProvider::with_provider_name(
+        format!("{}/v1", server.url()),
+        "k".into(),
+        "m".into(),
+        "openai-compatible",
+    );
+
+    let response = provider.chat(chat_request("Hello")).await.unwrap();
+    assert_eq!(response.message.content, "ok");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/chat/completions");
+}
+
+#[tokio::test]
+async fn direct_adapter_streaming_is_unavailable_without_a_connection() {
+    let server = FakeChatServer::start(&[]).await;
+    for (error, expected) in [
+        (
+            AnthropicProvider::new(Some(server.url()), "k".into(), "m".into())
+                .chat_stream(chat_request("Hello"))
+                .await
+                .err()
+                .expect("Anthropic streaming must be unavailable"),
+            "anthropic",
+        ),
+        (
+            GeminiProvider::new(Some(server.url()), "k".into(), "m".into())
+                .chat_stream(chat_request("Hello"))
+                .await
+                .err()
+                .expect("Gemini streaming must be unavailable"),
+            "gemini",
+        ),
+        (
+            OpenAiCompatibleProvider::with_provider_name(
+                server.url(),
+                "k".into(),
+                "m".into(),
+                "openai-compatible",
+            )
+            .chat_stream(chat_request("Hello"))
+            .await
+            .err()
+            .expect("OpenAI-compatible streaming must be unavailable"),
+            "openai-compatible",
+        ),
+    ] {
+        assert!(
+            error.to_string().contains(expected),
+            "error must name the provider: {error}"
+        );
+        assert!(matches!(
+            error.downcast_ref::<AppError>(),
+            Some(AppError::Unavailable(_))
+        ));
+    }
+    assert!(
+        server.requests().is_empty(),
+        "chat_stream must return before opening a connection"
+    );
 }

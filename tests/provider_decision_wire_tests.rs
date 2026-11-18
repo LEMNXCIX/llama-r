@@ -18,6 +18,8 @@
 //! here are canned fixtures modeled on the d1 `/v1/systemone` envelope that
 //! `src/adapters/router/fixtures/systemone_response.json` captured locally.
 
+use llama_r::adapters::rag::gemini_embeddings::GeminiEmbeddings;
+use llama_r::adapters::rag::openai_compatible_embeddings::OpenAiCompatibleEmbeddings;
 use llama_r::adapters::rag::openrouter_embeddings::OpenRouterEmbeddings;
 use llama_r::adapters::router::openai_decisions::OpenRouterRouter;
 use llama_r::adapters::router::opencode_decisions::OpenCodeRouter;
@@ -430,4 +432,163 @@ async fn openrouter_embeddings_sends_a_batched_input() {
     assert_eq!(request.body["model"], "openai/text-embedding-3-small");
     assert_eq!(request.body["input"][0], "refund policy");
     assert_eq!(request.body["input"][1], "warranty");
+}
+
+// --- Embeddings for the two direct providers that document an endpoint ------
+
+#[tokio::test]
+async fn openai_compatible_embeddings_posts_to_v1_embeddings() {
+    let reply = serde_json::json!({
+        "model": "text-embedding-3-small",
+        "object": "list",
+        "data": [
+            { "object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3] },
+            { "object": "embedding", "index": 1, "embedding": [0.4, 0.5, 0.6] }
+        ]
+    });
+    let server = FakeServer::start(&[("/v1/embeddings", reply)]).await;
+    let embeddings = OpenAiCompatibleEmbeddings::new(
+        server.url(),
+        "sk-openai-ABC123".to_string(),
+        "text-embedding-3-small".to_string(),
+        3,
+    );
+
+    let vectors = embeddings
+        .embed(&["refund policy".to_string(), "warranty".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(vectors.len(), 2);
+    assert_eq!(vectors[0], vec![0.1, 0.2, 0.3]);
+    assert_eq!(vectors[1], vec![0.4, 0.5, 0.6]);
+    assert_eq!(embeddings.dimensions(), 3);
+
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "all texts must be batched in one request"
+    );
+    let request = &requests[0];
+    assert_eq!(request.path, "/v1/embeddings");
+    assert_eq!(
+        header(&request.headers, "authorization"),
+        Some("Bearer sk-openai-ABC123")
+    );
+    let request_line = request.headers.lines().next().unwrap();
+    assert!(!request_line.contains("sk-openai-ABC123"), "{request_line}");
+    assert!(!request.body.to_string().contains("sk-openai-ABC123"));
+    assert_eq!(request.body["model"], "text-embedding-3-small");
+    assert_eq!(request.body["input"][0], "refund policy");
+    assert_eq!(request.body["input"][1], "warranty");
+}
+
+#[tokio::test]
+async fn openai_compatible_embeddings_accept_a_base_url_ending_in_v1() {
+    let reply = serde_json::json!({
+        "data": [{ "object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3] }]
+    });
+    let server = FakeServer::start(&[("/v1/embeddings", reply)]).await;
+    let embeddings = OpenAiCompatibleEmbeddings::new(
+        format!("{}/v1", server.url()),
+        "k".into(),
+        "text-embedding-3-small".into(),
+        3,
+    );
+
+    let vectors = embeddings.embed(&["text".to_string()]).await.unwrap();
+    assert_eq!(vectors[0], vec![0.1, 0.2, 0.3]);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/embeddings");
+}
+
+#[tokio::test]
+async fn gemini_embeddings_posts_to_batch_embed_contents_with_key_in_header() {
+    let reply = serde_json::json!({
+        "embeddings": [
+            { "values": [0.1, 0.2, 0.3] },
+            { "values": [0.4, 0.5, 0.6] }
+        ]
+    });
+    let server =
+        FakeServer::start(&[("/models/text-embedding-004:batchEmbedContents", reply)]).await;
+    let embeddings = GeminiEmbeddings::new(
+        Some(server.url()),
+        "gem-key-ABC123".to_string(),
+        "text-embedding-004".to_string(),
+        3,
+    );
+
+    let vectors = embeddings
+        .embed(&["refund policy".to_string(), "warranty".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(vectors.len(), 2);
+    assert_eq!(vectors[0], vec![0.1, 0.2, 0.3]);
+    assert_eq!(vectors[1], vec![0.4, 0.5, 0.6]);
+    assert_eq!(embeddings.dimensions(), 3);
+
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "all texts must be batched in one request"
+    );
+    let request = &requests[0];
+    assert_eq!(
+        request.path,
+        "/models/text-embedding-004:batchEmbedContents"
+    );
+    assert_eq!(
+        header(&request.headers, "x-goog-api-key"),
+        Some("gem-key-ABC123")
+    );
+    let request_line = request.headers.lines().next().unwrap();
+    assert!(!request_line.contains("gem-key-ABC123"), "{request_line}");
+    assert_eq!(
+        request.body["requests"][0]["model"],
+        "models/text-embedding-004"
+    );
+    assert_eq!(
+        request.body["requests"][0]["content"]["parts"][0]["text"],
+        "refund policy"
+    );
+    assert_eq!(
+        request.body["requests"][1]["content"]["parts"][0]["text"],
+        "warranty"
+    );
+}
+
+#[tokio::test]
+async fn direct_embeddings_reject_a_dimension_mismatch_instead_of_resizing() {
+    let openai_reply = serde_json::json!({
+        "data": [{ "object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3] }]
+    });
+    let openai = FakeServer::start(&[("/v1/embeddings", openai_reply)]).await;
+    let embeddings = OpenAiCompatibleEmbeddings::new(
+        openai.url(),
+        "k".into(),
+        "text-embedding-3-small".into(),
+        8,
+    );
+    let err = embeddings.embed(&["text".to_string()]).await.unwrap_err();
+    assert!(err.contains("dimension mismatch"), "{err}");
+    assert!(err.contains("got 3"), "{err}");
+
+    let gemini_reply = serde_json::json!({ "embeddings": [{ "values": [0.1, 0.2, 0.3] }] });
+    let gemini = FakeServer::start(&[(
+        "/models/text-embedding-004:batchEmbedContents",
+        gemini_reply,
+    )])
+    .await;
+    let embeddings = GeminiEmbeddings::new(
+        Some(gemini.url()),
+        "k".into(),
+        "text-embedding-004".into(),
+        8,
+    );
+    let err = embeddings.embed(&["text".to_string()]).await.unwrap_err();
+    assert!(err.contains("dimension mismatch"), "{err}");
+    assert!(err.contains("got 3"), "{err}");
 }

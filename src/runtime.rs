@@ -1,5 +1,8 @@
 use crate::adapters::mcp::{McpServerConfig, StaticMcpRegistry};
-use crate::adapters::rag::{FileRagStore, OllamaEmbeddings, OpenRouterEmbeddings};
+use crate::adapters::rag::{
+    FileRagStore, GeminiEmbeddings, OllamaEmbeddings, OpenAiCompatibleEmbeddings,
+    OpenRouterEmbeddings,
+};
 use crate::adapters::router::{LlamaCppRouter, OpenCodeRouter, OpenRouterRouter};
 use crate::api::agent_api::{
     create_agent, delete_agent, get_agent, get_agent_scope, list_agents_api, update_agent,
@@ -31,10 +34,12 @@ use crate::ports::history::ConversationStore;
 use crate::ports::mcp::McpServerRegistry;
 use crate::ports::rag::{EmbeddingProvider, RagStore};
 use crate::ports::router::DecisionRouter;
+use crate::providers::anthropic::AnthropicProvider;
+use crate::providers::gemini::GeminiProvider;
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::openai_compatible::OpenAiCompatibleProvider;
 use crate::providers::opencode::OpenCodeProvider;
-use crate::providers::registry::ProviderRegistry;
+use crate::providers::registry::{ProviderProfile, ProviderRegistry, DEFAULT_PROVIDER_TIMEOUT_MS};
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 #[cfg(feature = "rig-engine")]
@@ -632,6 +637,68 @@ pub mod startup_plan {
     }
 }
 
+/// Load the optional `providers.toml` once per stack build. A malformed file
+/// is non-fatal: warn and use the built-ins, exactly like `build_app_state`.
+fn load_provider_registry() -> ProviderRegistry {
+    match ProviderRegistry::load() {
+        Ok(registry) => registry,
+        Err(err) => {
+            tracing::warn!(error = %err, "invalid provider registry; using built-in profiles");
+            ProviderRegistry::builtins()
+        }
+    }
+}
+
+/// The profile for the selected `PROVIDER`. The registry always contains the
+/// six canonical names, so this fallback is only a safety net for a hand-built
+/// registry.
+fn profile_for(registry: &ProviderRegistry, config: &Config) -> ProviderProfile {
+    registry
+        .get(&config.provider.to_string())
+        .cloned()
+        .unwrap_or_else(|| ProviderProfile {
+            name: config.provider.to_string(),
+            kind: config.provider,
+            base_url: None,
+            api_key_env: None,
+            timeout_ms: DEFAULT_PROVIDER_TIMEOUT_MS,
+        })
+}
+
+/// Read a credential by the *variable name* a profile carries. `api_key_env`
+/// is never a key value; the value stays inside the adapter and is never put
+/// in a URL, log line, health field or error string.
+fn profile_api_key(profile: &ProviderProfile) -> String {
+    profile
+        .api_key_env
+        .as_deref()
+        .map(|name| std::env::var(name).unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// Ollama can supply embeddings to a provider that has no endpoint of its own.
+/// An empty `OLLAMA_URL` means there is no fallback, so the capability is
+/// reported as missing rather than pointed at a default localhost that is not
+/// running.
+fn ollama_embeddings_fallback(
+    config: &Config,
+    provider: &str,
+) -> Option<Arc<dyn EmbeddingProvider>> {
+    if config.ollama_url.trim().is_empty() {
+        tracing::warn!(
+            provider,
+            "embeddings are disabled: this provider does not serve them and OLLAMA_URL is empty"
+        );
+        None
+    } else {
+        Some(Arc::new(OllamaEmbeddings::new(
+            config.ollama_url.clone(),
+            config.embedding_model.clone(),
+            config.embedding_dimensions,
+        )))
+    }
+}
+
 /// Build the whole provider-dependent stack from the single `PROVIDER` choice.
 ///
 /// One setting selects chat, the decision router and — where the upstream can
@@ -655,6 +722,11 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
             RouterConfig::default()
         }
     };
+
+    // Profile overlays (`providers.toml`) are read once and passed into the
+    // direct adapters below, so a custom `api_key_env` or `base_url` reaches
+    // the selected provider and its embeddings instead of a built-in guess.
+    let registry = load_provider_registry();
 
     let provider: Arc<dyn LLMProvider + Send + Sync>;
     let embeddings: Option<Arc<dyn EmbeddingProvider>>;
@@ -706,18 +778,7 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
             // OpenCode serves no embeddings endpoint. Ollama can supply them,
             // but only when a URL was configured: an empty OLLAMA_URL means no
             // fallback exists, so report the capability as missing and say why.
-            embeddings = if config.ollama_url.trim().is_empty() {
-                tracing::warn!(
-                    "embeddings are disabled: the opencode provider does not serve them and OLLAMA_URL is empty"
-                );
-                None
-            } else {
-                Some(Arc::new(OllamaEmbeddings::new(
-                    config.ollama_url.clone(),
-                    config.embedding_model.clone(),
-                    config.embedding_dimensions,
-                )))
-            };
+            embeddings = ollama_embeddings_fallback(config, "opencode");
             router = if router_config.enabled {
                 Some(Arc::new(OpenCodeRouter::new(
                     config.opencode_url.clone(),
@@ -729,14 +790,61 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
                 None
             };
         }
-        // These kinds are now recognised (parsing, profiles, per-agent config)
-        // but their direct adapters are still to be wired. Fail loudly rather
-        // than silently answering on the wrong upstream.
-        ProviderKind::OpenAiCompatible | ProviderKind::Anthropic | ProviderKind::Gemini => {
-            return Err(AppError::Config(format!(
-                "provider '{}' is recognised but its direct adapter is not wired yet",
-                config.provider
+        // Groq/Mistral/DeepSeek/xAI and any self-hosted compatible gateway
+        // speak OpenAI's chat and embeddings wires, so they reuse the same
+        // adapters with the profile's base URL — no duplicated client.
+        ProviderKind::OpenAiCompatible => {
+            let profile = profile_for(&registry, config);
+            let key = profile_api_key(&profile);
+            let base_url = profile
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.openai.com".to_string());
+            provider = Arc::new(OpenAiCompatibleProvider::with_provider_name(
+                base_url.clone(),
+                key.clone(),
+                config.default_model.clone(),
+                config.provider.to_string(),
+            ));
+            embeddings = Some(Arc::new(OpenAiCompatibleEmbeddings::new(
+                base_url,
+                key,
+                config.embedding_model.clone(),
+                config.embedding_dimensions,
             )));
+            // No d1 decisions endpoint exists on the OpenAI wire. `None` lets
+            // `build_app_state` install the separate llama.cpp d1 router when
+            // routing is enabled, exactly as on the Ollama path.
+            router = None;
+        }
+        // Anthropic serves no embeddings endpoint of its own; the Ollama
+        // fallback (when configured) is the only way to get them.
+        ProviderKind::Anthropic => {
+            let profile = profile_for(&registry, config);
+            provider = Arc::new(AnthropicProvider::new(
+                profile.base_url.clone(),
+                profile_api_key(&profile),
+                config.default_model.clone(),
+            ));
+            embeddings = ollama_embeddings_fallback(config, "anthropic");
+            router = None;
+        }
+        ProviderKind::Gemini => {
+            let profile = profile_for(&registry, config);
+            let key = profile_api_key(&profile);
+            let base_url = profile.base_url.clone();
+            provider = Arc::new(GeminiProvider::new(
+                base_url.clone(),
+                key.clone(),
+                config.default_model.clone(),
+            ));
+            embeddings = Some(Arc::new(GeminiEmbeddings::new(
+                base_url,
+                key,
+                config.embedding_model.clone(),
+                config.embedding_dimensions,
+            )));
+            router = None;
         }
     }
 
