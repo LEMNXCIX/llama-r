@@ -12,6 +12,7 @@ use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
@@ -51,7 +52,6 @@ struct OperationDef {
     has_body: bool,
 }
 
-#[derive(Debug)]
 pub struct OpenApiConnection {
     server_id: String,
     base_url: String,
@@ -61,6 +61,28 @@ pub struct OpenApiConnection {
     timeout: Duration,
     tools: Vec<McpToolDef>,
     operations: HashMap<String, OperationDef>,
+}
+
+/// Resolved header values may hold API keys (`$VAR` expansion), so never print them.
+/// Header names and all other fields keep their normal debug output.
+impl fmt::Debug for OpenApiConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(name, _)| (name.as_str(), "[redacted]"))
+            .collect();
+        f.debug_struct("OpenApiConnection")
+            .field("server_id", &self.server_id)
+            .field("base_url", &self.base_url)
+            .field("http", &self.http)
+            .field("auth", &self.auth)
+            .field("headers", &redacted_headers)
+            .field("timeout", &self.timeout)
+            .field("tools", &self.tools)
+            .field("operations", &self.operations)
+            .finish()
+    }
 }
 
 impl OpenApiConnection {

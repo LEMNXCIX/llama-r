@@ -205,10 +205,44 @@ async fn streaming_connection_sends_auth_and_custom_headers() {
         .any(|(k, v)| k == "x-stream" && v == "yes"));
 }
 
+#[test]
+fn openapi_connection_debug_redacts_resolved_header_values() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let spec = json!({
+        "openapi": "3.0.3",
+        "info": { "title": "redaction", "version": "1.0" },
+        "servers": [{ "url": "http://127.0.0.1:1" }],
+        "paths": { "/ping": { "get": { "operationId": "ping" } } }
+    });
+    let spec_path = write_spec(dir.path(), "redaction.json", &spec);
+    let secret = "super-secret-api-key-value";
+    let connection = OpenApiConnection::from_spec_path(
+        "redaction",
+        spec_path,
+        ResolvedAuth::Bearer("super-secret-bearer-token".into()),
+        vec![("X-Api-Key".into(), secret.into())],
+        Duration::from_secs(5),
+    )
+    .expect("openapi connection");
+
+    let debug = format!("{:?}", connection);
+    assert!(
+        !debug.contains(secret),
+        "resolved header value leaked: {debug}"
+    );
+    assert!(
+        debug.contains("X-Api-Key"),
+        "header name should be visible: {debug}"
+    );
+    assert!(debug.contains("[redacted]"), "marker missing: {debug}");
+    assert!(
+        !debug.contains("super-secret-bearer-token"),
+        "auth token leaked: {debug}"
+    );
+}
+
 #[tokio::test]
 async fn a_request_spoofed_authorization_cannot_override_connection_auth() {
-    std::env::set_var("TEST_CONN_SPOOF_TOKEN", "real-connection-token");
-
     let (addr, captured) = spawn_capture_server(json!([])).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let spec = json!({
