@@ -3,6 +3,7 @@
 //! New scope fields are optional with **safe defaults** (deny-all tools, no RAG).
 //! Existing agent TOML files continue to deserialize without changes.
 
+use crate::domain::policy::PermissionPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -89,6 +90,12 @@ pub struct AgentConfig {
     /// the router derives the text from the rest of the manifest.
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+
+    /// Declarative permission policy compiled into `AgentScope.permission`.
+    /// Empty by default: a v1 manifest with no `[policy]` table requires no
+    /// approvals and keeps exactly the behavior it had before this field.
+    #[serde(default)]
+    pub policy: PermissionPolicy,
 }
 
 impl Default for AgentConfig {
@@ -121,6 +128,7 @@ impl Default for AgentConfig {
             memory: MemoryConfig::default(),
             observability: AgentObservabilityConfig::default(),
             routing: None,
+            policy: PermissionPolicy::default(),
         }
     }
 }

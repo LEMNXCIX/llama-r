@@ -669,6 +669,7 @@ mod tests {
                 max_tool_calls: 0,
                 max_iterations: 1,
                 timeout_secs: 1,
+                permission: crate::domain::policy::PermissionPolicy::default(),
             },
             model: String::new(),
             provider,

@@ -37,6 +37,7 @@ impl ScopeBuilder {
             max_tool_calls: config.max_tool_calls,
             max_iterations: config.max_iterations,
             timeout_secs: config.timeout_secs,
+            permission: config.policy.clone(),
         })
     }
 

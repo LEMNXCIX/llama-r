@@ -143,6 +143,7 @@ fn request(provider: ProviderKind, model: &str) -> AgentRunRequest {
             max_tool_calls: 0,
             max_iterations: 1,
             timeout_secs: 5,
+            permission: llama_r::domain::policy::PermissionPolicy::default(),
         },
         model: model.to_string(),
         provider,

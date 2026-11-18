@@ -5,6 +5,7 @@
 //! must go through these checks (defense in depth).
 
 use crate::domain::agent::RagWritePolicy;
+use crate::domain::policy::PermissionPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -66,6 +67,9 @@ pub struct AgentScope {
     pub max_tool_calls: u32,
     pub max_iterations: u32,
     pub timeout_secs: u64,
+    /// Declarative permission policy, evaluated by `PermissionEngine::authorize`
+    /// before a tool is dispatched. Empty by default = no tool needs approval.
+    pub permission: PermissionPolicy,
 }
 
 impl AgentScope {
@@ -150,6 +154,7 @@ mod tests {
             max_tool_calls: 8,
             max_iterations: 6,
             timeout_secs: 90,
+            permission: PermissionPolicy::default(),
         }
     }
 

@@ -23,6 +23,7 @@ fn scope_for(agent: &str, sources: &[&str], write: RagWritePolicy) -> AgentScope
         max_tool_calls: 8,
         max_iterations: 6,
         timeout_secs: 90,
+        permission: llama_r::domain::policy::PermissionPolicy::default(),
     }
 }
 

@@ -270,6 +270,7 @@ async fn filter_tools_for_scope_deny_all() {
         max_tool_calls: 8,
         max_iterations: 6,
         timeout_secs: 90,
+        permission: llama_r::domain::policy::PermissionPolicy::default(),
     };
 
     let tools = vec![
@@ -304,6 +305,7 @@ async fn filter_tools_for_scope_allowlist() {
         max_tool_calls: 8,
         max_iterations: 6,
         timeout_secs: 90,
+        permission: llama_r::domain::policy::PermissionPolicy::default(),
     };
 
     let tools = vec![
@@ -339,6 +341,7 @@ async fn filter_tools_for_scope_all_from_sources() {
         max_tool_calls: 8,
         max_iterations: 6,
         timeout_secs: 90,
+        permission: llama_r::domain::policy::PermissionPolicy::default(),
     };
 
     let tools = vec![
@@ -373,6 +376,7 @@ async fn filter_rejects_tools_from_non_scoped_servers() {
         max_tool_calls: 8,
         max_iterations: 6,
         timeout_secs: 90,
+        permission: llama_r::domain::policy::PermissionPolicy::default(),
     };
 
     let tools = vec![
@@ -618,6 +622,7 @@ async fn registry_discover_scoped_tools() {
         max_tool_calls: 5,
         max_iterations: 5,
         timeout_secs: 60,
+        permission: llama_r::domain::policy::PermissionPolicy::default(),
     };
 
     let discovered = registry

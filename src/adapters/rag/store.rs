@@ -339,6 +339,7 @@ mod tests {
             max_tool_calls: 8,
             max_iterations: 6,
             timeout_secs: 90,
+            permission: crate::domain::policy::PermissionPolicy::default(),
         }
     }
 

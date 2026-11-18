@@ -134,6 +134,7 @@ mod tests {
             max_tool_calls: 10,
             max_iterations: 5,
             timeout_secs: 30,
+            permission: crate::domain::policy::PermissionPolicy::default(),
         };
         let tool = ScopedMcpTool {
             def: McpToolDef {
