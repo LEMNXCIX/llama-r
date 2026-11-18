@@ -560,23 +560,15 @@ async fn registry_from_configs_and_namespacing() {
             id: "server1".into(),
             transport: "http".into(),
             url: Some(format!("http://{}/", addr)),
-            auth_env: None,
-            command: None,
-            args: vec![],
-            timeout_secs: 30,
             tool_namespace: Some("items".into()),
-            enabled: true,
+            ..Default::default()
         },
         McpServerConfig {
             id: "disabled_server".into(),
             transport: "http".into(),
             url: Some("http://127.0.0.1:9999/".into()),
-            auth_env: None,
-            command: None,
-            args: vec![],
-            timeout_secs: 30,
-            tool_namespace: None,
             enabled: false,
+            ..Default::default()
         },
     ];
 
@@ -610,12 +602,7 @@ async fn registry_discover_scoped_tools() {
         id: "db_server".into(),
         transport: "http".into(),
         url: Some(format!("http://{}/", addr)),
-        auth_env: None,
-        command: None,
-        args: vec![],
-        timeout_secs: 30,
-        tool_namespace: None,
-        enabled: true,
+        ..Default::default()
     }];
 
     let registry = StaticMcpRegistry::from_configs(&configs).expect("registry init");

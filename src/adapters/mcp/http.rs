@@ -6,16 +6,104 @@
 
 use crate::ports::mcp::{McpCallRequest, McpCallResult, McpClient, McpToolDef};
 use async_trait::async_trait;
+use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::fmt;
 use std::time::Duration;
+
+/// A connection credential resolved from environment variable *names* at build time.
+/// The secret value never lives in config or logs — only the resolved header does.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum ResolvedAuth {
+    Bearer(String),
+    Basic {
+        username: String,
+        password: String,
+    },
+    #[default]
+    None,
+}
+
+/// Never let a derived `Debug` put a credential into a log line.
+impl fmt::Debug for ResolvedAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bearer(_) => f.write_str("Bearer(<redacted>)"),
+            Self::Basic { .. } => f.write_str("Basic(<redacted>)"),
+            Self::None => f.write_str("None"),
+        }
+    }
+}
+
+/// Apply a connection's auth and custom headers to an outgoing HTTP request.
+///
+/// Custom headers are inserted first and the connection's auth is inserted last, so a
+/// value supplied by a caller (for example an OpenAPI `Authorization` header parameter
+/// coming from tool arguments) can never override or append to the configured credential.
+/// `HeaderMap::insert` replaces every previous value, guaranteeing exactly one value.
+pub fn apply_connection_headers(
+    request: &mut reqwest::Request,
+    auth: &ResolvedAuth,
+    headers: &[(String, String)],
+) -> Result<(), String> {
+    for (name, value) in headers {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|err| format!("invalid MCP header name '{name}': {err}"))?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|err| format!("invalid value for MCP header '{name}': {err}"))?;
+        request.headers_mut().insert(name, value);
+    }
+
+    match auth {
+        ResolvedAuth::Bearer(token) => {
+            let value = HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| "invalid bearer token for MCP connection".to_string())?;
+            request.headers_mut().insert(AUTHORIZATION, value);
+        }
+        ResolvedAuth::Basic { username, password } => {
+            let credentials = format!("{username}:{password}");
+            let value =
+                HeaderValue::from_str(&format!("Basic {}", base64_encode(credentials.as_bytes())))
+                    .map_err(|_| "invalid basic auth for MCP connection".to_string())?;
+            request.headers_mut().insert(AUTHORIZATION, value);
+        }
+        ResolvedAuth::None => {}
+    }
+    Ok(())
+}
+
+/// Minimal RFC 4648 base64 encoder (no extra dependency needed for Basic auth).
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
 
 #[derive(Clone)]
 pub struct HttpMcpClient {
     http: Client,
     server_id: String,
     base_url: String,
-    auth_token: Option<String>,
+    auth: ResolvedAuth,
+    headers: Vec<(String, String)>,
     timeout: Duration,
 }
 
@@ -25,13 +113,28 @@ impl HttpMcpClient {
             http: Client::new(),
             server_id: server_id.into(),
             base_url: base_url.into(),
-            auth_token: None,
+            auth: ResolvedAuth::None,
+            headers: Vec::new(),
             timeout: Duration::from_secs(30),
         }
     }
 
+    /// Legacy bearer-token setter, kept for callers that only have a token.
     pub fn with_auth(mut self, token: Option<String>) -> Self {
-        self.auth_token = token;
+        self.auth = match token {
+            Some(token) if !token.is_empty() => ResolvedAuth::Bearer(token),
+            _ => ResolvedAuth::None,
+        };
+        self
+    }
+
+    pub fn with_basic_auth(mut self, username: String, password: String) -> Self {
+        self.auth = ResolvedAuth::Basic { username, password };
+        self
+    }
+
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
         self
     }
 
@@ -52,18 +155,20 @@ impl HttpMcpClient {
             "params": params,
         });
 
-        let mut req = self
+        let builder = self
             .http
             .post(&self.base_url)
             .timeout(self.timeout)
             .header("Content-Type", "application/json")
             .json(&body);
+        let mut request = builder.build().map_err(|err| err.to_string())?;
+        apply_connection_headers(&mut request, &self.auth, &self.headers)?;
 
-        if let Some(token) = &self.auth_token {
-            req = req.bearer_auth(token);
-        }
-
-        let response = req.send().await.map_err(|err| err.to_string())?;
+        let response = self
+            .http
+            .execute(request)
+            .await
+            .map_err(|err| err.to_string())?;
         let status = response.status();
         let value: Value = response.json().await.map_err(|err| err.to_string())?;
 

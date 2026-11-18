@@ -2,6 +2,7 @@
 //!
 //! Handles streaming responses and Server-Sent Events (SSE) from streamable MCP servers.
 
+use super::http::{apply_connection_headers, ResolvedAuth};
 use crate::ports::mcp::{CancellationToken, McpCallRequest, McpCallResult, McpClient, McpToolDef};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -14,7 +15,8 @@ pub struct StreamingHttpMcpClient {
     http: Client,
     server_id: String,
     base_url: String,
-    auth_token: Option<String>,
+    auth: ResolvedAuth,
+    headers: Vec<(String, String)>,
     timeout: Duration,
 }
 
@@ -24,13 +26,28 @@ impl StreamingHttpMcpClient {
             http: Client::new(),
             server_id: server_id.into(),
             base_url: base_url.into(),
-            auth_token: None,
+            auth: ResolvedAuth::None,
+            headers: Vec::new(),
             timeout: Duration::from_secs(30),
         }
     }
 
+    /// Legacy bearer-token setter, kept for callers that only have a token.
     pub fn with_auth(mut self, token: Option<String>) -> Self {
-        self.auth_token = token;
+        self.auth = match token {
+            Some(token) if !token.is_empty() => ResolvedAuth::Bearer(token),
+            _ => ResolvedAuth::None,
+        };
+        self
+    }
+
+    pub fn with_basic_auth(mut self, username: String, password: String) -> Self {
+        self.auth = ResolvedAuth::Basic { username, password };
+        self
+    }
+
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
         self
     }
 
@@ -56,19 +73,17 @@ impl StreamingHttpMcpClient {
             "params": params,
         });
 
-        let mut req = self
+        let builder = self
             .http
             .post(&self.base_url)
             .timeout(self.timeout)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream, application/json")
             .json(&body);
+        let mut request = builder.build().map_err(|err| err.to_string())?;
+        apply_connection_headers(&mut request, &self.auth, &self.headers)?;
 
-        if let Some(token) = &self.auth_token {
-            req = req.bearer_auth(token);
-        }
-
-        let send_fut = req.send();
+        let send_fut = self.http.execute(request);
 
         let response = if let Some(ct) = cancel_token {
             tokio::select! {
