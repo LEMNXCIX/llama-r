@@ -35,6 +35,14 @@ pub struct AgentConfig {
     /// System-managed skills selected from project analysis.
     #[serde(default)]
     pub auto_skills: Vec<String>,
+    /// Local (in-process) tools this agent may call. Empty = deny-all;
+    /// `["*"]` = all local tools; otherwise an explicit allowlist by id.
+    #[serde(default)]
+    pub tools_local: Vec<String>,
+    /// Subset of `skills`/`auto_skills` announced by name and description only.
+    /// The body is loaded on demand via the `llama_r__skill` local tool.
+    #[serde(default)]
+    pub deferred_skills: Vec<String>,
     /// Dynamic template variables. Use {{var_name}} in system_prompt.
     #[serde(default)]
     pub variables: HashMap<String, String>,
@@ -96,6 +104,8 @@ impl Default for AgentConfig {
             rules: Vec::new(),
             skills: Vec::new(),
             auto_skills: Vec::new(),
+            tools_local: Vec::new(),
+            deferred_skills: Vec::new(),
             variables: HashMap::new(),
             max_context_tokens: default_context_budget(),
             optimize: OptimizeConfig::default(),
@@ -309,5 +319,42 @@ summary_collection = "agent:fudi_ops/memory"
             !text.contains("subagents"),
             "dead config must not leak back out: {text}"
         );
+    }
+
+    #[test]
+    fn a_manifest_without_the_new_fields_loads() {
+        // A v1 manifest must keep loading unchanged: both new fields are
+        // `#[serde(default)]` and therefore default to empty allowlists/sets.
+        let raw = r#"
+name = "Legacy"
+system_prompt = "v1 agent"
+skills = ["legacy-skill"]
+rules = ["Be brief."]
+"#;
+        let cfg: AgentConfig = toml::from_str(raw).unwrap();
+        assert!(cfg.tools_local.is_empty());
+        assert!(cfg.deferred_skills.is_empty());
+    }
+
+    #[test]
+    fn tools_local_and_deferred_skills_round_trip() {
+        let raw = r#"
+name = "V2 Agent"
+system_prompt = "v2 agent"
+skills = ["reviewer-skill", "legacy-skill"]
+tools_local = ["llama_r__skill", "llama_r__rag_query"]
+deferred_skills = ["reviewer-skill"]
+"#;
+        let cfg: AgentConfig = toml::from_str(raw).unwrap();
+        assert_eq!(
+            cfg.tools_local,
+            vec!["llama_r__skill", "llama_r__rag_query"]
+        );
+        assert_eq!(cfg.deferred_skills, vec!["reviewer-skill"]);
+
+        let encoded = toml::to_string(&cfg).unwrap();
+        let reparsed: AgentConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(reparsed.tools_local, cfg.tools_local);
+        assert_eq!(reparsed.deferred_skills, cfg.deferred_skills);
     }
 }

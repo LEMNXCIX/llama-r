@@ -39,6 +39,10 @@ pub struct CreateAgentRequest {
     #[serde(default)]
     pub skills: Vec<String>,
     #[serde(default)]
+    pub tools_local: Vec<String>,
+    #[serde(default)]
+    pub deferred_skills: Vec<String>,
+    #[serde(default)]
     pub variables: HashMap<String, String>,
     #[serde(default)]
     pub optimize: OptimizeConfig,
@@ -502,6 +506,23 @@ fn build_agent_toml(req: &CreateAgentRequest, project_id: Option<&str>) -> Strin
     }
     output.push_str("auto_skills = []\n");
 
+    let tools_local: Vec<String> = req
+        .tools_local
+        .iter()
+        .map(|tool| format!("\"{}\"", tool.replace('"', "\\\"")))
+        .collect();
+    output.push_str(&format!("tools_local = [{}]\n", tools_local.join(", ")));
+
+    let deferred_skills: Vec<String> = req
+        .deferred_skills
+        .iter()
+        .map(|skill| format!("\"{}\"", skill.replace('"', "\\\"")))
+        .collect();
+    output.push_str(&format!(
+        "deferred_skills = [{}]\n",
+        deferred_skills.join(", ")
+    ));
+
     if !req.variables.is_empty() {
         output.push_str("[variables]\n");
         for (key, value) in &req.variables {
@@ -523,4 +544,39 @@ fn build_agent_toml(req: &CreateAgentRequest, project_id: Option<&str>) -> Strin
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generators_emit_both_fields_when_set() {
+        let req: CreateAgentRequest = serde_json::from_value(serde_json::json!({
+            "id": "v2-agent",
+            "name": "V2 Agent",
+            "system_prompt": "v2 agent",
+            "tools_local": ["llama_r__skill", "llama_r__rag_query"],
+            "deferred_skills": ["reviewer-skill"],
+        }))
+        .unwrap();
+
+        let toml_text = build_agent_toml(&req, Some("demo"));
+        assert!(
+            toml_text.contains("tools_local = [\"llama_r__skill\", \"llama_r__rag_query\"]"),
+            "generated TOML missing tools_local: {toml_text}"
+        );
+        assert!(
+            toml_text.contains("deferred_skills = [\"reviewer-skill\"]"),
+            "generated TOML missing deferred_skills: {toml_text}"
+        );
+
+        // The emitted TOML must round-trip back into the manifest schema.
+        let parsed: crate::domain::agent::AgentConfig = toml::from_str(&toml_text).unwrap();
+        assert_eq!(
+            parsed.tools_local,
+            vec!["llama_r__skill", "llama_r__rag_query"]
+        );
+        assert_eq!(parsed.deferred_skills, vec!["reviewer-skill"]);
+    }
 }

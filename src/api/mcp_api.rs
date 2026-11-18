@@ -383,6 +383,24 @@ async fn create_agent_tool(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let tools_local = args["tools_local"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let deferred_skills = args["deferred_skills"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let toml_content = if let Some(raw) = args["toml"].as_str() {
         raw.to_string()
     } else {
@@ -413,9 +431,40 @@ async fn create_agent_tool(
                     .join(", ")
             )
         };
+        let tools_local_line = if tools_local.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\ntools_local = [{}]",
+                tools_local
+                    .iter()
+                    .map(|tool| format!("\"{}\"", tool.replace('"', "\\\"")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let deferred_skills_line = if deferred_skills.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\ndeferred_skills = [{}]",
+                deferred_skills
+                    .iter()
+                    .map(|skill| format!("\"{}\"", skill.replace('"', "\\\"")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         format!(
-            "name = \"{}\"\nmodel = \"{}\"\nsystem_prompt = \"\"\"\n{}\n\"\"\"{}{}{}",
-            name, model, system_prompt, context_project_line, rules_line, skills_line
+            "name = \"{}\"\nmodel = \"{}\"\nsystem_prompt = \"\"\"\n{}\n\"\"\"{}{}{}{}{}",
+            name,
+            model,
+            system_prompt,
+            context_project_line,
+            rules_line,
+            skills_line,
+            tools_local_line,
+            deferred_skills_line
         )
     };
 

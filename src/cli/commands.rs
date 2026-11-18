@@ -228,6 +228,8 @@ async fn init_agent_file(
 system_prompt = """{system_prompt}"""
 {context_project_line}rules = []
 skills = []
+tools_local = []
+deferred_skills = []
 
 [optimize]
 enabled = true

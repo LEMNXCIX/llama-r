@@ -1136,7 +1136,7 @@ impl TuiApp {
                     };
 
                     let toml_content = format!(
-                    "name = \"{}\"\nmodel = \"{}\"\nsystem_prompt = \"\"\"\n{}\n\"\"\"\ncontext_project = \"{}\"\nrules = {}\nskills = {}\n\n[optimize]\nenabled = {}\nrules = {}\n",
+                    "name = \"{}\"\nmodel = \"{}\"\nsystem_prompt = \"\"\"\n{}\n\"\"\"\ncontext_project = \"{}\"\nrules = {}\nskills = {}\ntools_local = []\ndeferred_skills = []\n\n[optimize]\nenabled = {}\nrules = {}\n",
                     self.form_name, self.form_model, self.form_prompt, project_id, rules_str, skills_str, self.form_optimize_enabled, opt_rules_str
                 );
                     let path = crate::core::paths::get_project_agents_dir(project_id)
