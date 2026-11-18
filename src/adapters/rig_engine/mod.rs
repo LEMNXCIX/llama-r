@@ -245,16 +245,31 @@ impl RigAgentEngine {
         req: &AgentRunRequest,
     ) -> Result<(Vec<ScopedMcpTool>, String), String> {
         let scope = &req.scope;
-        let tool_defs = self.mcp_registry.discover_scoped_tools(scope).await?;
 
-        let mut tools = Vec::with_capacity(tool_defs.len());
-        for def in tool_defs {
-            let client = self.mcp_registry.client_for(&def.server_id).await?;
-            tools.push(ScopedMcpTool {
-                def,
-                client,
-                scope: scope.clone(),
-            });
+        // Tool discovery is gated on the capability of the model resolved for
+        // *this* request. A model that cannot call tools (OpenCode, an unknown
+        // or renamed model, …) must not be handed a tool it cannot use; skip
+        // discovery entirely and say why, so the empty tool list is explainable
+        // to an operator instead of looking like an empty MCP registry.
+        let mut tools = Vec::new();
+        if req.capabilities.tool_calling {
+            let tool_defs = self.mcp_registry.discover_scoped_tools(scope).await?;
+            tools.reserve(tool_defs.len());
+            for def in tool_defs {
+                let client = self.mcp_registry.client_for(&def.server_id).await?;
+                tools.push(ScopedMcpTool {
+                    def,
+                    client,
+                    scope: scope.clone(),
+                });
+            }
+        } else {
+            tracing::warn!(
+                agent = %req.agent.qualified_id(),
+                model = %req.model,
+                capability = "tool_calling",
+                "skipping MCP tool discovery: the resolved model cannot call tools"
+            );
         }
 
         let mut system = req.system_prompt.clone();
