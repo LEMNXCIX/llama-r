@@ -735,9 +735,21 @@ fn chat_provider_from_profile(
     }
 }
 
-/// The single next profile after the primary, from the registry's deterministic
-/// (`ProviderRegistry::ordered`) order. Returning one `Option` is the bound: a
-/// request can fail over to at most one other upstream, never walk a chain.
+/// A profile is a usable fallback only when it can authenticate: local providers
+/// carry no `api_key_env`, while remote ones need their named variable to resolve
+/// to a non-empty value. The value is read only to test presence via the existing
+/// `profile_api_key` helper — it is never logged, named in an error or stored on
+/// the stack. Falling back to a profile we know cannot authenticate would mask
+/// the primary's real connection error with a spurious 401.
+fn profile_is_usable(profile: &ProviderProfile) -> bool {
+    profile.api_key_env.is_none() || !profile_api_key(profile).trim().is_empty()
+}
+
+/// The single next *usable* profile after the primary, from the registry's
+/// deterministic (`ProviderRegistry::ordered`) order. Returning one `Option` is
+/// the bound: a request can fail over to at most one other upstream, never walk
+/// a chain. When no profile can authenticate, there is no fallback and the
+/// original degraded behavior — the primary's own connection error — stands.
 fn build_fallback_provider(
     registry: &ProviderRegistry,
     config: &Config,
@@ -746,7 +758,7 @@ fn build_fallback_provider(
     registry
         .ordered()
         .into_iter()
-        .find(|profile| profile.name != primary)
+        .find(|profile| profile.name != primary && profile_is_usable(profile))
         .map(|profile| FallbackProvider {
             name: profile.name.clone(),
             provider: chat_provider_from_profile(profile, &config.default_model),

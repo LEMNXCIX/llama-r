@@ -263,46 +263,72 @@ async fn missing_usage_is_none_not_zero() {
     );
 }
 
-/// Isolate `get_base_dir()` so a developer's `providers.toml` cannot change the
-/// built-in order this startup test relies on. Restored on drop.
-struct BaseDirGuard {
-    previous: Option<String>,
+/// Every env var a built-in profile names as its `api_key_env`. Cleared so a
+/// startup test cannot accidentally pick up the developer's shell credentials,
+/// and restored on drop.
+const KEY_ENV_VARS: &[&str] = &[
+    "OPENROUTER_API_KEY",
+    "OPENCODE_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+];
+
+/// Isolate `get_base_dir()` (so a developer's `providers.toml` cannot change the
+/// built-in order) and every key var the fallback filter reads.
+struct EnvGuard {
+    saved_keys: Vec<(&'static str, Option<String>)>,
+    prev_dir: Option<String>,
     _dir: TempDir,
 }
 
-impl BaseDirGuard {
+impl EnvGuard {
     fn fresh() -> Self {
-        let previous = std::env::var("LLAMA_R_DIR").ok();
+        let saved_keys = KEY_ENV_VARS
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect();
+        let prev_dir = std::env::var("LLAMA_R_DIR").ok();
         let dir = tempfile::tempdir().expect("temp base dir");
+        for name in KEY_ENV_VARS {
+            std::env::remove_var(name);
+        }
         std::env::set_var("LLAMA_R_DIR", dir.path());
         Self {
-            previous,
+            saved_keys,
+            prev_dir,
             _dir: dir,
         }
     }
+
+    /// A dummy value used only to make a key-requiring profile usable. It is
+    /// never sent anywhere: no network call is made in these startup tests.
+    fn set_key(&self, name: &str, value: &str) {
+        std::env::set_var(name, value);
+    }
 }
 
-impl Drop for BaseDirGuard {
+impl Drop for EnvGuard {
     fn drop(&mut self) {
-        match &self.previous {
+        for (name, value) in &self.saved_keys {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        match &self.prev_dir {
             Some(value) => std::env::set_var("LLAMA_R_DIR", value),
             None => std::env::remove_var("LLAMA_R_DIR"),
         }
     }
 }
 
-/// Startup wires exactly one fallback, chosen as the next profile after the
-/// primary in the deterministic order — never a key, never a chain.
-#[test]
-fn startup_builds_one_deterministic_fallback() {
-    let _lock = test_lock();
-    let _dir = BaseDirGuard::fresh();
-
-    let config = Config {
+fn startup_config(ollama_url: &str, model: &str) -> Config {
+    Config {
         port: 3000,
         provider: ProviderKind::Ollama,
-        ollama_url: "http://127.0.0.1:11434".into(),
-        default_model: "model".into(),
+        ollama_url: ollama_url.into(),
+        default_model: model.into(),
         embedding_model: "nomic-embed-text".into(),
         embedding_dimensions: 768,
         rag_enabled: true,
@@ -311,16 +337,73 @@ fn startup_builds_one_deterministic_fallback() {
         opencode_api_key: None,
         opencode_url: "http://127.0.0.1:4096".into(),
         openai_base_url: None,
-    };
-    let stack = build_provider_stack(&config).expect("build stack");
-    let fallback = stack.fallback_provider.expect("a next profile exists");
+    }
+}
+
+/// With no keys set, every non-primary built-in that precedes another profile
+/// requires a credential it does not have. The fallback must be absent: falling
+/// back to a provider we know cannot authenticate would replace the real
+/// connection error with a spurious "Anthropic 401".
+#[test]
+fn startup_without_credentials_has_no_fallback() {
+    let _lock = test_lock();
+    let _env = EnvGuard::fresh();
+
+    let stack = build_provider_stack(&startup_config("http://127.0.0.1:11434", "model"))
+        .expect("build stack");
+    assert!(
+        stack.fallback_provider.is_none(),
+        "no usable fallback exists without credentials"
+    );
+}
+
+/// A key-requiring profile becomes the fallback once its env var is set. The
+/// recorded identity stays a secret-free profile name.
+#[test]
+fn startup_picks_the_first_usable_profile_when_its_key_is_set() {
+    let _lock = test_lock();
+    let _env = EnvGuard::fresh();
+    let dummy = "sk-dummy-key-never-sent";
+    _env.set_key("ANTHROPIC_API_KEY", dummy);
+
+    let stack = build_provider_stack(&startup_config("http://127.0.0.1:11434", "model"))
+        .expect("build stack");
+    let fallback = stack.fallback_provider.expect("anthropic is now usable");
 
     // Built-ins sorted by name: anthropic, gemini, ollama, openai-compatible,
-    // opencode, openrouter. Ollama's next is anthropic.
+    // opencode, openrouter. Anthropic is first and now has a key.
     assert_eq!(fallback.name, "anthropic");
     assert!(
-        !fallback.name.contains("sk-"),
-        "the recorded identity is a profile name, never a key"
+        !fallback.name.contains(dummy),
+        "the key value must never appear in the recorded identity"
+    );
+}
+
+/// The contract in AGENTS.md is that an unreachable provider fails with a 502
+/// naming the connection error. With no usable fallback that exact error must
+/// survive dispatch — not be masked by a "Fallback also failed" wrapper.
+#[tokio::test]
+async fn with_no_usable_fallback_the_real_connection_error_survives() {
+    let _lock = test_lock();
+    let _env = EnvGuard::fresh();
+
+    let a = StubServer::start(500, serde_json::json!({"error": "upstream down"})).await;
+    let stack =
+        build_provider_stack(&startup_config(&a.url(), "requested-model")).expect("build stack");
+    let state = state_for(stack);
+
+    let err = execute_chat(&state, chat("hello"), selection())
+        .await
+        .expect_err("the failing provider must surface its error");
+
+    let text = err.to_string();
+    assert!(
+        text.contains("Ollama error"),
+        "expected the real provider error: {text}"
+    );
+    assert!(
+        !text.contains("Fallback also failed"),
+        "no usable fallback must not replace the connection error: {text}"
     );
 }
 
