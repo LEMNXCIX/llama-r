@@ -1653,6 +1653,12 @@ impl TuiApp {
             crate::runtime::build_provider_stack(&config).map_err(|err| err.to_string())?;
         crate::runtime::build_companions_for_state(state, &config, &mut stack);
         config.save_to_env().map_err(|err| err.to_string())?;
+        // chat_core's skill-ranking enricher lives on AppState, not on the
+        // stack, so it must be rebuilt from the new embedder here too — boot
+        // installed it once and a swap would otherwise leave it stale. Like the
+        // services swap, this runs only after the env write succeeded, so a
+        // failed write leaves the old enricher in place as well.
+        crate::runtime::install_state_enricher(state, &config, &stack);
         state.replace_services(stack).await;
         Ok(())
     }

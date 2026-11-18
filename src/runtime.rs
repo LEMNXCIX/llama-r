@@ -69,6 +69,41 @@ pub struct Runtime {
     pub grpc_addr: SocketAddr,
 }
 
+/// Build the semantic skill-ranking enricher from a selected stack's embedder.
+///
+/// One constructor for all three sites that need one: the boot `AppState`, the
+/// per-agent `AgentRuntime`, and the `AppState` enricher reinstalled on every
+/// settings Apply. Sharing it is what keeps a hot swap from leaving chat_core
+/// ranking skills with the boot-time provider's embedder. Without an embedder
+/// every declared skill is used (best effort) rather than a broken Ollama
+/// embedder being attached to a non-Ollama provider.
+pub fn build_context_enricher(
+    context_store: Arc<ContextStore>,
+    skill_manager: Arc<SkillManager>,
+    default_model: String,
+    global_provider: ProviderKind,
+    embeddings: Option<Arc<dyn EmbeddingProvider>>,
+) -> Arc<ContextEnricher> {
+    let provider_registry = Arc::new(match ProviderRegistry::load() {
+        Ok(registry) => registry,
+        Err(err) => {
+            tracing::warn!(error = %err, "invalid provider registry; using built-in profiles");
+            ProviderRegistry::default()
+        }
+    });
+    let mut enricher = ContextEnricher::new(
+        context_store,
+        skill_manager,
+        default_model,
+        provider_registry,
+        global_provider,
+    );
+    if let Some(embeddings) = embeddings {
+        enricher = enricher.with_embeddings(embeddings);
+    }
+    Arc::new(enricher)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "stable interface: called from fourteen sites across the crate and tests"
@@ -85,33 +120,20 @@ pub fn build_app_state(
 ) -> Arc<AppState> {
     let metrics = Arc::new(TokenMetrics::new());
     let default_model = stack.default_model.clone();
-    // The resolver needs the profile registry and the process-wide provider.
-    // A broken registry is not fatal: warn and keep the canonical spellings.
-    let provider_registry = Arc::new(match ProviderRegistry::load() {
-        Ok(registry) => registry,
-        Err(err) => {
-            tracing::warn!(error = %err, "invalid provider registry; using built-in profiles");
-            ProviderRegistry::default()
-        }
-    });
     let global_provider = stack
         .provider_name
         .parse::<ProviderKind>()
         .unwrap_or_default();
-    // Semantic skill ranking uses the SELECTED stack's embedder. Without one,
-    // every declared skill is used (best effort) — never a broken Ollama
-    // embedder pointed at localhost for a non-Ollama provider.
-    let mut enricher = ContextEnricher::new(
+    // Semantic skill ranking uses the SELECTED stack's embedder. The same
+    // constructor rebuilds it on every settings Apply, so boot and Apply cannot
+    // disagree about which provider ranks skills.
+    let context_enricher = build_context_enricher(
         context_store.clone(),
         skill_manager.clone(),
         default_model,
-        provider_registry,
         global_provider,
+        stack.embeddings.clone(),
     );
-    if let Some(embeddings) = &stack.embeddings {
-        enricher = enricher.with_embeddings(embeddings.clone());
-    }
-    let context_enricher = Arc::new(enricher);
 
     // Router configuration. `RouterConfig` deliberately does not load `.env`
     // itself (that is `Config::from_env`'s job, which has already run on this
@@ -155,7 +177,7 @@ pub fn build_app_state(
         agent_registry,
         skill_manager,
         context_store,
-        context_enricher,
+        context_enricher: Mutex::new(context_enricher),
         metrics,
         observability: Arc::new(AppObservability::new()),
         api_running: AtomicBool::new(false),
@@ -982,17 +1004,6 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
     let agent_runtime = {
         use crate::adapters::rig_engine::{engine_target_for, RigAgentEngine};
 
-        // Same resolver inputs as `build_app_state`: the selected provider and
-        // the profile registry, so an Apply rebuild cannot resolve an agent
-        // differently from boot.
-        let provider_registry = Arc::new(match ProviderRegistry::load() {
-            Ok(registry) => registry,
-            Err(err) => {
-                tracing::warn!(error = %err, "invalid provider registry; using built-in profiles");
-                ProviderRegistry::default()
-            }
-        });
-
         let engine_target = engine_target_for(config);
         stack.engine_target = engine_target.as_ref().map(|target| target.kind());
         engine_target.map(|target| {
@@ -1001,25 +1012,20 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
                 handles.mcp_registry.clone(),
                 rag_store.clone(),
             ));
-            // ContextEnricher built from the selected stack's embedder. Without
-            // one, all declared skills are used (best effort) rather than a
-            // broken Ollama embedder being attached.
-            let mut enricher = ContextEnricher::new(
-                handles.context_store.clone(),
-                handles.skill_manager.clone(),
-                config.default_model.clone(),
-                provider_registry.clone(),
-                config.provider,
-            );
-            if let Some(embeddings) = &stack.embeddings {
-                enricher = enricher.with_embeddings(embeddings.clone());
-            }
             Arc::new(AgentRuntime {
                 registry: handles.agent_registry.clone(),
                 engine,
                 history: handles.history_store.clone(),
                 rag: rag_store.clone(),
-                enricher: Arc::new(enricher),
+                // Same constructor as boot and the AppState enricher: the
+                // selected stack's embedder ranks this agent's skills.
+                enricher: build_context_enricher(
+                    handles.context_store.clone(),
+                    handles.skill_manager.clone(),
+                    config.default_model.clone(),
+                    config.provider,
+                    stack.embeddings.clone(),
+                ),
             })
         })
     };
@@ -1049,6 +1055,24 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
 /// state; boot uses [`build_companions`] directly (no `AppState` yet).
 pub fn build_companions_for_state(state: &AppState, config: &Config, stack: &mut ProviderStack) {
     build_companions(&CompanionHandles::from_state(state), config, stack);
+}
+
+/// Rebuild the `AppState` skill-ranking enricher from a selected stack and
+/// install it on a running state. Called on every settings Apply right after
+/// the companions are rebuilt: `chat_core` reads this enricher, so leaving the
+/// boot-time one in place would keep ranking skills with the old provider's
+/// embedder after a swap. No lock is held across an await here — the guard in
+/// [`AppState::replace_context_enricher`] is released as soon as the value is
+/// installed.
+pub fn install_state_enricher(state: &AppState, config: &Config, stack: &ProviderStack) {
+    let enricher = build_context_enricher(
+        state.context_store.clone(),
+        state.skill_manager.clone(),
+        config.default_model.clone(),
+        config.provider,
+        stack.embeddings.clone(),
+    );
+    state.replace_context_enricher(enricher);
 }
 
 /// Load MCP server configs from the `mcp-servers/` directory.

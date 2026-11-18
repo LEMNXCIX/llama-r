@@ -40,7 +40,12 @@ pub struct AppState {
     pub agent_registry: Arc<AgentRegistry>,
     pub skill_manager: Arc<SkillManager>,
     pub context_store: Arc<ContextStore>,
-    pub context_enricher: Arc<ContextEnricher>,
+    /// The skill-ranking enricher used by `chat_core`. Behind a `Mutex` so a
+    /// settings Apply can rebuild it from the new stack's embedder: a boot-time
+    /// `Arc` would keep ranking skills with the old provider after a swap. Every
+    /// read snapshots the inner `Arc` before any `.await`, so the guard is never
+    /// held across one.
+    pub context_enricher: Mutex<Arc<ContextEnricher>>,
     pub metrics: Arc<TokenMetrics>,
     pub observability: Arc<AppObservability>,
     pub api_running: AtomicBool,
@@ -72,6 +77,28 @@ impl AppState {
     pub async fn replace_services(&self, new: ProviderStack) {
         let mut guard = self.services.write().await;
         *guard = Arc::new(new);
+    }
+
+    /// Clone the current skill-ranking enricher. The guard is dropped before
+    /// returning, so a caller can `.await` on the returned `Arc` with no lock
+    /// held — the same discipline as [`Self::services_snapshot`].
+    pub fn context_enricher_snapshot(&self) -> Arc<ContextEnricher> {
+        let guard = self
+            .context_enricher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&*guard)
+    }
+
+    /// Install a rebuilt enricher (with the new stack's embedder). The guard is
+    /// released as soon as the value is installed; it is never held across an
+    /// await.
+    pub fn replace_context_enricher(&self, new: Arc<ContextEnricher>) {
+        let mut guard = self
+            .context_enricher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = new;
     }
 
     pub fn mcp_server_ids(&self) -> Vec<String> {

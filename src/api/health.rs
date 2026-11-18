@@ -204,13 +204,13 @@ mod tests {
         let state = Arc::new(AppState {
             services: Arc::new(TokioRwLock::new(Arc::new(stack))),
             agent_registry: Arc::new(AgentRegistry::new()),
-            context_enricher: Arc::new(ContextEnricher::new(
+            context_enricher: Mutex::new(Arc::new(ContextEnricher::new(
                 context_store.clone(),
                 skill_manager.clone(),
                 "fallback-model".to_string(),
                 Arc::new(ProviderRegistry::default()),
                 ProviderKind::Ollama,
-            )),
+            ))),
             skill_manager,
             context_store,
             metrics: Arc::new(TokenMetrics::new()),

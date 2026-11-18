@@ -1491,6 +1491,21 @@ async fn settings_apply_swaps_the_provider_and_persists_it() {
     assert_eq!(std::env::var("PROVIDER").unwrap(), "openrouter");
     assert_eq!(std::env::var("DEFAULT_MODEL").unwrap(), "new-model");
     assert_eq!(std::env::var("OPENROUTER_API_KEY").unwrap(), "sk-test-key");
+
+    // finish_apply also rebuilds the AppState skill-ranking enricher from the
+    // new stack: an agent with no model of its own now resolves to the applied
+    // default, not the boot-time "llama3". A stale enricher here is the bug
+    // that left skill ranking on the boot provider after a switch.
+    use crate::domain::agent::{Agent, AgentConfig};
+    let agent = Agent {
+        id: "probe".to_string(),
+        project_id: None,
+        config: AgentConfig::default(),
+    };
+    assert_eq!(
+        app.state.context_enricher_snapshot().resolve(&agent).model,
+        "new-model"
+    );
 }
 
 /// A keyed provider with no key is refused before a stack is built, a file is

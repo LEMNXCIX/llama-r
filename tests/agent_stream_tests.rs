@@ -357,7 +357,7 @@ async fn a_non_streaming_provider_returns_unavailable_before_connecting() {
         engine: Arc::new(ConnectingEngine { addr }),
         history: None,
         rag: None,
-        enricher: state.context_enricher.clone(),
+        enricher: state.context_enricher_snapshot(),
     };
     let mut new_stack = (*state.services_snapshot().await).clone();
     new_stack.agent_runtime = Some(Arc::new(runtime));

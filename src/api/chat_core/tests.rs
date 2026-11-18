@@ -230,13 +230,13 @@ fn test_state_with_runtime_and_provider(
     let skill_manager = Arc::new(SkillManager::new());
     let context_store = Arc::new(ContextStore::new());
     let global_provider = provider_name.parse::<ProviderKind>().unwrap_or_default();
-    let context_enricher = Arc::new(ContextEnricher::new(
+    let context_enricher = Mutex::new(Arc::new(ContextEnricher::new(
         context_store.clone(),
         skill_manager.clone(),
         "fallback-model".to_string(),
         Arc::new(ProviderRegistry::default()),
         global_provider,
-    ));
+    )));
     let mut stack = ProviderStack::new(provider, "fallback-model");
     stack.provider_name = provider_name.to_string();
     stack.agent_runtime = agent_runtime;

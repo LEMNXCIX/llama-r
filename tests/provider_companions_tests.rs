@@ -21,12 +21,14 @@ use llama_r::api::health::{health, HealthResponse};
 use llama_r::api::route_resolution::AgentSelection;
 use llama_r::config::{Config, ProviderKind};
 use llama_r::context::store::ContextStore;
-use llama_r::domain::agent::AgentConfig;
+use llama_r::domain::agent::{Agent, AgentConfig};
 use llama_r::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
 use llama_r::ports::mcp::McpServerRegistry;
+use llama_r::ports::rag::EmbeddingProvider;
 use llama_r::providers::LLMProvider;
 use llama_r::runtime::{
     build_app_state, build_companions_for_state, build_provider_stack, build_router,
+    install_state_enricher,
 };
 use llama_r::services::agent_registry::AgentRegistry;
 use llama_r::services::provider_stack::ProviderStack;
@@ -34,6 +36,7 @@ use llama_r::services::skill_manager::SkillManager;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 use tokio_stream::Stream;
@@ -99,6 +102,17 @@ impl Drop for EnvGuard {
     }
 }
 
+/// Restore the working directory even if an assertion in the test panics — a
+/// leftover cwd inside a removed TempDir would break the next test in this
+/// (single-process) integration-test binary.
+struct CwdGuard(std::path::PathBuf);
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.0).expect("restore cwd");
+    }
+}
+
 fn config(provider: ProviderKind) -> Config {
     Config {
         port: 3000,
@@ -158,6 +172,25 @@ impl LLMProvider for LocalProvider {
         Box<dyn Error + Send + Sync>,
     > {
         unreachable!("these tests do not stream")
+    }
+}
+
+/// A no-network embedder that counts how many times it is asked to embed.
+/// Installing one on a stack and then driving skill ranking tells us which
+/// embedder the `AppState` enricher actually reached after an Apply.
+#[derive(Clone)]
+struct ProbeEmbedder {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl EmbeddingProvider for ProbeEmbedder {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+    }
+    fn dimensions(&self) -> usize {
+        2
     }
 }
 
@@ -423,4 +456,87 @@ async fn agent_chat_without_an_engine_is_not_silent() {
     let reason = reason.to_ascii_lowercase();
     assert!(reason.contains("tool") && reason.contains("rag") && reason.contains("mcp"));
     assert!(reason.contains("opencode"));
+}
+
+/// A settings Apply must rebuild the chat-path `ContextEnricher` from the NEW
+/// stack's embedder. `chat_core` reads the enricher on `AppState` (not the one
+/// inside `AgentRuntime`), so leaving the boot-time embedder in place would keep
+/// ranking skills with the old provider after a switch. Embedder A is installed
+/// at boot, embedder B on Apply; only B may be called when ranking runs.
+#[tokio::test]
+async fn apply_replaces_the_state_enricher_embedder() {
+    let _lock = test_lock();
+    let _env = EnvGuard::fresh();
+    let root = _env._dir.path().to_path_buf();
+
+    // A skill for the agent to consider. SkillManager scans `./skills`, so the
+    // cwd must point at the temp dir while it loads.
+    let skill_dir = root.join("skills").join("probe-skill");
+    std::fs::create_dir_all(&skill_dir).expect("skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: probe-skill\ndescription: A skill used to probe ranking\n---\nProbe skill body.",
+    )
+    .expect("SKILL.md");
+    let _cwd = CwdGuard(std::env::current_dir().expect("cwd"));
+    std::env::set_current_dir(&root).expect("set cwd");
+
+    let boot_calls = Arc::new(AtomicUsize::new(0));
+    let applied_calls = Arc::new(AtomicUsize::new(0));
+
+    let cfg = config(ProviderKind::OpenRouter);
+    // Boot stack: embedder A.
+    let mut boot_stack = build_provider_stack(&cfg).expect("boot stack");
+    boot_stack.embeddings = Some(Arc::new(ProbeEmbedder {
+        calls: boot_calls.clone(),
+    }));
+    boot_stack.provider = Arc::new(LocalProvider {
+        answer: String::new(),
+    });
+    let state = bare_state(boot_stack);
+    state.skill_manager.scan_and_load();
+
+    let agent = Agent {
+        id: "probe-agent".to_string(),
+        project_id: None,
+        config: AgentConfig {
+            name: "Probe".to_string(),
+            system_prompt: "base".to_string(),
+            skills: vec!["probe-skill".to_string()],
+            ..Default::default()
+        },
+    };
+
+    // Apply: a new stack with embedder B, installed through the same helper
+    // `finish_apply` uses.
+    let mut applied_stack = build_provider_stack(&cfg).expect("applied stack");
+    applied_stack.embeddings = Some(Arc::new(ProbeEmbedder {
+        calls: applied_calls.clone(),
+    }));
+    applied_stack.provider = Arc::new(LocalProvider {
+        answer: String::new(),
+    });
+    build_companions_for_state(&state, &cfg, &mut applied_stack);
+    install_state_enricher(&state, &cfg, &applied_stack);
+    state.replace_services(applied_stack).await;
+
+    // Drive skill ranking through the AppState enricher that chat_core reads.
+    let prompt = state
+        .context_enricher_snapshot()
+        .build_system_prompt(&agent)
+        .await;
+    assert!(
+        prompt.contains("probe-skill"),
+        "the candidate skill must be injected: {prompt}"
+    );
+
+    assert_eq!(
+        boot_calls.load(Ordering::SeqCst),
+        0,
+        "the boot embedder must not rank skills after an Apply"
+    );
+    assert!(
+        applied_calls.load(Ordering::SeqCst) > 0,
+        "the new stack's embedder must rank skills after an Apply"
+    );
 }

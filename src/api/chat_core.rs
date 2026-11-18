@@ -219,7 +219,10 @@ async fn prepare_request(
 
     if let Some(agent) = selected_agent {
         let mut prepared_messages = Vec::with_capacity(payload.messages.len() + 1);
-        let sys_prompt = state.context_enricher.build_system_prompt(&agent).await;
+        // Snapshot once for both reads below so a hot swap landing mid-request
+        // cannot make the system prompt and the model resolution disagree.
+        let enricher = state.context_enricher_snapshot();
+        let sys_prompt = enricher.build_system_prompt(&agent).await;
         prepared_messages.push(ChatMessage {
             role: "system".to_string(),
             content: sys_prompt,
@@ -248,7 +251,7 @@ async fn prepare_request(
 
         let optimized_messages = prepared_messages;
 
-        let resolved = state.context_enricher.resolve(&agent);
+        let resolved = enricher.resolve(&agent);
         tracing::info!(
             agent_id = %agent.qualified_id(),
             resolved_provider = %resolved.provider,
@@ -535,7 +538,7 @@ pub async fn execute_chat_stream(
         })
         .map(|registered| {
             state
-                .context_enricher
+                .context_enricher_snapshot()
                 .resolve(&registered.agent)
                 .capabilities
                 .streaming
