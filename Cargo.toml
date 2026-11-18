@@ -43,6 +43,7 @@ clap = { version = "4.5.60", features = ["derive"] }
 dialoguer = "0.12.0"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2.0.12"
+sha2 = "0.10"
 utoipa = { version = "5", features = ["chrono"] }
 uuid = { version = "1.10", features = ["v4"] }
 rusqlite = { version = "0.43", features = ["bundled"], optional = true }

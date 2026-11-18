@@ -202,6 +202,7 @@ impl LLMProvider for FakeProvider {
                     .unwrap_or_default(),
             },
             done: true,
+            approval: None,
         })])))
     }
 }

@@ -495,6 +495,7 @@ impl llama_r::providers::LLMProvider for RecordingProvider {
                 content: "answered".into(),
             },
             done: true,
+            approval: None,
         };
         Ok(Box::pin(tokio_stream::iter(vec![Ok(event)])))
     }

@@ -148,12 +148,30 @@ pub struct RoutedDebug {
     pub candidates: Vec<String>,
 }
 
+/// A pending human decision attached to one SSE event.
+///
+/// Carries only non-secret identifiers: the approval id, the tool name and the
+/// lowercase-hex SHA-256 of the exact arguments being approved. Raw arguments
+/// are deliberately absent from the stream. `id` is a string rather than a
+/// `Uuid` so the schema derives without an extra utoipa feature; clients see
+/// the same JSON string either way.
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct ApprovalInfo {
+    pub id: String,
+    pub tool_name: String,
+    pub args_hash: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct ChatStreamEvent {
     pub model: String,
     pub created_at: String,
     pub message: ChatMessage,
     pub done: bool,
+    /// Present only on an `ApprovalRequired` event. Skipped when absent so
+    /// existing SSE clients see an unchanged payload on ordinary events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]

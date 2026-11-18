@@ -43,6 +43,12 @@ pub enum AppError {
     Notify(#[from] notify::Error),
     #[error("Runtime error: {0}")]
     Runtime(String),
+    #[error("Approval request not found: {0}")]
+    ApprovalNotFound(String),
+    #[error("Approval request expired: {0}")]
+    ApprovalExpired(String),
+    #[error("Approval arguments changed: {0}")]
+    ApprovalArgsChanged(String),
 }
 
 impl AppError {
@@ -61,6 +67,9 @@ impl AppError {
             Self::Reqwest(_) => "http_error",
             Self::Notify(_) => "watcher_error",
             Self::Runtime(_) => "runtime_error",
+            Self::ApprovalNotFound(_) => "approval_not_found",
+            Self::ApprovalExpired(_) => "approval_expired",
+            Self::ApprovalArgsChanged(_) => "approval_args_changed",
         }
     }
 
@@ -74,6 +83,9 @@ impl AppError {
             Self::Unavailable(_) => StatusCode::NOT_IMPLEMENTED,
             Self::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Provider(_) => StatusCode::BAD_GATEWAY,
+            Self::ApprovalNotFound(_) => StatusCode::NOT_FOUND,
+            Self::ApprovalArgsChanged(_) => StatusCode::BAD_REQUEST,
+            Self::ApprovalExpired(_) => StatusCode::GONE,
             Self::Io(_)
             | Self::SerdeJson(_)
             | Self::Toml(_)

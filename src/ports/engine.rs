@@ -7,6 +7,7 @@ use crate::domain::scope::AgentScope;
 use crate::providers::capabilities::ModelCapabilities;
 use async_trait::async_trait;
 use serde_json::Value;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct AgentRunRequest {
@@ -56,6 +57,14 @@ pub enum AgentRunEvent {
     },
     Error {
         message: String,
+    },
+    /// A tool needs a human decision before it may run. The caller awaits the
+    /// oneshot registered in the approval gate; the stream keeps the request
+    /// open while the human decides.
+    ApprovalRequired {
+        id: Uuid,
+        tool_name: String,
+        args: Value,
     },
 }
 

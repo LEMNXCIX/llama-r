@@ -189,6 +189,7 @@ impl LLMProvider for FakeProvider {
                     .unwrap_or_default(),
             },
             done: true,
+            approval: None,
         };
         Ok(Box::pin(tokio_stream::iter(vec![Ok(event)])))
     }

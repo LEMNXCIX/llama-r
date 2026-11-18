@@ -1,10 +1,13 @@
 use crate::api::handlers::AppState;
 use crate::api::route_resolution::{resolve_selection, AgentSelection, ResolvedSelection};
-use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent};
+use crate::domain::models::{
+    ApprovalInfo, ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent,
+};
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
 use crate::ports::engine::AgentRunEvent;
 use crate::services::agent_runtime::RuntimeChatRequest;
+use crate::services::approval::args_hash_hex;
 use std::pin::Pin;
 use std::time::Instant;
 use tokio_stream::{Stream, StreamExt};
@@ -118,7 +121,9 @@ async fn build_runtime_request(
     })
 }
 
-fn engine_events_to_chat_stream(
+/// Map engine events to SSE events. Exposed so the approval-event mapping can
+/// be tested without standing up a full `AppState`.
+pub fn engine_events_to_chat_stream(
     model: String,
     mut rx: tokio::sync::mpsc::Receiver<AgentRunEvent>,
 ) -> AppChatStream {
@@ -141,6 +146,7 @@ fn engine_events_to_chat_stream(
                             content: text,
                         },
                         done: false,
+                        approval: None,
                     });
                 }
                 AgentRunEvent::Completed { result } => {
@@ -158,10 +164,30 @@ fn engine_events_to_chat_stream(
                             content,
                         },
                         done: true,
+                        approval: None,
                     });
                 }
                 AgentRunEvent::Error { message } => {
                     yield Err(AppError::Runtime(message));
+                }
+                AgentRunEvent::ApprovalRequired { id, tool_name, args } => {
+                    // Signal the pending decision without leaking the raw
+                    // arguments into the stream. The client gets the id and
+                    // the hash it must echo back with its decision.
+                    yield Ok(ChatStreamEvent {
+                        model: model.clone(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        message: ChatMessage {
+                            role: "assistant".to_string(),
+                            content: String::new(),
+                        },
+                        done: false,
+                        approval: Some(ApprovalInfo {
+                            id: id.to_string(),
+                            tool_name,
+                            args_hash: args_hash_hex(&args),
+                        }),
+                    });
                 }
                 AgentRunEvent::ToolCall { .. } | AgentRunEvent::ToolResult { .. } => {
                     // Tool progress is not mapped to ChatStreamEvent yet (Nivel-A streaming).
@@ -178,6 +204,7 @@ fn engine_events_to_chat_stream(
                     content: String::new(),
                 },
                 done: true,
+                approval: None,
             });
         }
     })

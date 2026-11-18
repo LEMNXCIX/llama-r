@@ -339,6 +339,7 @@ impl LLMProvider for RecordingProvider {
                 content: text,
             },
             done: true,
+            approval: None,
         })])))
     }
 }
