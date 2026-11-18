@@ -377,29 +377,68 @@ impl ContextEnricher {
                 }
             };
 
-            let selected_skills = kept_ids
+            // Partition the kept skills after ranking: a skill listed in
+            // `deferred_skills` is announced by name + description only and its
+            // body stays out of the system prompt (the model loads it with the
+            // `llama_r__skill` tool). Everything else keeps the full injection,
+            // byte-for-byte as before.
+            let deferred_ids: std::collections::HashSet<&str> = agent
+                .config
+                .deferred_skills
                 .iter()
-                .filter_map(|skill_id| {
-                    if let Some(project_path) = &project_path {
-                        self.skill_manager
-                            .resolve_for_project(skill_id, Path::new(project_path))
-                    } else {
-                        self.skill_manager.get_skill(skill_id)
-                    }
-                    .map(|skill| {
-                        format!(
-                            "### {}\nPath: {}\n\n{}",
-                            skill.id, skill.path, skill.content
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
+                .map(String::as_str)
+                .collect();
 
-            if !selected_skills.is_empty() {
+            // An id in `deferred_skills` that was never declared cannot be
+            // announced. Warn and ignore it rather than failing the request.
+            for id in &agent.config.deferred_skills {
+                if !candidate_skill_ids.iter().any(|candidate| candidate == id) {
+                    tracing::warn!(
+                        skill = %id,
+                        "deferred skill is not declared by the agent; ignoring"
+                    );
+                }
+            }
+
+            let mut full_bodies = Vec::new();
+            let mut announcements = Vec::new();
+            for skill_id in &kept_ids {
+                let skill = if let Some(project_path) = &project_path {
+                    self.skill_manager
+                        .resolve_for_project(skill_id, Path::new(project_path))
+                } else {
+                    self.skill_manager.get_skill(skill_id)
+                };
+                let Some(skill) = skill else { continue };
+
+                if deferred_ids.contains(skill_id.as_str()) {
+                    // The tool resolves by skill id, so announce the id as the
+                    // "name" the model must pass to llama_r__skill.
+                    announcements.push(format!("- {} — {}", skill.id, skill.metadata.description));
+                } else {
+                    full_bodies.push(format!(
+                        "### {}\nPath: {}\n\n{}",
+                        skill.id, skill.path, skill.content
+                    ));
+                }
+            }
+
+            let mut rendered = full_bodies.join("\n\n");
+            if !announcements.is_empty() {
+                if !rendered.is_empty() {
+                    rendered.push_str("\n\n");
+                }
+                rendered.push_str(
+                    "Las siguientes skills están disponibles bajo demanda; para cargar sus instrucciones completas, llama a llama_r__skill con el nombre de la skill (por ejemplo, llama_r__skill({name: \"<nombre>\"})):\n",
+                );
+                rendered.push_str(&announcements.join("\n"));
+            }
+
+            if !rendered.is_empty() {
                 sections.push((
                     format!(
                         "\n## Agent Skills\nUsa estas skills especificamente para este agente:\n\n{}",
-                        selected_skills.join("\n\n")
+                        rendered
                     ),
                     60,
                 ));
@@ -503,12 +542,121 @@ mod tests {
     use crate::config::ProviderKind;
     use crate::context::store::{ContextStore, ProjectContext};
     use crate::domain::agent::{Agent, AgentConfig, OptimizeConfig};
+    use crate::ports::rag::EmbeddingProvider;
     use crate::providers::registry::ProviderRegistry;
     use crate::services::skill_manager::SkillManager;
-    use std::sync::{Arc, MutexGuard};
+    use std::sync::{Arc, Mutex, MutexGuard};
+    use tracing_subscriber::prelude::*;
 
     fn lock_env() -> MutexGuard<'static, ()> {
         crate::core::paths::lock_env_for_tests()
+    }
+
+    /// Restore the process-wide environment touched by these tests.
+    struct EnvRestore {
+        dir: std::path::PathBuf,
+        llama_dir: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture() -> Self {
+            Self {
+                dir: std::env::current_dir().unwrap(),
+                llama_dir: std::env::var_os("LLAMA_R_DIR"),
+            }
+        }
+
+        fn enter(&self, temp_dir: &std::path::Path) {
+            std::env::set_current_dir(temp_dir).unwrap();
+            std::env::set_var("LLAMA_R_DIR", temp_dir);
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.dir).unwrap();
+            match &self.llama_dir {
+                Some(value) => std::env::set_var("LLAMA_R_DIR", value),
+                None => std::env::remove_var("LLAMA_R_DIR"),
+            }
+        }
+    }
+
+    /// Build an enricher whose skill manager sees only `temp_dir/skills`,
+    /// never the developer's real home-directory skills.
+    fn enricher_with_skills(
+        temp_dir: &std::path::Path,
+        specs: &[(&str, &str, &str)],
+    ) -> ContextEnricher {
+        let skills_root = temp_dir.join("skills");
+        for (id, description, body) in specs {
+            let dir = skills_root.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {id}\ndescription: {description}\n---\n{body}"),
+            )
+            .unwrap();
+        }
+        let skill_manager = Arc::new(SkillManager::with_paths(vec![skills_root]));
+        skill_manager.scan_and_load();
+        ContextEnricher::new(
+            Arc::new(ContextStore::new()),
+            skill_manager,
+            "fallback-model".to_string(),
+            Arc::new(ProviderRegistry::default()),
+            ProviderKind::Ollama,
+        )
+    }
+
+    /// An embedder that gives a clean relevance signal to the two test skills:
+    /// the query ("alpha is the priority") matches `alpha-skill`, not `beta-skill`.
+    struct KeywordEmbedder;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for KeywordEmbedder {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    let lower = text.to_ascii_lowercase();
+                    if lower.contains("alpha") {
+                        vec![1.0, 0.0]
+                    } else if lower.contains("beta") {
+                        vec![0.0, 1.0]
+                    } else {
+                        vec![0.5, 0.5]
+                    }
+                })
+                .collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+    }
+
+    /// Capture WARN events emitted while building a prompt.
+    #[derive(Clone, Default)]
+    struct WarnBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for WarnBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WarnBuffer {
+        type Writer = WarnBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     #[tokio::test]
@@ -586,5 +734,201 @@ mod tests {
         assert!(!prompt.contains("This must stay out of the prompt."));
 
         std::env::set_current_dir(previous_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_deferred_skill_announces_name_and_description_only() {
+        let _guard = lock_env();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let env = EnvRestore::capture();
+        env.enter(temp_dir.path());
+
+        let enricher = enricher_with_skills(
+            temp_dir.path(),
+            &[(
+                "deferred-skill",
+                "Provides deferred guidance",
+                "DEFERRED BODY SECRET",
+            )],
+        );
+        let agent = Agent {
+            id: "reviewer".to_string(),
+            project_id: None,
+            config: AgentConfig {
+                name: "Reviewer".to_string(),
+                model: String::new(),
+                system_prompt: "Base prompt".to_string(),
+                skills: vec!["deferred-skill".to_string()],
+                deferred_skills: vec!["deferred-skill".to_string()],
+                ..Default::default()
+            },
+        };
+
+        let prompt = enricher.build_system_prompt(&agent).await;
+
+        assert!(prompt.contains("## Agent Skills"));
+        assert!(
+            prompt.contains("deferred-skill"),
+            "the announced name must be present: {prompt}"
+        );
+        assert!(
+            prompt.contains("Provides deferred guidance"),
+            "the description must be announced: {prompt}"
+        );
+        assert!(
+            prompt.contains("llama_r__skill"),
+            "the model must be told how to load the body: {prompt}"
+        );
+        assert!(
+            !prompt.contains("DEFERRED BODY SECRET"),
+            "a deferred body must not be in the system prompt: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Path:"),
+            "a deferred skill must not be rendered as a full entry: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_deferred_skill_still_injects_its_body() {
+        let _guard = lock_env();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let env = EnvRestore::capture();
+        env.enter(temp_dir.path());
+
+        let enricher = enricher_with_skills(
+            temp_dir.path(),
+            &[("reviewer-skill", "Helps review code", "Full reviewer body.")],
+        );
+        let agent = Agent {
+            id: "reviewer".to_string(),
+            project_id: None,
+            config: AgentConfig {
+                name: "Reviewer".to_string(),
+                model: String::new(),
+                system_prompt: "Base prompt".to_string(),
+                skills: vec!["reviewer-skill".to_string()],
+                // No deferred_skills: baseline behavior must be byte-for-byte.
+                ..Default::default()
+            },
+        };
+
+        let prompt = enricher.build_system_prompt(&agent).await;
+
+        let skill_md =
+            "---\nname: reviewer-skill\ndescription: Helps review code\n---\nFull reviewer body.";
+        let expected = format!(
+            "\n## Agent Skills\nUsa estas skills especificamente para este agente:\n\n### reviewer-skill\nPath: {}\n\n{}",
+            temp_dir.path().join("skills").join("reviewer-skill").display(),
+            skill_md
+        );
+        assert!(
+            prompt.contains(&expected),
+            "non-deferred skills must keep the baseline rendering: {prompt}"
+        );
+        assert!(
+            !prompt.contains("llama_r__skill"),
+            "no deferred skills means no on-demand instruction: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_deferred_id_is_ignored_with_a_warning() {
+        let _guard = lock_env();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let env = EnvRestore::capture();
+        env.enter(temp_dir.path());
+
+        let enricher = enricher_with_skills(
+            temp_dir.path(),
+            &[("reviewer-skill", "Helps review code", "Reviewer body.")],
+        );
+        let agent = Agent {
+            id: "reviewer".to_string(),
+            project_id: None,
+            config: AgentConfig {
+                name: "Reviewer".to_string(),
+                model: String::new(),
+                system_prompt: "Base prompt".to_string(),
+                skills: vec!["reviewer-skill".to_string()],
+                deferred_skills: vec!["ghost-skill".to_string()],
+                ..Default::default()
+            },
+        };
+
+        let captured = WarnBuffer::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(captured.clone())
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let prompt = enricher.build_system_prompt(&agent).await;
+        drop(_subscriber_guard);
+
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("ghost-skill"),
+            "the warning must name the undeclared id: {logs}"
+        );
+        assert!(
+            !prompt.contains("ghost-skill"),
+            "the undeclared id must not leak into the prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("Reviewer body."),
+            "the declared non-deferred skill is still injected: {prompt}"
+        );
+        assert!(
+            !prompt.contains("llama_r__skill"),
+            "an undeclared id must not turn into a deferred announcement: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ranking_still_applies_to_deferred_skills() {
+        let _guard = lock_env();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let env = EnvRestore::capture();
+        env.enter(temp_dir.path());
+
+        let enricher = enricher_with_skills(
+            temp_dir.path(),
+            &[
+                ("beta-skill", "beta work", "BETA BODY"),
+                ("alpha-skill", "alpha work", "ALPHA BODY"),
+            ],
+        )
+        .with_embeddings(Arc::new(KeywordEmbedder));
+        let agent = Agent {
+            id: "reviewer".to_string(),
+            project_id: None,
+            config: AgentConfig {
+                name: "Reviewer".to_string(),
+                model: String::new(),
+                // Query matches alpha, so ranking must promote it over beta
+                // even though beta is listed first in the manifest.
+                system_prompt: "alpha is the priority".to_string(),
+                skills: vec!["beta-skill".to_string(), "alpha-skill".to_string()],
+                deferred_skills: vec!["beta-skill".to_string(), "alpha-skill".to_string()],
+                ..Default::default()
+            },
+        };
+
+        let prompt = enricher.build_system_prompt(&agent).await;
+
+        let alpha_pos = prompt
+            .find("alpha-skill —")
+            .expect("alpha must be announced");
+        let beta_pos = prompt.find("beta-skill —").expect("beta must be announced");
+        assert!(
+            alpha_pos < beta_pos,
+            "deferred announcements must follow relevance ranking: {prompt}"
+        );
+        assert!(
+            !prompt.contains("ALPHA BODY") && !prompt.contains("BETA BODY"),
+            "deferred bodies must stay out of the prompt: {prompt}"
+        );
     }
 }
