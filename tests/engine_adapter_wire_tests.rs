@@ -13,17 +13,26 @@
 use llama_r::adapters::rig_engine::builder::{
     run_with_anthropic, run_with_gemini, run_with_openai_compatible,
 };
+use llama_r::adapters::rig_engine::local_tools::LocalToolDeps;
 use llama_r::config::ProviderKind;
 use llama_r::domain::agent::{Agent, AgentConfig, RagWritePolicy};
 use llama_r::domain::scope::{AgentScope, ToolsAllow};
 use llama_r::ports::engine::AgentRunRequest;
 use llama_r::providers::capabilities::capabilities_for;
+use llama_r::services::skill_manager::SkillManager;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+
+fn test_deps() -> LocalToolDeps {
+    LocalToolDeps {
+        skill_manager: Arc::new(SkillManager::with_paths(Vec::new())),
+        rag: None,
+    }
+}
 
 #[derive(Clone)]
 struct RecordedRequest {
@@ -171,6 +180,7 @@ async fn openai_compatible_sends_bearer_to_chat_completions_and_scrubs_the_key()
         request(ProviderKind::OpenAiCompatible, "gpt-4o-mini"),
         "sys".to_string(),
         Vec::new(),
+        test_deps(),
     )
     .await
     .expect_err("the canned 401 must surface as an error");
@@ -208,6 +218,7 @@ async fn anthropic_sends_x_api_key_to_messages_and_scrubs_the_key() {
         request(ProviderKind::Anthropic, "claude-3-5-sonnet"),
         "sys".to_string(),
         Vec::new(),
+        test_deps(),
     )
     .await
     .expect_err("the canned 401 must surface as an error");
@@ -239,6 +250,7 @@ async fn gemini_sends_x_goog_api_key_to_interactions_and_scrubs_the_key() {
         request(ProviderKind::Gemini, "gemini-1.5-pro"),
         "sys".to_string(),
         Vec::new(),
+        test_deps(),
     )
     .await
     .expect_err("the canned 401 must surface as an error");

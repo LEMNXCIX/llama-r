@@ -1,5 +1,5 @@
 use crate::adapters::rig_engine::limits::ToolCallBudget;
-use crate::adapters::rig_engine::local_tools::LocalToolBridge;
+use crate::adapters::rig_engine::local_tools::{LocalToolBridge, LocalToolDeps};
 use crate::adapters::rig_engine::tools::McpToolBridge;
 use crate::adapters::rig_engine::ScopedTool;
 use crate::domain::models::ChatMessage;
@@ -60,12 +60,13 @@ async fn run_agent<C, M>(
     req: AgentRunRequest,
     system: String,
     tools: Vec<ScopedTool>,
+    deps: LocalToolDeps,
 ) -> Result<AgentRunResult, String>
 where
     C: CompletionClient<CompletionModel = M>,
     M: CompletionModel + 'static,
 {
-    run_agent_inner(client, model_name, req, system, tools, None).await
+    run_agent_inner(client, model_name, req, system, tools, None, deps).await
 }
 
 /// Anthropic's completion model refuses to build a request without an explicit
@@ -81,21 +82,33 @@ async fn run_agent_with_max_tokens<C, M>(
     system: String,
     tools: Vec<ScopedTool>,
     max_tokens: u64,
+    deps: LocalToolDeps,
 ) -> Result<AgentRunResult, String>
 where
     C: CompletionClient<CompletionModel = M>,
     M: CompletionModel + 'static,
 {
-    run_agent_inner(client, model_name, req, system, tools, Some(max_tokens)).await
+    run_agent_inner(
+        client,
+        model_name,
+        req,
+        system,
+        tools,
+        Some(max_tokens),
+        deps,
+    )
+    .await
 }
 
 /// Wrap one run's scoped tools in their `ToolDyn` bridges. MCP and local tools
 /// get *the same* `Arc<Mutex<ToolCallBudget>>`, so a run has one tool-call
-/// allowance no matter which kind of tool spends it.
+/// allowance no matter which kind of tool spends it. Every local bridge also
+/// gets a clone of the executor dependencies (skill manager + RAG store).
 pub fn build_tool_bridges(
     tools: Vec<ScopedTool>,
     scope: &AgentScope,
     budget: Arc<Mutex<ToolCallBudget>>,
+    deps: LocalToolDeps,
 ) -> Vec<Box<dyn ToolDyn>> {
     tools
         .into_iter()
@@ -103,10 +116,12 @@ pub fn build_tool_bridges(
             ScopedTool::Mcp(mcp) => {
                 Box::new(McpToolBridge::new(mcp, budget.clone())) as Box<dyn ToolDyn>
             }
-            ScopedTool::Local(local) => {
-                Box::new(LocalToolBridge::new(local, scope.clone(), budget.clone()))
-                    as Box<dyn ToolDyn>
-            }
+            ScopedTool::Local(local) => Box::new(LocalToolBridge::new(
+                local,
+                scope.clone(),
+                budget.clone(),
+                deps.clone(),
+            )) as Box<dyn ToolDyn>,
         })
         .collect()
 }
@@ -116,7 +131,7 @@ pub fn build_tool_bridges(
 /// preamble, tools, temperature or turn budget.
 #[allow(
     clippy::too_many_arguments,
-    reason = "shared agent configuration: preamble, tools, budget, turns, temperature and token cap"
+    reason = "shared agent configuration: preamble, tools, scope, budget, turns, temperature, token cap and executor deps"
 )]
 fn build_agent<C, M>(
     client: &C,
@@ -128,6 +143,7 @@ fn build_agent<C, M>(
     max_iterations: usize,
     temperature: Option<f64>,
     max_tokens: Option<u64>,
+    deps: LocalToolDeps,
 ) -> Agent<M>
 where
     C: CompletionClient<CompletionModel = M>,
@@ -146,7 +162,7 @@ where
         }
         builder.build()
     } else {
-        let rig_tools = build_tool_bridges(tools, scope, budget);
+        let rig_tools = build_tool_bridges(tools, scope, budget, deps);
         let mut builder = client
             .agent(model_name)
             .preamble(system)
@@ -169,6 +185,7 @@ async fn run_agent_inner<C, M>(
     system: String,
     tools: Vec<ScopedTool>,
     max_tokens: Option<u64>,
+    deps: LocalToolDeps,
 ) -> Result<AgentRunResult, String>
 where
     C: CompletionClient<CompletionModel = M>,
@@ -188,6 +205,7 @@ where
         max_iterations,
         temperature,
         max_tokens,
+        deps,
     );
 
     let history = to_rig_history(&req.history);
@@ -221,6 +239,10 @@ where
 /// The caller owns the timeout (at the `AgentEngine` boundary) and the event
 /// channel. Keeping this generic over the completion client/model means every
 /// provider with a streaming-capable Rig client uses the exact same driver.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared streaming driver: tools, budget, turn budget, temperature, token cap and executor deps"
+)]
 pub async fn run_agent_stream<C, M>(
     client: &C,
     model_name: &str,
@@ -229,6 +251,7 @@ pub async fn run_agent_stream<C, M>(
     tools: Vec<ScopedTool>,
     tx: &mpsc::Sender<AgentRunEvent>,
     max_tokens: Option<u64>,
+    deps: LocalToolDeps,
 ) -> Result<(), String>
 where
     C: CompletionClient<CompletionModel = M>,
@@ -248,6 +271,7 @@ where
         max_iterations,
         temperature,
         max_tokens,
+        deps,
     );
 
     let history = to_rig_history(&req.history);
@@ -293,6 +317,7 @@ pub async fn run_with_rig(
     req: AgentRunRequest,
     system: String,
     tools: Vec<ScopedTool>,
+    deps: LocalToolDeps,
 ) -> Result<AgentRunResult, String> {
     let client = ollama::Client::builder()
         .api_key(Nothing)
@@ -309,7 +334,7 @@ pub async fn run_with_rig(
         req.model.clone()
     };
 
-    run_agent(&client, &model_name, req, system, tools).await
+    run_agent(&client, &model_name, req, system, tools, deps).await
 }
 
 /// Run a single agent turn via Rig against OpenRouter.
@@ -324,6 +349,7 @@ pub async fn run_with_openrouter(
     req: AgentRunRequest,
     system: String,
     tools: Vec<ScopedTool>,
+    deps: LocalToolDeps,
 ) -> Result<AgentRunResult, String> {
     let client = match base_url {
         Some(url) => openrouter::Client::builder()
@@ -347,7 +373,7 @@ pub async fn run_with_openrouter(
     }
     let model_name = req.model.clone();
 
-    let result = run_agent(&client, &model_name, req, system, tools).await;
+    let result = run_agent(&client, &model_name, req, system, tools, deps).await;
     // Safety net: nothing from the upstream may carry the key back to a caller.
     match result {
         Err(message) => Err(redact(message, api_key)),
@@ -367,6 +393,7 @@ pub async fn run_with_openai_compatible(
     req: AgentRunRequest,
     system: String,
     tools: Vec<ScopedTool>,
+    deps: LocalToolDeps,
 ) -> Result<AgentRunResult, String> {
     let client = match base_url {
         Some(url) => openai::CompletionsClient::builder()
@@ -384,7 +411,7 @@ pub async fn run_with_openai_compatible(
     }
     let model_name = req.model.clone();
 
-    let result = run_agent(&client, &model_name, req, system, tools).await;
+    let result = run_agent(&client, &model_name, req, system, tools, deps).await;
     match result {
         Err(message) => Err(redact(message, api_key)),
         ok => ok,
@@ -401,6 +428,7 @@ pub async fn run_with_anthropic(
     req: AgentRunRequest,
     system: String,
     tools: Vec<ScopedTool>,
+    deps: LocalToolDeps,
 ) -> Result<AgentRunResult, String> {
     let client = match base_url {
         Some(url) => anthropic::Client::builder()
@@ -423,6 +451,7 @@ pub async fn run_with_anthropic(
         system,
         tools,
         ANTHROPIC_MAX_TOKENS,
+        deps,
     )
     .await;
     match result {
@@ -443,6 +472,7 @@ pub async fn run_with_gemini(
     req: AgentRunRequest,
     system: String,
     tools: Vec<ScopedTool>,
+    deps: LocalToolDeps,
 ) -> Result<AgentRunResult, String> {
     let client = match base_url {
         Some(url) => gemini::InteractionsClient::builder()
@@ -458,7 +488,7 @@ pub async fn run_with_gemini(
     }
     let model_name = req.model.clone();
 
-    let result = run_agent(&client, &model_name, req, system, tools).await;
+    let result = run_agent(&client, &model_name, req, system, tools, deps).await;
     match result {
         Err(message) => Err(redact(message, api_key)),
         ok => ok,
@@ -472,6 +502,7 @@ pub async fn stream_with_rig(
     system: String,
     tools: Vec<ScopedTool>,
     tx: &mpsc::Sender<AgentRunEvent>,
+    deps: LocalToolDeps,
 ) -> Result<(), String> {
     let client = ollama::Client::builder()
         .api_key(Nothing)
@@ -485,7 +516,7 @@ pub async fn stream_with_rig(
         req.model.clone()
     };
 
-    run_agent_stream(&client, &model_name, req, system, tools, tx, None).await
+    run_agent_stream(&client, &model_name, req, system, tools, tx, None, deps).await
 }
 
 /// The named refusal for a target with no streaming model. OpenRouter is
@@ -505,6 +536,7 @@ pub async fn stream_with_openai_compatible(
     system: String,
     tools: Vec<ScopedTool>,
     tx: &mpsc::Sender<AgentRunEvent>,
+    deps: LocalToolDeps,
 ) -> Result<(), String> {
     let client = match base_url {
         Some(url) => openai::CompletionsClient::builder()
@@ -520,7 +552,7 @@ pub async fn stream_with_openai_compatible(
     }
     let model_name = req.model.clone();
 
-    let result = run_agent_stream(&client, &model_name, req, system, tools, tx, None).await;
+    let result = run_agent_stream(&client, &model_name, req, system, tools, tx, None, deps).await;
     match result {
         Err(message) => Err(redact(message, api_key)),
         ok => ok,
@@ -536,6 +568,7 @@ pub async fn stream_with_anthropic(
     system: String,
     tools: Vec<ScopedTool>,
     tx: &mpsc::Sender<AgentRunEvent>,
+    deps: LocalToolDeps,
 ) -> Result<(), String> {
     let client = match base_url {
         Some(url) => anthropic::Client::builder()
@@ -559,6 +592,7 @@ pub async fn stream_with_anthropic(
         tools,
         tx,
         Some(ANTHROPIC_MAX_TOKENS),
+        deps,
     )
     .await;
     match result {
@@ -577,6 +611,7 @@ pub async fn stream_with_gemini(
     system: String,
     tools: Vec<ScopedTool>,
     tx: &mpsc::Sender<AgentRunEvent>,
+    deps: LocalToolDeps,
 ) -> Result<(), String> {
     let client = match base_url {
         Some(url) => gemini::InteractionsClient::builder()
@@ -592,7 +627,7 @@ pub async fn stream_with_gemini(
     }
     let model_name = req.model.clone();
 
-    let result = run_agent_stream(&client, &model_name, req, system, tools, tx, None).await;
+    let result = run_agent_stream(&client, &model_name, req, system, tools, tx, None, deps).await;
     match result {
         Err(message) => Err(redact(message, api_key)),
         ok => ok,
@@ -606,7 +641,15 @@ mod tests {
     use crate::domain::agent::{Agent, AgentConfig, RagWritePolicy};
     use crate::domain::scope::{AgentScope, ToolsAllow};
     use crate::providers::capabilities::capabilities_for;
+    use crate::services::skill_manager::SkillManager;
     use std::collections::HashSet;
+
+    fn test_deps() -> LocalToolDeps {
+        LocalToolDeps {
+            skill_manager: Arc::new(SkillManager::with_paths(Vec::new())),
+            rag: None,
+        }
+    }
 
     fn empty_model_request(provider: ProviderKind) -> AgentRunRequest {
         AgentRunRequest {
@@ -693,6 +736,7 @@ mod tests {
             empty_model_request(ProviderKind::OpenRouter),
             "sys".to_string(),
             Vec::new(),
+            test_deps(),
         )
         .await
         .expect_err("an empty model must be rejected");
@@ -711,6 +755,7 @@ mod tests {
             empty_model_request(ProviderKind::OpenAiCompatible),
             "sys".to_string(),
             Vec::new(),
+            test_deps(),
         )
         .await
         .expect_err("openai-compatible must reject an empty model");
@@ -722,6 +767,7 @@ mod tests {
             empty_model_request(ProviderKind::Anthropic),
             "sys".to_string(),
             Vec::new(),
+            test_deps(),
         )
         .await
         .expect_err("anthropic must reject an empty model");
@@ -733,6 +779,7 @@ mod tests {
             empty_model_request(ProviderKind::Gemini),
             "sys".to_string(),
             Vec::new(),
+            test_deps(),
         )
         .await
         .expect_err("gemini must reject an empty model");

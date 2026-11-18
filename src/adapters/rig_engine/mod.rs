@@ -7,6 +7,8 @@ pub mod local_tools;
 #[cfg(feature = "rig-engine")]
 pub mod tools;
 
+#[cfg(feature = "rig-engine")]
+use crate::adapters::rig_engine::local_tools::LocalToolDeps;
 use crate::adapters::rig_engine::local_tools::{LocalTool, LocalToolRegistry};
 use crate::config::{Config, ProviderKind, OPENROUTER_BASE_URL};
 use crate::domain::scope::AgentScope;
@@ -379,9 +381,15 @@ impl RigAgentEngine {
         #[cfg(feature = "rig-engine")]
         {
             let target = self.target_for_request(&req)?;
+            // The engine owns the executors' companions; each run clones them
+            // into the bridges built for that request.
+            let deps = LocalToolDeps {
+                skill_manager: self.skill_manager.clone(),
+                rag: self.rag.clone(),
+            };
             match &target {
                 EngineTarget::Ollama { url } => {
-                    builder::run_with_rig(url, req, system, tools).await
+                    builder::run_with_rig(url, req, system, tools, deps).await
                 }
                 EngineTarget::OpenRouter { api_key, base_url } => {
                     builder::run_with_openrouter(
@@ -390,6 +398,7 @@ impl RigAgentEngine {
                         req,
                         system,
                         tools,
+                        deps,
                     )
                     .await
                 }
@@ -400,6 +409,7 @@ impl RigAgentEngine {
                         req,
                         system,
                         tools,
+                        deps,
                     )
                     .await
                 }
@@ -410,6 +420,7 @@ impl RigAgentEngine {
                         req,
                         system,
                         tools,
+                        deps,
                     )
                     .await
                 }
@@ -420,6 +431,7 @@ impl RigAgentEngine {
                         req,
                         system,
                         tools,
+                        deps,
                     )
                     .await
                 }
@@ -469,9 +481,13 @@ impl RigAgentEngine {
         #[cfg(feature = "rig-engine")]
         {
             let target = self.target_for_request(&req)?;
+            let deps = LocalToolDeps {
+                skill_manager: self.skill_manager.clone(),
+                rag: self.rag.clone(),
+            };
             match &target {
                 EngineTarget::Ollama { url } => {
-                    builder::stream_with_rig(url, req, system, tools, &tx).await
+                    builder::stream_with_rig(url, req, system, tools, &tx, deps).await
                 }
                 EngineTarget::OpenRouter { .. } => Err(builder::openrouter_streaming_unavailable()),
                 EngineTarget::OpenAiCompatible { api_key, base_url } => {
@@ -482,6 +498,7 @@ impl RigAgentEngine {
                         system,
                         tools,
                         &tx,
+                        deps,
                     )
                     .await
                 }
@@ -493,6 +510,7 @@ impl RigAgentEngine {
                         system,
                         tools,
                         &tx,
+                        deps,
                     )
                     .await
                 }
@@ -504,6 +522,7 @@ impl RigAgentEngine {
                         system,
                         tools,
                         &tx,
+                        deps,
                     )
                     .await
                 }

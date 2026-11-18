@@ -6,9 +6,12 @@
 //! repeats the two disciplines `McpToolBridge` already enforces — a fresh scope
 //! check and a charged `ToolCallBudget` on every call.
 //!
-//! Executor bodies land with the skill/rag wiring in the next piece. Until then
-//! an otherwise authorised call returns a named "executor not wired" error: it
-//! is a refusal, never a silent no-op that looks like a successful tool call.
+//! Two executors live behind the bridge: `BuiltinSkill` loads a `SKILL.md` from
+//! the `SkillManager`, and `RagQuery` runs a scope-bounded RAG query. Both hold
+//! the same two disciplines as MCP: the scope is re-checked and the shared
+//! `ToolCallBudget` is charged before any executor runs. A missing skill, an
+//! empty RAG scope or a missing store is a named refusal, never a silent no-op
+//! that looks like a successful tool call.
 
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
@@ -36,8 +39,12 @@ pub struct LocalTool {
 pub enum LocalToolKind {
     /// Load a skill's `SKILL.md` on demand (`SkillManager::get_skill`).
     BuiltinSkill,
-    /// Query the RAG collections the scope may read. `source_id` pins one
-    /// collection; `None` means "the scope's first allowed rag_source".
+    /// Query the RAG collections the scope may read.
+    ///
+    /// `source_id` is informational from a `tools/*.toml` manifest: it is kept
+    /// for display and future use, but the query is always scoped via the
+    /// request's [`AgentScope`], which is the authoritative isolation boundary.
+    /// A manifest can never widen a query beyond `scope.rag_sources`.
     RagQuery { source_id: Option<String> },
 }
 
@@ -203,28 +210,52 @@ mod bridge {
     use super::*;
     use crate::adapters::rig_engine::limits::ToolCallBudget;
     use crate::domain::scope::AgentScope;
+    use crate::ports::rag::RagStore;
+    use crate::services::skill_manager::SkillManager;
     use rig_core::tool::{ToolDyn, ToolError};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    /// Upper bound — and the default — for `rag_query`'s `top_k`. The model must
+    /// not be able to ask for an unbounded slice of the knowledge base through
+    /// a tool call; `prepare` uses the same ceiling for injected context.
+    const RAG_QUERY_TOP_K_CAP: usize = 6;
+
+    /// The in-process companions the executors need, cloned from the engine into
+    /// every bridge built for a run. `SkillManager` loads a skill's `SKILL.md`;
+    /// `RagStore` answers scope-bounded queries (`None` when RAG is disabled).
+    #[derive(Clone)]
+    pub struct LocalToolDeps {
+        pub skill_manager: Arc<SkillManager>,
+        pub rag: Option<Arc<dyn RagStore>>,
+    }
+
     /// One `ToolDyn` per registered local tool. Holds the definition, the scope
-    /// of the request that offered it and the budget shared with MCP bridges.
+    /// of the request that offered it, the budget shared with MCP bridges and
+    /// the executor dependencies.
     pub struct LocalToolBridge {
         pub tool: LocalTool,
         pub scope: AgentScope,
         pub budget: Arc<Mutex<ToolCallBudget>>,
+        pub deps: LocalToolDeps,
     }
 
     impl LocalToolBridge {
-        pub fn new(tool: LocalTool, scope: AgentScope, budget: Arc<Mutex<ToolCallBudget>>) -> Self {
+        pub fn new(
+            tool: LocalTool,
+            scope: AgentScope,
+            budget: Arc<Mutex<ToolCallBudget>>,
+            deps: LocalToolDeps,
+        ) -> Self {
             Self {
                 tool,
                 scope,
                 budget,
+                deps,
             }
         }
 
-        pub async fn invoke_json(&self, _args: Value) -> Result<String, String> {
+        pub async fn invoke_json(&self, args: Value) -> Result<String, String> {
             // Defense in depth, exactly as on the MCP bridge: re-check the
             // scope before charging the budget or dispatching anything.
             if !self.scope.allows_local_tool(&self.tool.id) {
@@ -239,12 +270,88 @@ mod bridge {
                 b.try_consume()?;
             }
 
-            // Task 4 replaces this with the skill/rag executors. A named error
-            // is deliberate: a silent Ok("") would look like a real result.
-            Err(format!(
-                "local tool '{}' executor is not wired yet",
-                self.tool.id
-            ))
+            match &self.tool.kind {
+                LocalToolKind::BuiltinSkill => Self::exec_skill(&self.deps, &self.tool.id, &args),
+                LocalToolKind::RagQuery { source_id } => {
+                    // `source_id` is informational; scope stays authoritative.
+                    self.exec_rag_query(source_id.as_deref(), &args).await
+                }
+            }
+        }
+
+        /// Load a declared skill's full `SKILL.md` on demand. An unknown or
+        /// empty id is a named error carrying the id — never a panic or `""`.
+        fn exec_skill(deps: &LocalToolDeps, tool_id: &str, args: &Value) -> Result<String, String> {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    format!("local tool '{tool_id}' requires a non-empty string 'name' argument")
+                })?;
+            match deps.skill_manager.get_skill(name) {
+                Some(skill) => Ok(skill.content),
+                None => Err(format!(
+                    "local tool '{tool_id}': unknown skill '{name}' — check the agent's declared skills"
+                )),
+            }
+        }
+
+        /// Run a RAG query bounded by the request scope. The scope check here is
+        /// deliberate even though `prepare` already filtered with it: it is the
+        /// isolation boundary, and `RagStore::query_scoped` enforces the same
+        /// contract. With no allowed sources (or no store) we refuse without
+        /// touching the store at all.
+        async fn exec_rag_query(
+            &self,
+            source_id: Option<&str>,
+            args: &Value,
+        ) -> Result<String, String> {
+            let tool_id = &self.tool.id;
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .filter(|query| !query.trim().is_empty())
+                .ok_or_else(|| {
+                    format!("local tool '{tool_id}' requires a non-empty string 'query' argument")
+                })?;
+
+            if self.scope.rag_sources.is_empty() {
+                return Err(format!(
+                    "local tool '{tool_id}': the agent scope has no rag_sources; refusing to query (source_id '{}' is informational)",
+                    source_id.unwrap_or("<none>")
+                ));
+            }
+
+            let top_k = args
+                .get("top_k")
+                .and_then(Value::as_u64)
+                .unwrap_or(RAG_QUERY_TOP_K_CAP as u64)
+                .clamp(1, RAG_QUERY_TOP_K_CAP as u64) as usize;
+
+            let rag = self.deps.rag.as_ref().ok_or_else(|| {
+                format!("local tool '{tool_id}': no RAG store is configured (RAG is disabled)")
+            })?;
+            let chunks = rag.query_scoped(&self.scope, query, top_k).await?;
+
+            // Project to JSON explicitly: `RagChunk` is a domain port type
+            // without a `Serialize` derive, and this shape keeps the full chunk
+            // (including metadata) in the tool result without changing the port.
+            let view: Vec<Value> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    serde_json::json!({
+                        "id": chunk.id,
+                        "source_id": chunk.source_id,
+                        "text": chunk.text,
+                        "score": chunk.score,
+                        "metadata": chunk.metadata,
+                    })
+                })
+                .collect();
+            serde_json::to_string(&view).map_err(|err| {
+                format!("local tool '{tool_id}': failed to serialize RAG results: {err}")
+            })
         }
     }
 
@@ -284,7 +391,7 @@ mod bridge {
 }
 
 #[cfg(feature = "rig-engine")]
-pub use bridge::LocalToolBridge;
+pub use bridge::{LocalToolBridge, LocalToolDeps};
 
 #[cfg(test)]
 mod tests {

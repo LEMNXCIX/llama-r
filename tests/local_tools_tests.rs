@@ -1,14 +1,13 @@
-//! Task 3: the local-tool registry, its scoped bridge, and the `ScopedTool`
-//! plumbing that lets one `ToolCallBudget` cover both MCP and local tools.
-//!
-//! Executor bodies are deliberately not exercised here (they land in Task 4):
-//! what this file pins is discovery, scope, budget and the capability gate.
+//! Local-tool registry, scoped bridge and executors. Discovery, scope, budget
+//! and the capability gate (Task 3) live alongside the `builtin:skill` and
+//! `rag_query` executors (Task 4).
 
 use async_trait::async_trait;
 use llama_r::adapters::rig_engine::builder::build_tool_bridges;
 use llama_r::adapters::rig_engine::limits::ToolCallBudget;
 use llama_r::adapters::rig_engine::local_tools::{
-    LocalToolBridge, LocalToolKind, LocalToolRegistry,
+    LocalToolBridge, LocalToolDeps, LocalToolKind, LocalToolRegistry, BUILTIN_RAG_QUERY_ID,
+    BUILTIN_SKILL_ID,
 };
 use llama_r::adapters::rig_engine::{EngineTarget, RigAgentEngine, ScopedTool};
 use llama_r::config::{Config, ProviderKind};
@@ -19,6 +18,7 @@ use llama_r::ports::engine::AgentRunRequest;
 use llama_r::ports::mcp::{
     filter_tools_for_scope, McpCallRequest, McpCallResult, McpClient, McpServerRegistry, McpToolDef,
 };
+use llama_r::ports::rag::{RagChunk, RagReplaceBatch, RagStore, RagUpsert};
 use llama_r::providers::capabilities::{capabilities_for, ModelCapabilities};
 use llama_r::services::skill_manager::SkillManager;
 use rig_core::tool::ToolDyn;
@@ -166,6 +166,141 @@ fn prepare_blocking(engine: &RigAgentEngine, req: &AgentRunRequest) -> Vec<Scope
         .build()
         .unwrap();
     rt.block_on(async { engine.prepare(req).await.unwrap() }).0
+}
+
+// ---------------------------------------------------------------------------
+// Executor wiring (Task 4)
+// ---------------------------------------------------------------------------
+
+/// Write a minimal but valid `SKILL.md`. `content` is the whole file, so a test
+/// can assert the executor returned the skill verbatim.
+fn write_skill(dir: &std::path::Path, id: &str, body: &str) -> String {
+    let skill_dir = dir.join(id);
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let content = format!("---\nname: {id}\ndescription: skill {id}\n---\n\n{body}\n");
+    std::fs::write(skill_dir.join("SKILL.md"), &content).unwrap();
+    content
+}
+
+fn skill_deps(skills_root: &std::path::Path) -> LocalToolDeps {
+    let manager = SkillManager::with_paths(vec![skills_root.to_path_buf()]);
+    manager.scan_and_load();
+    LocalToolDeps {
+        skill_manager: Arc::new(manager),
+        rag: None,
+    }
+}
+
+fn empty_deps() -> LocalToolDeps {
+    LocalToolDeps {
+        skill_manager: Arc::new(SkillManager::with_paths(Vec::new())),
+        rag: None,
+    }
+}
+
+/// A `RagStore` that records every query and returns one chunk per source the
+/// *scope* allows — the same isolation contract the real store enforces. It
+/// deliberately holds data for a second, secret source that it never returns
+/// unless the scope names it, so a test can prove the executor cannot bypass
+/// scope even when the tool manifest carries a different `source_id`.
+#[derive(Default)]
+struct ScopingFakeRag {
+    calls: Arc<AtomicUsize>,
+    seen_sources: Arc<Mutex<Vec<String>>>,
+    seen_top_k: Arc<Mutex<Option<usize>>>,
+    seen_query: Arc<Mutex<Option<String>>>,
+}
+
+#[async_trait]
+impl RagStore for ScopingFakeRag {
+    async fn query_scoped(
+        &self,
+        scope: &AgentScope,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<RagChunk>, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.seen_sources.lock().unwrap() = scope.rag_sources.iter().cloned().collect();
+        *self.seen_top_k.lock().unwrap() = Some(top_k);
+        *self.seen_query.lock().unwrap() = Some(query.to_string());
+
+        // Data for two collections; only the ones the scope allows are returned.
+        let all = [
+            ("allowed", "content of the allowed source"),
+            ("secret", "CONTENT OF THE SECRET SOURCE"),
+        ];
+        Ok(all
+            .into_iter()
+            .filter(|(source, _)| scope.rag_sources.contains(*source))
+            .map(|(source, text)| RagChunk {
+                id: format!("{source}#chunk-0"),
+                source_id: source.to_string(),
+                text: text.to_string(),
+                score: 0.75,
+                metadata: serde_json::json!({"origin": "fake"}),
+            })
+            .take(top_k)
+            .collect())
+    }
+
+    async fn upsert_scoped(
+        &self,
+        _scope: &AgentScope,
+        _docs: Vec<RagUpsert>,
+    ) -> Result<usize, String> {
+        Ok(0)
+    }
+    async fn replace_batch_scoped(
+        &self,
+        _scope: &AgentScope,
+        _source_id: &str,
+        _batch: RagReplaceBatch,
+    ) -> Result<usize, String> {
+        Ok(0)
+    }
+    async fn replace_scoped(
+        &self,
+        _scope: &AgentScope,
+        _source_id: &str,
+        _id_prefix: &str,
+        _docs: Vec<RagUpsert>,
+    ) -> Result<usize, String> {
+        Ok(0)
+    }
+    async fn delete_document_scoped(
+        &self,
+        _scope: &AgentScope,
+        _source_id: &str,
+        _id_prefix: &str,
+    ) -> Result<usize, String> {
+        Ok(0)
+    }
+    async fn delete_collection_scoped(
+        &self,
+        _scope: &AgentScope,
+        _source_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    async fn delete_collection(&self, _source_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn rag_deps(rag: Arc<ScopingFakeRag>) -> LocalToolDeps {
+    LocalToolDeps {
+        skill_manager: Arc::new(SkillManager::with_paths(Vec::new())),
+        rag: Some(rag),
+    }
+}
+
+fn builtin(id: &str) -> llama_r::adapters::rig_engine::local_tools::LocalTool {
+    LocalToolRegistry::builtins()
+        .tools()
+        .iter()
+        .find(|t| t.id == id)
+        .unwrap()
+        .clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +456,12 @@ async fn local_bridge_rechecks_scope_and_shares_the_budget() {
         .clone();
     let budget = Arc::new(AsyncMutex::new(ToolCallBudget::new(1)));
 
-    let denied = LocalToolBridge::new(tool.clone(), scope(ToolsAllow::DenyAll), budget.clone());
+    let denied = LocalToolBridge::new(
+        tool.clone(),
+        scope(ToolsAllow::DenyAll),
+        budget.clone(),
+        empty_deps(),
+    );
     let err = denied
         .invoke_json(serde_json::json!({"name": "x"}))
         .await
@@ -337,19 +477,19 @@ async fn local_bridge_rechecks_scope_and_shares_the_budget() {
         tool.clone(),
         scope(ToolsAllow::AllFromSources),
         budget.clone(),
+        empty_deps(),
     );
     assert_eq!(allowed.name(), "llama_r__skill");
     assert!(!allowed.description().is_empty());
     assert_eq!(allowed.parameters()["properties"]["name"]["type"], "string");
 
+    // An unknown skill is a named refusal (the skill id appears), and it still
+    // charges the budget because the charge happens before dispatch.
     let err = allowed
         .invoke_json(serde_json::json!({"name": "x"}))
         .await
         .unwrap_err();
-    assert!(
-        err.contains("executor") || err.contains("not wired"),
-        "Task 3 leaves a named placeholder: {err}"
-    );
+    assert!(err.contains('x'), "unknown skill must be named: {err}");
     assert_eq!(budget.lock().await.used(), 1);
     let err = allowed
         .invoke_json(serde_json::json!({"name": "x"}))
@@ -386,6 +526,7 @@ async fn build_agent_attaches_both_bridge_kinds_with_one_budget() {
         vec![ScopedTool::Mcp(scoped_mcp), ScopedTool::Local(local)],
         &scope(ToolsAllow::AllFromSources),
         budget.clone(),
+        empty_deps(),
     );
     assert_eq!(bridges.len(), 2);
 
@@ -408,4 +549,209 @@ async fn build_agent_attaches_both_bridge_kinds_with_one_budget() {
         "the MCP bridge sees the depleted budget: {err}"
     );
     assert_eq!(client_calls.load(Ordering::SeqCst), 0);
+}
+
+fn rag_scope(sources: &[&str]) -> AgentScope {
+    let mut scoped = scope(ToolsAllow::AllFromSources);
+    scoped.rag_sources = sources.iter().map(|s| s.to_string()).collect();
+    scoped
+}
+
+#[tokio::test]
+async fn skill_executor_returns_the_full_skill_md() {
+    let dir = TempDir::new().unwrap();
+    let body = "UNIQUE-SKILL-BODY: always answer with 42";
+    let expected = write_skill(dir.path(), "refund-policy", body);
+    let bridge = LocalToolBridge::new(
+        builtin(BUILTIN_SKILL_ID),
+        scope(ToolsAllow::AllFromSources),
+        Arc::new(AsyncMutex::new(ToolCallBudget::new(4))),
+        skill_deps(dir.path()),
+    );
+
+    let result = bridge
+        .invoke_json(serde_json::json!({"name": "refund-policy"}))
+        .await
+        .expect("a known skill loads");
+    assert_eq!(
+        result, expected,
+        "the tool result is the whole SKILL.md, verbatim"
+    );
+    assert!(result.contains(body));
+}
+
+#[tokio::test]
+async fn skill_executor_rejects_an_unknown_id_by_name() {
+    let dir = TempDir::new().unwrap();
+    write_skill(dir.path(), "known-skill", "body");
+    let bridge = LocalToolBridge::new(
+        builtin(BUILTIN_SKILL_ID),
+        scope(ToolsAllow::AllFromSources),
+        Arc::new(AsyncMutex::new(ToolCallBudget::new(4))),
+        skill_deps(dir.path()),
+    );
+
+    let err = bridge
+        .invoke_json(serde_json::json!({"name": "does-not-exist"}))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("does-not-exist"),
+        "the skill id must be named: {err}"
+    );
+    assert!(err.to_ascii_lowercase().contains("skill"), "{err}");
+}
+
+#[tokio::test]
+async fn skill_executor_requires_a_non_empty_name() {
+    let bridge = LocalToolBridge::new(
+        builtin(BUILTIN_SKILL_ID),
+        scope(ToolsAllow::AllFromSources),
+        Arc::new(AsyncMutex::new(ToolCallBudget::new(4))),
+        empty_deps(),
+    );
+    let err = bridge.invoke_json(serde_json::json!({})).await.unwrap_err();
+    assert!(err.to_ascii_lowercase().contains("name"), "{err}");
+}
+
+#[tokio::test]
+async fn rag_query_returns_only_scoped_chunks() {
+    let fake = Arc::new(ScopingFakeRag::default());
+    // A manifest-supplied source_id is informational: it pins "secret", but the
+    // authoritative scope only allows "allowed", so only that source is returned.
+    let mut tool = builtin(BUILTIN_RAG_QUERY_ID);
+    tool.kind = LocalToolKind::RagQuery {
+        source_id: Some("secret".into()),
+    };
+    let bridge = LocalToolBridge::new(
+        tool,
+        rag_scope(&["allowed"]),
+        Arc::new(AsyncMutex::new(ToolCallBudget::new(4))),
+        rag_deps(fake.clone()),
+    );
+
+    let result = bridge
+        .invoke_json(serde_json::json!({"query": "policy", "top_k": 5}))
+        .await
+        .expect("the scoped query runs");
+    let chunks: Value = serde_json::from_str(&result).expect("the tool result is JSON");
+    let array = chunks.as_array().expect("chunks are a JSON array");
+    assert_eq!(array.len(), 1, "only the scope-allowed source: {result}");
+    assert_eq!(array[0]["source_id"], "allowed");
+    assert_eq!(array[0]["text"], "content of the allowed source");
+    assert!(
+        !result.contains("SECRET"),
+        "the secret source must not leak: {result}"
+    );
+
+    assert_eq!(
+        *fake.seen_sources.lock().unwrap(),
+        vec!["allowed".to_string()]
+    );
+    assert_eq!(fake.seen_query.lock().unwrap().as_deref(), Some("policy"));
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn rag_query_with_empty_scope_errors_without_querying() {
+    let fake = Arc::new(ScopingFakeRag::default());
+    let bridge = LocalToolBridge::new(
+        builtin(BUILTIN_RAG_QUERY_ID),
+        scope(ToolsAllow::AllFromSources), // rag_sources is empty
+        Arc::new(AsyncMutex::new(ToolCallBudget::new(4))),
+        rag_deps(fake.clone()),
+    );
+
+    let err = bridge
+        .invoke_json(serde_json::json!({"query": "x"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("no rag_sources"), "{err}");
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        0,
+        "an empty scope must never reach the store"
+    );
+}
+
+#[tokio::test]
+async fn rag_query_without_a_store_errors_by_name() {
+    let bridge = LocalToolBridge::new(
+        builtin(BUILTIN_RAG_QUERY_ID),
+        rag_scope(&["allowed"]),
+        Arc::new(AsyncMutex::new(ToolCallBudget::new(4))),
+        empty_deps(), // rag: None
+    );
+
+    let err = bridge
+        .invoke_json(serde_json::json!({"query": "x"}))
+        .await
+        .unwrap_err();
+    assert!(err.to_ascii_lowercase().contains("rag"), "{err}");
+}
+
+#[tokio::test]
+async fn rag_query_caps_top_k_and_defaults_it() {
+    let fake = Arc::new(ScopingFakeRag::default());
+    let bridge = LocalToolBridge::new(
+        builtin(BUILTIN_RAG_QUERY_ID),
+        rag_scope(&["allowed"]),
+        Arc::new(AsyncMutex::new(ToolCallBudget::new(8))),
+        rag_deps(fake.clone()),
+    );
+
+    bridge
+        .invoke_json(serde_json::json!({"query": "q", "top_k": 100}))
+        .await
+        .unwrap();
+    assert_eq!(*fake.seen_top_k.lock().unwrap(), Some(6), "cap at 6");
+
+    bridge
+        .invoke_json(serde_json::json!({"query": "q", "top_k": 2}))
+        .await
+        .unwrap();
+    assert_eq!(
+        *fake.seen_top_k.lock().unwrap(),
+        Some(2),
+        "smaller top_k honoured"
+    );
+
+    bridge
+        .invoke_json(serde_json::json!({"query": "q"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        *fake.seen_top_k.lock().unwrap(),
+        Some(6),
+        "missing top_k defaults to 6"
+    );
+}
+
+#[tokio::test]
+async fn n_plus_one_calls_exhaust_the_budget() {
+    let dir = TempDir::new().unwrap();
+    write_skill(dir.path(), "known-skill", "body");
+    let budget = Arc::new(AsyncMutex::new(ToolCallBudget::new(2)));
+    let bridge = LocalToolBridge::new(
+        builtin(BUILTIN_SKILL_ID),
+        scope(ToolsAllow::AllFromSources),
+        budget,
+        skill_deps(dir.path()),
+    );
+
+    for i in 0..2 {
+        bridge
+            .invoke_json(serde_json::json!({"name": "known-skill"}))
+            .await
+            .unwrap_or_else(|err| panic!("call {i} should succeed: {err}"));
+    }
+    let err = bridge
+        .invoke_json(serde_json::json!({"name": "known-skill"}))
+        .await
+        .unwrap_err();
+    let text = err.to_ascii_lowercase();
+    assert!(
+        text.contains("max_tool_calls") || text.contains("exceeded"),
+        "{err}"
+    );
 }
