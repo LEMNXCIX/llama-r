@@ -1,0 +1,53 @@
+# Multi-provider eval smoke cases.
+#
+# The runner in tests/provider_eval_smoke.rs executes every case against every
+# provider below. It ALWAYS uses recorded fixtures served from a local listener:
+# no live keys, no network, no secrets. This is the only mode CI runs.
+#
+# LIVE SMOKE (optional, never in CI, NOT performed by this harness):
+# a human may point these same cases at real upstreams by setting real keys in
+# the environment and sending the prompts by hand. That is a manual, labelled
+# exercise and is not required for `cargo test --test provider_eval_smoke` to
+# pass. No credential is ever stored in this file.
+
+[[cases]]
+id = "plain-greeting"
+kind = "plain"
+prompt = "Reply with a short greeting that contains the word hello."
+expect = "hello"
+
+[[cases]]
+id = "tool-required"
+kind = "tool"
+prompt = "Use the weather tool for Madrid and report the result, which is sunny."
+expect = "sunny"
+
+[[cases]]
+id = "streaming"
+kind = "stream"
+prompt = "Stream a short response containing the token one."
+expect = "one"
+
+[[providers]]
+name = "ollama"
+kind = "ollama"
+
+[[providers]]
+name = "openrouter"
+kind = "openrouter"
+
+[[providers]]
+name = "opencode"
+kind = "opencode"
+
+[[providers]]
+name = "openai-compatible"
+kind = "openai-compatible"
+
+[[providers]]
+name = "anthropic"
+kind = "anthropic"
+
+[[providers]]
+name = "gemini"
+kind = "gemini"
