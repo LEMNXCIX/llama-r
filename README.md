@@ -285,6 +285,21 @@ trace = true
 log_tool_args = false
 ```
 
+### Herramientas locales y skills bajo demanda
+
+Dos campos del TOML del agente (ambos listas, opcionales) controlan las herramientas en proceso y las skills que se cargan solo cuando se necesitan:
+
+```toml
+skills = ["reviewer-skill"]
+# Opt-in: sin esto, ninguna herramienta local se ofrece al modelo (deny-all).
+tools_local = ["llama_r__skill"]
+# El cuerpo de esta skill NO va en el prompt: el modelo lo pide con
+# llama_r__skill({name: "reviewer-skill"}) y recibe el SKILL.md completo.
+deferred_skills = ["reviewer-skill"]
+```
+
+Las dos herramientas integradas son `llama_r__skill` (`{name}`) y `llama_r__rag_query` (`{query}`, `top_k` opcional). `tools_local` también acepta ids de manifests en `tools/*.toml`. La query RAG está siempre limitada por el `AgentScope` del agente; un `source_id` en el manifest es solo informativo. Las herramientas locales comparten con MCP el presupuesto de llamadas (`max_tool_calls`) y solo existen en la ruta de agente con un modelo capaz de llamar herramientas. No hay variables de entorno nuevas.
+
 ### Almacenamiento
 
 - `agents/` — agentes globales
@@ -295,6 +310,7 @@ log_tool_args = false
 Cada request resuelve un `AgentScope` inmutable que define el perímetro de seguridad:
 - `mcp_sources` — servidores MCP permitidos
 - `tools_allow` — `DenyAll`, `AllFromSources`, o `Allowlist` específica
+- `local_tools_allow` — igual que `tools_allow`, pero para los ids de `tools_local`; se vuelve a comprobar en cada llamada
 - `rag_sources` — fuentes RAG legibles
 - `rag_write` — política de escritura (`none`, `own_memory_only`, `listed`)
 - `max_tool_calls`, `max_iterations`, `timeout_secs`
