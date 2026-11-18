@@ -56,6 +56,17 @@ impl AgentEngine for RecordingEngine {
 /// The caller must hold `env_lock`: `reload_all` and both stores read
 /// `LLAMA_R_DIR`, so this cannot be parallel with anything else that moves it.
 fn world(rules: &[&str], tools: &[&str]) -> (AgentRuntime, Arc<Mutex<Option<AgentRunRequest>>>) {
+    world_with_agent(rules, tools, "", "m")
+}
+
+/// Same as `world`, but lets the manifest declare its own provider and model so
+/// a test can prove the run request resolves them per agent.
+fn world_with_agent(
+    rules: &[&str],
+    tools: &[&str],
+    provider: &str,
+    model: &str,
+) -> (AgentRuntime, Arc<Mutex<Option<AgentRunRequest>>>) {
     let dir = TempDir::new().unwrap();
     std::env::set_var("LLAMA_R_DIR", dir.path());
 
@@ -66,7 +77,8 @@ fn world(rules: &[&str], tools: &[&str]) -> (AgentRuntime, Arc<Mutex<Option<Agen
     std::fs::write(
         agents.join("reviewer.toml"),
         format!(
-            "name = \"Reviewer\"\nmodel = \"m\"\nsystem_prompt = \"Base prompt\"\nrules = [{}]\n\
+            "name = \"Reviewer\"\nprovider = {provider:?}\nmodel = {model:?}\n\
+             system_prompt = \"Base prompt\"\nrules = [{}]\n\
              \n[optimize]\nenabled = true\nrules = [{}]\n",
             rendered.join(", "),
             tools.join(", ")
@@ -267,6 +279,44 @@ fn an_unknown_tool_is_named_by_the_loader() {
         "```python\n# c\nx = 1\n```",
         "and it changed nothing, which is what the warning is about"
     );
+}
+
+/// The run request carries the provider and capabilities resolved *for that
+/// agent*, not the global `PROVIDER` the engine was built with. This is the data
+/// Task 5 needs to pick a client per request instead of calling the wrong one.
+#[test]
+fn a_turn_carries_the_resolved_provider_and_capabilities() {
+    let _guard = env_lock().lock().unwrap();
+    let (runtime, seen) = world_with_agent(&[], &[], "anthropic", "claude-3-5-sonnet");
+
+    chat_blocking(&runtime, request());
+
+    let seen = seen.lock().unwrap();
+    let run = seen.as_ref().expect("the engine ran");
+    assert_eq!(run.provider, ProviderKind::Anthropic);
+    assert_eq!(
+        run.model, "claude-3-5-sonnet",
+        "the agent's own model still wins over the default"
+    );
+    assert!(
+        run.capabilities.vision && run.capabilities.tool_calling,
+        "the capabilities are those of the resolved provider/model pair"
+    );
+}
+
+/// An explicit model override still wins over the resolved model: threading the
+/// resolver through `build_run_request` must not change that precedence.
+#[test]
+fn a_model_override_still_beats_the_resolved_model() {
+    let _guard = env_lock().lock().unwrap();
+    let (runtime, seen) = world_with_agent(&[], &[], "anthropic", "claude-3-5-sonnet");
+
+    let mut req = request();
+    req.model_override = Some("override-model".to_string());
+    chat_blocking(&runtime, req);
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.as_ref().unwrap().model, "override-model");
 }
 
 /// The enricher the runtime needs is the same one the chat path uses, so this is a

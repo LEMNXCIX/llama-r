@@ -85,10 +85,18 @@ impl AgentRuntime {
             }
         });
 
+        // Resolve the provider/capabilities for this agent from the same source
+        // the system prompt used. `model_override` above keeps its precedence:
+        // the resolved model id is transport metadata here, not the name the
+        // engine will actually ask for.
+        let resolved = self.enricher.resolve(&agent);
+
         Ok(AgentRunRequest {
             agent,
             scope,
             model,
+            provider: resolved.provider,
+            capabilities: resolved.capabilities,
             system_prompt,
             user_message,
             history: req.history,

@@ -199,8 +199,10 @@ mod tests {
     /// check, so this stays hermetic.
     #[tokio::test]
     async fn run_with_openrouter_rejects_an_empty_model_without_network() {
+        use crate::config::ProviderKind;
         use crate::domain::agent::{Agent, AgentConfig, RagWritePolicy};
         use crate::domain::scope::{AgentScope, ToolsAllow};
+        use crate::providers::capabilities::capabilities_for;
         use std::collections::HashSet;
 
         let req = AgentRunRequest {
@@ -221,6 +223,8 @@ mod tests {
                 timeout_secs: 1,
             },
             model: String::new(),
+            provider: ProviderKind::OpenRouter,
+            capabilities: capabilities_for(ProviderKind::OpenRouter, ""),
             system_prompt: "sys".to_string(),
             user_message: "hi".to_string(),
             history: Vec::new(),

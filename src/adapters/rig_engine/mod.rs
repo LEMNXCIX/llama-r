@@ -11,6 +11,8 @@ use crate::domain::scope::AgentScope;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
 use crate::ports::mcp::{McpCallRequest, McpClient, McpServerRegistry, McpToolDef};
 use crate::ports::rag::RagStore;
+use crate::providers::capabilities::capabilities_for;
+use crate::providers::resolver::ResolvedModel;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
@@ -19,7 +21,7 @@ use tokio::sync::mpsc;
 
 /// Which upstream the Rig engine talks to.
 ///
-/// The key lives only inside the `OpenRouter` variant. This type deliberately
+/// The key lives only inside the key-bearing variants. This type deliberately
 /// has **no** `Debug` implementation: an engine target must never be logged or
 /// formatted into a response, because doing so would leak the API key. Use
 /// [`EngineTarget::kind`] for any diagnostic that does not need the secret.
@@ -27,6 +29,9 @@ use tokio::sync::mpsc;
 pub enum EngineTarget {
     Ollama { url: String },
     OpenRouter { api_key: String, base_url: String },
+    OpenAiCompatible { api_key: String, base_url: String },
+    Anthropic { api_key: String, base_url: String },
+    Gemini { api_key: String, base_url: String },
 }
 
 /// Non-secret discriminator for a target, safe to log and to put in health.
@@ -34,6 +39,9 @@ pub enum EngineTarget {
 pub enum EngineTargetKind {
     Ollama,
     OpenRouter,
+    OpenAiCompatible,
+    Anthropic,
+    Gemini,
 }
 
 impl EngineTarget {
@@ -41,17 +49,57 @@ impl EngineTarget {
         match self {
             EngineTarget::Ollama { .. } => EngineTargetKind::Ollama,
             EngineTarget::OpenRouter { .. } => EngineTargetKind::OpenRouter,
+            EngineTarget::OpenAiCompatible { .. } => EngineTargetKind::OpenAiCompatible,
+            EngineTarget::Anthropic { .. } => EngineTargetKind::Anthropic,
+            EngineTarget::Gemini { .. } => EngineTargetKind::Gemini,
         }
     }
 }
 
-/// Select the engine target from the single `PROVIDER` choice.
+/// Read a key by its *variable name*; the value stays opaque and is never
+/// trimmed, matching how `Config` and the provider profiles treat credentials.
+/// The names are the ones declared by the built-in profiles in
+/// `providers/registry.rs`, so a profile and the engine read the same secret.
+fn api_key_from_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_default()
+}
+
+/// Select the engine target from the single `PROVIDER` choice at boot.
 ///
-/// Ollama and OpenRouter both have a rig-core completion provider; OpenCode
-/// does not, so it gets **no engine** (and an agent-scoped chat degrades with an
-/// explicit warning rather than calling the wrong upstream).
+/// Only the three kinds that had a rig client before this change are selected
+/// here; the three new native clients are wired by Task 5, so the boot-time
+/// choice deliberately still returns `None` for them. Ollama and OpenRouter
+/// keep the exact target they had, OpenCode keeps none.
 pub fn engine_target_for(config: &Config) -> Option<EngineTarget> {
     match config.provider {
+        ProviderKind::Ollama | ProviderKind::OpenRouter | ProviderKind::OpenCode => {
+            // The global provider *is* the resolved one for a boot-time target.
+            let resolved = ResolvedModel {
+                provider: config.provider,
+                model: config.default_model.clone(),
+                capabilities: capabilities_for(config.provider, &config.default_model),
+            };
+            engine_target_for_resolved(config, &resolved)
+        }
+        ProviderKind::OpenAiCompatible | ProviderKind::Anthropic | ProviderKind::Gemini => None,
+    }
+}
+
+/// Select the engine target for one resolved request.
+///
+/// The provider comes from `resolved`, never from `config.provider`: an agent
+/// may name a different upstream than the global one, and building a client
+/// from the global choice is exactly the bug this path exists to prevent. The
+/// resolved model travels in [`AgentRunRequest::model`], not in a transport
+/// target, so it is not copied here.
+///
+/// Keys are read from the env vars named by the built-in provider profiles and
+/// stay inside the returned target: no key in a URL, a `Debug` output or health.
+pub fn engine_target_for_resolved(
+    config: &Config,
+    resolved: &ResolvedModel,
+) -> Option<EngineTarget> {
+    match resolved.provider {
         ProviderKind::Ollama => Some(EngineTarget::Ollama {
             url: config.ollama_url.clone(),
         }),
@@ -62,12 +110,22 @@ pub fn engine_target_for(config: &Config) -> Option<EngineTarget> {
                 .clone()
                 .unwrap_or_else(|| OPENROUTER_BASE_URL.to_string()),
         }),
-        // Not wired to a rig completion client yet — like OpenCode, agent
-        // chats degrade to a direct answer until their wrappers land.
-        ProviderKind::OpenCode
-        | ProviderKind::OpenAiCompatible
-        | ProviderKind::Anthropic
-        | ProviderKind::Gemini => None,
+        ProviderKind::OpenAiCompatible => Some(EngineTarget::OpenAiCompatible {
+            api_key: api_key_from_env("OPENAI_API_KEY"),
+            // An empty base URL means "use the client's own endpoint"; Task 5
+            // passes it as `None` to the wrapper.
+            base_url: config.openai_base_url.clone().unwrap_or_default(),
+        }),
+        ProviderKind::Anthropic => Some(EngineTarget::Anthropic {
+            api_key: api_key_from_env("ANTHROPIC_API_KEY"),
+            // Anthropic's rig client has a native endpoint; no config URL.
+            base_url: String::new(),
+        }),
+        ProviderKind::Gemini => Some(EngineTarget::Gemini {
+            api_key: api_key_from_env("GEMINI_API_KEY"),
+            base_url: String::new(),
+        }),
+        ProviderKind::OpenCode => None,
     }
 }
 
@@ -236,6 +294,13 @@ impl RigAgentEngine {
                     )
                     .await
                 }
+                // The client wrappers for these land in Task 5. Fail loudly
+                // here instead of opening a connection to the wrong upstream.
+                EngineTarget::OpenAiCompatible { .. } => {
+                    Err("engine not wired for openai-compatible".to_string())
+                }
+                EngineTarget::Anthropic { .. } => Err("engine not wired for anthropic".to_string()),
+                EngineTarget::Gemini { .. } => Err("engine not wired for gemini".to_string()),
             }
         }
 
