@@ -2,8 +2,9 @@ use crate::adapters::rig_engine::limits::ToolCallBudget;
 use crate::adapters::rig_engine::tools::McpToolBridge;
 use crate::adapters::rig_engine::ScopedMcpTool;
 use crate::domain::models::ChatMessage;
-use crate::ports::engine::{AgentRunRequest, AgentRunResult};
-use rig_core::agent::Agent;
+use crate::ports::engine::{AgentRunEvent, AgentRunRequest, AgentRunResult};
+use futures::StreamExt;
+use rig_core::agent::{Agent, MultiTurnStreamItem, Text};
 use rig_core::client::completion::CompletionClient;
 use rig_core::client::Nothing;
 use rig_core::completion::{CompletionModel, Message, Prompt};
@@ -12,9 +13,10 @@ use rig_core::providers::gemini;
 use rig_core::providers::ollama;
 use rig_core::providers::openai;
 use rig_core::providers::openrouter;
+use rig_core::streaming::{StreamedAssistantContent, StreamingPrompt};
 use rig_core::tool::ToolDyn;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 /// Convert llama-r chat history into Rig completion messages.
 /// System messages are skipped (preamble already carries the system prompt).
@@ -73,26 +75,31 @@ where
     run_agent_inner(client, model_name, req, system, tools, Some(max_tokens)).await
 }
 
-async fn run_agent_inner<C, M>(
+/// Build a configured Rig agent, shared verbatim by the blocking and the
+/// streaming drivers. One copy is what keeps the two paths from disagreeing on
+/// preamble, tools, temperature or turn budget.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared agent configuration: preamble, tools, budget, turns, temperature and token cap"
+)]
+fn build_agent<C, M>(
     client: &C,
     model_name: &str,
-    req: AgentRunRequest,
-    system: String,
+    system: &str,
     tools: Vec<ScopedMcpTool>,
+    budget: Arc<Mutex<ToolCallBudget>>,
+    max_iterations: usize,
+    temperature: Option<f64>,
     max_tokens: Option<u64>,
-) -> Result<AgentRunResult, String>
+) -> Agent<M>
 where
     C: CompletionClient<CompletionModel = M>,
     M: CompletionModel + 'static,
 {
-    let budget = Arc::new(Mutex::new(ToolCallBudget::new(req.scope.max_tool_calls)));
-    let max_iterations = req.scope.max_iterations.max(1) as usize;
-    let temperature = req.agent.config.temperature.map(|t| t as f64);
-
-    let agent: Agent<M> = if tools.is_empty() {
+    if tools.is_empty() {
         let mut builder = client
             .agent(model_name)
-            .preamble(&system)
+            .preamble(system)
             .default_max_turns(max_iterations);
         if let Some(temp) = temperature {
             builder = builder.temperature(temp);
@@ -111,7 +118,7 @@ where
             .collect();
         let mut builder = client
             .agent(model_name)
-            .preamble(&system)
+            .preamble(system)
             .tools(rig_tools)
             .default_max_turns(max_iterations);
         if let Some(temp) = temperature {
@@ -121,7 +128,35 @@ where
             builder = builder.max_tokens(tokens);
         }
         builder.build()
-    };
+    }
+}
+
+async fn run_agent_inner<C, M>(
+    client: &C,
+    model_name: &str,
+    req: AgentRunRequest,
+    system: String,
+    tools: Vec<ScopedMcpTool>,
+    max_tokens: Option<u64>,
+) -> Result<AgentRunResult, String>
+where
+    C: CompletionClient<CompletionModel = M>,
+    M: CompletionModel + 'static,
+{
+    let budget = Arc::new(Mutex::new(ToolCallBudget::new(req.scope.max_tool_calls)));
+    let max_iterations = req.scope.max_iterations.max(1) as usize;
+    let temperature = req.agent.config.temperature.map(|t| t as f64);
+
+    let agent: Agent<M> = build_agent(
+        client,
+        model_name,
+        &system,
+        tools,
+        budget.clone(),
+        max_iterations,
+        temperature,
+        max_tokens,
+    );
 
     let history = to_rig_history(&req.history);
     let text = agent
@@ -143,6 +178,79 @@ where
         iterations,
         model: req.model,
     })
+}
+
+/// Stream a single agent turn via Rig, emitting one [`AgentRunEvent::Token`]
+/// per completed text delta and a single [`AgentRunEvent::Completed`] at the
+/// end. There is deliberately **no** full-text prelude token: the old engine
+/// did a full completion and emitted its text as one `Token`, which made a
+/// `200` response fake a stream. Every delta here is a real provider chunk.
+///
+/// The caller owns the timeout (at the `AgentEngine` boundary) and the event
+/// channel. Keeping this generic over the completion client/model means every
+/// provider with a streaming-capable Rig client uses the exact same driver.
+pub async fn run_agent_stream<C, M>(
+    client: &C,
+    model_name: &str,
+    req: AgentRunRequest,
+    system: String,
+    tools: Vec<ScopedMcpTool>,
+    tx: &mpsc::Sender<AgentRunEvent>,
+    max_tokens: Option<u64>,
+) -> Result<(), String>
+where
+    C: CompletionClient<CompletionModel = M>,
+    M: CompletionModel + 'static,
+{
+    let budget = Arc::new(Mutex::new(ToolCallBudget::new(req.scope.max_tool_calls)));
+    let max_iterations = req.scope.max_iterations.max(1) as usize;
+    let temperature = req.agent.config.temperature.map(|t| t as f64);
+
+    let agent: Agent<M> = build_agent(
+        client,
+        model_name,
+        &system,
+        tools,
+        budget.clone(),
+        max_iterations,
+        temperature,
+        max_tokens,
+    );
+
+    let history = to_rig_history(&req.history);
+    let mut stream = agent
+        .stream_prompt(req.user_message.as_str())
+        .history(history)
+        .max_turns(max_iterations)
+        .await;
+
+    let mut full_text = String::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
+                Text { text, .. },
+            ))) => {
+                full_text.push_str(&text);
+                let _ = tx.send(AgentRunEvent::Token { text }).await;
+            }
+            // The terminal item is surfaced as `Completed` below; tool progress
+            // is not mapped to SSE yet (Nivel-A streaming), matching `run`.
+            Ok(MultiTurnStreamItem::FinalResponse(_)) => {}
+            Err(err) => return Err(format!("agent stream failed: {err}")),
+            _ => {}
+        }
+    }
+
+    let tool_calls = budget.lock().await.used();
+    let iterations = (1u32).saturating_add(tool_calls).min(max_iterations as u32);
+    let result = AgentRunResult {
+        text: full_text,
+        tool_calls,
+        iterations,
+        model: req.model,
+    };
+    let _ = tx.send(AgentRunEvent::Completed { result }).await;
+    Ok(())
 }
 
 /// Run a single agent turn via Rig against Ollama. Caller is responsible for
@@ -318,6 +426,140 @@ pub async fn run_with_gemini(
     let model_name = req.model.clone();
 
     let result = run_agent(&client, &model_name, req, system, tools).await;
+    match result {
+        Err(message) => Err(message.replace(api_key, "[redacted]")),
+        ok => ok,
+    }
+}
+
+/// Stream one agent turn against Ollama. Caller owns the timeout.
+pub async fn stream_with_rig(
+    ollama_url: &str,
+    req: AgentRunRequest,
+    system: String,
+    tools: Vec<ScopedMcpTool>,
+    tx: &mpsc::Sender<AgentRunEvent>,
+) -> Result<(), String> {
+    let client = ollama::Client::builder()
+        .api_key(Nothing)
+        .base_url(ollama_url)
+        .build()
+        .map_err(|e| format!("failed to create Ollama client: {}", e))?;
+
+    let model_name = if req.model.is_empty() {
+        "llama3.2".to_string()
+    } else {
+        req.model.clone()
+    };
+
+    run_agent_stream(&client, &model_name, req, system, tools, tx, None).await
+}
+
+/// The named refusal for a target with no streaming model. OpenRouter is
+/// gated out by capabilities before the engine is reached; if a caller still
+/// asks this target to stream, it gets this explicit error rather than a fake
+/// single-token stream.
+pub fn openrouter_streaming_unavailable() -> String {
+    "streaming is unavailable for the OpenRouter engine target: its Rig client has no streaming model; refusing rather than faking a stream".to_string()
+}
+
+/// Stream one agent turn against any OpenAI-compatible chat endpoint. The key
+/// is scrubbed from every error exactly as on the blocking path.
+pub async fn stream_with_openai_compatible(
+    api_key: &str,
+    base_url: Option<&str>,
+    req: AgentRunRequest,
+    system: String,
+    tools: Vec<ScopedMcpTool>,
+    tx: &mpsc::Sender<AgentRunEvent>,
+) -> Result<(), String> {
+    let client = match base_url {
+        Some(url) => openai::CompletionsClient::builder()
+            .api_key(api_key.to_string())
+            .base_url(url)
+            .build(),
+        None => openai::CompletionsClient::new(api_key.to_string()),
+    }
+    .map_err(|_| "failed to create OpenAI-compatible client".to_string())?;
+
+    if req.model.is_empty() {
+        return Err("OpenAI-compatible agent run requires a non-empty model; the agent and default model are both empty".to_string());
+    }
+    let model_name = req.model.clone();
+
+    let result = run_agent_stream(&client, &model_name, req, system, tools, tx, None).await;
+    match result {
+        Err(message) => Err(message.replace(api_key, "[redacted]")),
+        ok => ok,
+    }
+}
+
+/// Stream one agent turn against Anthropic. The native completion model needs
+/// an explicit `max_tokens` floor, as on the blocking path.
+pub async fn stream_with_anthropic(
+    api_key: &str,
+    base_url: Option<&str>,
+    req: AgentRunRequest,
+    system: String,
+    tools: Vec<ScopedMcpTool>,
+    tx: &mpsc::Sender<AgentRunEvent>,
+) -> Result<(), String> {
+    let client = match base_url {
+        Some(url) => anthropic::Client::builder()
+            .api_key(api_key.to_string())
+            .base_url(url)
+            .build(),
+        None => anthropic::Client::new(api_key.to_string()),
+    }
+    .map_err(|_| "failed to create Anthropic client".to_string())?;
+
+    if req.model.is_empty() {
+        return Err("Anthropic agent run requires a non-empty model; the agent and default model are both empty".to_string());
+    }
+    let model_name = req.model.clone();
+
+    let result = run_agent_stream(
+        &client,
+        &model_name,
+        req,
+        system,
+        tools,
+        tx,
+        Some(ANTHROPIC_MAX_TOKENS),
+    )
+    .await;
+    match result {
+        Err(message) => Err(message.replace(api_key, "[redacted]")),
+        ok => ok,
+    }
+}
+
+/// Stream one agent turn against Google Gemini via the Interactions client.
+/// The key travels in a header, never in a URL or log, and is scrubbed from
+/// every error.
+pub async fn stream_with_gemini(
+    api_key: &str,
+    base_url: Option<&str>,
+    req: AgentRunRequest,
+    system: String,
+    tools: Vec<ScopedMcpTool>,
+    tx: &mpsc::Sender<AgentRunEvent>,
+) -> Result<(), String> {
+    let client = match base_url {
+        Some(url) => gemini::InteractionsClient::builder()
+            .api_key(api_key.to_string())
+            .base_url(url)
+            .build(),
+        None => gemini::InteractionsClient::new(api_key.to_string()),
+    }
+    .map_err(|_| "failed to create Gemini client".to_string())?;
+
+    if req.model.is_empty() {
+        return Err("Gemini agent run requires a non-empty model; the agent and default model are both empty".to_string());
+    }
+    let model_name = req.model.clone();
+
+    let result = run_agent_stream(&client, &model_name, req, system, tools, tx, None).await;
     match result {
         Err(message) => Err(message.replace(api_key, "[redacted]")),
         ok => ok,

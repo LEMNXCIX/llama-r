@@ -341,6 +341,68 @@ impl RigAgentEngine {
             Err("feature `rig-engine` disabled".into())
         }
     }
+
+    /// Streaming body: prepare scoped tools/context, then drive the real Rig
+    /// streaming client for the resolved target. Wrapped by a timeout at the
+    /// `AgentEngine` boundary. A target with no streaming model is refused with
+    /// a named error — never a single full-text token pretending to be a
+    /// stream.
+    async fn stream_inner(
+        &self,
+        req: AgentRunRequest,
+        tx: mpsc::Sender<AgentRunEvent>,
+    ) -> Result<(), String> {
+        let (tools, system) = self.prepare(&req).await?;
+
+        #[cfg(feature = "rig-engine")]
+        {
+            match &self.target {
+                EngineTarget::Ollama { url } => {
+                    builder::stream_with_rig(url, req, system, tools, &tx).await
+                }
+                EngineTarget::OpenRouter { .. } => Err(builder::openrouter_streaming_unavailable()),
+                EngineTarget::OpenAiCompatible { api_key, base_url } => {
+                    builder::stream_with_openai_compatible(
+                        api_key,
+                        optional_base_url(base_url),
+                        req,
+                        system,
+                        tools,
+                        &tx,
+                    )
+                    .await
+                }
+                EngineTarget::Anthropic { api_key, base_url } => {
+                    builder::stream_with_anthropic(
+                        api_key,
+                        optional_base_url(base_url),
+                        req,
+                        system,
+                        tools,
+                        &tx,
+                    )
+                    .await
+                }
+                EngineTarget::Gemini { api_key, base_url } => {
+                    builder::stream_with_gemini(
+                        api_key,
+                        optional_base_url(base_url),
+                        req,
+                        system,
+                        tools,
+                        &tx,
+                    )
+                    .await
+                }
+            }
+        }
+
+        #[cfg(not(feature = "rig-engine"))]
+        {
+            let _ = (req, system, tools, tx);
+            Err("feature `rig-engine` disabled".into())
+        }
+    }
 }
 
 #[async_trait]
@@ -371,27 +433,20 @@ impl AgentEngine for RigAgentEngine {
                 mcp_registry,
                 rag,
             };
-            let result = match tokio::time::timeout(
-                Duration::from_secs(timeout_secs),
-                engine.run_inner(req),
-            )
-            .await
-            {
-                Ok(inner) => inner,
-                Err(_) => Err(format!("agent run timed out after {timeout_secs}s")),
-            };
-
-            match result {
-                Ok(res) => {
+            // The timeout covers the whole stream lifecycle, not just a single
+            // completion, and stays at the trait boundary as before.
+            let stream = engine.stream_inner(req, tx.clone());
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), stream).await {
+                Ok(Ok(())) => {}
+                Ok(Err(msg)) => {
+                    let _ = tx.send(AgentRunEvent::Error { message: msg }).await;
+                }
+                Err(_) => {
                     let _ = tx
-                        .send(AgentRunEvent::Token {
-                            text: res.text.clone(),
+                        .send(AgentRunEvent::Error {
+                            message: format!("agent stream timed out after {timeout_secs}s"),
                         })
                         .await;
-                    let _ = tx.send(AgentRunEvent::Completed { result: res }).await;
-                }
-                Err(msg) => {
-                    let _ = tx.send(AgentRunEvent::Error { message: msg }).await;
                 }
             }
         });

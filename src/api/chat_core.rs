@@ -115,13 +115,16 @@ fn engine_events_to_chat_stream(
     mut rx: tokio::sync::mpsc::Receiver<AgentRunEvent>,
 ) -> AppChatStream {
     Box::pin(async_stream::stream! {
-        let mut final_text = String::new();
+        // Accumulate every delta. Once tokens have been streamed the full answer
+        // has already been delivered, so the `done` marker carries no content —
+        // repeating `result.text` there would duplicate the whole response.
+        let mut streamed_text = String::new();
         let mut saw_completed = false;
 
         while let Some(event) = rx.recv().await {
             match event {
                 AgentRunEvent::Token { text } => {
-                    final_text = text.clone();
+                    streamed_text.push_str(&text);
                     yield Ok(ChatStreamEvent {
                         model: model.clone(),
                         created_at: chrono::Utc::now().to_rfc3339(),
@@ -134,11 +137,10 @@ fn engine_events_to_chat_stream(
                 }
                 AgentRunEvent::Completed { result } => {
                     saw_completed = true;
-                    // If we already streamed the same text as a Token, only emit the done marker.
-                    let content = if final_text == result.text && !final_text.is_empty() {
-                        String::new()
-                    } else {
+                    let content = if streamed_text.is_empty() {
                         result.text
+                    } else {
+                        String::new()
                     };
                     yield Ok(ChatStreamEvent {
                         model: model.clone(),
@@ -159,7 +161,7 @@ fn engine_events_to_chat_stream(
             }
         }
 
-        if !saw_completed && !final_text.is_empty() {
+        if !saw_completed && !streamed_text.is_empty() {
             yield Ok(ChatStreamEvent {
                 model,
                 created_at: chrono::Utc::now().to_rfc3339(),
@@ -516,15 +518,31 @@ pub async fn execute_chat_stream(
     let prepared = prepare_request(state, &services, payload, &resolved).await?;
     let started_at = Instant::now();
 
-    // Streaming from a non-Ollama provider is a documented non-goal: the
-    // engine's `run_stream` is a full completion dressed up as Token+Completed,
-    // so taking this branch for OpenRouter/OpenCode would answer `stream: true`
-    // with a 200 pseudo-stream instead of the required 501. Gate the engine on
-    // the selected provider so those requests fall through to
-    // `run_stream_with_fallback`, whose `chat_stream()` returns
-    // `AppError::Unavailable` and whose 501-preserving downcast stays intact.
-    if let Some((project_id, agent_id)) = engine_ids.filter(|_| services.provider_name == "ollama")
-    {
+    // Streaming is a capability of the *resolved model*, not a property of the
+    // globally selected provider name. Ask the same resolver the non-streaming
+    // path used: a model whose catalog says `streaming: false` (OpenRouter,
+    // OpenCode, an unknown model) must not enter the engine branch — it would
+    // either fake a stream or call a client with no streaming model. Those
+    // requests fall through to `run_stream_with_fallback`, whose adapters
+    // return `AppError::Unavailable` (501) before opening any connection, and
+    // whose 501-preserving downcast stays intact.
+    let streaming = engine_ids
+        .as_ref()
+        .and_then(|(project_id, agent_id)| {
+            state
+                .agent_registry
+                .resolve(project_id.as_deref(), agent_id.as_deref())
+        })
+        .map(|registered| {
+            state
+                .context_enricher
+                .resolve(&registered.agent)
+                .capabilities
+                .streaming
+        })
+        .unwrap_or(false);
+
+    if let Some((project_id, agent_id)) = engine_ids.filter(|_| streaming) {
         if let Some(runtime) = &services.agent_runtime {
             let conversation_id = selection.conversation_id.map(|s| s.to_string());
             let rt_req =

@@ -775,9 +775,11 @@ async fn streaming_uses_engine_when_agent_present() {
     });
     let (_dir, state) = test_state_with_runtime(provider, Some(runtime));
 
+    // A model the capability catalog marks as streaming: the new gate reads
+    // resolved capabilities, so this agent may enter the engine stream path.
     let config = AgentConfig {
         name: "stream-agent".to_string(),
-        model: "agent-model".to_string(),
+        model: "llama3.2".to_string(),
         system_prompt: "You are helpful".to_string(),
         context_project: Some("stream-proj".to_string()),
         ..Default::default()
@@ -946,7 +948,7 @@ async fn an_unavailable_stream_error_stays_a_501_not_a_502() {
 }
 
 #[tokio::test]
-async fn non_ollama_engine_stream_is_rejected_with_501_without_calling_engine() {
+async fn non_streaming_model_stream_is_rejected_with_501_without_calling_engine() {
     let _guard = lock_env();
     let stream_called = Arc::new(AtomicBool::new(false));
     let engine = Arc::new(StreamSpyEngine {
@@ -961,8 +963,10 @@ async fn non_ollama_engine_stream_is_rejected_with_501_without_calling_engine() 
         rag: None,
         enricher: test_enricher(),
     });
-    // A non-Ollama provider whose chat_stream rejects streaming the way the
-    // OpenRouter/OpenCode adapters do.
+    // The agent resolves against OpenRouter (whose catalog says streaming is
+    // false), and the provider's chat_stream rejects streaming the way the real
+    // OpenRouter/OpenCode adapters do. The capability gate must skip the engine
+    // and let that 501 through.
     let (_dir, state) = test_state_with_runtime_and_provider(
         Arc::new(UnavailableStreamProvider),
         Some(runtime),
@@ -1009,7 +1013,7 @@ async fn non_ollama_engine_stream_is_rejected_with_501_without_calling_engine() 
     assert_eq!(err.status_code(), axum::http::StatusCode::NOT_IMPLEMENTED);
     assert!(
         !stream_called.load(Ordering::SeqCst),
-        "the engine's chat_stream must not be called for a non-Ollama provider"
+        "the engine's chat_stream must not be called for a non-streaming model"
     );
 }
 
@@ -1035,9 +1039,11 @@ async fn ollama_engine_stream_is_still_taken() {
         "ollama",
     );
 
+    // A streaming-capable resolved model (Ollama/llama3.2) must keep the
+    // engine stream path under the capability gate.
     let config = AgentConfig {
         name: "ol-agent".to_string(),
-        model: "agent-model".to_string(),
+        model: "llama3.2".to_string(),
         system_prompt: "You are helpful".to_string(),
         context_project: Some("ol-proj".to_string()),
         ..Default::default()
@@ -1076,7 +1082,7 @@ async fn ollama_engine_stream_is_still_taken() {
     assert!(saw_engine, "Ollama stream should contain engine text");
     assert!(
         stream_called.load(Ordering::SeqCst),
-        "the engine's chat_stream must be called for an Ollama provider"
+        "the engine's chat_stream must be called for a streaming-capable model"
     );
 }
 
