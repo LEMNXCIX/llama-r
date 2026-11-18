@@ -236,6 +236,9 @@ async fn run_case(case: &EvalCase, provider: &str, kind: ProviderKind) -> Result
     };
 
     let (passed, detail) = match case.kind {
+        // Both plain and tool-prompt cases only check the returned answer text.
+        // Direct chat has no tools path; tool invocation belongs to the Rig
+        // engine and is out of scope for this fixture smoke.
         CaseKind::Plain | CaseKind::Tool => match client.chat(request).await {
             Ok(response) if response.message.content.contains(&case.expect) => {
                 (true, "matched expected answer".to_string())
@@ -323,6 +326,7 @@ fn render_table(rows: &[ResultRow]) -> String {
 #[tokio::test]
 async fn runner_loads_cases_and_reports_all_case_provider_pairs() {
     let eval = load_eval();
+    // Pinned expectations: the TOML ships 3 cases and 6 provider profiles.
     assert_eq!(eval.cases.len(), 3, "three smoke cases in the TOML");
     assert_eq!(eval.providers.len(), 6, "six provider profiles in the TOML");
 
@@ -354,7 +358,7 @@ async fn runner_loads_cases_and_reports_all_case_provider_pairs() {
         rows.iter().all(|row| row.passed),
         "every fixture-backed case should pass:\n{table}"
     );
-    // Dummy keys only: nothing that resembles a credential may reach the table.
-    assert!(!table.contains("sk-eval-dummy"));
-    assert!(!table.contains("ant-eval-dummy"));
+    // Dummy keys only: no credential material may reach the table. All four
+    // dummy keys (sk-/ant-/oc-/gem-) share the "-eval-dummy" suffix.
+    assert!(!table.contains("-eval-dummy"));
 }

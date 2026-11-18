@@ -16,8 +16,11 @@ kind = "plain"
 prompt = "Reply with a short greeting that contains the word hello."
 expect = "hello"
 
+# This case checks that the adapter returns the expected answer text for a
+# prompt that REQUESTS a tool. It does NOT verify tool invocation: direct-chat
+# has no tools path (tools live in the Rig agent engine, out of scope here).
 [[cases]]
-id = "tool-required"
+id = "tool-prompt"
 kind = "tool"
 prompt = "Use the weather tool for Madrid and report the result, which is sunny."
 expect = "sunny"
