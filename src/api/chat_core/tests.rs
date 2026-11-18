@@ -4,6 +4,7 @@ use crate::adapters::mcp::StaticMcpRegistry;
 use crate::api::handlers::AppState;
 use crate::api::observability::AppObservability;
 use crate::api::route_resolution::AgentSelection;
+use crate::config::ProviderKind;
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::{ContextStore, ProjectContext};
 use crate::domain::agent::{AgentConfig, OptimizeConfig};
@@ -11,6 +12,7 @@ use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEv
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
+use crate::providers::registry::ProviderRegistry;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::agent_runtime::AgentRuntime;
@@ -114,6 +116,8 @@ fn test_enricher() -> Arc<crate::context::analyzer::ContextEnricher> {
         Arc::new(crate::context::store::ContextStore::new()),
         Arc::new(crate::services::skill_manager::SkillManager::new()),
         "test-model".to_string(),
+        Arc::new(ProviderRegistry::default()),
+        ProviderKind::Ollama,
     ))
 }
 
@@ -225,10 +229,13 @@ fn test_state_with_runtime_and_provider(
     let _ = agent_registry.reload_all(&[]);
     let skill_manager = Arc::new(SkillManager::new());
     let context_store = Arc::new(ContextStore::new());
+    let global_provider = provider_name.parse::<ProviderKind>().unwrap_or_default();
     let context_enricher = Arc::new(ContextEnricher::new(
         context_store.clone(),
         skill_manager.clone(),
         "fallback-model".to_string(),
+        Arc::new(ProviderRegistry::default()),
+        global_provider,
     ));
     let mut stack = ProviderStack::new(provider, "fallback-model");
     stack.provider_name = provider_name.to_string();

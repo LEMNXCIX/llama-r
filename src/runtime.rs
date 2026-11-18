@@ -34,6 +34,7 @@ use crate::ports::router::DecisionRouter;
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::openai_compatible::OpenAiCompatibleProvider;
 use crate::providers::opencode::OpenCodeProvider;
+use crate::providers::registry::ProviderRegistry;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 #[cfg(feature = "rig-engine")]
@@ -79,11 +80,29 @@ pub fn build_app_state(
 ) -> Arc<AppState> {
     let metrics = Arc::new(TokenMetrics::new());
     let default_model = stack.default_model.clone();
+    // The resolver needs the profile registry and the process-wide provider.
+    // A broken registry is not fatal: warn and keep the canonical spellings.
+    let provider_registry = Arc::new(match ProviderRegistry::load() {
+        Ok(registry) => registry,
+        Err(err) => {
+            tracing::warn!(error = %err, "invalid provider registry; using built-in profiles");
+            ProviderRegistry::default()
+        }
+    });
+    let global_provider = stack
+        .provider_name
+        .parse::<ProviderKind>()
+        .unwrap_or_default();
     // Semantic skill ranking uses the SELECTED stack's embedder. Without one,
     // every declared skill is used (best effort) — never a broken Ollama
     // embedder pointed at localhost for a non-Ollama provider.
-    let mut enricher =
-        ContextEnricher::new(context_store.clone(), skill_manager.clone(), default_model);
+    let mut enricher = ContextEnricher::new(
+        context_store.clone(),
+        skill_manager.clone(),
+        default_model,
+        provider_registry,
+        global_provider,
+    );
     if let Some(embeddings) = &stack.embeddings {
         enricher = enricher.with_embeddings(embeddings.clone());
     }
@@ -855,6 +874,17 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
     let agent_runtime = {
         use crate::adapters::rig_engine::{engine_target_for, RigAgentEngine};
 
+        // Same resolver inputs as `build_app_state`: the selected provider and
+        // the profile registry, so an Apply rebuild cannot resolve an agent
+        // differently from boot.
+        let provider_registry = Arc::new(match ProviderRegistry::load() {
+            Ok(registry) => registry,
+            Err(err) => {
+                tracing::warn!(error = %err, "invalid provider registry; using built-in profiles");
+                ProviderRegistry::default()
+            }
+        });
+
         let engine_target = engine_target_for(config);
         stack.engine_target = engine_target.as_ref().map(|target| target.kind());
         engine_target.map(|target| {
@@ -870,6 +900,8 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
                 handles.context_store.clone(),
                 handles.skill_manager.clone(),
                 config.default_model.clone(),
+                provider_registry.clone(),
+                config.provider,
             );
             if let Some(embeddings) = &stack.embeddings {
                 enricher = enricher.with_embeddings(embeddings.clone());

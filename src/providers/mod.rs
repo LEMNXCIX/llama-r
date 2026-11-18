@@ -9,6 +9,7 @@ pub mod ollama;
 pub mod openai_compatible;
 pub mod opencode;
 pub mod registry;
+pub mod resolver;
 
 #[async_trait]
 pub trait LLMProvider: Send + Sync {

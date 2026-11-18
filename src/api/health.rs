@@ -124,10 +124,12 @@ mod tests {
     use super::*;
     use crate::adapters::mcp::StaticMcpRegistry;
     use crate::api::observability::AppObservability;
+    use crate::config::ProviderKind;
     use crate::context::analyzer::ContextEnricher;
     use crate::context::store::ContextStore;
     use crate::domain::models::{ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
     use crate::optimizer::metrics::TokenMetrics;
+    use crate::providers::registry::ProviderRegistry;
     use crate::providers::LLMProvider;
     use crate::services::agent_registry::AgentRegistry;
     use crate::services::provider_stack::ProviderStack;
@@ -206,6 +208,8 @@ mod tests {
                 context_store.clone(),
                 skill_manager.clone(),
                 "fallback-model".to_string(),
+                Arc::new(ProviderRegistry::default()),
+                ProviderKind::Ollama,
             )),
             skill_manager,
             context_store,

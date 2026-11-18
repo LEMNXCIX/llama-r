@@ -246,13 +246,14 @@ async fn prepare_request(
 
         let optimized_messages = prepared_messages;
 
-        let resolved_model = state.context_enricher.resolve_model(&agent);
+        let resolved = state.context_enricher.resolve(&agent);
         tracing::info!(
             agent_id = %agent.qualified_id(),
-            resolved_model = %resolved_model,
+            resolved_provider = %resolved.provider,
+            resolved_model = %resolved.model,
             "Resolved chat request to configured agent"
         );
-        payload.model = resolved_model;
+        payload.model = resolved.model;
         payload.messages = optimized_messages;
     }
 

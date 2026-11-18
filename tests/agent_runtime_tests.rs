@@ -6,9 +6,11 @@
 //! the model itself. The TOML writer is covered by the round-trip in
 //! `src/domain/agent.rs`; this file covers the two hops after it.
 
+use llama_r::config::ProviderKind;
 use llama_r::context::analyzer::ContextEnricher;
 use llama_r::context::store::ContextStore;
 use llama_r::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
+use llama_r::providers::registry::ProviderRegistry;
 use llama_r::services::agent_registry::AgentRegistry;
 use llama_r::services::agent_runtime::{AgentRuntime, RuntimeChatRequest};
 use llama_r::services::skill_manager::SkillManager;
@@ -120,6 +122,8 @@ fn enricher() -> ContextEnricher {
         Arc::new(ContextStore::new()),
         Arc::new(SkillManager::new()),
         "fallback".to_string(),
+        Arc::new(ProviderRegistry::default()),
+        ProviderKind::Ollama,
     )
 }
 

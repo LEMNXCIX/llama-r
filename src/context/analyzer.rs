@@ -1,6 +1,10 @@
+use crate::config::ProviderKind;
 use crate::context::store::{ContextStore, ProjectContext};
 use crate::domain::agent::Agent;
 use crate::ports::rag::EmbeddingProvider;
+use crate::providers::capabilities::capabilities_for;
+use crate::providers::registry::ProviderRegistry;
+use crate::providers::resolver::{resolve_for, ResolvedModel};
 use crate::services::agent_skill_sync::merge_skill_ids;
 use crate::services::skill_index::{apply_ranking, SkillIndex};
 use crate::services::skill_manager::SkillManager;
@@ -242,6 +246,12 @@ pub struct ContextEnricher {
     context_store: Arc<ContextStore>,
     skill_manager: Arc<SkillManager>,
     default_model: String,
+    /// Profiles from `providers.toml`, used to resolve an agent's provider
+    /// name to a kind. Held as `Arc` so a swap can rebuild an enricher without
+    /// cloning the whole registry.
+    provider_registry: Arc<ProviderRegistry>,
+    /// The process-wide `PROVIDER`, used when an agent does not name one.
+    global_provider: ProviderKind,
     /// Embeddings for ranking skills semantically. `None` disables ranking, in
     /// which case every declared skill is used — the previous behaviour.
     embeddings: Option<Arc<dyn EmbeddingProvider>>,
@@ -252,11 +262,15 @@ impl ContextEnricher {
         context_store: Arc<ContextStore>,
         skill_manager: Arc<SkillManager>,
         default_model: String,
+        provider_registry: Arc<ProviderRegistry>,
+        global_provider: ProviderKind,
     ) -> Self {
         Self {
             context_store,
             skill_manager,
             default_model,
+            provider_registry,
+            global_provider,
             embeddings: None,
         }
     }
@@ -267,12 +281,37 @@ impl ContextEnricher {
         self
     }
 
-    pub fn resolve_model(&self, agent: &Agent) -> String {
-        if agent.config.model.is_empty() {
-            self.default_model.clone()
-        } else {
-            agent.config.model.clone()
+    /// Resolve the agent's provider and model to the full result, including
+    /// the capabilities of the pair. An invalid provider in a manifest is a
+    /// configuration error; the chat path degrades to the global provider with
+    /// a warning rather than failing the request outright.
+    pub fn resolve(&self, agent: &Agent) -> ResolvedModel {
+        match resolve_for(
+            &self.provider_registry,
+            &agent.config,
+            self.global_provider,
+            &self.default_model,
+        ) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                tracing::warn!(error = %err, "invalid agent provider; using the global provider");
+                let model = if agent.config.model.trim().is_empty() {
+                    self.default_model.clone()
+                } else {
+                    agent.config.model.clone()
+                };
+                ResolvedModel {
+                    capabilities: capabilities_for(self.global_provider, &model),
+                    provider: self.global_provider,
+                    model,
+                }
+            }
         }
+    }
+
+    /// Kept for callers that only need the model id. Delegates to [`Self::resolve`].
+    pub fn resolve_model(&self, agent: &Agent) -> String {
+        self.resolve(agent).model
     }
 
     pub async fn build_system_prompt(&self, agent: &Agent) -> String {
@@ -461,8 +500,10 @@ impl ContextEnricher {
 mod tests {
     #![allow(clippy::await_holding_lock)] // tests hold an env lock across .await to serialise access
     use super::ContextEnricher;
+    use crate::config::ProviderKind;
     use crate::context::store::{ContextStore, ProjectContext};
     use crate::domain::agent::{Agent, AgentConfig, OptimizeConfig};
+    use crate::providers::registry::ProviderRegistry;
     use crate::services::skill_manager::SkillManager;
     use std::sync::{Arc, MutexGuard};
 
@@ -510,8 +551,13 @@ mod tests {
             })
             .unwrap();
 
-        let enricher =
-            ContextEnricher::new(context_store, skill_manager, "fallback-model".to_string());
+        let enricher = ContextEnricher::new(
+            context_store,
+            skill_manager,
+            "fallback-model".to_string(),
+            Arc::new(ProviderRegistry::default()),
+            ProviderKind::Ollama,
+        );
         let agent = Agent {
             id: "reviewer".to_string(),
             project_id: Some("demo".to_string()),
