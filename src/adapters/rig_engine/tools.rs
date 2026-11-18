@@ -128,6 +128,7 @@ mod tests {
             } else {
                 ToolsAllow::DenyAll
             },
+            local_tools_allow: ToolsAllow::DenyAll,
             rag_sources: HashSet::new(),
             rag_write: crate::domain::agent::RagWritePolicy::None,
             max_tool_calls: 10,

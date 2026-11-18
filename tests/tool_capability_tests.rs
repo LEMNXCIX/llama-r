@@ -76,6 +76,7 @@ fn scope() -> AgentScope {
         project_id: Some("proj".into()),
         mcp_sources: HashSet::from(["fake".into()]),
         tools_allow: ToolsAllow::AllFromSources,
+        local_tools_allow: ToolsAllow::DenyAll,
         rag_sources: HashSet::new(),
         rag_write: RagWritePolicy::None,
         max_tool_calls: 8,

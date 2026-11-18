@@ -139,6 +139,7 @@ mod tests {
             project_id: None,
             mcp_sources: HashSet::from(["fudi".into()]),
             tools_allow: ToolsAllow::Allowlist(HashSet::from([ToolRef::parse("fudi/list")])),
+            local_tools_allow: ToolsAllow::DenyAll,
             rag_sources: HashSet::new(),
             rag_write: RagWritePolicy::None,
             max_tool_calls: 8,

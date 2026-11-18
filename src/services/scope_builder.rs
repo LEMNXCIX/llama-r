@@ -11,6 +11,7 @@ impl ScopeBuilder {
     pub fn build(agent: &Agent) -> Result<AgentScope, AppError> {
         let config = &agent.config;
         let tools_allow = Self::parse_tools_override(&config.tools_override);
+        let local_tools_allow = Self::parse_tools_local(&config.tools_local);
 
         if let ToolsAllow::Allowlist(ref allowlist) = tools_allow {
             for tool in allowlist {
@@ -30,6 +31,7 @@ impl ScopeBuilder {
             project_id: agent.project_id.clone(),
             mcp_sources: config.mcp_sources.iter().cloned().collect(),
             tools_allow,
+            local_tools_allow,
             rag_sources: config.rag_sources.iter().cloned().collect(),
             rag_write: config.rag_write.clone(),
             max_tool_calls: config.max_tool_calls,
@@ -51,13 +53,33 @@ impl ScopeBuilder {
             .collect::<HashSet<_>>();
         ToolsAllow::Allowlist(set)
     }
+
+    /// Local ids have no server to validate against `mcp_sources`, so this
+    /// follows the same three-branch shape as `parse_tools_override` but builds
+    /// bare `ToolRef`s (`server_id: None`).
+    fn parse_tools_local(list: &[String]) -> ToolsAllow {
+        if list.is_empty() {
+            return ToolsAllow::DenyAll;
+        }
+        if list.iter().any(|entry| entry == "*") {
+            return ToolsAllow::AllFromSources;
+        }
+        let set = list
+            .iter()
+            .map(|id| ToolRef {
+                server_id: None,
+                name: id.clone(),
+            })
+            .collect::<HashSet<_>>();
+        ToolsAllow::Allowlist(set)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::agent::AgentConfig;
-    use crate::domain::scope::ToolsAllow;
+    use crate::domain::scope::{ToolRef, ToolsAllow};
 
     #[test]
     fn empty_tools_override_is_deny_all() {
@@ -89,6 +111,26 @@ mod tests {
         };
         let err = ScopeBuilder::build(&agent).unwrap_err();
         assert!(err.to_string().contains("not listed in mcp_sources"));
+    }
+
+    #[test]
+    fn parse_tools_local_builds_bare_tool_refs() {
+        // Local ids have no server, so even an id containing '/' stays bare;
+        // ToolRef::parse is for MCP references and must not be used here.
+        let allow = ScopeBuilder::parse_tools_local(&["ns/tool".into(), "ping".into()]);
+        match allow {
+            ToolsAllow::Allowlist(set) => {
+                assert!(set.contains(&ToolRef {
+                    server_id: None,
+                    name: "ns/tool".into(),
+                }));
+                assert!(set.contains(&ToolRef {
+                    server_id: None,
+                    name: "ping".into(),
+                }));
+            }
+            other => panic!("expected an allowlist, got {other:?}"),
+        }
     }
 
     #[test]

@@ -599,6 +599,7 @@ mod tests {
                 project_id: None,
                 mcp_sources: HashSet::new(),
                 tools_allow: ToolsAllow::DenyAll,
+                local_tools_allow: ToolsAllow::DenyAll,
                 rag_sources: HashSet::new(),
                 rag_write: RagWritePolicy::None,
                 max_tool_calls: 0,

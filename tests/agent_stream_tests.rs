@@ -152,6 +152,7 @@ fn run_request(model: &str, provider: ProviderKind) -> AgentRunRequest {
             project_id: None,
             mcp_sources: HashSet::new(),
             tools_allow: ToolsAllow::DenyAll,
+            local_tools_allow: ToolsAllow::DenyAll,
             rag_sources: HashSet::new(),
             rag_write: RagWritePolicy::None,
             max_tool_calls: 0,

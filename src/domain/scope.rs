@@ -57,6 +57,10 @@ pub struct AgentScope {
     pub project_id: Option<String>,
     pub mcp_sources: HashSet<String>,
     pub tools_allow: ToolsAllow,
+    /// Authorization for in-process (local) tools, keyed by bare tool id.
+    /// Deliberately separate from `tools_allow`: MCP permissions are not local
+    /// permissions and vice versa.
+    pub local_tools_allow: ToolsAllow,
     pub rag_sources: HashSet<String>,
     pub rag_write: RagWritePolicy,
     pub max_tool_calls: u32,
@@ -95,6 +99,21 @@ impl AgentScope {
         }
     }
 
+    /// Whether this scope may use a local (in-process) tool by id.
+    ///
+    /// Unlike [`Self::allows_tool`], this never consults `mcp_sources`: local
+    /// tools are discovered in-process and have no MCP server behind them.
+    pub fn allows_local_tool(&self, id: &str) -> bool {
+        match &self.local_tools_allow {
+            ToolsAllow::DenyAll => false,
+            ToolsAllow::AllFromSources => true,
+            ToolsAllow::Allowlist(set) => set.contains(&ToolRef {
+                server_id: None,
+                name: id.to_string(),
+            }),
+        }
+    }
+
     pub fn allows_rag_read(&self, source_id: &str) -> bool {
         self.rag_sources.contains(source_id)
     }
@@ -125,6 +144,7 @@ mod tests {
             project_id: Some("fudi".into()),
             mcp_sources: HashSet::from(["fudi".into(), "other".into()]),
             tools_allow: tools,
+            local_tools_allow: ToolsAllow::DenyAll,
             rag_sources: HashSet::from(["fudi/policies".into(), "agent:fudi/ops/memory".into()]),
             rag_write: RagWritePolicy::OwnMemoryOnly,
             max_tool_calls: 8,

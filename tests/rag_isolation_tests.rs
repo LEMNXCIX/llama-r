@@ -17,6 +17,7 @@ fn scope_for(agent: &str, sources: &[&str], write: RagWritePolicy) -> AgentScope
         project_id: None,
         mcp_sources: HashSet::new(),
         tools_allow: ToolsAllow::DenyAll,
+        local_tools_allow: ToolsAllow::DenyAll,
         rag_sources: sources.iter().map(|s| (*s).to_string()).collect(),
         rag_write: write,
         max_tool_calls: 8,
