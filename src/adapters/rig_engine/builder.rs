@@ -292,8 +292,10 @@ pub async fn run_with_anthropic(
 
 /// Run a single agent turn via Rig against Google Gemini. `base_url = None`
 /// uses rig-core's native Gemini endpoint; `Some` targets a compatible
-/// gateway. We only ever hand the client a key-free base URL, and every error
-/// is scrubbed of the key before it reaches a caller.
+/// gateway. Use the Interactions client, not the GenerateContent client: the
+/// latter appends `?key=<key>` to the request URL, while the former sends the
+/// key in an `x-goog-api-key` header, keeping it out of URLs and logs. Every
+/// error is scrubbed of the key before it reaches a caller.
 pub async fn run_with_gemini(
     api_key: &str,
     base_url: Option<&str>,
@@ -302,11 +304,11 @@ pub async fn run_with_gemini(
     tools: Vec<ScopedMcpTool>,
 ) -> Result<AgentRunResult, String> {
     let client = match base_url {
-        Some(url) => gemini::Client::builder()
+        Some(url) => gemini::InteractionsClient::builder()
             .api_key(api_key.to_string())
             .base_url(url)
             .build(),
-        None => gemini::Client::new(api_key.to_string()),
+        None => gemini::InteractionsClient::new(api_key.to_string()),
     }
     .map_err(|_| "failed to create Gemini client".to_string())?;
 

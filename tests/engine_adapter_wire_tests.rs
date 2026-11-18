@@ -228,7 +228,7 @@ async fn anthropic_sends_x_api_key_to_messages_and_scrubs_the_key() {
 }
 
 #[tokio::test]
-async fn gemini_calls_generate_content_and_scrubs_the_key() {
+async fn gemini_sends_x_goog_api_key_to_interactions_and_scrubs_the_key() {
     const KEY: &str = "sk-gemini-wire-secret";
     let server = WireServer::start("HTTP/1.1 401 Unauthorized", key_echo_error(KEY)).await;
 
@@ -246,15 +246,26 @@ async fn gemini_calls_generate_content_and_scrubs_the_key() {
     let requests = server.requests();
     assert_eq!(requests.len(), 1, "exactly one HTTP request expected");
     let request = &requests[0];
+    // The Interactions client posts here, not to :generateContent.
     assert!(
         request
             .request_line
-            .starts_with("POST /v1beta/models/gemini-1.5-pro:generateContent"),
+            .starts_with("POST /v1beta/interactions "),
         "unexpected request line: {}",
         request.request_line
     );
-    // Our code never places the key in the base_url it hands to the client.
-    // (rig-core's native GenerateContent client authenticates with a `?key=`
-    // query parameter itself; that is the library's behaviour, not ours.)
+    assert_eq!(header(&request.headers, "x-goog-api-key"), Some(KEY));
+    // The key must never appear in the URL / request line, under `key=` or at
+    // all. GenerateContent would have put it in a `?key=` query parameter.
+    assert!(
+        !request.request_line.contains("key="),
+        "no key query parameter allowed: {}",
+        request.request_line
+    );
+    assert!(
+        !request.request_line.contains(KEY),
+        "no key material in the request line: {}",
+        request.request_line
+    );
     assert!(!server.url().contains(KEY));
 }
