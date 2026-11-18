@@ -12,21 +12,38 @@ pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 /// Which upstream serves chat, the decision model and (where supported)
 /// embeddings. One value selects every service; there is no per-service mix.
+///
+/// This is a non-secret discriminator (it may be logged and shown in health
+/// output). The secret-bearing counterpart is `EngineTarget`, which deliberately
+/// does not implement `Debug`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProviderKind {
     #[default]
     Ollama,
     OpenRouter,
     OpenCode,
+    OpenAiCompatible,
+    Anthropic,
+    Gemini,
 }
+
+/// The one canonical spelling of each kind. Used by `Display` and the error
+/// message, so accepted values and their documentation cannot drift apart.
+pub const PROVIDER_KIND_SPELLINGS: &[(&str, ProviderKind)] = &[
+    ("ollama", ProviderKind::Ollama),
+    ("openrouter", ProviderKind::OpenRouter),
+    ("opencode", ProviderKind::OpenCode),
+    ("openai-compatible", ProviderKind::OpenAiCompatible),
+    ("anthropic", ProviderKind::Anthropic),
+    ("gemini", ProviderKind::Gemini),
+];
 
 impl fmt::Display for ProviderKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::Ollama => "ollama",
-            Self::OpenRouter => "openrouter",
-            Self::OpenCode => "opencode",
-        };
+        let (name, _) = PROVIDER_KIND_SPELLINGS
+            .iter()
+            .find(|(_, kind)| kind == self)
+            .expect("every ProviderKind has a spelling");
         f.write_str(name)
     }
 }
@@ -35,15 +52,25 @@ impl FromStr for ProviderKind {
     type Err = AppError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "ollama" => Ok(Self::Ollama),
-            "openrouter" => Ok(Self::OpenRouter),
-            "opencode" => Ok(Self::OpenCode),
-            _ => Err(AppError::Config(format!(
-                "PROVIDER must be one of ollama, openrouter, opencode; received '{}'",
-                value
-            ))),
+        let lower = value.trim().to_ascii_lowercase();
+        if let Some((_, kind)) = PROVIDER_KIND_SPELLINGS
+            .iter()
+            .find(|(spelling, _)| *spelling == lower)
+        {
+            return Ok(*kind);
         }
+
+        let accepted = PROVIDER_KIND_SPELLINGS
+            .iter()
+            .map(|(spelling, _)| *spelling)
+            .collect::<Vec<_>>()
+            .join(", ");
+        // `value` is a provider name supplied by the caller, never a stored
+        // credential: no key material is read or rendered here.
+        Err(AppError::Config(format!(
+            "PROVIDER must be one of {accepted}; received '{}'",
+            value
+        )))
     }
 }
 
@@ -86,7 +113,7 @@ impl Config {
 
         // An absent or empty PROVIDER means the documented default. Any other
         // value is validated by `FromStr`, whose error names the value and the
-        // three accepted spellings.
+        // six accepted spellings.
         let raw_provider = env::var("PROVIDER").unwrap_or_default();
         let provider = if raw_provider.trim().is_empty() {
             ProviderKind::default()
@@ -377,21 +404,20 @@ mod tests {
     }
 
     #[test]
-    fn provider_parses_all_three_kinds() {
-        assert_eq!(
-            "ollama".parse::<ProviderKind>().unwrap(),
-            ProviderKind::Ollama
-        );
-        assert_eq!(
-            "openrouter".parse::<ProviderKind>().unwrap(),
-            ProviderKind::OpenRouter
-        );
-        assert_eq!(
-            "opencode".parse::<ProviderKind>().unwrap(),
-            ProviderKind::OpenCode
-        );
+    fn provider_parses_all_six_kinds() {
+        let cases = [
+            ("ollama", ProviderKind::Ollama),
+            ("openrouter", ProviderKind::OpenRouter),
+            ("opencode", ProviderKind::OpenCode),
+            ("openai-compatible", ProviderKind::OpenAiCompatible),
+            ("anthropic", ProviderKind::Anthropic),
+            ("gemini", ProviderKind::Gemini),
+        ];
+        for (spelling, kind) in cases {
+            assert_eq!(spelling.parse::<ProviderKind>().unwrap(), kind);
+            assert_eq!(kind.to_string(), spelling);
+        }
         // Display is the canonical spelling and parsing ignores case.
-        assert_eq!(ProviderKind::OpenRouter.to_string(), "openrouter");
         assert_eq!(
             "OpenRouter".parse::<ProviderKind>().unwrap(),
             ProviderKind::OpenRouter
@@ -404,20 +430,27 @@ mod tests {
         let _env = ConfigEnvGuard::cleared();
         let _cwd = CwdGuard::fresh();
 
-        env::set_var("PROVIDER", "gemini");
+        env::set_var("PROVIDER", "totally-not-a-provider");
         let err = Config::from_env().unwrap_err();
         let message = err.to_string();
         assert!(matches!(err, AppError::Config(_)));
         assert!(
-            message.contains("gemini"),
+            message.contains("totally-not-a-provider"),
             "error must name the bad value: {message}"
         );
-        assert!(
-            message.contains("ollama")
-                && message.contains("openrouter")
-                && message.contains("opencode"),
-            "error must list the three accepted values: {message}"
-        );
+        for spelling in [
+            "ollama",
+            "openrouter",
+            "opencode",
+            "openai-compatible",
+            "anthropic",
+            "gemini",
+        ] {
+            assert!(
+                message.contains(spelling),
+                "error must list {spelling} as accepted: {message}"
+            );
+        }
     }
 
     #[test]

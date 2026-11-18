@@ -54,9 +54,15 @@ pub struct Settings {
 impl Settings {
     pub fn new(provider: ProviderKind, key: &str, model: &str) -> Self {
         let index = match provider {
-            ProviderKind::Ollama => 0,
             ProviderKind::OpenRouter => 1,
             ProviderKind::OpenCode => 2,
+            // The dialog cycles the three shipped providers; the newly opened
+            // kinds are normalised to the first slot until their adapters and
+            // their own dialog entries land.
+            ProviderKind::Ollama
+            | ProviderKind::OpenAiCompatible
+            | ProviderKind::Anthropic
+            | ProviderKind::Gemini => 0,
         };
         Self {
             provider: index,
@@ -112,7 +118,12 @@ impl Settings {
         match provider {
             ProviderKind::OpenRouter => config.openrouter_api_key = Some(self.key.clone()),
             ProviderKind::OpenCode => config.opencode_api_key = Some(self.key.clone()),
-            ProviderKind::Ollama => {}
+            // `Config` has no field for these keys yet; the dialog cannot
+            // select their index, so this arm is unreachable from the UI.
+            ProviderKind::Ollama
+            | ProviderKind::OpenAiCompatible
+            | ProviderKind::Anthropic
+            | ProviderKind::Gemini => {}
         }
         Ok(config)
     }

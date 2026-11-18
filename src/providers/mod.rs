@@ -7,6 +7,7 @@ use tokio_stream::Stream;
 pub mod ollama;
 pub mod openai_compatible;
 pub mod opencode;
+pub mod registry;
 
 #[async_trait]
 pub trait LLMProvider: Send + Sync {

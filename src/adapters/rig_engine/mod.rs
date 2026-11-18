@@ -62,7 +62,12 @@ pub fn engine_target_for(config: &Config) -> Option<EngineTarget> {
                 .clone()
                 .unwrap_or_else(|| OPENROUTER_BASE_URL.to_string()),
         }),
-        ProviderKind::OpenCode => None,
+        // Not wired to a rig completion client yet — like OpenCode, agent
+        // chats degrade to a direct answer until their wrappers land.
+        ProviderKind::OpenCode
+        | ProviderKind::OpenAiCompatible
+        | ProviderKind::Anthropic
+        | ProviderKind::Gemini => None,
     }
 }
 

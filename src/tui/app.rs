@@ -1593,7 +1593,12 @@ impl TuiApp {
         let key = match provider {
             ProviderKind::OpenRouter => config.as_ref().and_then(|c| c.openrouter_api_key.clone()),
             ProviderKind::OpenCode => config.as_ref().and_then(|c| c.opencode_api_key.clone()),
-            ProviderKind::Ollama => None,
+            // No `Config` field for the new kinds' keys yet, and the dialog
+            // cannot select them, so there is nothing to seed the key from.
+            ProviderKind::Ollama
+            | ProviderKind::OpenAiCompatible
+            | ProviderKind::Anthropic
+            | ProviderKind::Gemini => None,
         };
         let model = config
             .as_ref()

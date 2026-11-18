@@ -710,6 +710,15 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
                 None
             };
         }
+        // These kinds are now recognised (parsing, profiles, per-agent config)
+        // but their direct adapters are still to be wired. Fail loudly rather
+        // than silently answering on the wrong upstream.
+        ProviderKind::OpenAiCompatible | ProviderKind::Anthropic | ProviderKind::Gemini => {
+            return Err(AppError::Config(format!(
+                "provider '{}' is recognised but its direct adapter is not wired yet",
+                config.provider
+            )));
+        }
     }
 
     tracing::info!(provider = %config.provider, "Provider stack initialized");

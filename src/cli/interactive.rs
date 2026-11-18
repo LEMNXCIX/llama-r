@@ -47,6 +47,9 @@ fn prompt_provider_settings(config: &mut Config) -> Result<(), Box<dyn Error + S
                 .default(config.opencode_url.clone())
                 .interact_text()?;
         }
+        // First-run setup only offers the three kinds above; the newly
+        // opened kinds get their own prompts once their adapters are wired.
+        ProviderKind::OpenAiCompatible | ProviderKind::Anthropic | ProviderKind::Gemini => {}
     }
     Ok(())
 }
