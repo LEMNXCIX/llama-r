@@ -44,6 +44,7 @@ use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
 #[cfg(feature = "rig-engine")]
 use crate::services::agent_runtime::AgentRuntime;
+use crate::services::approval::ApprovalGate;
 use crate::services::provider_stack::{FallbackProvider, ProviderStack};
 use crate::services::rag_ingest::RagIngestService;
 use crate::services::router_config::RouterConfig;
@@ -109,6 +110,38 @@ pub fn build_context_enricher(
     reason = "stable interface: called from fourteen sites across the crate and tests"
 )]
 pub fn build_app_state(
+    stack: ProviderStack,
+    agent_registry: Arc<AgentRegistry>,
+    skill_manager: Arc<SkillManager>,
+    context_store: Arc<ContextStore>,
+    logs: Arc<Mutex<VecDeque<String>>>,
+    known_mcp_servers: Vec<String>,
+    mcp_registry: Arc<dyn McpServerRegistry>,
+    history_store: Option<Arc<dyn ConversationStore>>,
+) -> Arc<AppState> {
+    build_app_state_with_gate(
+        Arc::new(ApprovalGate::default()),
+        stack,
+        agent_registry,
+        skill_manager,
+        context_store,
+        logs,
+        known_mcp_servers,
+        mcp_registry,
+        history_store,
+    )
+}
+
+/// Same as [`build_app_state`] but installs a caller-owned approval gate. Boot
+/// uses this so the exact same `Arc` is given to the engine (via
+/// [`CompanionHandles`]) and stored on `AppState`; a TUI Apply rebuilds the
+/// engine from `CompanionHandles::from_state`, so pending decisions survive.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors build_app_state with the boot-owned approval gate added"
+)]
+pub fn build_app_state_with_gate(
+    approval_gate: Arc<ApprovalGate>,
     mut stack: ProviderStack,
     agent_registry: Arc<AgentRegistry>,
     skill_manager: Arc<SkillManager>,
@@ -188,6 +221,7 @@ pub fn build_app_state(
         history_store,
         router_config: Arc::new(router_config),
         router_healthy: AtomicBool::new(false),
+        approval_gate,
     })
 }
 
@@ -451,15 +485,21 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     // old behaviour) meant a non-Ollama provider got a broken Ollama embedder
     // and an engine hardwired to Ollama. One helper serves boot and hot Apply,
     // so the two cannot disagree about which upstream the engine targets.
+    // One gate for the process lifetime, created before either the engine or
+    // `AppState` needs it. Sharing the same `Arc` is what makes a settings Apply
+    // safe: it rebuilds the engine but leaves pending decisions intact.
+    let approval_gate = Arc::new(ApprovalGate::default());
     let handles = CompanionHandles {
         mcp_registry: mcp_registry.clone(),
         agent_registry: agent_registry.clone(),
         skill_manager: skill_manager.clone(),
         context_store: context_store.clone(),
         history_store: history_store.clone(),
+        approval_gate: approval_gate.clone(),
     };
     build_companions(&handles, &config, &mut stack);
-    let state = build_app_state(
+    let state = build_app_state_with_gate(
+        approval_gate,
         stack,
         agent_registry.clone(),
         skill_manager,
@@ -1050,6 +1090,9 @@ pub struct CompanionHandles {
     pub skill_manager: Arc<SkillManager>,
     pub context_store: Arc<ContextStore>,
     pub history_store: Option<Arc<dyn ConversationStore>>,
+    /// The boot-owned gate, read from `AppState` on a settings Apply so pending
+    /// approvals are never dropped by a stack rebuild.
+    pub approval_gate: Arc<ApprovalGate>,
 }
 
 impl CompanionHandles {
@@ -1060,6 +1103,7 @@ impl CompanionHandles {
             skill_manager: state.skill_manager.clone(),
             context_store: state.context_store.clone(),
             history_store: state.history_store.clone(),
+            approval_gate: state.approval_gate.clone(),
         }
     }
 }
@@ -1101,6 +1145,7 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
                 config.clone(),
                 handles.skill_manager.clone(),
                 local_tools.clone(),
+                handles.approval_gate.clone(),
             ));
             Arc::new(AgentRuntime {
                 registry: handles.agent_registry.clone(),

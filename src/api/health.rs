@@ -223,6 +223,7 @@ mod tests {
             history_store: None,
             router_config: Arc::new(router_config),
             router_healthy: AtomicBool::new(router_healthy),
+            approval_gate: Arc::new(crate::services::approval::ApprovalGate::default()),
         });
         (temp_dir, state)
     }

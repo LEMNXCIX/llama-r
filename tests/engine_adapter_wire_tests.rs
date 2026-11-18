@@ -19,6 +19,7 @@ use llama_r::domain::agent::{Agent, AgentConfig, RagWritePolicy};
 use llama_r::domain::scope::{AgentScope, ToolsAllow};
 use llama_r::ports::engine::AgentRunRequest;
 use llama_r::providers::capabilities::capabilities_for;
+use llama_r::services::approval::ApprovalGate;
 use llama_r::services::skill_manager::SkillManager;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -31,6 +32,8 @@ fn test_deps() -> LocalToolDeps {
     LocalToolDeps {
         skill_manager: Arc::new(SkillManager::with_paths(Vec::new())),
         rag: None,
+        gate: Arc::new(ApprovalGate::default()),
+        event_tx: None,
     }
 }
 

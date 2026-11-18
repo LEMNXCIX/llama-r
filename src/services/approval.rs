@@ -112,6 +112,14 @@ impl ApprovalGate {
         }
     }
 
+    /// How long a pending decision stays valid. The bridge wraps its `rx.await`
+    /// in a `tokio::time::timeout` of this length so a request nobody decides
+    /// fails with a named error instead of hanging forever (the gate's own
+    /// reaper only runs when `request`/`decide` is next called).
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Register a pending approval. Reaps expired entries first, then returns
     /// a fresh id and the receiver the caller awaits before executing a tool.
     pub fn request(

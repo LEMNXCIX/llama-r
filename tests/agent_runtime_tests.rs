@@ -563,6 +563,7 @@ fn a_deferred_skill_is_announced_offered_and_loaded_on_demand() {
                 cfg,
                 Arc::clone(&skill_manager),
                 Arc::new(LocalToolRegistry::builtins()),
+                Arc::new(llama_r::services::approval::ApprovalGate::default()),
             );
             let enricher = ContextEnricher::new(
                 Arc::new(ContextStore::new()),

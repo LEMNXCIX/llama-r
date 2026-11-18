@@ -189,6 +189,7 @@ fn boot_ollama_runtime(config: &Config, base_dir: &std::path::Path, agent: &str)
         config.clone(),
         Arc::new(SkillManager::new()),
         Arc::new(LocalToolRegistry::builtins()),
+        Arc::new(llama_r::services::approval::ApprovalGate::default()),
     );
     let enricher = ContextEnricher::new(
         Arc::new(ContextStore::new()),

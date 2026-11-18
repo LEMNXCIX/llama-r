@@ -201,6 +201,7 @@ async fn collect_engine_stream() -> (Vec<String>, Option<AgentRunResult>) {
         test_config(&server.url()),
         Arc::new(SkillManager::new()),
         Arc::new(LocalToolRegistry::builtins()),
+        Arc::new(llama_r::services::approval::ApprovalGate::default()),
     );
     let mut rx = engine
         .run_stream(run_request("llama3.2", ProviderKind::Ollama))

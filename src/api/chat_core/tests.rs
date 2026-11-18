@@ -261,6 +261,7 @@ fn test_state_with_runtime_and_provider(
         history_store: None,
         router_config: Arc::new(RouterConfig::default()),
         router_healthy: AtomicBool::new(false),
+        approval_gate: Arc::new(crate::services::approval::ApprovalGate::default()),
     });
     (temp_dir, state)
 }

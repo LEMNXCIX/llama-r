@@ -113,9 +113,12 @@ pub fn build_tool_bridges(
     tools
         .into_iter()
         .map(|t| match t {
-            ScopedTool::Mcp(mcp) => {
-                Box::new(McpToolBridge::new(mcp, budget.clone())) as Box<dyn ToolDyn>
-            }
+            ScopedTool::Mcp(mcp) => Box::new(McpToolBridge::new(
+                mcp,
+                budget.clone(),
+                deps.gate.clone(),
+                deps.event_tx.clone(),
+            )) as Box<dyn ToolDyn>,
             ScopedTool::Local(local) => Box::new(LocalToolBridge::new(
                 local,
                 scope.clone(),
@@ -648,6 +651,8 @@ mod tests {
         LocalToolDeps {
             skill_manager: Arc::new(SkillManager::with_paths(Vec::new())),
             rag: None,
+            gate: Arc::new(crate::services::approval::ApprovalGate::default()),
+            event_tx: None,
         }
     }
 

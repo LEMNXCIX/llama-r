@@ -208,13 +208,16 @@ struct LocalToolManifest {
 #[cfg(feature = "rig-engine")]
 mod bridge {
     use super::*;
+    use crate::adapters::rig_engine::approval;
     use crate::adapters::rig_engine::limits::ToolCallBudget;
     use crate::domain::scope::AgentScope;
+    use crate::ports::engine::AgentRunEvent;
     use crate::ports::rag::RagStore;
+    use crate::services::approval::ApprovalGate;
     use crate::services::skill_manager::SkillManager;
     use rig_core::tool::{ToolDyn, ToolError};
     use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use tokio::sync::{mpsc, Mutex};
 
     /// Upper bound — and the default — for `rag_query`'s `top_k`. The model must
     /// not be able to ask for an unbounded slice of the knowledge base through
@@ -228,6 +231,13 @@ mod bridge {
     pub struct LocalToolDeps {
         pub skill_manager: Arc<SkillManager>,
         pub rag: Option<Arc<dyn RagStore>>,
+        /// The run's approval gate, owned by `AppState` so a settings Apply
+        /// cannot drop a pending decision. Also read by the MCP bridge via
+        /// `build_tool_bridges`, so both bridge kinds share one gate.
+        pub gate: Arc<ApprovalGate>,
+        /// `Some` on the streaming path (the `ApprovalRequired` event reaches
+        /// the SSE caller); `None` on the non-streaming path.
+        pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
     }
 
     /// One `ToolDyn` per registered local tool. Holds the definition, the scope
@@ -238,6 +248,10 @@ mod bridge {
         pub scope: AgentScope,
         pub budget: Arc<Mutex<ToolCallBudget>>,
         pub deps: LocalToolDeps,
+        /// Cloned from `deps` so the gate is an explicit part of the bridge,
+        /// mirroring `McpToolBridge`.
+        pub gate: Arc<ApprovalGate>,
+        pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
     }
 
     impl LocalToolBridge {
@@ -247,11 +261,15 @@ mod bridge {
             budget: Arc<Mutex<ToolCallBudget>>,
             deps: LocalToolDeps,
         ) -> Self {
+            let gate = deps.gate.clone();
+            let event_tx = deps.event_tx.clone();
             Self {
                 tool,
                 scope,
                 budget,
                 deps,
+                gate,
+                event_tx,
             }
         }
 
@@ -264,6 +282,18 @@ mod bridge {
                     self.tool.id
                 ));
             }
+
+            // Authorize (possibly blocking on a human) before charging the
+            // shared budget. A denial/expiry/args-change spends nothing. A
+            // local tool's bare id is the name approval rules match on.
+            approval::authorize(
+                &self.gate,
+                self.event_tx.as_ref(),
+                &self.scope.permission,
+                &self.tool.id,
+                &args,
+            )
+            .await?;
 
             {
                 let mut b = self.budget.lock().await;

@@ -1,8 +1,11 @@
+use crate::adapters::rig_engine::approval;
 use crate::adapters::rig_engine::limits::ToolCallBudget;
 use crate::adapters::rig_engine::ScopedMcpTool;
+use crate::ports::engine::AgentRunEvent;
+use crate::services::approval::ApprovalGate;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 pub fn rig_tool_name(server_id: &str, tool_name: &str) -> String {
     format!("{server_id}__{tool_name}")
@@ -17,11 +20,28 @@ pub fn parse_rig_tool_name(qualified: &str) -> Option<(String, String)> {
 pub struct McpToolBridge {
     pub inner: ScopedMcpTool,
     pub budget: Arc<Mutex<ToolCallBudget>>,
+    /// The run's approval gate, owned by `AppState` (not the hot-swapped stack),
+    /// so a settings Apply cannot drop a pending decision.
+    pub gate: Arc<ApprovalGate>,
+    /// `Some` on the streaming path, where `ApprovalRequired` reaches the SSE
+    /// caller; `None` on the non-streaming path, where an approval-gated tool is
+    /// refused with a named error instead of faking an event nobody can see.
+    pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
 }
 
 impl McpToolBridge {
-    pub fn new(inner: ScopedMcpTool, budget: Arc<Mutex<ToolCallBudget>>) -> Self {
-        Self { inner, budget }
+    pub fn new(
+        inner: ScopedMcpTool,
+        budget: Arc<Mutex<ToolCallBudget>>,
+        gate: Arc<ApprovalGate>,
+        event_tx: Option<mpsc::Sender<AgentRunEvent>>,
+    ) -> Self {
+        Self {
+            inner,
+            budget,
+            gate,
+            event_tx,
+        }
     }
 
     pub async fn invoke_json(&self, args: Value) -> Result<String, String> {
@@ -36,6 +56,19 @@ impl McpToolBridge {
                 self.inner.def.server_id, self.inner.def.name
             ));
         }
+
+        // Authorize (which may block on a human) BEFORE charging the budget: a
+        // denied, expired or args-changed call spends nothing. The qualified
+        // name is the one an agent manifest's approval rules match on.
+        let tool_name = rig_tool_name(&self.inner.def.server_id, &self.inner.def.name);
+        approval::authorize(
+            &self.gate,
+            self.event_tx.as_ref(),
+            &self.inner.scope.permission,
+            &tool_name,
+            &args,
+        )
+        .await?;
 
         {
             let mut b = self.budget.lock().await;
@@ -90,6 +123,7 @@ mod tests {
     use super::*;
     use crate::domain::scope::{AgentScope, ToolsAllow};
     use crate::ports::mcp::{McpCallRequest, McpCallResult, McpClient, McpToolDef};
+    use crate::services::approval::ApprovalGate;
     use async_trait::async_trait;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -154,7 +188,12 @@ mod tests {
     #[tokio::test]
     async fn allowed_tool_invokes_mcp() {
         let (tool, call_count) = make_scoped_tool(true);
-        let bridge = McpToolBridge::new(tool, Arc::new(Mutex::new(ToolCallBudget::new(5))));
+        let bridge = McpToolBridge::new(
+            tool,
+            Arc::new(Mutex::new(ToolCallBudget::new(5))),
+            Arc::new(ApprovalGate::default()),
+            None,
+        );
         let result = bridge
             .invoke_json(serde_json::json!({"key": "value"}))
             .await;
@@ -167,7 +206,12 @@ mod tests {
     async fn denied_tool_returns_error() {
         let (tool, call_count) = make_scoped_tool(false);
         let budget = Arc::new(Mutex::new(ToolCallBudget::new(5)));
-        let bridge = McpToolBridge::new(tool, budget.clone());
+        let bridge = McpToolBridge::new(
+            tool,
+            budget.clone(),
+            Arc::new(ApprovalGate::default()),
+            None,
+        );
         let result = bridge
             .invoke_json(serde_json::json!({"key": "value"}))
             .await;

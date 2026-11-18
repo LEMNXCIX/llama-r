@@ -20,6 +20,7 @@ use llama_r::ports::mcp::{
 };
 use llama_r::ports::rag::{RagChunk, RagReplaceBatch, RagStore, RagUpsert};
 use llama_r::providers::capabilities::{capabilities_for, ModelCapabilities};
+use llama_r::services::approval::ApprovalGate;
 use llama_r::services::skill_manager::SkillManager;
 use rig_core::tool::ToolDyn;
 use serde_json::Value;
@@ -158,6 +159,7 @@ fn engine(
         test_config(),
         Arc::new(SkillManager::new()),
         Arc::new(local_tools),
+        Arc::new(ApprovalGate::default()),
     );
     (engine, discover, client_calls)
 }
@@ -189,6 +191,8 @@ fn skill_deps(skills_root: &std::path::Path) -> LocalToolDeps {
     LocalToolDeps {
         skill_manager: Arc::new(manager),
         rag: None,
+        gate: Arc::new(ApprovalGate::default()),
+        event_tx: None,
     }
 }
 
@@ -196,6 +200,8 @@ fn empty_deps() -> LocalToolDeps {
     LocalToolDeps {
         skill_manager: Arc::new(SkillManager::with_paths(Vec::new())),
         rag: None,
+        gate: Arc::new(ApprovalGate::default()),
+        event_tx: None,
     }
 }
 
@@ -292,6 +298,8 @@ fn rag_deps(rag: Arc<ScopingFakeRag>) -> LocalToolDeps {
     LocalToolDeps {
         skill_manager: Arc::new(SkillManager::with_paths(Vec::new())),
         rag: Some(rag),
+        gate: Arc::new(ApprovalGate::default()),
+        event_tx: None,
     }
 }
 

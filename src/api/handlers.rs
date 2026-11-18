@@ -11,6 +11,7 @@ use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::mcp::McpServerRegistry;
 use crate::services::agent_registry::AgentRegistry;
+use crate::services::approval::ApprovalGate;
 use crate::services::provider_stack::ProviderStack;
 use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
@@ -62,6 +63,11 @@ pub struct AppState {
     /// Last known router reachability, set by the ladder. Deliberately not a live
     /// probe: `health()` already probes the provider on every call.
     pub router_healthy: AtomicBool,
+    /// Human-approval gate. Built once at boot and deliberately NOT part of the
+    /// hot-swapped `ProviderStack`: a TUI Apply rebuilds the engine and its
+    /// companions but must not drop pending decisions. A dropped request leaves
+    /// its pending in the gate until timeout (Fase 7 seeds a background reaper).
+    pub approval_gate: Arc<ApprovalGate>,
 }
 
 impl AppState {

@@ -139,6 +139,7 @@ fn engine() -> (RigAgentEngine, Arc<AtomicUsize>) {
         test_config(),
         Arc::new(SkillManager::new()),
         Arc::new(LocalToolRegistry::builtins()),
+        Arc::new(llama_r::services::approval::ApprovalGate::default()),
     );
     (engine, calls)
 }

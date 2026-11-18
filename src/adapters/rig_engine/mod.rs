@@ -1,6 +1,8 @@
 //! Rig.rs agent engine adapter (feature-gated wiring documented in ARCHITECTURE_PLAN).
 
 #[cfg(feature = "rig-engine")]
+pub mod approval;
+#[cfg(feature = "rig-engine")]
 pub mod builder;
 pub mod limits;
 pub mod local_tools;
@@ -17,6 +19,7 @@ use crate::ports::mcp::{McpCallRequest, McpClient, McpServerRegistry, McpToolDef
 use crate::ports::rag::RagStore;
 use crate::providers::capabilities::capabilities_for;
 use crate::providers::resolver::ResolvedModel;
+use crate::services::approval::ApprovalGate;
 use crate::services::skill_manager::SkillManager;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -216,6 +219,9 @@ pub struct RigAgentEngine {
     /// The local-tool catalog `prepare` filters by scope. Built at boot from
     /// `tools/*.toml`, with the two built-ins always present.
     pub local_tools: Arc<LocalToolRegistry>,
+    /// Human-approval gate. Owned by `AppState`, not by the hot-swapped stack:
+    /// a TUI Apply rebuilds the engine but must not drop pending decisions.
+    pub gate: Arc<ApprovalGate>,
 }
 
 impl RigAgentEngine {
@@ -231,6 +237,7 @@ impl RigAgentEngine {
         config: Config,
         skill_manager: Arc<SkillManager>,
         local_tools: Arc<LocalToolRegistry>,
+        gate: Arc<ApprovalGate>,
     ) -> Self {
         Self::from_target(
             EngineTarget::Ollama {
@@ -241,6 +248,7 @@ impl RigAgentEngine {
             config,
             skill_manager,
             local_tools,
+            gate,
         )
     }
 
@@ -258,6 +266,7 @@ impl RigAgentEngine {
         config: Config,
         skill_manager: Arc<SkillManager>,
         local_tools: Arc<LocalToolRegistry>,
+        gate: Arc<ApprovalGate>,
     ) -> Self {
         Self::from_target(
             EngineTarget::OpenRouter {
@@ -271,6 +280,7 @@ impl RigAgentEngine {
             config,
             skill_manager,
             local_tools,
+            gate,
         )
     }
 
@@ -285,6 +295,7 @@ impl RigAgentEngine {
         config: Config,
         skill_manager: Arc<SkillManager>,
         local_tools: Arc<LocalToolRegistry>,
+        gate: Arc<ApprovalGate>,
     ) -> Self {
         Self {
             target,
@@ -293,6 +304,7 @@ impl RigAgentEngine {
             config,
             skill_manager,
             local_tools,
+            gate,
         }
     }
 
@@ -382,10 +394,15 @@ impl RigAgentEngine {
         {
             let target = self.target_for_request(&req)?;
             // The engine owns the executors' companions; each run clones them
-            // into the bridges built for that request.
+            // into the bridges built for that request. The non-streaming path
+            // has no event channel, so `event_tx` is `None`: an approval-gated
+            // tool is refused with a named error rather than faking an event
+            // that can never reach a human. HITL approval requires the SSE path.
             let deps = LocalToolDeps {
                 skill_manager: self.skill_manager.clone(),
                 rag: self.rag.clone(),
+                gate: self.gate.clone(),
+                event_tx: None,
             };
             match &target {
                 EngineTarget::Ollama { url } => {
@@ -481,9 +498,14 @@ impl RigAgentEngine {
         #[cfg(feature = "rig-engine")]
         {
             let target = self.target_for_request(&req)?;
+            // The caller's event channel is the one the SSE stream reads. A
+            // bridge awaiting approval emits `ApprovalRequired` on it, so the
+            // human sees the id/hash and can decide while the request stays open.
             let deps = LocalToolDeps {
                 skill_manager: self.skill_manager.clone(),
                 rag: self.rag.clone(),
+                gate: self.gate.clone(),
+                event_tx: Some(tx.clone()),
             };
             match &target {
                 EngineTarget::Ollama { url } => {
@@ -561,6 +583,10 @@ impl AgentEngine for RigAgentEngine {
         let rag = self.rag.clone();
         let skill_manager = self.skill_manager.clone();
         let local_tools = self.local_tools.clone();
+        // The gate is shared, not cloned into a new one: pending approvals from
+        // other requests must survive and must be decidable while this stream
+        // is open. AppState owns the single instance.
+        let gate = self.gate.clone();
         let timeout_secs = req.scope.timeout_secs.max(1);
 
         tokio::spawn(async move {
@@ -571,6 +597,7 @@ impl AgentEngine for RigAgentEngine {
                 config,
                 skill_manager,
                 local_tools,
+                gate,
             };
             // The timeout covers the whole stream lifecycle, not just a single
             // completion, and stays at the trait boundary as before.
