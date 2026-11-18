@@ -1,11 +1,11 @@
 # Llama-R: Personal AI Gateway
 
-Llama-R es un gateway AI personal escrito en Rust que se sitúa frente a Ollama y expone APIs unificadas para chatear con agentes especializados. Cada agente puede tener su propio prompt de sistema, contexto de proyecto, herramientas MCP, reglas de optimización y política de acceso RAG.
+Llama-R es un gateway AI personal escrito en Rust que se sitúa frente a un provider de LLM (Ollama por defecto, o `openrouter`, `opencode`, `openai-compatible`, `anthropic` y `gemini`) y expone APIs unificadas para chatear con agentes especializados. Cada agente puede tener su propio provider y modelo, prompt de sistema, contexto de proyecto, herramientas MCP, reglas de optimización y política de acceso RAG.
 
 ## Arquitectura
 
 ```
-Cliente HTTP/gRPC/MCP → Llama-R → Ollama
+Cliente HTTP/gRPC/MCP → Llama-R → Provider (Ollama por defecto, o uno de los cinco remotos)
                             ↓
                     AgentRegistry
                     ScopeBuilder
@@ -21,7 +21,7 @@ El runtime levanta tres servidores simultáneamente:
 ## Requisitos
 
 - Rust y Cargo
-- [Ollama](https://ollama.ai) ejecutándose localmente (por defecto `http://127.0.0.1:11434`)
+- Un provider accesible: [Ollama](https://ollama.ai) local para el valor por defecto (`http://127.0.0.1:11434`), o credenciales para OpenRouter/OpenCode/OpenAI-compatible/Anthropic/Gemini. El provider caído no impide el arranque: `/api/health` reporta `degraded` y se recupera solo.
 
 ## Configuración rápida
 
@@ -38,33 +38,58 @@ En el primer arranque, si falta `DEFAULT_MODEL`, Llama-R abre un setup interacti
 | Variable | Default | Descripción |
 |---|---|---|
 | `PORT` | `3000` | Puerto HTTP |
-| `PROVIDER` | `ollama` | Provider único para chat, enrutado y embeddings: `ollama` \| `openrouter` \| `opencode` |
-| `OLLAMA_URL` | `http://localhost:11434` | URL del provider Ollama (también fallback de embeddings con OpenCode) |
+| `PROVIDER` | `ollama` | Provider de arranque para chat, enrutado y embeddings: `ollama` \| `openrouter` \| `opencode` \| `openai-compatible` \| `anthropic` \| `gemini`. Un agente puede sobreescribirlo con su campo `provider` |
+| `OLLAMA_URL` | `http://localhost:11434` | URL de Ollama (también fallback de embeddings para providers sin endpoint propio: `opencode`, `anthropic`) |
 | `OPENROUTER_API_KEY` | — | Clave Bearer de OpenRouter; se guarda en `.env` (modo `0600`), nunca en URLs/logs/health/pantalla |
-| `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` | Base OpenAI-compatible para OpenRouter y el motor Rig |
+| `OPENAI_API_KEY` | — | Clave Bearer para `openai-compatible` (Groq/Mistral/DeepSeek/xAI/gateways propios) |
+| `ANTHROPIC_API_KEY` | — | Clave de Anthropic; viaja en la cabecera `x-api-key`, nunca en la URL |
+| `GEMINI_API_KEY` | — | Clave de Gemini; viaja en la cabecera `x-goog-api-key` (nunca `?key=` en la URL) |
+| `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` | Base OpenAI-compatible para OpenRouter y `openai-compatible` (este último no tiene default fijo) |
 | `OPENCODE_API_KEY` | — | Contraseña del servidor OpenCode (HTTP basic auth); misma regla de secreto que las demás claves |
 | `OPENCODE_URL` | `http://127.0.0.1:4096` | Origen de los endpoints generate/decisión de OpenCode |
 | `DEFAULT_MODEL` | — | Modelo por defecto (obligatorio) |
 | `LLAMA_R_DIR` | — | Directorio base override para datos |
 
+Las claves `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` y `GEMINI_API_KEY` son **nombres** de variables referenciados por los perfiles integrados de `providers.toml` (`api_key_env`); `Config::from_env` lee directamente `OPENROUTER_API_KEY`, `OPENCODE_API_KEY` y `OPENAI_BASE_URL`. Ninguna clave aparece en health, logs, URLs ni la TUI (los tests lo comprueban).
+
 ## Providers
 
-Una sola variable `PROVIDER` elige el upstream para **todos** los servicios (chat, router de decisión y, donde existe, embeddings); no se puede mezclar por servicio. Valores: `ollama` (por defecto), `openrouter` y `opencode`. Las credenciales viven en `.env` (modo `0600` en Unix) y nunca aparecen en URLs, logs, `/api/health` ni en la TUI. El provider se elige en el setup interactivo del primer arranque y se puede cambiar en caliente desde el modal Settings de la TUI (sobre el Dashboard): Apply persiste en `.env` y reconstruye el stack y sus companion services (motor, RAG) sin reiniciar. Salvedad: el embedder de ranking de skills del `context_enricher` conserva el valor que tenía al arrancar tras un Apply.
+`PROVIDER` elige el upstream de **arranque** para chat, router de decisión y (donde existe) embeddings; no se mezcla por servicio. Valores: `ollama` (por defecto), `openrouter`, `opencode`, `openai-compatible`, `anthropic` y `gemini` (un valor desconocido es un error de configuración que nombra los seis). **Cada agente puede sobreescribirlo**: la precedencia es `agent.provider` > `PROVIDER` global > `ollama` (y `agent.model` > `DEFAULT_MODEL`); `agent.provider` acepta un nombre canónico o un perfil de `providers.toml`. Las credenciales viven en `.env` (modo `0600` en Unix) y nunca aparecen en URLs, logs, `/api/health` ni en la TUI. El provider se elige en el setup interactivo del primer arranque y se puede cambiar en caliente desde el modal Settings de la TUI (sobre el Dashboard): Apply persiste en `.env` y reconstruye el stack, sus companion services (motor, RAG) **y el embedder de ranking de skills del `context_enricher`** sin reiniciar (la salvedad anterior ya no aplica). El modal Settings cicla los tres providers con motor en el arranque — Ollama / OpenRouter / OpenCode; `openai-compatible`, `anthropic` y `gemini` se seleccionan por `PROVIDER`/`providers.toml`.
 
-| Capacidad | Ollama | OpenRouter | OpenCode |
-|---|---|---|---|
-| Chat no-streaming | sí | sí | sí |
-| `stream: true` | sí | `501 Unavailable` | `501 Unavailable` |
-| Embeddings / RAG | sí | sí | no (salvo fallback Ollama) |
-| Router de decisión d1 | sí | sí | sí |
-| Motor de agentes (Rig) | `rig-core` ollama | `rig-core` openrouter (tools/RAG/MCP) | no |
+#### Perfiles `providers.toml`
 
-- **Streaming:** `stream: true` con OpenRouter u OpenCode devuelve `501 Unavailable`, también en peticiones con agente (`X-Project`/`X-Agent`), no solo en chat directo; solo Ollama hace streaming.
-- **Embeddings/RAG:** Ollama y OpenRouter tienen adaptador de embeddings; OpenCode no. Con `PROVIDER=opencode` y sin `OLLAMA_URL`, RAG queda desactivado y `/api/rag/*` responde un `501` explícito que nombra los embeddings (no un `500`). Si se define `OLLAMA_URL`, los embeddings de Ollama pueden servir de fallback para OpenCode.
-- **Router:** los tres providers tienen adaptador de decisión para el modelo d1. El enrutado sigue **desactivado por defecto** (`ROUTER_ENABLED=false`) y no cambia cuando está off.
-- **Motor de agentes:** Ollama usa `rig-core` ollama y OpenRouter usa `rig-core` openrouter, conservando herramientas, RAG y MCP. OpenCode no tiene motor: las peticiones con agente degradan a un chat directo del provider con un aviso explícito (tools/RAG/MCP no disponibles). Ese estado se reporta en `/api/health` como `provider.agent_engine: false` junto a `provider.agent_engine_reason`.
+Opcional, en el directorio base. Seis perfiles integrados (`ollama`, `openrouter`, `opencode`, `openai-compatible`, `anthropic`, `gemini`) existen siempre; el archivo solo sobrescribe los campos que especifica. Cada perfil acepta `type` (uno de los seis valores de `PROVIDER`), `base_url`, `api_key_env` (**nombre** de la variable de entorno con la clave, nunca la clave) y `timeout_ms` (default `30000`; `0` se rechaza). Un archivo ausente es correcto; uno malformado se registra como aviso y se usan los perfiles integrados. Ejemplo:
 
-`/api/health` expone el objeto `provider`: `{ "name", "embeddings": bool, "reason": null|string, "agent_engine": bool, "agent_engine_reason": null|string }`. Ningún campo contiene claves; `reason` nombra la carencia de embeddings y `agent_engine_reason` usa el mismo texto que el aviso de degradación del chat.
+```toml
+[providers.my-openai]
+type = "openai-compatible"
+base_url = "https://api.example.com/v1"
+api_key_env = "MY_OPENAI_KEY"   # nombre de la variable, no la clave
+timeout_ms = 30000
+```
+
+#### Matriz de capacidades
+
+El streaming y el uso de herramientas se deciden por la **capacidad del modelo resuelto** (`ModelCapabilities`, catálogo estático y conservador en `src/providers/capabilities.rs`), no por el nombre del provider. Un modelo desconocido o renombrado recibe todas las capacidades en `false`: nunca se asume nada. El catálogo actual marca los prefijos de Ollama con streaming + tools + embeddings; los de Anthropic, Gemini y OpenAI-compatible con streaming + tools + vision; OpenRouter con tools + embeddings pero sin streaming (501); y OpenCode sin ninguna.
+
+| Capacidad | Ollama | OpenRouter | OpenCode | OpenAI-compatible | Anthropic | Gemini |
+|---|---|---|---|---|---|---|
+| Chat no-streaming | sí | sí | sí | sí | sí | sí |
+| `stream: true` | sí | `501` | `501` | `501` (sin motor; ver nota\*) | `501` (sin motor; ver nota\*) | `501` (sin motor; ver nota\*) |
+| Embeddings / RAG | sí | sí | no (salvo fallback Ollama) | sí | no (salvo fallback Ollama) | sí |
+| Router de decisión d1 | sí (llama.cpp) | sí (nativo) | sí (nativo) | sí (llama.cpp) | sí (llama.cpp) | sí (llama.cpp) |
+| Motor de agentes (Rig) | `rig-core` ollama | `rig-core` openrouter (tools/RAG/MCP) | no | cliente nativo\* | cliente nativo\* | cliente nativo\* |
+
+\* Existen clientes Rig nativos para OpenAI-compatible, Anthropic y Gemini, pero el selector de arranque (`engine_target_for`) solo acopla motor a Ollama y OpenRouter. En los otros tres (y en OpenCode) las peticiones con agente degradan a un chat directo del provider con un aviso explícito de que tools/RAG/MCP no están disponibles; `/api/health` lo reporta como `provider.agent_engine: false` junto a `provider.agent_engine_reason`.
+
+- **Streaming:** los modelos marcados como `streaming: true` con motor acoplado emiten tokens finales progresivamente (Nivel-A: token final + completado; los eventos de herramienta aún no se mapean a SSE). Los adaptadores directos distintos de Ollama rechazan `chat_stream` con `501 Unavailable` antes de abrir conexión, así que un stream sin agente (o sin motor) sigue devolviendo 501 aunque el catálogo diga que el modelo puede hacer streaming. El descubrimiento de herramientas MCP se omite para modelos sin `tool_calling`.
+- **Embeddings/RAG:** Ollama, OpenRouter, OpenAI-compatible y Gemini tienen adaptador de embeddings; Anthropic y OpenCode no. Sin `OLLAMA_URL` como fallback, RAG queda desactivado y `/api/rag/*` responde un `501` explícito que nombra los embeddings (no un `500`). Con `OLLAMA_URL`, los embeddings de Ollama pueden servir de fallback.
+- **Fallback acotado:** si fallan el provider principal y su reintento con `DEFAULT_MODEL`, se prueba **un único** perfil siguiente usable (en orden determinista por nombre; se omiten perfiles sin credencial en su `api_key_env`). Nunca se recorre una cadena. `ChatResponse.served_by` nombra el perfil que respondió y `ChatResponse.usage` trae los tokens del upstream (`cost_usd` solo si hay precios en el catálogo, hoy ninguno). En streaming el failover solo ocurre al abrir el stream y un 501 deliberado no se reintenta.
+- **Router:** los seis providers pueden servir la decisión d1. Ollama, OpenAI-compatible, Anthropic y Gemini usan el `llama-server` aparte; OpenRouter y OpenCode tienen adaptadores nativos. El enrutado sigue **desactivado por defecto** (`ROUTER_ENABLED=false`) y no cambia cuando está off.
+
+`/api/health` expone el objeto `provider`: `{ "name", "embeddings": bool, "reason": null|string, "agent_engine": bool, "agent_engine_reason": null|string }` — sin claves. `reason` nombra la carencia de embeddings y `agent_engine_reason` usa el mismo texto que el aviso de degradación del chat. (`usage` y `served_by` pertenecen a la respuesta de chat, no a health.)
+
+El smoke multi-provider se ejecuta con `cargo test --test provider_eval_smoke` (modo fixture por defecto, sin clave ni red real).
 
 ## CLI
 
@@ -229,6 +254,10 @@ Los agentes se definen en archivos TOML editables. Campos principales:
 
 ```toml
 name = "MiAgente"
+# Opcional: sobreescribe el PROVIDER global para este agente.
+# Acepta un nombre canónico (ollama | openrouter | opencode |
+# openai-compatible | anthropic | gemini) o un perfil de providers.toml.
+provider = "anthropic"
 model = "llama3.2"
 system_prompt = "Eres un asistente experto en..."
 description = "Descripción para UIs y MCP"
@@ -336,6 +365,7 @@ Navegación con teclas: `Tab` entre paneles, `Enter` para editar.
 cargo check
 cargo fmt
 cargo test --target-dir target-tests
+cargo test --test provider_eval_smoke   # smoke multi-provider (fixture, sin red)
 ```
 
 ## Instalación
@@ -377,6 +407,8 @@ cargo run -- <comando>
 │               └── context.md
 ├── mcp-servers/                # Config MCP
 │   └── *.toml
+├── providers.toml              # Perfiles de provider (opcional)
+├── router.toml                 # Ajustes del router (opcional)
 └── logs/
     └── llama-r.log.YYYY-MM-DD
 ```
