@@ -1,7 +1,9 @@
 use crate::adapters::rig_engine::limits::ToolCallBudget;
+use crate::adapters::rig_engine::local_tools::LocalToolBridge;
 use crate::adapters::rig_engine::tools::McpToolBridge;
-use crate::adapters::rig_engine::ScopedMcpTool;
+use crate::adapters::rig_engine::ScopedTool;
 use crate::domain::models::ChatMessage;
+use crate::domain::scope::AgentScope;
 use crate::ports::engine::{AgentRunEvent, AgentRunRequest, AgentRunResult};
 use futures::StreamExt;
 use rig_core::agent::{Agent, MultiTurnStreamItem, Text};
@@ -57,7 +59,7 @@ async fn run_agent<C, M>(
     model_name: &str,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
 ) -> Result<AgentRunResult, String>
 where
     C: CompletionClient<CompletionModel = M>,
@@ -77,7 +79,7 @@ async fn run_agent_with_max_tokens<C, M>(
     model_name: &str,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
     max_tokens: u64,
 ) -> Result<AgentRunResult, String>
 where
@@ -85,6 +87,28 @@ where
     M: CompletionModel + 'static,
 {
     run_agent_inner(client, model_name, req, system, tools, Some(max_tokens)).await
+}
+
+/// Wrap one run's scoped tools in their `ToolDyn` bridges. MCP and local tools
+/// get *the same* `Arc<Mutex<ToolCallBudget>>`, so a run has one tool-call
+/// allowance no matter which kind of tool spends it.
+pub fn build_tool_bridges(
+    tools: Vec<ScopedTool>,
+    scope: &AgentScope,
+    budget: Arc<Mutex<ToolCallBudget>>,
+) -> Vec<Box<dyn ToolDyn>> {
+    tools
+        .into_iter()
+        .map(|t| match t {
+            ScopedTool::Mcp(mcp) => {
+                Box::new(McpToolBridge::new(mcp, budget.clone())) as Box<dyn ToolDyn>
+            }
+            ScopedTool::Local(local) => {
+                Box::new(LocalToolBridge::new(local, scope.clone(), budget.clone()))
+                    as Box<dyn ToolDyn>
+            }
+        })
+        .collect()
 }
 
 /// Build a configured Rig agent, shared verbatim by the blocking and the
@@ -98,7 +122,8 @@ fn build_agent<C, M>(
     client: &C,
     model_name: &str,
     system: &str,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
+    scope: &AgentScope,
     budget: Arc<Mutex<ToolCallBudget>>,
     max_iterations: usize,
     temperature: Option<f64>,
@@ -121,13 +146,7 @@ where
         }
         builder.build()
     } else {
-        let rig_tools: Vec<Box<dyn ToolDyn>> = tools
-            .into_iter()
-            .map(|t| {
-                let bridge = McpToolBridge::new(t, budget.clone());
-                Box::new(bridge) as Box<dyn ToolDyn>
-            })
-            .collect();
+        let rig_tools = build_tool_bridges(tools, scope, budget);
         let mut builder = client
             .agent(model_name)
             .preamble(system)
@@ -148,7 +167,7 @@ async fn run_agent_inner<C, M>(
     model_name: &str,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
     max_tokens: Option<u64>,
 ) -> Result<AgentRunResult, String>
 where
@@ -164,6 +183,7 @@ where
         model_name,
         &system,
         tools,
+        &req.scope,
         budget.clone(),
         max_iterations,
         temperature,
@@ -206,7 +226,7 @@ pub async fn run_agent_stream<C, M>(
     model_name: &str,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
     tx: &mpsc::Sender<AgentRunEvent>,
     max_tokens: Option<u64>,
 ) -> Result<(), String>
@@ -223,6 +243,7 @@ where
         model_name,
         &system,
         tools,
+        &req.scope,
         budget.clone(),
         max_iterations,
         temperature,
@@ -271,7 +292,7 @@ pub async fn run_with_rig(
     ollama_url: &str,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
 ) -> Result<AgentRunResult, String> {
     let client = ollama::Client::builder()
         .api_key(Nothing)
@@ -302,7 +323,7 @@ pub async fn run_with_openrouter(
     base_url: Option<&str>,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
 ) -> Result<AgentRunResult, String> {
     let client = match base_url {
         Some(url) => openrouter::Client::builder()
@@ -345,7 +366,7 @@ pub async fn run_with_openai_compatible(
     base_url: Option<&str>,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
 ) -> Result<AgentRunResult, String> {
     let client = match base_url {
         Some(url) => openai::CompletionsClient::builder()
@@ -379,7 +400,7 @@ pub async fn run_with_anthropic(
     base_url: Option<&str>,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
 ) -> Result<AgentRunResult, String> {
     let client = match base_url {
         Some(url) => anthropic::Client::builder()
@@ -421,7 +442,7 @@ pub async fn run_with_gemini(
     base_url: Option<&str>,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
 ) -> Result<AgentRunResult, String> {
     let client = match base_url {
         Some(url) => gemini::InteractionsClient::builder()
@@ -449,7 +470,7 @@ pub async fn stream_with_rig(
     ollama_url: &str,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
     tx: &mpsc::Sender<AgentRunEvent>,
 ) -> Result<(), String> {
     let client = ollama::Client::builder()
@@ -482,7 +503,7 @@ pub async fn stream_with_openai_compatible(
     base_url: Option<&str>,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
     tx: &mpsc::Sender<AgentRunEvent>,
 ) -> Result<(), String> {
     let client = match base_url {
@@ -513,7 +534,7 @@ pub async fn stream_with_anthropic(
     base_url: Option<&str>,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
     tx: &mpsc::Sender<AgentRunEvent>,
 ) -> Result<(), String> {
     let client = match base_url {
@@ -554,7 +575,7 @@ pub async fn stream_with_gemini(
     base_url: Option<&str>,
     req: AgentRunRequest,
     system: String,
-    tools: Vec<ScopedMcpTool>,
+    tools: Vec<ScopedTool>,
     tx: &mpsc::Sender<AgentRunEvent>,
 ) -> Result<(), String> {
     let client = match base_url {

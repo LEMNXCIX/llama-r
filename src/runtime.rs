@@ -1076,7 +1076,20 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
 
     #[cfg(feature = "rig-engine")]
     let agent_runtime = {
-        use crate::adapters::rig_engine::{engine_target_for, RigAgentEngine};
+        use crate::adapters::rig_engine::{
+            engine_target_for, local_tools::LocalToolRegistry, RigAgentEngine,
+        };
+
+        // The registry is loaded once at boot (and again on a settings Apply):
+        // a malformed `tools/*.toml` is a path-naming config error the operator
+        // should see, but it is never fatal — the built-ins always exist.
+        let local_tools = Arc::new(match LocalToolRegistry::load() {
+            Ok(registry) => registry,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to load local tool manifests; falling back to the built-ins");
+                LocalToolRegistry::builtins()
+            }
+        });
 
         let engine_target = engine_target_for(config);
         stack.engine_target = engine_target.as_ref().map(|target| target.kind());
@@ -1086,6 +1099,8 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
                 handles.mcp_registry.clone(),
                 rag_store.clone(),
                 config.clone(),
+                handles.skill_manager.clone(),
+                local_tools.clone(),
             ));
             Arc::new(AgentRuntime {
                 registry: handles.agent_registry.clone(),

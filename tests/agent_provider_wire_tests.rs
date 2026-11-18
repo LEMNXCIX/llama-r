@@ -10,6 +10,7 @@
 #![allow(clippy::await_holding_lock)] // the env lock is held for the whole test by design
 
 use llama_r::adapters::mcp::StaticMcpRegistry;
+use llama_r::adapters::rig_engine::local_tools::LocalToolRegistry;
 use llama_r::adapters::rig_engine::{engine_target_for, RigAgentEngine};
 use llama_r::config::{Config, ProviderKind};
 use llama_r::context::analyzer::ContextEnricher;
@@ -186,6 +187,8 @@ fn boot_ollama_runtime(config: &Config, base_dir: &std::path::Path, agent: &str)
         Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
         None,
         config.clone(),
+        Arc::new(SkillManager::new()),
+        Arc::new(LocalToolRegistry::builtins()),
     );
     let enricher = ContextEnricher::new(
         Arc::new(ContextStore::new()),

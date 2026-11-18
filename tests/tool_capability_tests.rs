@@ -7,7 +7,8 @@
 //! and capture the warning an operator sees when tools vanish.
 
 use async_trait::async_trait;
-use llama_r::adapters::rig_engine::RigAgentEngine;
+use llama_r::adapters::rig_engine::local_tools::LocalToolRegistry;
+use llama_r::adapters::rig_engine::{RigAgentEngine, ScopedTool};
 use llama_r::config::{Config, ProviderKind};
 use llama_r::domain::agent::{Agent, AgentConfig, RagWritePolicy};
 use llama_r::domain::scope::{AgentScope, ToolsAllow};
@@ -16,6 +17,7 @@ use llama_r::ports::mcp::{
     filter_tools_for_scope, McpCallRequest, McpCallResult, McpClient, McpServerRegistry, McpToolDef,
 };
 use llama_r::providers::capabilities::{capabilities_for, ModelCapabilities};
+use llama_r::services::skill_manager::SkillManager;
 use std::collections::HashSet;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -134,6 +136,8 @@ fn engine() -> (RigAgentEngine, Arc<AtomicUsize>) {
         Arc::new(registry),
         None,
         test_config(),
+        Arc::new(SkillManager::new()),
+        Arc::new(LocalToolRegistry::builtins()),
     );
     (engine, calls)
 }
@@ -143,7 +147,14 @@ fn prepare_blocking(engine: &RigAgentEngine, req: &AgentRunRequest) -> (Vec<Stri
         .build()
         .unwrap();
     let (tools, system) = rt.block_on(async { engine.prepare(req).await.unwrap() });
-    (tools.into_iter().map(|t| t.def.name).collect(), system)
+    let names = tools
+        .into_iter()
+        .map(|t| match t {
+            ScopedTool::Mcp(mcp) => mcp.def.name,
+            ScopedTool::Local(local) => local.id,
+        })
+        .collect();
+    (names, system)
 }
 
 /// The central behaviour: a model whose catalog says `tool_calling: false`

@@ -3,9 +3,11 @@
 #[cfg(feature = "rig-engine")]
 pub mod builder;
 pub mod limits;
+pub mod local_tools;
 #[cfg(feature = "rig-engine")]
 pub mod tools;
 
+use crate::adapters::rig_engine::local_tools::{LocalTool, LocalToolRegistry};
 use crate::config::{Config, ProviderKind, OPENROUTER_BASE_URL};
 use crate::domain::scope::AgentScope;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
@@ -13,6 +15,7 @@ use crate::ports::mcp::{McpCallRequest, McpClient, McpServerRegistry, McpToolDef
 use crate::ports::rag::RagStore;
 use crate::providers::capabilities::capabilities_for;
 use crate::providers::resolver::ResolvedModel;
+use crate::services::skill_manager::SkillManager;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
@@ -176,6 +179,22 @@ impl ScopedMcpTool {
     }
 }
 
+/// A tool that survived scope filtering, ready to be wrapped in a `ToolDyn`
+/// bridge. Both variants carry only public, scope-safe data; the bridges are
+/// built per run in `builder::build_agent` and share one `ToolCallBudget`.
+///
+/// The MCP variant is intentionally unboxed: the catalog shape is part of this
+/// task's interface, and one scoped tool per run is short-lived, so a heap hop
+/// would buy nothing here.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "interface pins Mcp(ScopedMcpTool); one short-lived tool per run, boxing buys nothing"
+)]
+pub enum ScopedTool {
+    Mcp(ScopedMcpTool),
+    Local(LocalTool),
+}
+
 /// Engine implementation backed by a rig-core completion provider. The target
 /// decides which provider that is; the Ollama-only original was hardwired to
 /// `rig_core::providers::ollama`, which made an agent-scoped chat on another
@@ -190,15 +209,26 @@ pub struct RigAgentEngine {
     /// Holds credentials, so it is never logged, formatted or exposed through a
     /// `Debug` derive: use `target_kind()` for any non-secret diagnostic.
     pub config: Config,
+    /// Loads a skill's `SKILL.md` when the model calls `llama_r__skill`.
+    pub skill_manager: Arc<SkillManager>,
+    /// The local-tool catalog `prepare` filters by scope. Built at boot from
+    /// `tools/*.toml`, with the two built-ins always present.
+    pub local_tools: Arc<LocalToolRegistry>,
 }
 
 impl RigAgentEngine {
     /// Ergonomic Ollama constructor, kept for existing call sites.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "companions are injected explicitly, as with `config` in the Fase-1 constructor change"
+    )]
     pub fn new(
         ollama_url: impl Into<String>,
         mcp_registry: Arc<dyn McpServerRegistry>,
         rag: Option<Arc<dyn RagStore>>,
         config: Config,
+        skill_manager: Arc<SkillManager>,
+        local_tools: Arc<LocalToolRegistry>,
     ) -> Self {
         Self::from_target(
             EngineTarget::Ollama {
@@ -207,17 +237,25 @@ impl RigAgentEngine {
             mcp_registry,
             rag,
             config,
+            skill_manager,
+            local_tools,
         )
     }
 
     /// Build an engine targeting OpenRouter. `base_url` overrides the default
     /// endpoint for a compatible gateway; `None` uses rig-core's default.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "companions are injected explicitly, as with `config` in the Fase-1 constructor change"
+    )]
     pub fn with_openrouter(
         api_key: impl Into<String>,
         base_url: Option<impl Into<String>>,
         mcp_registry: Arc<dyn McpServerRegistry>,
         rag: Option<Arc<dyn RagStore>>,
         config: Config,
+        skill_manager: Arc<SkillManager>,
+        local_tools: Arc<LocalToolRegistry>,
     ) -> Self {
         Self::from_target(
             EngineTarget::OpenRouter {
@@ -229,20 +267,30 @@ impl RigAgentEngine {
             mcp_registry,
             rag,
             config,
+            skill_manager,
+            local_tools,
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "companions are injected explicitly, as with `config` in the Fase-1 constructor change"
+    )]
     pub fn from_target(
         target: EngineTarget,
         mcp_registry: Arc<dyn McpServerRegistry>,
         rag: Option<Arc<dyn RagStore>>,
         config: Config,
+        skill_manager: Arc<SkillManager>,
+        local_tools: Arc<LocalToolRegistry>,
     ) -> Self {
         Self {
             target,
             mcp_registry,
             rag,
             config,
+            skill_manager,
+            local_tools,
         }
     }
 
@@ -255,25 +303,34 @@ impl RigAgentEngine {
     pub async fn prepare(
         &self,
         req: &AgentRunRequest,
-    ) -> Result<(Vec<ScopedMcpTool>, String), String> {
+    ) -> Result<(Vec<ScopedTool>, String), String> {
         let scope = &req.scope;
 
         // Tool discovery is gated on the capability of the model resolved for
         // *this* request. A model that cannot call tools (OpenCode, an unknown
         // or renamed model, …) must not be handed a tool it cannot use; skip
         // discovery entirely and say why, so the empty tool list is explainable
-        // to an operator instead of looking like an empty MCP registry.
-        let mut tools = Vec::new();
+        // to an operator instead of looking like an empty MCP registry. The gate
+        // sits above BOTH producers: a non-tool model sees no MCP and no local
+        // tools, with the same warning.
+        let mut tools: Vec<ScopedTool> = Vec::new();
         if req.capabilities.tool_calling {
             let tool_defs = self.mcp_registry.discover_scoped_tools(scope).await?;
-            tools.reserve(tool_defs.len());
+            tools.reserve(tool_defs.len() + self.local_tools.tools().len());
             for def in tool_defs {
                 let client = self.mcp_registry.client_for(&def.server_id).await?;
-                tools.push(ScopedMcpTool {
+                tools.push(ScopedTool::Mcp(ScopedMcpTool {
                     def,
                     client,
                     scope: scope.clone(),
-                });
+                }));
+            }
+            // Deny-all by default: a registered tool is not an offered tool.
+            // The bridge re-checks this same predicate on every invocation.
+            for local in self.local_tools.tools() {
+                if scope.allows_local_tool(&local.id) {
+                    tools.push(ScopedTool::Local(local.clone()));
+                }
             }
         } else {
             tracing::warn!(
@@ -483,6 +540,8 @@ impl AgentEngine for RigAgentEngine {
         let config = self.config.clone();
         let mcp_registry = self.mcp_registry.clone();
         let rag = self.rag.clone();
+        let skill_manager = self.skill_manager.clone();
+        let local_tools = self.local_tools.clone();
         let timeout_secs = req.scope.timeout_secs.max(1);
 
         tokio::spawn(async move {
@@ -491,6 +550,8 @@ impl AgentEngine for RigAgentEngine {
                 mcp_registry,
                 rag,
                 config,
+                skill_manager,
+                local_tools,
             };
             // The timeout covers the whole stream lifecycle, not just a single
             // completion, and stays at the trait boundary as before.

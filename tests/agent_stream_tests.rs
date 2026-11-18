@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 use llama_r::adapters::mcp::StaticMcpRegistry;
+use llama_r::adapters::rig_engine::local_tools::LocalToolRegistry;
 use llama_r::adapters::rig_engine::{EngineTarget, RigAgentEngine};
 use llama_r::api::chat_core::execute_chat_stream;
 use llama_r::api::handlers::AppState;
@@ -197,6 +198,8 @@ async fn collect_engine_stream() -> (Vec<String>, Option<AgentRunResult>) {
         Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
         None,
         test_config(&server.url()),
+        Arc::new(SkillManager::new()),
+        Arc::new(LocalToolRegistry::builtins()),
     );
     let mut rx = engine
         .run_stream(run_request("llama3.2", ProviderKind::Ollama))
