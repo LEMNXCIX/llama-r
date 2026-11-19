@@ -161,6 +161,19 @@ mod tests {
     }
 
     #[test]
+    fn trace_redaction_never_restores_a_string_secret_under_counter_keys() {
+        // The numeric-counter exception must be gated on `is_number()`: a
+        // string under the same key is a credential and stays redacted.
+        let payload = json!({
+            "input_tokens": "sk-leak-input",
+            "output_tokens": "sk-leak-output"
+        });
+        let out = redact_trace_payload(&payload);
+        assert_eq!(out["input_tokens"], REDACTED_MARKER);
+        assert_eq!(out["output_tokens"], REDACTED_MARKER);
+    }
+
+    #[test]
     fn args_hash_is_deterministic_for_reordered_keys() {
         let a = json!({"b": 2, "a": {"y": 1, "x": 0}});
         let b = json!({"a": {"x": 0, "y": 1}, "b": 2});
