@@ -331,6 +331,40 @@ enabled = true
 
 Solo servidores `enabled = true` se cargan. Si un agente referencia un servidor desconocido en `mcp_sources`, se emite una advertencia pero no se bloquea la carga.
 
+Las conexiones tipadas añaden tres campos opcionales (todos con default, los perfiles v1 cargan igual): `headers = [["X-Tenant", "$MI_VAR"]]` (un valor `$VAR` se resuelve del entorno al construir el cliente), `auth = "bearer" | "basic" | "none"` (por defecto `bearer`, `none` hay que pedirlo explícitamente) y `auth_user_env` (nombre de la variable con el usuario Basic; la contraseña sigue viniendo de `auth_env`). Los secretos nunca van en el TOML: solo nombres de variables. Las cabeceras de la conexión se aplican **después** de las del modelo/request y la autenticación se inserta la última, así que un `Authorization` falso enviado como argumento no puede sobrescribir la credencial configurada. `transport = "openapi"` toma en `url` la ruta a un spec JSON OpenAPI 3.x / Swagger 2.0 y expone cada operación como tool; un spec inválido se advierte y se omite sin detener el arranque.
+
+### Aprobación humana (HITL)
+
+Un agente puede exigir aprobación antes de ejecutar ciertas herramientas con una política declarativa en su TOML:
+
+```toml
+mcp_sources = ["fudi"]
+tools_override = ["*"]
+
+[policy]
+connections_allow = ["fudi"]
+
+[[policy.approvals]]
+tool_pattern = "fudi__drop*"   # server__tool para MCP; id pelado para una tool local
+policy = "always"              # never | once | always | auto
+```
+
+`tool_pattern` es un glob simple (`*` = cualquier secuencia, resto literal, toda la cadena) y **gana la primera regla que coincide**; sin coincidencia el default es `never` (sin aprobación). Hoy `auto` equivale a `always` — no hay modelo de decisión (Fase 6) y no hay supresión de `once` tras el primer uso, así que ninguno aprueba automáticamente. Sin reglas, ninguna tool pide aprobación.
+
+La tool se bloquea hasta que alguien decide, con un `approval_id` (UUID) ligado al `args_hash` (SHA-256 de los argumentos canónicos). El presupuesto de llamadas **no se carga mientras espera**: una negativa, expiración o cambio de argumentos no gasta nada. El timeout por defecto es 120 s. En un chat con streaming llega un evento SSE con el campo `approval` (`id`, `tool_name`, `args_hash`; sin argumentos en crudo). Sin streaming, el cliente descubre el pendiente sondeando `GET /api/approvals` y decide con `POST /api/approvals/:id`:
+
+```bash
+# Ver pendientes (argumentos con campos sensibles redactados como [REDACTED]):
+curl -s http://127.0.0.1:3000/api/approvals
+
+# Aprobar o denegar; args_hash es opcional (si se omite se usa el hash guardado):
+curl -s -X POST http://127.0.0.1:3000/api/approvals/<approval_id> \
+  -H 'Content-Type: application/json' \
+  -d '{"approve": true}'
+```
+
+Errores: `400` hash malo/distinto, `404` id desconocido, `409` ya decidida, `410` expirada. Estos endpoints **no** requieren `X-Debug` (son la respuesta humana, no una vista de administración) y todavía no tienen identidad de usuario (Fase 7). Las aprobaciones **no sobreviven a un reinicio** (Fase 7, ejecución durable), pero sí a un cambio de provider en caliente desde la TUI.
+
 ## Contexto de proyecto
 
 El `ProjectContext` se genera automáticamente via LLM:

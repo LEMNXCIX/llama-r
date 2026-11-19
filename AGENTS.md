@@ -250,6 +250,14 @@ GET  /api/mcp
 POST /api/mcp
 ```
 
+### Approval (human-in-the-loop — no `X-Debug` required)
+```text
+GET  /api/approvals
+POST /api/approvals/:id
+```
+
+`GET /api/approvals` lists undecided pending approvals (`id`, `tool_name`, `args`, `created_at`), with secret-bearing argument fields redacted. `POST /api/approvals/:id` takes `{"approve": bool, "args_hash"?: "<64-hex>"}` and unblocks the waiting tool call; omitting `args_hash` still binds the decision to the hash on file. Errors: `400` malformed/mismatched hash, `404` unknown id, `409` already decided, `410` expired. Unlike the RAG/Router admin endpoints these are **not** behind `X-Debug`: they are how a human answers a live approval, not an admin view. There is no user identity on the endpoint yet (Fase 7 adds auth), so any caller that can reach the API can list and decide. No persistence across restart (Fase 7 durable execution). See "Connections, permissions and human approval" for the full flow.
+
 ### RAG (debug/admin — requires `X-Debug: true`)
 ```text
 POST /api/rag/ingest
@@ -279,6 +287,7 @@ cargo test --test provider_eval_smoke
 
 ## Storage Layout
 - `agents/`: editable global agent TOML files
+- `mcp-servers/` (optional): one `*.toml` per external connection. The classic fields are `id`, `transport` (`http` | `sse`/`streaming` | `stdio` | `openapi`), `url`, `command`/`args` (stdio), `timeout_secs`, `tool_namespace`, `enabled`, and `auth_env` (the **name** of the env var holding the credential, never the secret). Typed-connection fields: `headers` (array of `[name, value]` pairs; a `$VAR` value is resolved from the environment at build time), `auth` (`bearer` | `basic` | `none`, defaults to `bearer` so a v1 config with only `auth_env` keeps working; `none` must be explicit), and `auth_user_env` (env var name for the Basic username; the password still comes from `auth_env`). All new fields are `#[serde(default)]`, so v1 manifests load unchanged. With `transport = "openapi"`, `url` is a path to a JSON OpenAPI 3.x / Swagger 2.0 spec (see "Connections, permissions and human approval" below).
 - `tools/` (optional): local tool manifests, one `*.toml` per file (`type` = `builtin:skill` or `rag_query`, plus `id`, `description`, `input_schema`, `source_id`); overlays the two built-ins, malformed files are warned about and ignored at boot
 - `contextos/projects/<project_id>/agents/`: project-scoped agent TOML files
 - `contextos/projects/<project_id>/context/`: saved generated context
@@ -327,6 +336,30 @@ cargo test --test provider_eval_smoke
 - On engine failure, requests fall back to legacy Ollama chat
 - Direct model requests (no agent resolved) always use the legacy provider path
 - Source modules: `src/adapters/rig_engine/` (`builder.rs`, `tools.rs`, `limits.rs`, `local_tools.rs`)
+
+## Connections, permissions and human approval
+
+Three capabilities added around the agent engine; all three are opt-in through config and change nothing for a v1 manifest that does not use them.
+
+### Connections (`mcp-servers/*.toml`)
+
+- `McpServerConfig` (`src/adapters/mcp/registry.rs`) gained `headers`, `auth` and `auth_user_env`, all `#[serde(default)]` so existing profiles load unchanged. Credentials stay **env var names** (`auth_env`, `auth_user_env`, or `$VAR` inside a header value), never values in TOML. `auth` is `bearer` (the default), `basic` (username from `auth_user_env`, password from `auth_env`) or `none` (explicit only). A missing `$VAR` is skipped with a warning naming only the variable, never a secret; boot continues.
+- **Auth cannot be spoofed.** `apply_connection_headers` (`src/adapters/mcp/http.rs`) inserts custom headers first and the connection's `Authorization` last with `HeaderMap::insert`, leaving exactly one value: a header supplied by a caller (e.g. an OpenAPI `Authorization` header parameter coming from tool arguments) can never override or append to the configured credential. `OpenApiConnection`'s `Debug` redacts resolved header values, so an API key from `$VAR` is not printed in logs.
+- **`transport = "openapi"`** turns a JSON OpenAPI 3.x or Swagger 2.0 spec into MCP tools (`src/adapters/mcp/openapi.rs`): `paths` with `get`/`post`/`put`/`patch`/`delete`, path/query/header parameters and an optional JSON request body. It is a small parser, not a validator. An unreadable, invalid or unsupported spec is a **warning naming the path** and the connection is skipped — boot is never blocked by one bad spec.
+
+### Permission policy
+
+- An agent's `[policy]` table is compiled into `AgentScope.permission` by `ScopeBuilder` (`src/domain/policy.rs`, `src/services/scope_builder.rs`). It has `connections_allow` (declarative list of connection ids; actual tool visibility is still enforced by `mcp_sources`/`tools_override`/`allows_tool`, so a v1 manifest keeps exactly its old behavior) and ordered `[[policy.approvals]]` rules `{ tool_pattern, policy }`.
+- `tool_pattern` is a simple glob over the qualified tool name — `server__tool` for an MCP tool (`rig_tool_name`), or the bare id for a local tool. `*` matches any run of characters; everything else is literal; the whole string must match, case-sensitively. **First matching rule wins**, not the most specific; with no match the default is `Never`, which allows. `PermissionEngine::authorize` is a pure function (no I/O, no runtime), tested in `tests/permission_tests.rs`. **No tool requires approval by default.**
+- `ApprovalPolicy` is `Never` (execute without asking; the default), `Once`, `Always` or `Auto`. In this phase `Once` and **`Auto` both behave exactly like `Always`**: `Auto`'s automatic decision model is Fase 6 and there is no "first use only" suppression yet, so neither is a silent automatic approval. All three block the first call in the pure engine.
+
+### Human-in-the-loop approval
+
+- A single `ApprovalGate` (`src/services/approval.rs`) lives on `AppState`. A Settings Apply rebuilds the engine from the same `Arc`, so a pending decision survives a hot provider swap; it is **not persisted across restart** (Fase 7 durable execution). The timeout is 120 s by default (`DEFAULT_APPROVAL_TIMEOUT`), with a reaper on `request`/`decide` and no background task.
+- Flow: before dispatching a tool, the bridge calls `approval::authorize` (`src/adapters/rig_engine/approval.rs`). For an approval-ruled tool it registers a pending with a UUID `approval_id` and computes `args_hash` = SHA-256 over the canonical JSON of the exact args (`serde_json` sorts object keys), then **blocks the chat request** (long-poll in the same request). The decision is bound to what the human saw: a changed hash is rejected and the tool never runs.
+- Discovery differs by path: in a streaming chat the `ApprovalRequired` engine event maps to an SSE `ChatStreamEvent` whose optional `approval` field carries `{ id, tool_name, args_hash }` — raw args are deliberately absent from the stream. In a non-streaming chat there is no SSE channel, so the bridge still registers the pending and the client **polls `GET /api/approvals`** (there is no SSE id to hand it) and decides via `POST /api/approvals/:id`. `args_hash` may be omitted on the POST; the gate then uses its stored hash, still binding the decision to the exact args.
+- The wait is bounded: an undecided pending times out with a named tool error and the turn continues. `400` malformed/mismatched hash, `404` unknown id, `409` already decided, `410` expired. The shared tool-call budget is charged **only after approval succeeds** — a denial, expiry, hash mismatch or timeout spends no allowance.
+- `GET /api/approvals` redacts secret-bearing fields recursively (names containing `key`, `token`, `password`, `secret` or `authorization`, case-insensitively, including inside arrays) to `[REDACTED]`. No credential appears in the endpoints, logs, health or stream. The approval endpoints are not behind `X-Debug` and carry no user identity yet (Fase 7 auth). Source modules: `src/services/approval.rs`, `src/api/approval_api.rs`, `src/adapters/rig_engine/approval.rs`; end-to-end tests in `tests/approval_tests.rs`.
 
 ## Optimization tools
 
