@@ -15,6 +15,7 @@ use crate::adapters::rig_engine::local_tools::LocalToolDeps;
 use crate::adapters::rig_engine::local_tools::{LocalTool, LocalToolRegistry};
 use crate::config::{Config, ProviderKind, OPENROUTER_BASE_URL};
 use crate::domain::scope::AgentScope;
+use crate::ports::auto::AutoDecider;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
 use crate::ports::execution::ExecutionStore;
 use crate::ports::mcp::{McpCallRequest, McpClient, McpServerRegistry, McpToolDef};
@@ -224,6 +225,11 @@ pub struct RigAgentEngine {
     /// Human-approval gate. Owned by `AppState`, not by the hot-swapped stack:
     /// a TUI Apply rebuilds the engine but must not drop pending decisions.
     pub gate: Arc<ApprovalGate>,
+    /// Optional automatic-approval decider. Owned by `AppState`, like the gate,
+    /// so a settings Apply rebuilds the engine with the same `Auto` behaviour.
+    /// `None` (the default for direct/test constructors) means every `Auto`
+    /// tool keeps asking a human, as before Fase 6.
+    pub auto_decider: Option<Arc<dyn AutoDecider>>,
     /// Durable execution store behind the tool-call idempotency guard. Built
     /// once at boot and shared, like the approval gate, so a settings Apply
     /// cannot lose the record of completed operations. A no-op store is the
@@ -312,6 +318,7 @@ impl RigAgentEngine {
             skill_manager,
             local_tools,
             gate,
+            auto_decider: None,
             execution_store: Arc::new(crate::adapters::execution::NoOpExecutionStore),
         }
     }
@@ -321,6 +328,15 @@ impl RigAgentEngine {
     /// default; only the boot/Apply path needs durable operations.
     pub fn with_execution_store(mut self, store: Arc<dyn ExecutionStore>) -> Self {
         self.execution_store = store;
+        self
+    }
+
+    /// Install the boot-owned `Auto` decider. A setter (rather than another
+    /// constructor argument) keeps the many direct/test constructors unchanged:
+    /// only the boot/Apply path supplies one, so an engine built in a test
+    /// still routes every `Auto` tool to the human gate.
+    pub fn with_auto_decider(mut self, decider: Option<Arc<dyn AutoDecider>>) -> Self {
+        self.auto_decider = decider;
         self
     }
 
@@ -418,6 +434,7 @@ impl RigAgentEngine {
                 skill_manager: self.skill_manager.clone(),
                 rag: self.rag.clone(),
                 gate: self.gate.clone(),
+                auto_decider: self.auto_decider.clone(),
                 event_tx: None,
                 operations: operations::OperationContext::new(
                     req.execution_id,
@@ -525,6 +542,7 @@ impl RigAgentEngine {
                 skill_manager: self.skill_manager.clone(),
                 rag: self.rag.clone(),
                 gate: self.gate.clone(),
+                auto_decider: self.auto_decider.clone(),
                 event_tx: Some(tx.clone()),
                 operations: operations::OperationContext::new(
                     req.execution_id,
@@ -635,6 +653,7 @@ impl AgentEngine for RigAgentEngine {
         // other requests must survive and must be decidable while this stream
         // is open. AppState owns the single instance.
         let gate = self.gate.clone();
+        let auto_decider = self.auto_decider.clone();
         let execution_store = self.execution_store.clone();
         let timeout = effective_run_timeout(&req.scope, gate.timeout());
 
@@ -647,6 +666,7 @@ impl AgentEngine for RigAgentEngine {
                 skill_manager,
                 local_tools,
                 gate,
+                auto_decider,
                 execution_store,
             };
             // The timeout covers the whole stream lifecycle, not just a single
@@ -704,6 +724,7 @@ mod tests {
                 tool_pattern: "*".into(),
                 policy: ApprovalPolicy::Always,
             }],
+            auto_threshold: None,
         }
     }
 

@@ -33,6 +33,7 @@ fn test_deps() -> LocalToolDeps {
         skill_manager: Arc::new(SkillManager::with_paths(Vec::new())),
         rag: None,
         gate: Arc::new(ApprovalGate::default()),
+        auto_decider: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }

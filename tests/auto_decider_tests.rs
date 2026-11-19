@@ -298,3 +298,384 @@ async fn question_is_a_yes_no_choice_over_the_redacted_state() {
     }
     assert!(!req.state.contains("hunter2"), "password leaked into state");
 }
+
+// ---------------------------------------------------------------------------
+// Task 2: the gate seam. All of these drive the real `approval::authorize`
+// function; human-path cases resolve the pending from a background task so the
+// call never blocks on the gate's 120 s default timeout.
+// ---------------------------------------------------------------------------
+
+use llama_r::adapters::rig_engine::approval::authorize;
+use llama_r::domain::policy::{ApprovalPolicy, ApprovalRule, PermissionPolicy};
+use llama_r::ports::engine::AgentRunEvent;
+use llama_r::services::approval::{args_hash, ApprovalGate};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::mpsc;
+
+fn auto_policy(threshold: Option<f32>) -> PermissionPolicy {
+    PermissionPolicy {
+        auto_threshold: threshold,
+        approvals: vec![ApprovalRule {
+            tool_pattern: "*".into(),
+            policy: ApprovalPolicy::Auto,
+        }],
+        ..PermissionPolicy::default()
+    }
+}
+
+fn policy_with(policy: ApprovalPolicy) -> PermissionPolicy {
+    PermissionPolicy {
+        connections_allow: Vec::new(),
+        auto_threshold: None,
+        approvals: vec![ApprovalRule {
+            tool_pattern: "*".into(),
+            policy,
+        }],
+    }
+}
+
+/// One observed `should_allow` call: tool, redacted args, hash, threshold.
+type DeciderCall = (String, Value, String, f32);
+type CallLog = Arc<Mutex<Vec<DeciderCall>>>;
+
+/// A decider that records every call (tool, redacted args, hash, threshold) and
+/// returns a fixed verdict. Used to prove *which* threshold the gate passed and
+/// that a `Never`/`Always` tool never consults the decider at all.
+struct RecordingDecider {
+    verdict: AutoVerdict,
+    min_confidence: f32,
+    calls: CallLog,
+}
+
+#[async_trait]
+impl AutoDecider for RecordingDecider {
+    fn min_confidence(&self) -> f32 {
+        self.min_confidence
+    }
+
+    async fn should_allow(
+        &self,
+        tool_name: &str,
+        redacted_args: &Value,
+        args_hash_hex: &str,
+        threshold: f32,
+    ) -> AutoVerdict {
+        self.calls.lock().unwrap().push((
+            tool_name.to_string(),
+            redacted_args.clone(),
+            args_hash_hex.to_string(),
+            threshold,
+        ));
+        self.verdict
+    }
+}
+
+fn recorder(verdict: AutoVerdict, min_confidence: f32) -> (RecordingDecider, CallLog) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    (
+        RecordingDecider {
+            verdict,
+            min_confidence,
+            calls: calls.clone(),
+        },
+        calls,
+    )
+}
+
+/// Drive one gate call. A background task resolves any pending it sees through
+/// the event channel, so a human-path call returns promptly and we can assert
+/// that a pending really was registered.
+async fn authorize_with_human(
+    gate: &Arc<ApprovalGate>,
+    permission: &PermissionPolicy,
+    decider: Option<&dyn AutoDecider>,
+    tool: &str,
+    args: &Value,
+) -> (Result<(), String>, Arc<AtomicBool>) {
+    let (tx, mut rx) = mpsc::channel(4);
+    let seen = Arc::new(AtomicBool::new(false));
+    let gate2 = gate.clone();
+    let seen2 = seen.clone();
+    let expected = args.clone();
+    let resolver = tokio::spawn(async move {
+        if let Some(event) = rx.recv().await {
+            match event {
+                AgentRunEvent::ApprovalRequired { id, .. } => {
+                    seen2.store(true, Ordering::SeqCst);
+                    gate2.decide(id, true, args_hash(&expected)).unwrap();
+                }
+                _ => panic!("expected an ApprovalRequired event"),
+            }
+        }
+    });
+    let result = authorize(gate, Some(&tx), permission, tool, args, None, decider).await;
+    drop(tx);
+    let _ = resolver.await;
+    (result, seen)
+}
+
+#[tokio::test]
+async fn auto_yes_high_confidence_executes_without_a_pending() {
+    let (router, _seen) = fake_router(
+        Reply::Choice {
+            key: "yes",
+            confidence: 0.95,
+        },
+        false,
+    );
+    let decider = RouterAutoDecider::new(router, 0.6);
+    let gate = Arc::new(ApprovalGate::default());
+    let (result, human_seen) = authorize_with_human(
+        &gate,
+        &auto_policy(None),
+        Some(&decider),
+        "db__drop",
+        &json!({"table": "users"}),
+    )
+    .await;
+    assert!(result.is_ok(), "an affirmative decision lets the tool run");
+    assert!(
+        !human_seen.load(Ordering::SeqCst),
+        "no human approval expected"
+    );
+    assert!(
+        gate.list_pending().is_empty(),
+        "an auto-approved call must register no pending"
+    );
+}
+
+#[tokio::test]
+async fn auto_no_registers_a_pending() {
+    let (router, _seen) = fake_router(
+        Reply::Choice {
+            key: "no",
+            confidence: 0.95,
+        },
+        false,
+    );
+    let decider = RouterAutoDecider::new(router, 0.6);
+    let gate = Arc::new(ApprovalGate::default());
+    let (result, human_seen) = authorize_with_human(
+        &gate,
+        &auto_policy(None),
+        Some(&decider),
+        "db__drop",
+        &json!({"table": "users"}),
+    )
+    .await;
+    assert!(result.is_ok(), "the human approves, so the tool runs");
+    assert!(
+        human_seen.load(Ordering::SeqCst),
+        "a refusal must fall back to the human gate"
+    );
+}
+
+#[tokio::test]
+async fn auto_low_confidence_registers_a_pending() {
+    // 0.4 < 0.6 threshold: an affirmative label below the bar is a refusal.
+    let (router, _seen) = fake_router(
+        Reply::Choice {
+            key: "yes",
+            confidence: 0.4,
+        },
+        false,
+    );
+    let decider = RouterAutoDecider::new(router, 0.6);
+    let gate = Arc::new(ApprovalGate::default());
+    let (result, human_seen) = authorize_with_human(
+        &gate,
+        &auto_policy(None),
+        Some(&decider),
+        "db__drop",
+        &json!({"table": "users"}),
+    )
+    .await;
+    assert!(result.is_ok());
+    assert!(
+        human_seen.load(Ordering::SeqCst),
+        "low confidence must fall back to the human gate"
+    );
+}
+
+#[tokio::test]
+async fn auto_router_error_registers_a_pending() {
+    let (router, _seen) = fake_router(
+        Reply::Choice {
+            key: "yes",
+            confidence: 0.99,
+        },
+        true, // router unreachable
+    );
+    let decider = RouterAutoDecider::new(router, 0.6);
+    let gate = Arc::new(ApprovalGate::default());
+    let (result, human_seen) = authorize_with_human(
+        &gate,
+        &auto_policy(None),
+        Some(&decider),
+        "db__drop",
+        &json!({"table": "users"}),
+    )
+    .await;
+    assert!(result.is_ok());
+    assert!(
+        human_seen.load(Ordering::SeqCst),
+        "an unavailable router must fall back to the human gate"
+    );
+}
+
+#[tokio::test]
+async fn auto_without_a_decider_registers_a_pending() {
+    let gate = Arc::new(ApprovalGate::default());
+    let (result, human_seen) = authorize_with_human(
+        &gate,
+        &auto_policy(None),
+        None,
+        "db__drop",
+        &json!({"table": "users"}),
+    )
+    .await;
+    assert!(result.is_ok());
+    assert!(
+        human_seen.load(Ordering::SeqCst),
+        "Auto with no decider is exactly Always"
+    );
+}
+
+#[tokio::test]
+async fn always_registers_a_pending_and_never_consults_the_decider() {
+    let (decider, calls) = recorder(AutoVerdict::Allow, 0.6);
+    let gate = Arc::new(ApprovalGate::default());
+    let (result, human_seen) = authorize_with_human(
+        &gate,
+        &policy_with(ApprovalPolicy::Always),
+        Some(&decider),
+        "db__drop",
+        &json!({"table": "users"}),
+    )
+    .await;
+    assert!(result.is_ok());
+    assert!(human_seen.load(Ordering::SeqCst));
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "Always must not consult the auto decider"
+    );
+}
+
+#[tokio::test]
+async fn once_registers_a_pending_and_never_consults_the_decider() {
+    // `Once` is unchanged by Fase 6: the gate only special-cases `Auto`.
+    let (decider, calls) = recorder(AutoVerdict::Allow, 0.6);
+    let gate = Arc::new(ApprovalGate::default());
+    let (result, human_seen) = authorize_with_human(
+        &gate,
+        &policy_with(ApprovalPolicy::Once),
+        Some(&decider),
+        "db__drop",
+        &json!({"table": "users"}),
+    )
+    .await;
+    assert!(result.is_ok());
+    assert!(human_seen.load(Ordering::SeqCst));
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "Once must not consult the auto decider"
+    );
+}
+
+#[tokio::test]
+async fn never_tool_never_consults_the_decider() {
+    let (decider, calls) = recorder(AutoVerdict::Allow, 0.6);
+    let gate = Arc::new(ApprovalGate::default());
+    let (result, human_seen) = authorize_with_human(
+        &gate,
+        &policy_with(ApprovalPolicy::Never),
+        Some(&decider),
+        "db__read",
+        &json!({"table": "users"}),
+    )
+    .await;
+    assert!(result.is_ok());
+    assert!(
+        !human_seen.load(Ordering::SeqCst),
+        "Never needs no approval"
+    );
+    assert!(
+        gate.list_pending().is_empty(),
+        "a Never tool must not register a pending"
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a Never tool must not consult the decider"
+    );
+}
+
+#[tokio::test]
+async fn policy_auto_threshold_override_reaches_the_decider() {
+    let (decider, calls) = recorder(AutoVerdict::Allow, 0.42);
+    let gate = ApprovalGate::default();
+    authorize(
+        &gate,
+        None,
+        &auto_policy(Some(0.85)),
+        "db__drop",
+        &json!({"table": "users"}),
+        None,
+        Some(&decider),
+    )
+    .await
+    .expect("an Allow verdict executes the tool");
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].3, 0.85, "the policy override is authoritative");
+    assert!(
+        gate.list_pending().is_empty(),
+        "an auto-approved call registers no pending"
+    );
+}
+
+#[tokio::test]
+async fn no_override_falls_back_to_the_decider_min_confidence() {
+    let (decider, calls) = recorder(AutoVerdict::Allow, 0.42);
+    let gate = ApprovalGate::default();
+    authorize(
+        &gate,
+        None,
+        &auto_policy(None),
+        "db__drop",
+        &json!({"table": "users"}),
+        None,
+        Some(&decider),
+    )
+    .await
+    .expect("an Allow verdict executes the tool");
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].3, 0.42,
+        "the configured decider default is the fallback threshold"
+    );
+}
+
+#[tokio::test]
+async fn gate_redacts_secrets_before_calling_the_decider() {
+    let args = json!({"table": "users", "api_key": "SUPER-SECRET-VALUE"});
+    let (decider, calls) = recorder(AutoVerdict::Allow, 0.6);
+    let gate = ApprovalGate::default();
+    authorize(
+        &gate,
+        None,
+        &auto_policy(None),
+        "db__drop",
+        &args,
+        None,
+        Some(&decider),
+    )
+    .await
+    .expect("an Allow verdict executes the tool");
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "db__drop");
+    assert_eq!(calls[0].2, args_hash_hex(&args), "canonical hash is passed");
+    assert!(!calls[0].1.to_string().contains("SUPER-SECRET-VALUE"));
+    assert!(calls[0].1.to_string().contains(REDACTED_MARKER));
+}

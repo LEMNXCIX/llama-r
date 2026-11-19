@@ -71,6 +71,10 @@ impl RouterAutoDecider {
 
 #[async_trait]
 impl AutoDecider for RouterAutoDecider {
+    fn min_confidence(&self) -> f32 {
+        self.min_confidence
+    }
+
     async fn should_allow(
         &self,
         tool_name: &str,

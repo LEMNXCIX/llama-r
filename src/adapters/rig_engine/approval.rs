@@ -23,10 +23,12 @@
 //! timeout keeps that from hanging the tool call.
 
 use crate::domain::policy::{
-    ApprovalDecision as PolicyDecision, PermissionEngine, PermissionPolicy,
+    ApprovalDecision as PolicyDecision, ApprovalPolicy, PermissionEngine, PermissionPolicy,
 };
+use crate::ports::auto::{AutoDecider, AutoVerdict};
 use crate::ports::engine::AgentRunEvent;
 use crate::services::approval::{ApprovalDecision as GateDecision, ApprovalGate};
+use crate::services::redaction::{args_hash_hex, redact_secrets};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -34,6 +36,14 @@ use uuid::Uuid;
 /// Authorize one tool call. `Ok(())` means "execute" (the caller then charges
 /// the shared budget and dispatches); `Err` is a named refusal carrying the tool
 /// name and the reason.
+///
+/// The pure permission engine returns `Approve` for `Once`, `Always` and `Auto`
+/// alike. This gate is the only place `Auto` can skip the human: when the matched
+/// rule is `Auto` and `auto_decider` is present, an affirmative, high-confidence
+/// verdict returns `Ok(())` **without registering a pending**. Every other
+/// outcome (a refusal, a low-confidence answer, an unavailable router, no
+/// decider, or any `Once`/`Always` rule) takes the unchanged human path below.
+/// The budget is never charged here — the caller does that only after `Ok`.
 pub async fn authorize(
     gate: &ApprovalGate,
     event_tx: Option<&mpsc::Sender<AgentRunEvent>>,
@@ -41,10 +51,37 @@ pub async fn authorize(
     tool_name: &str,
     args: &Value,
     execution_id: Option<Uuid>,
+    auto_decider: Option<&dyn AutoDecider>,
 ) -> Result<(), String> {
     match PermissionEngine::authorize(permission, tool_name) {
         PolicyDecision::Allow => Ok(()),
         PolicyDecision::Approve => {
+            // `Auto` is the only policy that may skip the human, and only with a
+            // positive answer from the injected decision model. The per-call
+            // threshold is authoritative: an explicit policy override wins, else
+            // the decider's configured default. Args are redacted before they
+            // leave this process even though the adapter redacts again.
+            if permission.approval_for(tool_name) == ApprovalPolicy::Auto {
+                if let Some(decider) = auto_decider {
+                    let threshold = permission
+                        .auto_threshold
+                        .unwrap_or_else(|| decider.min_confidence());
+                    let verdict = decider
+                        .should_allow(
+                            tool_name,
+                            &redact_secrets(args),
+                            &args_hash_hex(args),
+                            threshold,
+                        )
+                        .await;
+                    if verdict == AutoVerdict::Allow {
+                        return Ok(());
+                    }
+                    // Deny / Unavailable: fall through to the human gate. Never
+                    // execute a tool the model refused or could not judge.
+                }
+            }
+
             // Register first, then (if there is a channel) announce. Registering
             // before the announcement means a non-streaming client can discover
             // the pending via GET /api/approvals even though no SSE event exists
@@ -99,6 +136,7 @@ mod tests {
                 tool_pattern: "*".into(),
                 policy: ApprovalPolicy::Always,
             }],
+            auto_threshold: None,
         }
     }
 
@@ -126,7 +164,7 @@ mod tests {
                 .unwrap();
         });
 
-        authorize(&gate, None, &always(), "db__drop", &args, None)
+        authorize(&gate, None, &always(), "db__drop", &args, None, None)
             .await
             .expect("approval through the list/decide path lets the tool run");
         decider.await.unwrap();
@@ -142,6 +180,7 @@ mod tests {
             &PermissionPolicy::default(),
             "db__drop",
             &serde_json::json!({}),
+            None,
             None,
         )
         .await

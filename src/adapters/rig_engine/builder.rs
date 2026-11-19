@@ -120,7 +120,8 @@ pub fn build_tool_bridges(
                     deps.gate.clone(),
                     deps.event_tx.clone(),
                 )
-                .with_operations(deps.operations.clone()),
+                .with_operations(deps.operations.clone())
+                .with_auto_decider(deps.auto_decider.clone()),
             ) as Box<dyn ToolDyn>,
             ScopedTool::Local(local) => Box::new(LocalToolBridge::new(
                 local,
@@ -655,6 +656,7 @@ mod tests {
             skill_manager: Arc::new(SkillManager::with_paths(Vec::new())),
             rag: None,
             gate: Arc::new(crate::services::approval::ApprovalGate::default()),
+            auto_decider: None,
             event_tx: None,
             operations: crate::adapters::rig_engine::operations::OperationContext::disabled(),
         }

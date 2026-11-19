@@ -21,9 +21,10 @@ pub enum ApprovalPolicy {
     Once,
     /// Ask before every call.
     Always,
-    /// Ask via an automatic decision model. There is no decision model in this
-    /// phase (Fase 6), so `Auto` is exactly `Always` today — documented here
-    /// so nobody assumes a silent approval.
+    /// Ask via an automatic decision model. The pure engine still treats this
+    /// like `Always` (it needs no I/O); the approval gate is where an injected
+    /// `AutoDecider` may approve without a human — and only on an affirmative,
+    /// high-confidence answer. With no decider it stays exactly `Always`.
     Auto,
 }
 
@@ -40,7 +41,10 @@ pub struct ApprovalRule {
 }
 
 /// Permission policy carried from the agent manifest into `AgentScope`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` is dropped: `auto_threshold` is an `Option<f32>` and floats are only
+// `PartialEq`. Nothing requires `PermissionPolicy: Eq` (nor `AgentScope`, which
+// holds one), so the loss is harmless and keeps the override representable.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PermissionPolicy {
     /// Connection ids whose tools the agent may see. Kept here as declarative
     /// data; tool visibility itself is still enforced by
@@ -51,6 +55,12 @@ pub struct PermissionPolicy {
     /// Ordered approval rules. The first pattern that matches wins.
     #[serde(default)]
     pub approvals: Vec<ApprovalRule>,
+    /// Per-agent override of the confidence an `Auto` decision must reach. The
+    /// gate passes this as the per-call threshold to `AutoDecider::should_allow`;
+    /// `None` uses the decider's configured default (`RouterConfig::min_confidence`).
+    /// Only consulted for tools whose rule resolves to `Auto`.
+    #[serde(default)]
+    pub auto_threshold: Option<f32>,
 }
 
 impl PermissionPolicy {

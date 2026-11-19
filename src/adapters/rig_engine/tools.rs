@@ -2,6 +2,7 @@ use crate::adapters::rig_engine::approval;
 use crate::adapters::rig_engine::limits::ToolCallBudget;
 use crate::adapters::rig_engine::operations::{self, OperationContext};
 use crate::adapters::rig_engine::ScopedMcpTool;
+use crate::ports::auto::AutoDecider;
 use crate::ports::engine::AgentRunEvent;
 use crate::services::approval::ApprovalGate;
 use serde_json::Value;
@@ -24,6 +25,9 @@ pub struct McpToolBridge {
     /// The run's approval gate, owned by `AppState` (not the hot-swapped stack),
     /// so a settings Apply cannot drop a pending decision.
     pub gate: Arc<ApprovalGate>,
+    /// The boot-owned `Auto` decider, shared with `LocalToolBridge` so both tool
+    /// kinds agree on automatic approval. `None` keeps the human gate in place.
+    pub auto_decider: Option<Arc<dyn AutoDecider>>,
     /// `Some` on the streaming path, where `ApprovalRequired` reaches the SSE
     /// caller; `None` on the non-streaming path, where the pending is discovered
     /// by polling `GET /api/approvals` instead. Both paths block on the gate.
@@ -45,6 +49,7 @@ impl McpToolBridge {
             inner,
             budget,
             gate,
+            auto_decider: None,
             event_tx,
             operations: None,
         }
@@ -54,6 +59,13 @@ impl McpToolBridge {
     /// this; a directly built bridge stays a transparent pass-through.
     pub fn with_operations(mut self, operations: OperationContext) -> Self {
         self.operations = Some(operations);
+        self
+    }
+
+    /// Install the boot-owned `Auto` decider. A setter keeps `new`'s signature
+    /// stable for directly built test bridges.
+    pub fn with_auto_decider(mut self, decider: Option<Arc<dyn AutoDecider>>) -> Self {
+        self.auto_decider = decider;
         self
     }
 
@@ -81,6 +93,7 @@ impl McpToolBridge {
             &tool_name,
             &args,
             self.operations.as_ref().map(|ctx| ctx.execution_id),
+            self.auto_decider.as_deref(),
         )
         .await?;
 

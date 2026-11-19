@@ -9,6 +9,7 @@ use crate::domain::models::{
 };
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
+use crate::ports::auto::AutoDecider;
 use crate::ports::execution::ExecutionStore;
 use crate::ports::mcp::McpServerRegistry;
 use crate::services::agent_registry::AgentRegistry;
@@ -69,6 +70,12 @@ pub struct AppState {
     /// companions but must not drop pending decisions. A dropped request leaves
     /// its pending in the gate until timeout (Fase 7 seeds a background reaper).
     pub approval_gate: Arc<ApprovalGate>,
+    /// Optional automatic-approval decider, built at boot from the same
+    /// `DecisionRouter` that serves agent routing when routing is enabled. Like
+    /// `approval_gate`, it lives outside the hot-swapped `ProviderStack`, so a
+    /// settings Apply cannot drop it. `None` means every `Auto` tool keeps
+    /// asking a human (the pre-Fase-6 behaviour).
+    pub auto_decider: Option<Arc<dyn AutoDecider>>,
     /// Durable execution store. Built once at boot from the history DB path and
     /// deliberately NOT part of the hot-swapped `ProviderStack`: a TUI Apply
     /// rebuilds the engine but must not swap out the record of in-flight turns.

@@ -291,6 +291,7 @@ fn test_state_inner(
         router_config: Arc::new(RouterConfig::default()),
         router_healthy: AtomicBool::new(false),
         approval_gate: Arc::new(crate::services::approval::ApprovalGate::default()),
+        auto_decider: None,
         execution_store,
     });
     (temp_dir, state)

@@ -13,6 +13,7 @@ fn policy(approvals: Vec<ApprovalRule>) -> PermissionPolicy {
     PermissionPolicy {
         connections_allow: Vec::new(),
         approvals,
+        auto_threshold: None,
     }
 }
 

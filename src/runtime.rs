@@ -1,3 +1,4 @@
+use crate::adapters::auto::RouterAutoDecider;
 use crate::adapters::execution::NoOpExecutionStore;
 use crate::adapters::mcp::{McpServerConfig, StaticMcpRegistry};
 use crate::adapters::rag::{
@@ -32,6 +33,7 @@ use crate::core::hot_reload::HotReloader;
 use crate::domain::execution::ExecutionStatus;
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
+use crate::ports::auto::AutoDecider;
 #[cfg(feature = "rig-engine")]
 use crate::ports::engine::AgentEngine;
 use crate::ports::execution::ExecutionStore;
@@ -108,6 +110,26 @@ pub fn build_context_enricher(
         enricher = enricher.with_embeddings(embeddings);
     }
     Arc::new(enricher)
+}
+
+/// Build the `Auto` decider from the **same** `DecisionRouter` the routing
+/// ladder uses, with `RouterConfig`'s `min_confidence` as its default threshold.
+/// Kept as a pure helper so the wiring can be tested without boot, env or a
+/// live decision model. No routing (disabled or no router) means no decider:
+/// `Auto` then behaves exactly like `Always`.
+fn build_auto_decider(
+    router_config: &RouterConfig,
+    router: Option<&Arc<dyn DecisionRouter>>,
+) -> Option<Arc<dyn AutoDecider>> {
+    if !router_config.enabled {
+        return None;
+    }
+    router.map(|router| {
+        Arc::new(RouterAutoDecider::new(
+            router.clone(),
+            router_config.min_confidence,
+        )) as Arc<dyn AutoDecider>
+    })
 }
 
 #[allow(
@@ -215,6 +237,13 @@ pub fn build_app_state_with_gate(
         };
     }
 
+    // The automatic-approval decider wraps the very router the routing ladder
+    // uses (built above, or injected by a caller). It is stored on AppState —
+    // outside the hot-swapped ProviderStack — so a settings Apply cannot drop
+    // it, exactly like the approval gate. With no router (routing disabled)
+    // every `Auto` tool keeps asking a human.
+    let auto_decider = build_auto_decider(&router_config, stack.router.as_ref());
+
     Arc::new(AppState {
         services: Arc::new(TokioRwLock::new(Arc::new(stack))),
         agent_registry,
@@ -232,6 +261,7 @@ pub fn build_app_state_with_gate(
         router_config: Arc::new(router_config),
         router_healthy: AtomicBool::new(false),
         approval_gate,
+        auto_decider,
         execution_store,
     })
 }
@@ -502,7 +532,7 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     // One `PROVIDER` selects chat, the decision router and embeddings. A
     // completed interactive setup already produced such a stack from the values
     // the user entered; otherwise build one from the boot configuration.
-    let mut stack = match setup_stack {
+    let stack = match setup_stack {
         Some(stack) => stack,
         None => build_provider_stack(&config)?,
     };
@@ -519,16 +549,6 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     if let Err(err) = approval_gate.load_from_store().await {
         tracing::warn!(error = %err, "Boot could not reload pending approvals; continuing");
     }
-    let handles = CompanionHandles {
-        mcp_registry: mcp_registry.clone(),
-        agent_registry: agent_registry.clone(),
-        skill_manager: skill_manager.clone(),
-        context_store: context_store.clone(),
-        history_store: history_store.clone(),
-        approval_gate: approval_gate.clone(),
-        execution_store: execution_store.clone(),
-    };
-    build_companions(&handles, &config, &mut stack);
     let state = build_app_state_with_gate(
         approval_gate,
         stack,
@@ -541,6 +561,16 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         history_store,
         execution_store,
     );
+    // Build the companions only now, from the state that owns the boot gate
+    // *and* the boot `auto_decider`. `CompanionHandles::from_state` reads both,
+    // so boot and a settings Apply share one engine-building path and the
+    // engine can never be left without the decider the routing router built.
+    let mut stack = {
+        let guard = state.services.read().await;
+        (**guard).clone()
+    };
+    build_companions_for_state(&state, &config, &mut stack);
+    state.replace_services(stack).await;
 
     // One probe at startup, then last-known-value: the ladder updates the flag
     // after every decision and `/api/health` never probes — the point of the
@@ -1179,9 +1209,9 @@ pub async fn mark_interrupted(store: &dyn ExecutionStore) -> Result<usize, Strin
 }
 
 /// Handles from `AppState` that the provider-dependent companions need. Kept as
-/// a struct so the SAME builder runs at boot (before `AppState` exists) and on a
-/// settings Apply (from a live `AppState`) without either path building a stack
-/// twice or swapping a half-built stack into the running process.
+/// a struct so the SAME builder runs at boot (from the freshly built `AppState`)
+/// and on a settings Apply (from a live `AppState`) without either path building
+/// a stack twice or swapping a half-built stack into the running process.
 #[derive(Clone)]
 pub struct CompanionHandles {
     pub mcp_registry: Arc<dyn McpServerRegistry>,
@@ -1192,6 +1222,10 @@ pub struct CompanionHandles {
     /// The boot-owned gate, read from `AppState` on a settings Apply so pending
     /// approvals are never dropped by a stack rebuild.
     pub approval_gate: Arc<ApprovalGate>,
+    /// The boot-owned automatic-approval decider, read from `AppState` on a
+    /// settings Apply just like the gate, so an engine rebuild keeps the same
+    /// `Auto` behaviour (and survives Apply).
+    pub auto_decider: Option<Arc<dyn AutoDecider>>,
     /// The boot-owned execution store, read from `AppState` on a settings Apply
     /// so completed tool operations survive an engine rebuild.
     pub execution_store: Arc<dyn ExecutionStore>,
@@ -1206,6 +1240,7 @@ impl CompanionHandles {
             context_store: state.context_store.clone(),
             history_store: state.history_store.clone(),
             approval_gate: state.approval_gate.clone(),
+            auto_decider: state.auto_decider.clone(),
             execution_store: state.execution_store.clone(),
         }
     }
@@ -1251,7 +1286,8 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
                     local_tools.clone(),
                     handles.approval_gate.clone(),
                 )
-                .with_execution_store(handles.execution_store.clone()),
+                .with_execution_store(handles.execution_store.clone())
+                .with_auto_decider(handles.auto_decider.clone()),
             );
             Arc::new(AgentRuntime {
                 registry: handles.agent_registry.clone(),
@@ -1370,6 +1406,60 @@ pub fn start_grpc_server(runtime: &Runtime) -> tokio::task::JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::router::{DecisionRequest, DecisionResponse, DecisionRouter};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn auto_decider_wraps_the_routing_router_at_the_configured_threshold() {
+        struct CountingRouter(AtomicUsize);
+
+        #[async_trait::async_trait]
+        impl DecisionRouter for CountingRouter {
+            async fn decide(&self, _req: DecisionRequest) -> Result<DecisionResponse, AppError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(DecisionResponse {
+                    answers: Default::default(),
+                })
+            }
+        }
+
+        let counting = Arc::new(CountingRouter(AtomicUsize::new(0)));
+        let router: Arc<dyn DecisionRouter> = counting.clone();
+        let config = RouterConfig {
+            enabled: true,
+            min_confidence: 0.73,
+            ..RouterConfig::default()
+        };
+
+        let decider =
+            build_auto_decider(&config, Some(&router)).expect("routing on and router present");
+        assert_eq!(
+            decider.min_confidence(),
+            0.73,
+            "configured default is carried"
+        );
+        decider
+            .should_allow("tool", &serde_json::json!({}), "hash", 0.9)
+            .await;
+        assert_eq!(
+            counting.0.load(Ordering::SeqCst),
+            1,
+            "the decider must call the very router the ladder uses"
+        );
+
+        let disabled = RouterConfig {
+            enabled: false,
+            ..config.clone()
+        };
+        assert!(
+            build_auto_decider(&disabled, Some(&router)).is_none(),
+            "routing off means every Auto tool still asks a human"
+        );
+        assert!(
+            build_auto_decider(&config, None).is_none(),
+            "no router means no decider"
+        );
+    }
 
     #[test]
     fn router_origin_extracts_host_and_port() {

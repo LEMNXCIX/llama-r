@@ -212,6 +212,7 @@ mod bridge {
     use crate::adapters::rig_engine::limits::ToolCallBudget;
     use crate::adapters::rig_engine::operations::{self, OperationContext};
     use crate::domain::scope::AgentScope;
+    use crate::ports::auto::AutoDecider;
     use crate::ports::engine::AgentRunEvent;
     use crate::ports::rag::RagStore;
     use crate::services::approval::ApprovalGate;
@@ -236,6 +237,9 @@ mod bridge {
         /// cannot drop a pending decision. Also read by the MCP bridge via
         /// `build_tool_bridges`, so both bridge kinds share one gate.
         pub gate: Arc<ApprovalGate>,
+        /// The same boot-owned `Auto` decider the MCP bridge receives, so local
+        /// and MCP tools cannot disagree about whether a call is auto-approved.
+        pub auto_decider: Option<Arc<dyn AutoDecider>>,
         /// `Some` on the streaming path (the `ApprovalRequired` event reaches
         /// the SSE caller); `None` on the non-streaming path.
         pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
@@ -255,6 +259,9 @@ mod bridge {
         /// Cloned from `deps` so the gate is an explicit part of the bridge,
         /// mirroring `McpToolBridge`.
         pub gate: Arc<ApprovalGate>,
+        /// Cloned from `deps` so the decider is an explicit part of the bridge,
+        /// mirroring the gate and the MCP bridge.
+        pub auto_decider: Option<Arc<dyn AutoDecider>>,
         pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
         /// The same idempotency guard the MCP bridge uses. `Some` for every
         /// bridge built by the engine; a directly built test bridge can leave
@@ -270,6 +277,7 @@ mod bridge {
             deps: LocalToolDeps,
         ) -> Self {
             let gate = deps.gate.clone();
+            let auto_decider = deps.auto_decider.clone();
             let event_tx = deps.event_tx.clone();
             let operations = Some(deps.operations.clone());
             Self {
@@ -278,6 +286,7 @@ mod bridge {
                 budget,
                 deps,
                 gate,
+                auto_decider,
                 event_tx,
                 operations,
             }
@@ -303,6 +312,7 @@ mod bridge {
                 &self.tool.id,
                 &args,
                 self.operations.as_ref().map(|ctx| ctx.execution_id),
+                self.auto_decider.as_deref(),
             )
             .await?;
 

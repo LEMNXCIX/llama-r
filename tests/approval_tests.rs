@@ -326,6 +326,7 @@ fn always_for(pattern: &str) -> PermissionPolicy {
             tool_pattern: pattern.into(),
             policy: ApprovalPolicy::Always,
         }],
+        auto_threshold: None,
     }
 }
 
@@ -364,6 +365,7 @@ fn local_bridge(
         skill_manager: Arc::new(manager),
         rag: None,
         gate,
+        auto_decider: None,
         event_tx,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     };
@@ -637,6 +639,7 @@ async fn build_tool_bridges_carries_gate_to_both_bridge_kinds() {
         skill_manager: Arc::new(manager),
         rag: None,
         gate: gate.clone(),
+        auto_decider: None,
         event_tx: Some(tx),
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     };

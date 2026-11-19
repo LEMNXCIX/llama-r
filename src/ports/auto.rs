@@ -34,6 +34,12 @@ pub enum AutoVerdict {
 /// without human approval.
 #[async_trait]
 pub trait AutoDecider: Send + Sync {
+    /// The configured default confidence threshold this decider was built with
+    /// (for the router-backed adapter, `RouterConfig::min_confidence`). The gate
+    /// uses it only when a tool's policy has no explicit `auto_threshold`; the
+    /// per-call `threshold` passed to [`Self::should_allow`] is authoritative.
+    fn min_confidence(&self) -> f32;
+
     /// `tool_name` is the qualified tool id, `redacted_args` is the call's
     /// arguments (already redacted by the caller, and re-redacted by the
     /// adapter), `args_hash_hex` is the shared canonical SHA-256 of the original
