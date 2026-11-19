@@ -4,6 +4,7 @@
 //! Application services should depend on ports, never on concrete crates of
 //! external apps.
 
+pub mod auto;
 pub mod engine;
 pub mod execution;
 pub mod history;
