@@ -1,9 +1,9 @@
 # Fase 4 — Subagents con aislamiento
 
 **Fecha:** 2026-11-19
-**Estado:** aprobado en brainstorming (diseño de 3 secciones), pendiente de revisión del spec
-**Alcance:** sustituir el stub `[subagents]` por delegación real de un coordinador a
-especialistas del mismo proyecto, con herencia cero y aprobaciones reenviadas al padre.
+**Estado:** revisado tras petición del usuario (anidamiento acotado); pendiente de aprobación del spec
+**Alcance:** sustituir el stub `[subagents]` por delegación real con **anidamiento limitado**,
+herencia cero, budget compartido, trazas jerárquicas y aprobaciones reenviadas al padre.
 
 ## Contexto
 
@@ -30,11 +30,14 @@ condicionan el diseño:
 Decisiones confirmadas en brainstorming:
 
 - **Caso de uso:** coordinador → especialistas del **mismo proyecto**, reutilizando el runtime actual.
-- **Un solo nivel:** el especialista no delega. `max_depth` se acepta pero se ignora.
+- **Anidamiento acotado** (revisión del usuario): un subagente puede delegar a su vez, hasta un
+  `max_depth` configurable. Se revive el campo `max_depth` del stub, antes ignorado. Límite duro
+  global de 8 niveles y detección de ciclos.
 - **Allowlist de agentes ya registrados:** el coordinador declara ids; los especialistas viven en
   `contextos/projects/<p>/agents/` con su propio TOML y Scope. No se duplica el schema de `AgentConfig`.
 - **Enfoque A + aprobaciones mapeadas:** tool local con un `Delegator` inyectado; reentrada a
-  `execute_chat_with_id`; `ApprovalRequired` del hijo reenviado al SSE del padre con `task_id`.
+  `execute_chat_with_id`; `ApprovalRequired` de cualquier nivel reenviado al SSE del coordinador
+  raíz con `task_id` y `depth`.
 
 Se descartaron dos alternativas: delegar directamente a `AgentRuntime::chat` (B: se salta
 `finish_execution`, trazas y fallback, duplicando lógica) y un evento `AgentRunEvent::DelegateRequested`
@@ -42,15 +45,16 @@ Se descartaron dos alternativas: delegar directamente a `AgentRuntime::chat` (B:
 
 ## Goal
 
-Que un agente coordinador delegue tareas a especialistas del mismo proyecto **solo con TOML**, que
-el especialista arranque con herencia cero demostrable, y que el resultado, sus aprobaciones y sus
-trazas vuelvan al padre reutilizando el pipeline y los puertos existentes.
+Que un agente coordinador delegue tareas a especialistas del mismo proyecto **solo con TOML**, con
+anidamiento limitado y sin ciclos; que cada especialista arranque con herencia cero demostrable; y que
+resultado, aprobaciones y trazas de todo el árbol vuelvan al coordinador reutilizando el pipeline y
+los puertos existentes.
 
 ## Non-goals
 
-- Anidamiento (sub-subagentes), detección de ciclos y `max_depth` funcional.
+- Anidamiento **ilimitado** (techo duro de 8) y agentes con `max_depth` fuera de rango.
 - Agentes remotos o sandbox (Fase 8).
-- *Steering* de mensajes al hijo en vuelo (Fase 7 lo deja diferido).
+- *Steering* de mensajes a un hijo en vuelo (Fase 7 lo deja diferido).
 - Cambios en la TUI, en `AgentEngine`/`LLMProvider`/`DecisionRouter` ni en agentes que no declaren
   `[subagents]` (v1 intacto).
 - Identidad de usuario en aprobaciones (ya diferida en Fase 3/7).
@@ -58,11 +62,10 @@ trazas vuelvan al padre reutilizando el pipeline y los puertos existentes.
 ## Decisiones de diseño
 
 1. **Manifest tipado y compatible.** `AgentConfig.subagents` pasa a
-   `Option<SubagentsConfig { allowed: Vec<String>, allow_global: bool }>` (`#[serde(default)]`).
-   Los manifests v1 con `[subagents]` siguen cargando; `max_depth` se acepta y se ignora. A diferencia
-   del stub, el campo presente **sí se serializa**, para que `PUT /api/agents/:id` preserve la
-   allowlist (igual que `routing` y `description`). Se actualiza
-   `the_subagents_stub_never_serialises` para reflejarlo.
+   `Option<SubagentsConfig { allowed: Vec<String>, allow_global: bool, max_depth: Option<u32> }>`
+   (`#[serde(default)]`). Los manifests v1 con `[subagents]` siguen cargando. El campo presente **sí
+   se serializa**, para que `PUT /api/agents/:id` preserve la allowlist y la profundidad (igual que
+   `routing` y `description`). Se actualiza `the_subagents_stub_never_serialises`.
 2. **Puerto nuevo y aditivo.** `src/ports/delegation.rs` define
    `trait Delegator: Send + Sync { async fn delegate(&self, req: DelegateRequest) -> Result<DelegateResult, String> }`.
    Ningún puerto existente cambia de firma. Igual que `AutoDecider` en Fase 6.
@@ -73,40 +76,56 @@ trazas vuelvan al padre reutilizando el pipeline y los puertos existentes.
 4. **Reentrada al pipeline.** `delegate_turn` en `src/api/chat_core.rs` reconstruye un
    `AgentSelection` con el `project_id` del padre y el id resuelto, y llama `execute_chat_with_id`
    con `stream: false`, `execution_id` hijo nuevo y `conversation_id = task_id` (o UUID nuevo).
-   El hijo corre con **su** manifiesto, **su** scope y **su** budget; el resultado vuelve como
-   `ToolResult` al bucle de Rig del padre.
+   El hijo corre con **su** manifiesto y **su** scope. El resultado vuelve como `ToolResult` al bucle
+   de Rig del padre, que sigue; el `task_id` efectivo se devuelve para reanudar.
 5. **Herencia cero por construcción.** El hijo se resuelve únicamente por su id, validado contra
    `allowed` y el mismo proyecto (o `agents/` si `allow_global`). El padre no le pasa project context,
    skills, RAG sources ni tools: el `ScopeBuilder` del hijo ya produce `DenyAll`. Un id no permitido
    es un `ToolError` nombrado, nunca una delegación.
-6. **Aprobaciones sin tocar el gate.** El hijo usa el mismo `ApprovalGate` global. En streaming, un
-   `EventForwarder` del padre reenvía el `ApprovalRequired` del engine hijo al `ChatStreamEvent` del
-   padre con un campo `task_id` opcional y aditivo en el payload de `approval`. En no-streaming no hay
-   sender: el cliente descubre el pendiente con `GET /api/approvals` y decide con `POST`, sin cambios.
-   `approval_id` sigue siendo el UUID global; no se prefija.
-7. **Budget, idempotencia y deadline.** La delegación gasta **1 unidad del budget del padre** (como
-   cualquier tool, cargada solo tras `authorize → Ok`) más las que gaste el hijo con el suyo. El
-   `operation_id` de Fase 7 cachea el resultado del tool call, así que reintentar el turno del padre no
-   re-ejecuta al hijo. `DelegateRequest` lleva el `deadline` del padre y el delegator usa
-   `timeout_at(deadline - 5s)` para que el error del hijo llegue antes de que el bucle del padre expire.
-8. **Un solo nivel, sin recursión.** El scope del hijo no incluye `llama_r__delegate`, así que el
-   tool ni siquiera se le ofrece. No hay `max_depth` ni contador de profundidad.
+6. **Profundidad acotada y sin ciclos.** `max_depth` = número máximo de niveles de delegación desde
+   el coordinador raíz. Default `1` (comportamiento de un solo nivel de la primera versión del diseño),
+   rango válido `1..=8`. El **límite efectivo** es el mínimo entre el `max_depth` del raíz y el de cada
+   agente del chain, con techo global 8; se propaga en `DelegateRequest`. `DelegateRequest.chain` lleva
+   los ids cualificados de los ancestros; si el id destino ya está en el chain → `ToolError` nombrado,
+   cero ejecución. Un valor fuera de rango se ignora con un warning que nombra ruta y valor, y cae al
+   default 1 (misma disciplina que los manifests malformados).
+7. **Budget compartido (jerárquico).** `build_tool_bridges` ya crea un `Arc<ToolCallBudget>` por run
+   (`src/adapters/rig_engine/limits.rs:3-27`). El `DelegateRequest` lo lleva; cada turno del árbol
+   usa **el mismo** budget en vez de crear uno nuevo. Así hay una sola asignación para todo el árbol,
+   sin importar cuántos niveles se deleguen. Agotarlo da un `ToolError` nombrado que sube por la cadena.
+   La carga sigue ocurriendo solo después de `authorize → Ok`.
+8. **Aprobaciones sin tocar el gate.** El hijo usa el mismo `ApprovalGate` global. Un `EventForwarder`
+   del coordinador raíz reenvía el `ApprovalRequired` de **cualquier** nivel al SSE del raíz con
+   `task_id` y `depth` en el payload de `approval` (campos opcionales y aditivos en el DTO, sin cambiar
+   el puerto). En no-streaming no hay sender: el cliente descubre el pendiente con
+   `GET /api/approvals` y decide con `POST`, sin cambios. `approval_id` sigue siendo el UUID global.
+9. **Trazas jerárquicas.** Cada turno del árbol emite su `TraceRecorded` con su propio
+   `execution_id`. El payload gana campos opcionales `parent_execution_id`, `root_execution_id` y
+   `depth`, de modo que el log de ejecución reconstruye el árbol sin un backend nuevo. Se redacta con
+   el mismo `redact_trace_payload` de Fase 6.
+10. **Idempotencia y deadline.** `operation_id` de Fase 7 cachea el resultado de cada tool call, así
+    que reintentar un turno no re-ejecuta a sus hijos. `DelegateRequest.deadline` se deriva del padre
+    (`min(restante − 5s, timeout del scope del hijo)`) recursivamente, para que el error del hijo llegue
+    antes de que expire el bucle del padre.
 
 ## Arquitectura
 
 ### Manifest y resolución
 
-- `src/domain/agent.rs`: `SubagentsConfig { allowed, allow_global }`, campo tipado, defaults y tests.
+- `src/domain/agent.rs`: `SubagentsConfig`, campo tipado, defaults, validación de `max_depth` y tests.
 - `src/services/agent_registry.rs:178-232`: reutilizar `resolve_agent` / `get_project_agent` / `get_agent`;
-  la validación de allowlist vive en el delegator, no en el registry.
+  la validación de allowlist y profundidad vive en el delegator, no en el registry.
 - `src/api/route_resolution.rs:19-25`: construir `AgentSelection` nueva sin reutilizar la del padre
   (los headers ya se consumieron en `handlers.rs:180-189`).
 
 ### Componentes
 
 - `src/ports/delegation.rs` (nuevo): `DelegateRequest { agent_id, message, task_id: Option<String>,
-  deadline: Instant, event_tx: Option<EventForwarder> }`, `DelegateResult { answer, task_id }`, trait.
-- `src/services/delegation.rs` (nuevo): validación, resolución, `delegate_turn`, timeout.
+  chain: Vec<String>, depth: u32, effective_max_depth: u32, deadline: Instant,
+  budget: Arc<ToolCallBudget>, event_tx: Option<EventForwarder> }`,
+  `DelegateResult { answer, task_id }`, trait `Delegator`.
+- `src/services/delegation.rs` (nuevo): validación de allowlist/proyecto/profundidad/ciclo,
+  resolución, `delegate_turn`, timeout, propagación de budget y eventos.
 - `src/adapters/rig_engine/local_tools.rs`: id `llama_r__delegate`, `LocalToolKind::Delegate`,
   esquema JSON `{message, task_id?}`, dispatch al delegator; re-check de scope, aprobación, budget,
   idempotencia y eventos `ToolCall`/`ToolResult` igual que las demás tools.
@@ -115,27 +134,32 @@ trazas vuelvan al padre reutilizando el pipeline y los puertos existentes.
 ### Threading
 
 Igual que Fase 6: `delegator` viaja en `LocalToolDeps` y se inyecta en el engine; boot y Apply
-comparten `build_companions`, de modo que un hot swap de provider no pierde el delegator.
+comparten `build_companions`, de modo que un hot swap de provider no pierde el delegator. El budget
+se comparte explícitamente por `DelegateRequest`, sin tocar el puerto del engine.
 
 ## Flujo de datos
 
-1. El modelo del coordinador emite `llama_r__delegate({message, task_id?})`.
-2. El bridge re-checka `allows_local_tool`, resuelve aprobación del padre, carga 1 unidad del budget,
-   calcula `operation_id` y llama `delegator.delegate(...)`.
-3. El delegator valida el id (allowlist + mismo proyecto), resuelve el agente y llama `delegate_turn`.
+1. Un agente emite `llama_r__delegate({message, task_id?})`.
+2. El bridge re-checka `allows_local_tool`, resuelve aprobación, carga 1 unidad del budget compartido,
+   calcula `operation_id` y llama `delegator.delegate(...)` con `depth+1`, el chain actualizado y el
+   `effective_max_depth` recalculado.
+3. El delegator valida id (allowlist + mismo proyecto), profundidad (`depth <= max`) y ciclo
+   (`id ∉ chain`), y llama `delegate_turn`.
 4. `delegate_turn` crea `execution_id` hijo, usa `task_id` como `conversation_id` y ejecuta
-   `execute_chat_with_id(stream: false)`. El hijo emite su propio `TraceRecorded`.
-5. Los `ApprovalRequired` del hijo se reenvían al SSE del padre con `task_id`; en no-streaming el
-   cliente usa el polling global existente.
-6. La respuesta del hijo vuelve como `ToolResult`; el bucle de Rig del padre continúa y el `task_id`
-   efectivo se devuelve en el resultado para reanudar.
+   `execute_chat_with_id(stream: false)` con el budget compartido. El hijo emite su `TraceRecorded`
+   con `parent_execution_id`, `root_execution_id` y `depth`.
+5. Los `ApprovalRequired` de cualquier nivel se reenvían al SSE del raíz con `task_id` y `depth`;
+   en no-streaming el cliente usa el polling global existente.
+6. La respuesta del hijo vuelve como `ToolResult`; el bucle del padre continúa y el `task_id` efectivo
+   se devuelve en el resultado para reanudar.
 
 ## Manejo de errores
 
 - Id no permitido, de otro proyecto o global sin `allow_global` → `ToolError` nombrado, cero ejecución.
-- Hijo ausente, provider caído o timeout → `ToolError` con el motivo; el turno del padre **continúa**
-  (el modelo decide cómo responder). Nunca se propaga como error del chat padre.
-- Fallo al persistir la traza o el pending del hijo → warning best-effort, mismo discipline que Fase 7.
+- Profundidad excedida o id ya presente en el chain (ciclo) → `ToolError` nombrado, cero ejecución.
+- Hijo ausente, provider caído, budget agotado o timeout → `ToolError` con el motivo; el turno del
+  padre **continúa** (el modelo decide cómo responder). Nunca se propaga como error del chat raíz.
+- Fallo al persistir la traza o el pending → warning best-effort, misma disciplina que Fase 7.
 - `Weak::upgrade` fallido (AppState ya liberado) → `ToolError` nombrado, no panic.
 
 ## Testing
@@ -146,12 +170,18 @@ comparten `build_companions`, de modo que un hot swap de provider no pierde el d
 - Fuera de allowlist, otro proyecto, global sin `allow_global` → `ToolError`, sin ejecutar nada.
 - **Herencia cero**: scope del hijo `DenyAll` en tools locales y MCP, sin `rag_sources` ni skills del
   padre, y su prompt no contiene las secciones del padre.
+- **Anidamiento**: cadena de 2–3 niveles funciona; `max_depth = 1` impide el segundo nivel; un valor
+  fuera de `1..=8` cae al default 1 con warning; el límite efectivo es el mínimo del chain; un ciclo
+  (A → B → A) se rechaza nombrando el id, sin ejecutar.
+- **Budget compartido**: un solo allowance para todo el árbol; agotarlo en un hijo produce el
+  `ToolError` nombrado en el padre.
+- **Trazas**: cada nivel emite un `TraceRecorded` con su `execution_id` y los campos de jerarquía;
+  el árbol se reconstruye desde `GET /api/executions/:id`.
 - `task_id` → `conversation_id` del hijo; sin él se genera y se devuelve; `task_id` existente reanuda.
-- Aprobación del hijo: en streaming llega al SSE del padre con `task_id`; en no-streaming aparece en
-  `GET /api/approvals` y se decide con `POST`.
-- Budget (1 del padre + el suyo), fallo del hijo no tumba al padre, reintento cacheado por
-  `operation_id` sin re-ejecutar, y el hijo **no** recibe `llama_r__delegate` ofrecido.
-- Manifiestos v1 con `[subagents]` cargan; `max_depth` ignorado; `PUT /api/agents` preserva la allowlist.
+- Aprobación de cualquier nivel: en streaming llega al SSE del raíz con `task_id` y `depth`; en
+  no-streaming aparece en `GET /api/approvals` y se decide con `POST`.
+- Fallo del hijo no tumba al padre; reintento cacheado por `operation_id` sin re-ejecutar.
+- Manifiestos v1 con `[subagents]` cargan; `PUT /api/agents` preserva allowlist y `max_depth`.
 
 Gates: fmt / clippy `-D warnings` / audit / suite completa (813+) / build `--no-default-features`.
 Verificación explícita de que ninguna firma de `pub trait` existente cambió.
@@ -160,8 +190,10 @@ Verificación explícita de que ninguna firma de `pub trait` existente cambió.
 
 - **Ciclo AppState ↔ engine:** mitigado con `Weak<AppState>` y construcción del delegator después del
   AppState, reutilizando el patrón de companions de Fase 6.
-- **Timeout del padre antes que el del hijo:** mitigado con `deadline - 5s`.
-- **Aprobar de más por el hijo:** el subagente hereda la política de **su** manifiesto, nunca la del
+- **Explosión combinatoria por anidamiento:** mitigada con techo duro 8, `max_depth` efectivo = mínimo
+  del chain, detección de ciclos y **un solo budget compartido** para todo el árbol.
+- **Timeout del padre antes que el del hijo:** mitigado con `deadline` recursivo (`restante − 5s`).
+- **Aprobar de más por un hijo:** el subagente hereda la política de **su** manifiesto, nunca la del
   padre; con scope vacío no tiene tools que aprobar salvo las declaradas explícitamente.
 - **La allowlist se vuelva un agujero:** `allow_global` es opt-in (default `false`) y la validación
   de proyecto ocurre en el delegator, no solo en el registry.
@@ -171,7 +203,8 @@ Verificación explícita de que ninguna firma de `pub trait` existente cambió.
 
 ## Exit criteria
 
-- El coordinador delega a un especialista del mismo proyecto solo con TOML; el especialista arranca
-  con herencia cero demostrable; resultado, aprobaciones y trazas vuelven al padre.
+- El coordinador delega a especialistas del mismo proyecto solo con TOML, con anidamiento hasta
+  `max_depth`, sin ciclos y con un budget compartido; cada especialista arranca con herencia cero
+  demostrable; resultado, aprobaciones y trazas jerárquicas vuelven al raíz.
 - Ningún puerto existente cambia de firma; agentes sin `[subagents]` y manifests v1 siguen igual.
-- Sin anidamiento, sin agentes remotos y sin cambios en la TUI; gates verdes.
+- Sin agentes remotos y sin cambios en la TUI; gates verdes.
