@@ -559,13 +559,37 @@ impl RigAgentEngine {
     }
 }
 
+/// Extra room above the approval gate's own deadline when a request carries
+/// approval rules. The gate's `tokio::time::timeout` in the bridge must fire
+/// first so an undecided approval becomes a *named tool error* that rig feeds
+/// back into the tool loop. If the engine-level timeout fired instead it would
+/// drop the bridge's pending oneshot (a late decision would be a no-op) and, on
+/// the non-streaming path, hand chat_core an `Err` that triggers its legacy
+/// direct-chat fallback — a gated tool silently bypassed.
+const APPROVAL_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
+
+/// Effective whole-run timeout at the `AgentEngine` boundary.
+///
+/// Without approval rules the scope deadline is unchanged. With them the run
+/// may legitimately block on a human for up to the gate's deadline, so the
+/// engine timeout is the larger of the scope deadline and `gate + margin`,
+/// guaranteeing the bridge's named refusal wins before this outer deadline.
+fn effective_run_timeout(scope: &AgentScope, gate_timeout: Duration) -> Duration {
+    let scope_timeout = Duration::from_secs(scope.timeout_secs.max(1));
+    if scope.permission.approvals.is_empty() {
+        scope_timeout
+    } else {
+        scope_timeout.max(gate_timeout + APPROVAL_TIMEOUT_MARGIN)
+    }
+}
+
 #[async_trait]
 impl AgentEngine for RigAgentEngine {
     async fn run(&self, req: AgentRunRequest) -> Result<AgentRunResult, String> {
-        let timeout_secs = req.scope.timeout_secs.max(1);
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), self.run_inner(req)).await {
+        let timeout = effective_run_timeout(&req.scope, self.gate.timeout());
+        match tokio::time::timeout(timeout, self.run_inner(req)).await {
             Ok(result) => result,
-            Err(_) => Err(format!("agent run timed out after {timeout_secs}s")),
+            Err(_) => Err(format!("agent run timed out after {}s", timeout.as_secs())),
         }
     }
 
@@ -587,7 +611,7 @@ impl AgentEngine for RigAgentEngine {
         // other requests must survive and must be decidable while this stream
         // is open. AppState owns the single instance.
         let gate = self.gate.clone();
-        let timeout_secs = req.scope.timeout_secs.max(1);
+        let timeout = effective_run_timeout(&req.scope, gate.timeout());
 
         tokio::spawn(async move {
             let engine = RigAgentEngine {
@@ -600,9 +624,12 @@ impl AgentEngine for RigAgentEngine {
                 gate,
             };
             // The timeout covers the whole stream lifecycle, not just a single
-            // completion, and stays at the trait boundary as before.
+            // completion, and stays at the trait boundary as before. With
+            // approval rules it outlives the gate deadline so the bridge's
+            // named refusal fires (and rig continues the turn) before this
+            // outer deadline can drop the pending oneshot.
             let stream = engine.stream_inner(req, tx.clone());
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), stream).await {
+            match tokio::time::timeout(timeout, stream).await {
                 Ok(Ok(())) => {}
                 Ok(Err(msg)) => {
                     let _ = tx.send(AgentRunEvent::Error { message: msg }).await;
@@ -610,7 +637,7 @@ impl AgentEngine for RigAgentEngine {
                 Err(_) => {
                     let _ = tx
                         .send(AgentRunEvent::Error {
-                            message: format!("agent stream timed out after {timeout_secs}s"),
+                            message: format!("agent stream timed out after {}s", timeout.as_secs()),
                         })
                         .await;
                 }
@@ -618,5 +645,80 @@ impl AgentEngine for RigAgentEngine {
         });
 
         Ok(rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::agent::RagWritePolicy;
+    use crate::domain::policy::{ApprovalPolicy, ApprovalRule, PermissionPolicy};
+    use std::collections::HashSet;
+
+    fn scope(timeout_secs: u64, permission: PermissionPolicy) -> AgentScope {
+        AgentScope {
+            agent_id: "a".into(),
+            project_id: None,
+            mcp_sources: HashSet::new(),
+            tools_allow: crate::domain::scope::ToolsAllow::DenyAll,
+            local_tools_allow: crate::domain::scope::ToolsAllow::DenyAll,
+            rag_sources: HashSet::new(),
+            rag_write: RagWritePolicy::None,
+            max_tool_calls: 1,
+            max_iterations: 2,
+            timeout_secs,
+            permission,
+        }
+    }
+
+    fn approvals() -> PermissionPolicy {
+        PermissionPolicy {
+            connections_allow: Vec::new(),
+            approvals: vec![ApprovalRule {
+                tool_pattern: "*".into(),
+                policy: ApprovalPolicy::Always,
+            }],
+        }
+    }
+
+    #[test]
+    fn effective_timeout_without_approvals_is_the_scope_deadline() {
+        // No approval rules: the engine deadline must stay at the short scope
+        // value even though the gate's own timeout is much longer.
+        let gate = Duration::from_secs(120);
+        let scope = scope(1, PermissionPolicy::default());
+        assert_eq!(effective_run_timeout(&scope, gate), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn effective_timeout_with_approvals_outlives_the_gate_deadline() {
+        // With approval rules the outer deadline must exceed the gate's 2s by
+        // the margin, so the bridge's named refusal wins before this timeout.
+        let gate = Duration::from_secs(2);
+        let scope = scope(1, approvals());
+        let effective = effective_run_timeout(&scope, gate);
+        assert!(effective > gate, "gate must fire first: {effective:?}");
+        assert_eq!(effective, gate + APPROVAL_TIMEOUT_MARGIN);
+    }
+
+    #[test]
+    fn effective_timeout_with_approvals_never_shrinks_a_longer_scope_deadline() {
+        // The real 90s scope vs 120s gate case takes the gate branch.
+        let gate = Duration::from_secs(120);
+        let short = scope(90, approvals());
+        assert_eq!(
+            effective_run_timeout(&short, gate),
+            gate + APPROVAL_TIMEOUT_MARGIN
+        );
+        // A scope deadline already longer than gate+margin is kept as-is.
+        let long = scope(200, approvals());
+        assert_eq!(effective_run_timeout(&long, gate), Duration::from_secs(200));
+    }
+
+    #[test]
+    fn effective_timeout_clamps_zero_scope_to_one_second() {
+        let gate = Duration::from_secs(2);
+        let scope = scope(0, PermissionPolicy::default());
+        assert_eq!(effective_run_timeout(&scope, gate), Duration::from_secs(1));
     }
 }

@@ -1143,3 +1143,189 @@ async fn gated_tool_denied_via_api_never_executes() {
         "the denied tool never loaded the skill body"
     );
 }
+
+// --- Fase 3 final fix: approval deadline must outlive the engine timeout ----
+//
+// The bridge waits on the gate for `gate.timeout()` (default 120s), but the
+// `AgentEngine` boundary used to wrap the whole run in a shorter scope timeout
+// (default 90s). When that outer deadline fired first it dropped the bridge's
+// pending oneshot (a late decision became a no-op) and, non-streaming, handed
+// chat_core an `Err` that triggered its legacy, ungated direct-chat fallback.
+// With approval rules the outer timeout is now `max(scope, gate + margin)`, so
+// the bridge's named refusal fires first and rig continues the turn.
+
+/// Build a real engine whose gate deadline and scope deadline are both short
+/// and configurable, pointed at a fake Ollama that calls the gated skill tool.
+async fn short_timeout_engine(
+    gate_timeout: Duration,
+    scope_timeout_secs: u64,
+    permission: PermissionPolicy,
+    skill_root: &Path,
+) -> (RigAgentEngine, GatedToolServer, AgentRunRequest) {
+    let server = GatedToolServer::start().await;
+    let skill_dir = skill_root.join("skills").join(E2E_SKILL);
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("---\nname: {E2E_SKILL}\ndescription: demo\n---\n{E2E_SKILL_BODY}"),
+    )
+    .unwrap();
+    let skill_manager = Arc::new(SkillManager::with_paths(vec![skill_root.join("skills")]));
+    skill_manager.scan_and_load();
+    let engine = RigAgentEngine::from_target(
+        EngineTarget::Ollama { url: server.url() },
+        Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
+        None,
+        e2e_config(&server.url()),
+        skill_manager,
+        Arc::new(LocalToolRegistry::builtins()),
+        Arc::new(ApprovalGate::new(gate_timeout)),
+    );
+    let mut req = e2e_request();
+    req.scope.timeout_secs = scope_timeout_secs;
+    req.scope.permission = permission;
+    (engine, server, req)
+}
+
+#[tokio::test]
+async fn approval_timeout_outlives_engine_timeout_nonstreaming() {
+    let dir = tempfile::tempdir().unwrap();
+    // gate 2s, scope 1s, tool gated: the named approval refusal must win before
+    // the engine's extended (7s) deadline. No decision is ever posted, so the
+    // bridge's own 2s timeout is the only thing that can end the wait.
+    let (engine, server, req) = short_timeout_engine(
+        Duration::from_secs(2),
+        1,
+        always_for(BUILTIN_SKILL_ID),
+        dir.path(),
+    )
+    .await;
+
+    let result = engine.run(req).await;
+    match &result {
+        Ok(r) => assert!(
+            !r.text.is_empty(),
+            "the turn continues after the named refusal"
+        ),
+        Err(e) => panic!("engine must not fail with a generic timeout: {e}"),
+    }
+    let bodies = server.bodies();
+    assert!(
+        bodies.iter().any(|b| b.contains("approval timed out")),
+        "the named approval timeout must be fed back as a tool result: {bodies:?}"
+    );
+    assert!(
+        !bodies.concat().contains("agent run timed out after 1s"),
+        "the short scope deadline must not have fired first"
+    );
+}
+
+#[tokio::test]
+async fn approval_timeout_outlives_engine_timeout_streaming() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, server, req) = short_timeout_engine(
+        Duration::from_secs(2),
+        1,
+        always_for(BUILTIN_SKILL_ID),
+        dir.path(),
+    )
+    .await;
+
+    let mut rx = engine
+        .run_stream(req)
+        .await
+        .expect("run_stream opens the event channel");
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    for event in &events {
+        if let AgentRunEvent::Error { message } = event {
+            assert!(
+                !message.contains("agent stream timed out after 1s"),
+                "the short scope deadline must not leak as a stream error: {message}"
+            );
+        }
+    }
+    let bodies = server.bodies();
+    assert!(
+        bodies.iter().any(|b| b.contains("approval timed out")),
+        "the named approval timeout must be fed back as a tool result: {bodies:?}"
+    );
+}
+
+/// A fake Ollama that answers later than the scope deadline, used to prove a
+/// request with *no* approval rules keeps the unchanged short timeout.
+struct SlowFinalServer {
+    addr: SocketAddr,
+    handle: JoinHandle<()>,
+}
+
+impl SlowFinalServer {
+    async fn start(delay: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(_body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            tokio::time::sleep(delay).await;
+            let payload = format!(
+                "{}\n",
+                json!({
+                    "model": "llama3.2",
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "message": {"role": "assistant", "content": "slow final"},
+                    "done": true
+                })
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+        Self { addr, handle }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+impl Drop for SlowFinalServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn no_approval_rules_keep_the_short_scope_timeout() {
+    let server = SlowFinalServer::start(Duration::from_millis(1500)).await;
+    let engine = RigAgentEngine::from_target(
+        EngineTarget::Ollama { url: server.url() },
+        Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
+        None,
+        e2e_config(&server.url()),
+        Arc::new(SkillManager::new()),
+        Arc::new(LocalToolRegistry::builtins()),
+        // A long gate timeout must NOT stretch the engine deadline when the
+        // request carries no approval rules.
+        Arc::new(ApprovalGate::new(Duration::from_secs(120))),
+    );
+    let mut req = e2e_request();
+    req.scope.timeout_secs = 1;
+    req.scope.permission = PermissionPolicy::default();
+    req.scope.local_tools_allow = ToolsAllow::DenyAll;
+
+    let err = engine
+        .run(req)
+        .await
+        .expect_err("the slow answer must exceed the unchanged 1s scope deadline");
+    assert_eq!(err, "agent run timed out after 1s");
+}
