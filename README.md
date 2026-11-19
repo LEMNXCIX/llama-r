@@ -363,7 +363,24 @@ curl -s -X POST http://127.0.0.1:3000/api/approvals/<approval_id> \
   -d '{"approve": true}'
 ```
 
-Errores: `400` hash malo/distinto, `404` id desconocido, `409` ya decidida, `410` expirada. Estos endpoints **no** requieren `X-Debug` (son la respuesta humana, no una vista de administración) y todavía no tienen identidad de usuario (Fase 7). Las aprobaciones **no sobreviven a un reinicio** (Fase 7, ejecución durable), pero sí a un cambio de provider en caliente desde la TUI.
+Errores: `400` hash malo/distinto, `404` id desconocido, `409` ya decidida, `410` expirada. Estos endpoints **no** requieren `X-Debug` (son la respuesta humana, no una vista de administración) y todavía no tienen identidad de usuario (autenticación diferida). Las aprobaciones **sí sobreviven a un reinicio**: los pendientes y las decisiones se guardan en el store de ejecución y se rehidratan al arrancar; una decisión tomada mientras no había petición viva es consumida por el reintento. También sobreviven a un cambio de provider en caliente desde la TUI.
+
+### Ejecución durable: observación y reintento
+
+Cada turno de agente queda registrado en `data/history.db` (tablas `executions`, `execution_events`, `tool_operations`, `pending_approvals`, añadidas de forma no destructiva). Tras un arranque, los turnos que quedaron `Running`/`WaitingApproval` por un crash se marcan `Interrupted` y pueden reintentarse. Los tres endpoints están tras `X-Debug: true` (como RAG/Router):
+
+```bash
+# Ver los turnos recientes (de más reciente a más antiguo; ?limit, default 50, max 200):
+curl -s http://127.0.0.1:3000/api/executions -H 'X-Debug: true'
+
+# Ver un turno y su log de eventos (argumentos/secrets redactados):
+curl -s http://127.0.0.1:3000/api/executions/<execution_id> -H 'X-Debug: true'
+
+# Reintentar un turno Interrupted o Failed:
+curl -s -X POST http://127.0.0.1:3000/api/executions/<execution_id>/retry -H 'X-Debug: true'
+```
+
+El reintento reutiliza el **mismo id** de ejecución: las herramientas ya completadas se replayan desde la caché (`operation_id = <execution_id>:<tool>:<args_hash_hex>`) en lugar de repetir sus efectos. Es recuperación **a nivel de turno**, no replay paso a paso: se re-ejecuta el turno desde el `user_message` guardado (`stream: false`, sin recargar el historial de conversación previo) y el modelo puede generar una respuesta distinta. El reintento da `200` si el turno se re-ejecuta, `400` id malformado, `403` sin `X-Debug` o fila legacy sin `user_message`, `404` id desconocido y `409` si el turno no está en estado reintentable. Sin store (build `--no-default-features` o fallo al abrirlo) la ejecución degrada a pass-through y el chat sigue funcionando. Queda diferido: backend Postgres/async, identidad de usuario en los endpoints, modelo de decisión `Auto` y replay exacto de pasos.
 
 ## Contexto de proyecto
 
