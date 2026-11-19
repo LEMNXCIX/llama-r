@@ -1,4 +1,14 @@
+use crate::ports::delegation::ToolBudget;
+use async_trait::async_trait;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+
+#[async_trait]
+impl ToolBudget for Mutex<ToolCallBudget> {
+    async fn try_consume(&self) -> Result<(), String> {
+        self.lock().await.try_consume()
+    }
+}
 
 pub struct ToolCallBudget {
     pub max: u32,
@@ -55,6 +65,19 @@ impl RunDeadline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn tool_budget_is_shared_through_arc_dyn() {
+        let shared: Arc<Mutex<ToolCallBudget>> = Arc::new(Mutex::new(ToolCallBudget::new(1)));
+        let a: Arc<dyn ToolBudget> = shared.clone();
+        let b: Arc<dyn ToolBudget> = shared.clone();
+
+        assert!(a.try_consume().await.is_ok());
+        // The second handle sees the same single allowance, not a fresh one.
+        assert!(b.try_consume().await.is_err());
+        assert_eq!(shared.lock().await.used(), 1);
+    }
 
     #[test]
     fn budget_allows_up_to_max() {

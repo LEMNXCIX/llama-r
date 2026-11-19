@@ -5,6 +5,7 @@
 //! external apps.
 
 pub mod auto;
+pub mod delegation;
 pub mod engine;
 pub mod execution;
 pub mod history;
