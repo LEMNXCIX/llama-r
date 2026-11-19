@@ -113,12 +113,15 @@ pub fn build_tool_bridges(
     tools
         .into_iter()
         .map(|t| match t {
-            ScopedTool::Mcp(mcp) => Box::new(McpToolBridge::new(
-                mcp,
-                budget.clone(),
-                deps.gate.clone(),
-                deps.event_tx.clone(),
-            )) as Box<dyn ToolDyn>,
+            ScopedTool::Mcp(mcp) => Box::new(
+                McpToolBridge::new(
+                    mcp,
+                    budget.clone(),
+                    deps.gate.clone(),
+                    deps.event_tx.clone(),
+                )
+                .with_operations(deps.operations.clone()),
+            ) as Box<dyn ToolDyn>,
             ScopedTool::Local(local) => Box::new(LocalToolBridge::new(
                 local,
                 scope.clone(),
@@ -653,6 +656,7 @@ mod tests {
             rag: None,
             gate: Arc::new(crate::services::approval::ApprovalGate::default()),
             event_tx: None,
+            operations: crate::adapters::rig_engine::operations::OperationContext::disabled(),
         }
     }
 
@@ -683,6 +687,7 @@ mod tests {
             user_message: "hi".to_string(),
             history: Vec::new(),
             conversation_id: None,
+            execution_id: uuid::Uuid::new_v4(),
         }
     }
 

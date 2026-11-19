@@ -34,6 +34,7 @@ fn test_deps() -> LocalToolDeps {
         rag: None,
         gate: Arc::new(ApprovalGate::default()),
         event_tx: None,
+        operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
 }
 
@@ -155,6 +156,7 @@ fn request(provider: ProviderKind, model: &str) -> AgentRunRequest {
         user_message: "hi".to_string(),
         history: Vec::new(),
         conversation_id: None,
+        execution_id: uuid::Uuid::new_v4(),
     }
 }
 

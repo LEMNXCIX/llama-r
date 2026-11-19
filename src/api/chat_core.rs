@@ -1,5 +1,6 @@
 use crate::api::handlers::AppState;
 use crate::api::route_resolution::{resolve_selection, AgentSelection, ResolvedSelection};
+use crate::domain::execution::{AgentExecution, EventKind, ExecutionEvent, ExecutionStatus};
 use crate::domain::models::{
     ApprovalInfo, ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent,
 };
@@ -8,9 +9,11 @@ use crate::optimizer::TokenOptimizer;
 use crate::ports::engine::AgentRunEvent;
 use crate::services::agent_runtime::RuntimeChatRequest;
 use crate::services::approval::args_hash_hex;
+use serde_json::json;
 use std::pin::Pin;
 use std::time::Instant;
 use tokio_stream::{Stream, StreamExt};
+use uuid::Uuid;
 
 pub type AppChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, AppError>> + Send>>;
 
@@ -107,6 +110,7 @@ async fn build_runtime_request(
     project_id: Option<String>,
     agent_id: Option<String>,
     conversation_id: Option<String>,
+    execution_id: Uuid,
 ) -> Result<RuntimeChatRequest, AppError> {
     let (system, history, user_message) = split_engine_messages(&prepared.messages)?;
     Ok(RuntimeChatRequest {
@@ -118,6 +122,175 @@ async fn build_runtime_request(
         model_override: Some(prepared.model.clone()),
         system_prompt: system,
         default_model: services.default_model.clone(),
+        execution_id,
+    })
+}
+
+/// The one identity shared by the execution row, its event log and every tool
+/// operation in the turn. Created as soon as an agent resolves — before the
+/// engine runs — so the turn is observable even if the engine fails and the
+/// answer comes from the legacy fallback.
+fn new_execution(
+    agent_qualified_id: String,
+    provider: String,
+    model: String,
+    conversation_id: Option<String>,
+    user_message: &str,
+) -> AgentExecution {
+    let now = chrono::Utc::now();
+    AgentExecution {
+        id: Uuid::new_v4(),
+        conversation_id,
+        agent_qualified_id,
+        provider,
+        model,
+        status: ExecutionStatus::Running,
+        current_step: 0,
+        user_message: Some(user_message.to_string()),
+        user_message_hash: args_hash_hex(&serde_json::Value::String(user_message.to_string())),
+        created_at: now,
+        updated_at: now,
+        finished_at: None,
+        error: None,
+    }
+}
+
+/// The last user turn, redacted by the store before it reaches disk.
+fn turn_user_message(prepared: &ChatRequest) -> String {
+    prepared
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
+}
+
+/// Create and register the execution for a resolved agent turn. `None` means
+/// no agent resolved (a direct model request has no agent turn to observe).
+async fn begin_turn_execution(
+    state: &AppState,
+    services: &crate::services::provider_stack::ProviderStack,
+    engine_ids: Option<&(Option<String>, Option<String>)>,
+    conversation_id: Option<&str>,
+    prepared: &ChatRequest,
+) -> Option<AgentExecution> {
+    let execution = engine_ids.map(|(project_id, agent_id)| {
+        let qualified_id = state
+            .agent_registry
+            .resolve(project_id.as_deref(), agent_id.as_deref())
+            .map(|registered| registered.agent.qualified_id())
+            .unwrap_or_else(|| {
+                agent_id
+                    .clone()
+                    .unwrap_or_else(|| project_id.clone().unwrap_or_default())
+            });
+        new_execution(
+            qualified_id,
+            services.provider_name.clone(),
+            prepared.model.clone(),
+            conversation_id.map(str::to_string),
+            &turn_user_message(prepared),
+        )
+    });
+    if let Some(execution) = &execution {
+        record_start(state, execution).await;
+    }
+    execution
+}
+
+/// Register the start. A store failure is a warning, never a failed chat: an
+/// unavailable store degrades to a no-op exactly like the tool guard does.
+async fn record_start(state: &AppState, execution: &AgentExecution) {
+    if let Err(err) = state.execution_store.create(execution).await {
+        tracing::warn!(error = %err, "could not persist execution start; continuing");
+        return;
+    }
+    let event = ExecutionEvent::new(execution.id, EventKind::Started, json!({}));
+    if let Err(err) = state
+        .execution_store
+        .append_event(execution.id, &event)
+        .await
+    {
+        tracing::warn!(error = %err, "could not append execution Started event");
+    }
+}
+
+/// Finalize the turn on every outcome — engine success, engine failure answered
+/// by the fallback, or an outright error — so no turn is left `Running`.
+async fn finish_execution(
+    state: &AppState,
+    execution: Option<&AgentExecution>,
+    outcome: Result<(), String>,
+) {
+    let Some(execution) = execution else {
+        return;
+    };
+    let (status, kind, payload, error) = match &outcome {
+        Ok(()) => (
+            ExecutionStatus::Completed,
+            EventKind::ExecutionCompleted,
+            json!({}),
+            None,
+        ),
+        Err(message) => (
+            ExecutionStatus::Failed,
+            EventKind::ExecutionFailed,
+            json!({"error": message}),
+            Some(message.as_str()),
+        ),
+    };
+    let store = state.execution_store.as_ref();
+    if let Err(err) = store.set_status(execution.id, status, error).await {
+        tracing::warn!(error = %err, "could not set execution status");
+    }
+    let event = ExecutionEvent::new(execution.id, kind, payload);
+    if let Err(err) = store.append_event(execution.id, &event).await {
+        tracing::warn!(error = %err, "could not append execution terminal event");
+    }
+}
+
+/// Wrap the returned stream so a turn that ends (or errors) still records its
+/// terminal status and event. Wrapping at this boundary covers both the engine
+/// stream and the legacy stream without either path knowing about the store.
+fn finalize_stream(
+    state: &AppState,
+    execution: Option<AgentExecution>,
+    stream: AppChatStream,
+) -> AppChatStream {
+    if execution.is_none() {
+        return stream;
+    }
+    let store = state.execution_store.clone();
+    Box::pin(async_stream::stream! {
+        let mut stream = stream;
+        let mut error: Option<String> = None;
+        while let Some(item) = stream.next().await {
+            if let Err(err) = &item {
+                error = Some(err.to_string());
+            }
+            yield item;
+        }
+        let execution = execution.unwrap();
+        let (status, kind, payload, error_text) = match error {
+            Some(message) => (
+                ExecutionStatus::Failed,
+                EventKind::ExecutionFailed,
+                json!({"error": message}),
+                Some(message),
+            ),
+            None => (
+                ExecutionStatus::Completed,
+                EventKind::ExecutionCompleted,
+                json!({}),
+                None,
+            ),
+        };
+        let _ = store
+            .set_status(execution.id, status, error_text.as_deref())
+            .await;
+        let event = ExecutionEvent::new(execution.id, kind, payload);
+        let _ = store.append_event(execution.id, &event).await;
     })
 }
 
@@ -516,6 +689,19 @@ pub async fn execute_chat(
     }
     let prepared = prepare_request(state, &services, payload, &resolved).await?;
 
+    // Create the execution when the agent resolves, not when the engine starts:
+    // a failed engine that falls back to a direct answer is still an observable
+    // turn. The store may be a no-op (degraded boot); recording then does
+    // nothing, and the id still threads into the engine for tool idempotency.
+    let execution = begin_turn_execution(
+        state,
+        &services,
+        engine_ids.as_ref(),
+        selection.conversation_id,
+        &prepared,
+    )
+    .await;
+
     let debug_prompt = if selection.debug {
         Some(
             prepared
@@ -538,64 +724,88 @@ pub async fn execute_chat(
         None
     };
 
-    // Use agent engine when headers or model resolve an agent and runtime is available.
-    if let Some((project_id, agent_id)) = engine_ids {
-        if let Some(runtime) = &services.agent_runtime {
-            let conversation_id = selection.conversation_id.map(|s| s.to_string());
-            let rt_req =
-                build_runtime_request(&services, &prepared, project_id, agent_id, conversation_id)
-                    .await?;
-            let started_at = Instant::now();
-            match runtime.chat(rt_req).await {
-                Ok(text) => {
-                    let response = ChatResponse {
-                        model: prepared.model.clone(),
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                        message: ChatMessage {
-                            role: "assistant".to_string(),
-                            content: text,
-                        },
-                        done: true,
-                        // The engine path has no token accounting surface yet.
-                        usage: None,
-                        served_by: None,
-                        debug_prompt,
-                        debug_route,
-                    };
-                    state
-                        .observability
-                        .record_chat_request(started_at.elapsed().as_millis() as u64);
-                    tracing::info!(
-                        requested_model = %requested_model,
-                        final_model = %response.model,
-                        "Completed chat request via agent engine"
-                    );
-                    return Ok(response);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "agent engine failed; falling back to legacy chat");
+    // One id for the whole turn, whether or not a store could persist it.
+    let run_id = execution
+        .as_ref()
+        .map(|e| e.id)
+        .unwrap_or_else(Uuid::new_v4);
+    let outcome: Result<ChatResponse, AppError> = async {
+        // Use agent engine when headers or model resolve an agent and runtime is available.
+        if let Some((project_id, agent_id)) = engine_ids {
+            if let Some(runtime) = &services.agent_runtime {
+                let conversation_id = selection.conversation_id.map(str::to_string);
+                let rt_req = build_runtime_request(
+                    &services,
+                    &prepared,
+                    project_id,
+                    agent_id,
+                    conversation_id,
+                    run_id,
+                )
+                .await?;
+                let started_at = Instant::now();
+                match runtime.chat(rt_req).await {
+                    Ok(text) => {
+                        let response = ChatResponse {
+                            model: prepared.model.clone(),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                            message: ChatMessage {
+                                role: "assistant".to_string(),
+                                content: text,
+                            },
+                            done: true,
+                            // The engine path has no token accounting surface yet.
+                            usage: None,
+                            served_by: None,
+                            debug_prompt,
+                            debug_route,
+                        };
+                        state
+                            .observability
+                            .record_chat_request(started_at.elapsed().as_millis() as u64);
+                        tracing::info!(
+                            requested_model = %requested_model,
+                            final_model = %response.model,
+                            "Completed chat request via agent engine"
+                        );
+                        return Ok(response);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "agent engine failed; falling back to legacy chat");
+                    }
                 }
             }
         }
+
+        let started_at = Instant::now();
+        let mut response = run_with_fallback(state, &services, prepared, &requested_model).await?;
+        response.debug_prompt = debug_prompt;
+        // The decision rides here too — `None` unless `X-Debug: true` asked for
+        // it, same as the engine path above. The streaming path has no field to
+        // carry it and gRPC drops it deliberately.
+        response.debug_route = debug_route;
+
+        state
+            .observability
+            .record_chat_request(started_at.elapsed().as_millis() as u64);
+        tracing::info!(
+            requested_model = %requested_model,
+            final_model = %response.model,
+            "Completed chat request"
+        );
+        Ok(response)
     }
+    .await;
 
-    let started_at = Instant::now();
-    let mut response = run_with_fallback(state, &services, prepared, &requested_model).await?;
-    response.debug_prompt = debug_prompt;
-    // The decision rides here too — `None` unless `X-Debug: true` asked for
-    // it, same as the engine path above. The streaming path has no field to
-    // carry it and gRPC drops it deliberately.
-    response.debug_route = debug_route;
-
-    state
-        .observability
-        .record_chat_request(started_at.elapsed().as_millis() as u64);
-    tracing::info!(
-        requested_model = %requested_model,
-        final_model = %response.model,
-        "Completed chat request"
-    );
-    Ok(response)
+    // Finalize on both branches above: an engine failure that the legacy chat
+    // answers is still a completed, observable turn.
+    finish_execution(
+        state,
+        execution.as_ref(),
+        outcome.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    outcome
 }
 
 pub async fn execute_chat_stream(
@@ -623,6 +833,18 @@ pub async fn execute_chat_stream(
         );
     }
     let prepared = prepare_request(state, &services, payload, &resolved).await?;
+    let execution = begin_turn_execution(
+        state,
+        &services,
+        engine_ids.as_ref(),
+        selection.conversation_id,
+        &prepared,
+    )
+    .await;
+    let run_id = execution
+        .as_ref()
+        .map(|e| e.id)
+        .unwrap_or_else(Uuid::new_v4);
     let started_at = Instant::now();
 
     // Streaming is a capability of the *resolved model*, not a property of the
@@ -649,39 +871,56 @@ pub async fn execute_chat_stream(
         })
         .unwrap_or(false);
 
-    if let Some((project_id, agent_id)) = engine_ids.filter(|_| streaming) {
-        if let Some(runtime) = &services.agent_runtime {
-            let conversation_id = selection.conversation_id.map(|s| s.to_string());
-            let rt_req =
-                build_runtime_request(&services, &prepared, project_id, agent_id, conversation_id)
-                    .await?;
-            match runtime.chat_stream(rt_req).await {
-                Ok(rx) => {
-                    state
-                        .observability
-                        .record_chat_request(started_at.elapsed().as_millis() as u64);
-                    tracing::info!(
-                        requested_model = %requested_model,
-                        "Started streaming chat request via agent engine"
-                    );
-                    return Ok(engine_events_to_chat_stream(prepared.model.clone(), rx));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "agent engine stream failed; falling back to legacy stream"
-                    );
+    let outcome: Result<AppChatStream, AppError> = async {
+        if let Some((project_id, agent_id)) = engine_ids.filter(|_| streaming) {
+            if let Some(runtime) = &services.agent_runtime {
+                let conversation_id = selection.conversation_id.map(str::to_string);
+                let rt_req = build_runtime_request(
+                    &services,
+                    &prepared,
+                    project_id,
+                    agent_id,
+                    conversation_id,
+                    run_id,
+                )
+                .await?;
+                match runtime.chat_stream(rt_req).await {
+                    Ok(rx) => {
+                        state
+                            .observability
+                            .record_chat_request(started_at.elapsed().as_millis() as u64);
+                        tracing::info!(
+                            requested_model = %requested_model,
+                            "Started streaming chat request via agent engine"
+                        );
+                        return Ok(engine_events_to_chat_stream(prepared.model.clone(), rx));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "agent engine stream failed; falling back to legacy stream"
+                        );
+                    }
                 }
             }
         }
-    }
 
-    let stream = run_stream_with_fallback(state, &services, prepared, &requested_model).await?;
-    state
-        .observability
-        .record_chat_request(started_at.elapsed().as_millis() as u64);
-    tracing::info!(requested_model = %requested_model, "Started streaming chat request");
-    Ok(stream)
+        let stream = run_stream_with_fallback(state, &services, prepared, &requested_model).await?;
+        state
+            .observability
+            .record_chat_request(started_at.elapsed().as_millis() as u64);
+        tracing::info!(requested_model = %requested_model, "Started streaming chat request");
+        Ok(stream)
+    }
+    .await;
+
+    match outcome {
+        Ok(stream) => Ok(finalize_stream(state, execution, stream)),
+        Err(err) => {
+            finish_execution(state, execution.as_ref(), Err(err.to_string())).await;
+            Err(err)
+        }
+    }
 }
 
 #[cfg(test)]

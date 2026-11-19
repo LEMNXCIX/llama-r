@@ -6,6 +6,7 @@ pub mod approval;
 pub mod builder;
 pub mod limits;
 pub mod local_tools;
+pub mod operations;
 #[cfg(feature = "rig-engine")]
 pub mod tools;
 
@@ -15,6 +16,7 @@ use crate::adapters::rig_engine::local_tools::{LocalTool, LocalToolRegistry};
 use crate::config::{Config, ProviderKind, OPENROUTER_BASE_URL};
 use crate::domain::scope::AgentScope;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
+use crate::ports::execution::ExecutionStore;
 use crate::ports::mcp::{McpCallRequest, McpClient, McpServerRegistry, McpToolDef};
 use crate::ports::rag::RagStore;
 use crate::providers::capabilities::capabilities_for;
@@ -222,6 +224,11 @@ pub struct RigAgentEngine {
     /// Human-approval gate. Owned by `AppState`, not by the hot-swapped stack:
     /// a TUI Apply rebuilds the engine but must not drop pending decisions.
     pub gate: Arc<ApprovalGate>,
+    /// Durable execution store behind the tool-call idempotency guard. Built
+    /// once at boot and shared, like the approval gate, so a settings Apply
+    /// cannot lose the record of completed operations. A no-op store is the
+    /// default: no `history` feature or a degraded boot simply replays nothing.
+    pub execution_store: Arc<dyn ExecutionStore>,
 }
 
 impl RigAgentEngine {
@@ -305,7 +312,16 @@ impl RigAgentEngine {
             skill_manager,
             local_tools,
             gate,
+            execution_store: Arc::new(crate::adapters::execution::NoOpExecutionStore),
         }
+    }
+
+    /// Install the boot-owned execution store. Kept as a chainable setter so
+    /// the many existing engine constructors keep working with the no-op
+    /// default; only the boot/Apply path needs durable operations.
+    pub fn with_execution_store(mut self, store: Arc<dyn ExecutionStore>) -> Self {
+        self.execution_store = store;
+        self
     }
 
     /// Non-secret target discriminator, safe for logs and health.
@@ -403,6 +419,10 @@ impl RigAgentEngine {
                 rag: self.rag.clone(),
                 gate: self.gate.clone(),
                 event_tx: None,
+                operations: operations::OperationContext::new(
+                    req.execution_id,
+                    self.execution_store.clone(),
+                ),
             };
             match &target {
                 EngineTarget::Ollama { url } => {
@@ -506,6 +526,10 @@ impl RigAgentEngine {
                 rag: self.rag.clone(),
                 gate: self.gate.clone(),
                 event_tx: Some(tx.clone()),
+                operations: operations::OperationContext::new(
+                    req.execution_id,
+                    self.execution_store.clone(),
+                ),
             };
             match &target {
                 EngineTarget::Ollama { url } => {
@@ -611,6 +635,7 @@ impl AgentEngine for RigAgentEngine {
         // other requests must survive and must be decidable while this stream
         // is open. AppState owns the single instance.
         let gate = self.gate.clone();
+        let execution_store = self.execution_store.clone();
         let timeout = effective_run_timeout(&req.scope, gate.timeout());
 
         tokio::spawn(async move {
@@ -622,6 +647,7 @@ impl AgentEngine for RigAgentEngine {
                 skill_manager,
                 local_tools,
                 gate,
+                execution_store,
             };
             // The timeout covers the whole stream lifecycle, not just a single
             // completion, and stays at the trait boundary as before. With

@@ -124,6 +124,7 @@ fn request(capabilities: ModelCapabilities, model: &str, local: ToolsAllow) -> A
         user_message: "hola".into(),
         history: Vec::new(),
         conversation_id: None,
+        execution_id: uuid::Uuid::new_v4(),
     }
 }
 
@@ -193,6 +194,7 @@ fn skill_deps(skills_root: &std::path::Path) -> LocalToolDeps {
         rag: None,
         gate: Arc::new(ApprovalGate::default()),
         event_tx: None,
+        operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
 }
 
@@ -202,6 +204,7 @@ fn empty_deps() -> LocalToolDeps {
         rag: None,
         gate: Arc::new(ApprovalGate::default()),
         event_tx: None,
+        operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
 }
 
@@ -300,6 +303,7 @@ fn rag_deps(rag: Arc<ScopingFakeRag>) -> LocalToolDeps {
         rag: Some(rag),
         gate: Arc::new(ApprovalGate::default()),
         event_tx: None,
+        operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
 }
 

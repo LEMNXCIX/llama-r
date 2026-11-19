@@ -8,10 +8,14 @@ use crate::config::ProviderKind;
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::{ContextStore, ProjectContext};
 use crate::domain::agent::{AgentConfig, OptimizeConfig};
+#[cfg(feature = "history")]
+use crate::domain::execution::{EventKind, ExecutionStatus};
 use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
+#[cfg(feature = "history")]
+use crate::ports::execution::ExecutionStore;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::LLMProvider;
 use crate::services::agent_registry::AgentRegistry;
@@ -223,6 +227,31 @@ fn test_state_with_runtime_and_provider(
     agent_runtime: Option<Arc<AgentRuntime>>,
     provider_name: &str,
 ) -> (TempDir, Arc<AppState>) {
+    test_state_inner(
+        provider,
+        agent_runtime,
+        provider_name,
+        Arc::new(crate::adapters::execution::NoOpExecutionStore),
+    )
+}
+
+/// Same rig as the other helpers but with a caller-owned execution store, so a
+/// test can assert the Started/Completed events an agent turn writes.
+#[cfg(feature = "history")]
+fn test_state_with_store(
+    provider: Arc<dyn LLMProvider + Send + Sync>,
+    agent_runtime: Option<Arc<AgentRuntime>>,
+    execution_store: Arc<dyn crate::ports::execution::ExecutionStore>,
+) -> (TempDir, Arc<AppState>) {
+    test_state_inner(provider, agent_runtime, "ollama", execution_store)
+}
+
+fn test_state_inner(
+    provider: Arc<dyn LLMProvider + Send + Sync>,
+    agent_runtime: Option<Arc<AgentRuntime>>,
+    provider_name: &str,
+    execution_store: Arc<dyn crate::ports::execution::ExecutionStore>,
+) -> (TempDir, Arc<AppState>) {
     let temp_dir = tempfile::tempdir().unwrap();
     std::env::set_var("LLAMA_R_DIR", temp_dir.path());
     let agent_registry = agent_runtime
@@ -262,7 +291,7 @@ fn test_state_with_runtime_and_provider(
         router_config: Arc::new(RouterConfig::default()),
         router_healthy: AtomicBool::new(false),
         approval_gate: Arc::new(crate::services::approval::ApprovalGate::default()),
-        execution_store: Arc::new(crate::adapters::execution::NoOpExecutionStore),
+        execution_store,
     });
     (temp_dir, state)
 }
@@ -1248,6 +1277,155 @@ async fn a_mid_request_swap_cannot_change_the_fallback_stack() {
     let after = state.services_snapshot().await;
     assert_eq!(after.default_model, "model-b");
     assert_eq!(after.provider.get_base_url(), "http://provider-B");
+}
+
+#[cfg(feature = "history")]
+fn install_execution_test_agent(registry: &Arc<AgentRegistry>, project: &str, agent: &str) {
+    let config = AgentConfig {
+        name: agent.to_string(),
+        model: "agent-model".to_string(),
+        system_prompt: "You are helpful".to_string(),
+        context_project: Some(project.to_string()),
+        ..Default::default()
+    };
+    let dir = crate::core::paths::get_project_agents_dir(project);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{agent}.toml")),
+        toml::to_string(&config).unwrap(),
+    )
+    .unwrap();
+    registry.reload_all(&[]).unwrap();
+}
+
+#[cfg(feature = "history")]
+fn execution_test_rig(
+    fail: bool,
+) -> (
+    TempDir,
+    Arc<AppState>,
+    std::sync::Arc<crate::adapters::execution::SqliteExecutionStore>,
+) {
+    let engine = Arc::new(FakeEngine {
+        response: "engine-echo".to_string(),
+        fail,
+    });
+    let registry = Arc::new(AgentRegistry::new());
+    let runtime = Arc::new(AgentRuntime {
+        registry: registry.clone(),
+        engine,
+        history: None,
+        rag: None,
+        enricher: test_enricher(),
+    });
+    let provider = Arc::new(FakeProvider {
+        fail_primary_once: AtomicBool::new(false),
+        fail_always: false,
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        crate::adapters::execution::SqliteExecutionStore::new(dir.path().join("history.db"))
+            .unwrap(),
+    );
+    // `test_state_inner` sets LLAMA_R_DIR to its own temp dir; pass a store that
+    // points at another temp path (the store holds its own connection) then let
+    // the agent files land under the state's dir.
+    let (state_dir, state) = test_state_with_store(provider, Some(runtime), store.clone());
+    install_execution_test_agent(&registry, "exec-proj", "exec-agent");
+    (state_dir, state, store)
+}
+
+#[cfg(feature = "history")]
+#[tokio::test]
+async fn a_turn_records_started_and_completed_events() {
+    let _guard = lock_env();
+    let (_dir, state, store) = execution_test_rig(false);
+
+    let response = execute_chat(
+        &state,
+        ChatRequest {
+            model: "fallback-model".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "ping".to_string(),
+            }],
+            stream: false,
+        },
+        AgentSelection {
+            project_id: Some("exec-proj"),
+            agent_id: Some("exec-agent"),
+            conversation_id: None,
+            debug: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(response.message.content.contains("engine-echo"));
+
+    let executions = store.list(10).await.unwrap();
+    assert_eq!(executions.len(), 1, "one agent turn = one execution");
+    let execution = &executions[0];
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let events = store.get_events(execution.id).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::Started),
+        "a turn records a Started event: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == EventKind::ExecutionCompleted),
+        "a turn records an ExecutionCompleted event: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e.seq > 0),
+        "the store assigns monotonic seq numbers"
+    );
+}
+
+#[cfg(feature = "history")]
+#[tokio::test]
+async fn a_legacy_fallback_turn_is_also_recorded() {
+    let _guard = lock_env();
+    // The engine fails; chat_core falls back to the direct provider. The turn
+    // must still be observable — no fallback turns left unrecorded.
+    let (_dir, state, store) = execution_test_rig(true);
+
+    let response = execute_chat(
+        &state,
+        ChatRequest {
+            model: "fallback-model".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "ping".to_string(),
+            }],
+            stream: false,
+        },
+        AgentSelection {
+            project_id: Some("exec-proj"),
+            agent_id: Some("exec-agent"),
+            conversation_id: None,
+            debug: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !response.message.content.is_empty(),
+        "the fallback answered"
+    );
+
+    let executions = store.list(10).await.unwrap();
+    assert_eq!(executions.len(), 1, "a fallback turn is still an execution");
+    let execution = &executions[0];
+    let events = store.get_events(execution.id).await.unwrap();
+    assert!(events.iter().any(|e| e.kind == EventKind::Started));
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == EventKind::ExecutionCompleted),
+        "a fallback that answered is recorded as completed: {events:?}"
+    );
 }
 
 #[test]

@@ -640,6 +640,10 @@ impl TuiApp {
                             model_override: None,
                             system_prompt: None,
                             default_model: services.default_model.clone(),
+                            // The TUI does not route through chat_core, so it
+                            // has no durable turn record; a fresh id still
+                            // gives the run a valid tool-operation namespace.
+                            execution_id: uuid::Uuid::new_v4(),
                         })
                         .await
                         .map_err(|e| e.to_string())

@@ -103,6 +103,7 @@ fn request(capabilities: ModelCapabilities, model: &str) -> AgentRunRequest {
         user_message: "hola".into(),
         history: Vec::new(),
         conversation_id: None,
+        execution_id: uuid::Uuid::new_v4(),
     }
 }
 

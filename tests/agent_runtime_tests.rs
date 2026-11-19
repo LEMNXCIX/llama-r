@@ -135,6 +135,7 @@ fn request() -> RuntimeChatRequest {
         model_override: None,
         system_prompt: None,
         default_model: "fallback".to_string(),
+        execution_id: uuid::Uuid::new_v4(),
     }
 }
 

@@ -1,5 +1,6 @@
 use crate::adapters::rig_engine::approval;
 use crate::adapters::rig_engine::limits::ToolCallBudget;
+use crate::adapters::rig_engine::operations::{self, OperationContext};
 use crate::adapters::rig_engine::ScopedMcpTool;
 use crate::ports::engine::AgentRunEvent;
 use crate::services::approval::ApprovalGate;
@@ -27,6 +28,10 @@ pub struct McpToolBridge {
     /// caller; `None` on the non-streaming path, where the pending is discovered
     /// by polling `GET /api/approvals` instead. Both paths block on the gate.
     pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
+    /// The same idempotency guard `LocalToolBridge` uses, so an identical retry
+    /// replays the stored result instead of calling MCP again. `None` for a
+    /// bridge built directly (e.g. by a unit test): no store, no guard.
+    pub operations: Option<OperationContext>,
 }
 
 impl McpToolBridge {
@@ -41,7 +46,15 @@ impl McpToolBridge {
             budget,
             gate,
             event_tx,
+            operations: None,
         }
+    }
+
+    /// Install the run's operation context. `build_tool_bridges` always calls
+    /// this; a directly built bridge stays a transparent pass-through.
+    pub fn with_operations(mut self, operations: OperationContext) -> Self {
+        self.operations = Some(operations);
+        self
     }
 
     pub async fn invoke_json(&self, args: Value) -> Result<String, String> {
@@ -75,7 +88,17 @@ impl McpToolBridge {
             b.try_consume()?;
         }
 
-        self.inner.invoke(args).await
+        // Wrap the actual MCP call, not the scope/approval/budget checks above:
+        // a replay still goes through those, but never reaches the upstream.
+        let tool_name = rig_tool_name(&self.inner.def.server_id, &self.inner.def.name);
+        let invoke_args = args.clone();
+        operations::run_idempotent(
+            self.operations.as_ref(),
+            &tool_name,
+            &args,
+            self.inner.invoke(invoke_args),
+        )
+        .await
     }
 }
 

@@ -210,6 +210,7 @@ mod bridge {
     use super::*;
     use crate::adapters::rig_engine::approval;
     use crate::adapters::rig_engine::limits::ToolCallBudget;
+    use crate::adapters::rig_engine::operations::{self, OperationContext};
     use crate::domain::scope::AgentScope;
     use crate::ports::engine::AgentRunEvent;
     use crate::ports::rag::RagStore;
@@ -238,6 +239,9 @@ mod bridge {
         /// `Some` on the streaming path (the `ApprovalRequired` event reaches
         /// the SSE caller); `None` on the non-streaming path.
         pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
+        /// The turn's durable operation context, shared with the MCP bridge.
+        /// Carries the `execution_id` the operation id is scoped to.
+        pub operations: OperationContext,
     }
 
     /// One `ToolDyn` per registered local tool. Holds the definition, the scope
@@ -252,6 +256,10 @@ mod bridge {
         /// mirroring `McpToolBridge`.
         pub gate: Arc<ApprovalGate>,
         pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
+        /// The same idempotency guard the MCP bridge uses. `Some` for every
+        /// bridge built by the engine; a directly built test bridge can leave
+        /// it out and execute without a store.
+        pub operations: Option<OperationContext>,
     }
 
     impl LocalToolBridge {
@@ -263,6 +271,7 @@ mod bridge {
         ) -> Self {
             let gate = deps.gate.clone();
             let event_tx = deps.event_tx.clone();
+            let operations = Some(deps.operations.clone());
             Self {
                 tool,
                 scope,
@@ -270,6 +279,7 @@ mod bridge {
                 deps,
                 gate,
                 event_tx,
+                operations,
             }
         }
 
@@ -300,13 +310,24 @@ mod bridge {
                 b.try_consume()?;
             }
 
-            match &self.tool.kind {
-                LocalToolKind::BuiltinSkill => Self::exec_skill(&self.deps, &self.tool.id, &args),
-                LocalToolKind::RagQuery { source_id } => {
-                    // `source_id` is informational; scope stays authoritative.
-                    self.exec_rag_query(source_id.as_deref(), &args).await
+            // The durable guard wraps only the actual dispatch: scope, approval
+            // and the shared budget are still enforced above it on every call.
+            // A replay returns the stored result without touching the executor.
+            let tool_id = self.tool.id.clone();
+            let dispatch_args = args.clone();
+            operations::run_idempotent(self.operations.as_ref(), &tool_id, &args, async {
+                match &self.tool.kind {
+                    LocalToolKind::BuiltinSkill => {
+                        Self::exec_skill(&self.deps, &tool_id, &dispatch_args)
+                    }
+                    LocalToolKind::RagQuery { source_id } => {
+                        // `source_id` is informational; scope stays authoritative.
+                        self.exec_rag_query(source_id.as_deref(), &dispatch_args)
+                            .await
+                    }
                 }
-            }
+            })
+            .await
         }
 
         /// Load a declared skill's full `SKILL.md` on demand. An unknown or

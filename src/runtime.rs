@@ -517,6 +517,7 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         context_store: context_store.clone(),
         history_store: history_store.clone(),
         approval_gate: approval_gate.clone(),
+        execution_store: execution_store.clone(),
     };
     build_companions(&handles, &config, &mut stack);
     let state = build_app_state_with_gate(
@@ -1182,6 +1183,9 @@ pub struct CompanionHandles {
     /// The boot-owned gate, read from `AppState` on a settings Apply so pending
     /// approvals are never dropped by a stack rebuild.
     pub approval_gate: Arc<ApprovalGate>,
+    /// The boot-owned execution store, read from `AppState` on a settings Apply
+    /// so completed tool operations survive an engine rebuild.
+    pub execution_store: Arc<dyn ExecutionStore>,
 }
 
 impl CompanionHandles {
@@ -1193,6 +1197,7 @@ impl CompanionHandles {
             context_store: state.context_store.clone(),
             history_store: state.history_store.clone(),
             approval_gate: state.approval_gate.clone(),
+            execution_store: state.execution_store.clone(),
         }
     }
 }
@@ -1227,15 +1232,18 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
         let engine_target = engine_target_for(config);
         stack.engine_target = engine_target.as_ref().map(|target| target.kind());
         engine_target.map(|target| {
-            let engine: Arc<dyn AgentEngine> = Arc::new(RigAgentEngine::from_target(
-                target,
-                handles.mcp_registry.clone(),
-                rag_store.clone(),
-                config.clone(),
-                handles.skill_manager.clone(),
-                local_tools.clone(),
-                handles.approval_gate.clone(),
-            ));
+            let engine: Arc<dyn AgentEngine> = Arc::new(
+                RigAgentEngine::from_target(
+                    target,
+                    handles.mcp_registry.clone(),
+                    rag_store.clone(),
+                    config.clone(),
+                    handles.skill_manager.clone(),
+                    local_tools.clone(),
+                    handles.approval_gate.clone(),
+                )
+                .with_execution_store(handles.execution_store.clone()),
+            );
             Arc::new(AgentRuntime {
                 registry: handles.agent_registry.clone(),
                 engine,

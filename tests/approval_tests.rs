@@ -365,6 +365,7 @@ fn local_bridge(
         rag: None,
         gate,
         event_tx,
+        operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     };
     let tool = LocalToolRegistry::builtins()
         .tools()
@@ -629,6 +630,7 @@ async fn build_tool_bridges_carries_gate_to_both_bridge_kinds() {
         rag: None,
         gate: gate.clone(),
         event_tx: Some(tx),
+        operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     };
     let mcp_tool = ScopedMcpTool {
         def: McpToolDef {
@@ -1006,6 +1008,7 @@ fn e2e_request() -> AgentRunRequest {
         user_message: "load the skill".to_string(),
         history: Vec::new(),
         conversation_id: None,
+        execution_id: Uuid::new_v4(),
     }
 }
 

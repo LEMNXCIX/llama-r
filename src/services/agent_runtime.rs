@@ -11,6 +11,7 @@ use crate::ports::rag::RagStore;
 use crate::services::agent_registry::AgentRegistry;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 pub struct AgentRuntime {
     pub registry: Arc<AgentRegistry>,
@@ -43,6 +44,10 @@ pub struct RuntimeChatRequest {
     /// used to do.
     pub system_prompt: Option<String>,
     pub default_model: String,
+    /// The durable turn id to stamp on the engine request. Created by whichever
+    /// caller resolves the agent (`chat_core`) so the execution record, its
+    /// events and the tool-operation ids all share one identity.
+    pub execution_id: Uuid,
 }
 
 impl AgentRuntime {
@@ -101,6 +106,7 @@ impl AgentRuntime {
             user_message,
             history: req.history,
             conversation_id: req.conversation_id,
+            execution_id: req.execution_id,
         })
     }
 

@@ -25,6 +25,12 @@ pub struct AgentRunRequest {
     pub user_message: String,
     pub history: Vec<ChatMessage>,
     pub conversation_id: Option<String>,
+    /// The durable turn this run belongs to. Threads the Fase 7 execution id
+    /// into the tool bridges so a retry of the same turn can replay a tool's
+    /// stored result instead of repeating its side effect. Every caller must
+    /// supply one; a fresh `Uuid::new_v4()` is correct for a one-shot turn that
+    /// has no execution record (e.g. the TUI).
+    pub execution_id: Uuid,
 }
 
 #[derive(Debug, Clone)]

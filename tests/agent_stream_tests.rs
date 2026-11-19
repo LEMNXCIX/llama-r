@@ -168,6 +168,7 @@ fn run_request(model: &str, provider: ProviderKind) -> AgentRunRequest {
         user_message: "hi".to_string(),
         history: Vec::new(),
         conversation_id: None,
+        execution_id: uuid::Uuid::new_v4(),
     }
 }
 
