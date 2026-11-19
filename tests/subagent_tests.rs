@@ -443,6 +443,61 @@ impl LLMProvider for FakeProvider {
     }
 }
 
+/// The `ChatRequest`s a fallback provider saw. `stream` lives on this type, not
+/// on `AgentRunRequest`, so a provider is the only place a delegated turn's
+/// `stream` flag is observable without changing production code.
+#[derive(Clone, Default)]
+struct SeenChatRequests(Arc<StdMutex<Vec<ChatRequest>>>);
+
+struct RecordingProvider {
+    seen: SeenChatRequests,
+}
+
+#[async_trait]
+impl LLMProvider for RecordingProvider {
+    fn get_base_url(&self) -> String {
+        "http://fake-provider".into()
+    }
+
+    async fn health_check(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error + Send + Sync>> {
+        Ok(vec![])
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<ChatResponse, Box<dyn Error + Send + Sync>> {
+        self.seen.0.lock().unwrap().push(request.clone());
+        Ok(ChatResponse {
+            model: request.model,
+            created_at: "now".into(),
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: "FALLBACK_ANSWER".into(),
+            },
+            done: true,
+            usage: None,
+            served_by: None,
+            debug_prompt: None,
+            debug_route: None,
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, Box<dyn Error + Send + Sync>>> + Send>>,
+        Box<dyn Error + Send + Sync>,
+    > {
+        Err("a child turn must never stream".into())
+    }
+}
+
 fn register_real(registry: &AgentRegistry, agent: Agent) {
     let scope = ScopeBuilder::build(&agent).expect("manifest builds a scope");
     registry.register(agent, scope);
@@ -505,6 +560,12 @@ fn parent_with(allowed: &[&str], extra: AgentConfig) -> Agent {
         project_id: Some("proj".into()),
         config,
     }
+}
+
+fn agent_with_model(id: &str, project: Option<&str>, model: &str) -> Agent {
+    let mut target = agent(id, project, None);
+    target.config.model = model.into();
+    target
 }
 
 fn request_child(message: &str) -> DelegateRequest {
@@ -722,5 +783,138 @@ async fn expired_deadline_is_rejected_without_executing() {
     assert!(
         runs.0.lock().unwrap().is_empty(),
         "no child turn ran past an expired deadline"
+    );
+}
+
+#[tokio::test]
+async fn child_request_is_non_streaming_and_uses_the_target_model() {
+    let registry = Arc::new(AgentRegistry::new());
+    register_real(
+        &registry,
+        parent_with(
+            &["child"],
+            AgentConfig {
+                model: "coordinator-model".into(),
+                ..Default::default()
+            },
+        ),
+    );
+    register_real(
+        &registry,
+        agent_with_model("child", Some("proj"), "specialist-model"),
+    );
+    let runs = RecordedRuns::default();
+    let seen = SeenChatRequests::default();
+    let state = test_state(
+        registry.clone(),
+        Arc::new(RecordingEngine {
+            runs: runs.clone(),
+            answer: "unused".into(),
+            // The engine records the request before failing, so the turn falls
+            // through to the recording provider — the only place `ChatRequest`
+            // (and therefore `stream`) is observable from a test.
+            fail_on: Some("do the thing".into()),
+            spend_budget: false,
+        }),
+        Arc::new(RecordingProvider { seen: seen.clone() }),
+    );
+    let delegator = RuntimeDelegator::new(registry, Arc::downgrade(&state));
+
+    let result = delegator
+        .delegate(request_child("do the thing"))
+        .await
+        .expect("the child turn answers through the fallback");
+    assert_eq!(result.answer, "FALLBACK_ANSWER");
+
+    {
+        let guard = runs.0.lock().unwrap();
+        assert_eq!(guard.len(), 1, "exactly one child engine turn ran");
+        assert_eq!(guard[0].agent.id, "child");
+        assert_eq!(
+            guard[0].model, "specialist-model",
+            "the child uses the target agent's own model, not the coordinator's"
+        );
+        assert_ne!(guard[0].model, "coordinator-model");
+    }
+    {
+        let guard = seen.0.lock().unwrap();
+        assert_eq!(guard.len(), 1, "one fallback chat request");
+        assert!(!guard[0].stream, "the delegated turn is not streaming");
+        let last = guard[0].messages.last().expect("a user message");
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content, "do the thing");
+    }
+    // `debug` is consumed by chat dispatch before the engine sees the turn: it
+    // appears on neither `AgentRunRequest` nor `ChatRequest`, and `delegate_turn`
+    // drops the response field it feeds. Pin the literal at its one source, the
+    // same source-guard pattern `tests/tui_chrome.rs` uses for unobservable UI
+    // contracts.
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/api/chat_core.rs"))
+            .expect("chat_core source is readable");
+    let body = &source[source
+        .find("pub async fn delegate_turn")
+        .expect("delegate_turn exists")..];
+    assert!(
+        body.contains("stream: false"),
+        "delegate_turn must build a non-streaming child ChatRequest"
+    );
+    assert!(
+        body.contains("debug: false"),
+        "delegate_turn must build a non-debug child AgentSelection"
+    );
+}
+
+#[tokio::test]
+async fn global_target_runs_unscoped_without_project_context() {
+    let registry = Arc::new(AgentRegistry::new());
+    let parent = Agent {
+        id: "parent".into(),
+        project_id: Some("proj".into()),
+        config: AgentConfig {
+            name: "parent".into(),
+            model: "coordinator-model".into(),
+            context_project: Some("parent-context".into()),
+            subagents: Some(SubagentsConfig {
+                allowed: vec!["glob".into()],
+                allow_global: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    };
+    register_real(&registry, parent);
+    register_real(&registry, agent_with_model("glob", None, "global-model"));
+    let runs = RecordedRuns::default();
+    let state = test_state(
+        registry.clone(),
+        Arc::new(RecordingEngine {
+            runs: runs.clone(),
+            answer: "GLOBAL_OK".into(),
+            fail_on: None,
+            spend_budget: false,
+        }),
+        Arc::new(FakeProvider { fail: false }),
+    );
+    let delegator = RuntimeDelegator::new(registry, Arc::downgrade(&state));
+
+    let mut req = request("glob", "parent", Some("proj"));
+    req.message = "do the thing".into();
+    let result = delegator
+        .delegate(req)
+        .await
+        .expect("an allowed global target must run");
+    assert_eq!(result.answer, "GLOBAL_OK");
+
+    let guard = runs.0.lock().unwrap();
+    assert_eq!(guard.len(), 1, "exactly one child turn ran");
+    let child = &guard[0];
+    assert_eq!(child.agent.id, "glob");
+    assert_eq!(child.agent.project_id, None, "the target is a global agent");
+    assert_eq!(child.scope.project_id, None, "unscoped dispatch");
+    assert_eq!(child.model, "global-model", "the target's own model");
+    assert!(
+        !child.system_prompt.contains("parent-context"),
+        "no coordinator project context leaks into a global delegate"
     );
 }
