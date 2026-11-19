@@ -74,14 +74,12 @@ pub struct AgentConfig {
     #[serde(default)]
     pub temperature: Option<f32>,
 
-    /// Compatibility stub: old manifests may carry a `[subagents]` table, but
-    /// the runtime never read it. Accept and ignore it so those files still load.
-    ///
-    /// `pub` so test fixtures that build `AgentConfig` with a struct literal
-    /// (including integration crates) can leave it at `None`. It is never read
-    /// outside this module and never serialised.
-    #[serde(default, skip_serializing)]
-    pub subagents: Option<toml::Table>,
+    /// Bounded subagent delegation policy. `None` means the agent has no
+    /// `[subagents]` table and cannot spawn subagents; a present table opts in
+    /// with an explicit allowlist and depth. It serialises so a
+    /// `PUT /api/agents/:id` round-trip preserves the operator's settings.
+    #[serde(default)]
+    pub subagents: Option<SubagentsConfig>,
     #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
@@ -239,6 +237,53 @@ pub struct RoutingConfig {
     pub hint: Option<String>,
 }
 
+/// Bounded subagent delegation policy from the `[subagents]` manifest table.
+///
+/// Every field is `#[serde(default)]` so an old manifest that sets only some
+/// of them keeps loading. The declared depth is validated at read time by
+/// [`SubagentsConfig::effective_max_depth`]: an out-of-range value is ignored
+/// with a warning and falls back to `1`, never silently clamped.
+#[derive(Debug, Serialize, Deserialize, Clone, Default, ToSchema)]
+pub struct SubagentsConfig {
+    /// Agent ids this agent may delegate to. Empty = deny-all.
+    #[serde(default)]
+    pub allowed: Vec<String>,
+    /// Whether delegation may reach a global agent (outside this project).
+    #[serde(default)]
+    pub allow_global: bool,
+    /// Maximum nesting depth in `1..=8`. `None` or an out-of-range value
+    /// resolves to [`SubagentsConfig::DEFAULT_MAX_DEPTH`].
+    #[serde(default)]
+    pub max_depth: Option<u32>,
+}
+
+impl SubagentsConfig {
+    /// Depth used when the manifest omits `max_depth` or gives an invalid one.
+    pub const DEFAULT_MAX_DEPTH: u32 = 1;
+    /// Highest accepted `max_depth`.
+    pub const MAX_DEPTH_CEILING: u32 = 8;
+
+    /// The validated depth: the declared value when it lies in `1..=8`,
+    /// otherwise `1`. An invalid value is ignored with a warning naming the
+    /// manifest path and the value, never silently clamped.
+    pub fn effective_max_depth(&self) -> u32 {
+        match self.max_depth {
+            Some(depth) if (Self::DEFAULT_MAX_DEPTH..=Self::MAX_DEPTH_CEILING).contains(&depth) => {
+                depth
+            }
+            Some(depth) => {
+                tracing::warn!(
+                    path = "subagents.max_depth",
+                    value = depth,
+                    "ignoring out-of-range subagents.max_depth (expected 1..=8); using 1"
+                );
+                Self::DEFAULT_MAX_DEPTH
+            }
+            None => Self::DEFAULT_MAX_DEPTH,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub id: String, // Usually the filename without .toml
@@ -313,20 +358,90 @@ summary_collection = "agent:fudi_ops/memory"
     #[test]
     fn a_manifest_with_subagents_still_deserialises() {
         let toml = "name = \"Demo\"\nsystem_prompt = \"hi\"\n\
-                    [subagents]\nallowed = [\"one\"]\nallow_global = true\nmax_depth = 2\n";
+                    [subagents]\nallowed = [\"one\", \"two\"]\nallow_global = true\nmax_depth = 2\n";
         let config: AgentConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.name, "Demo");
         assert_eq!(config.system_prompt, "hi");
+        let subagents = config
+            .subagents
+            .as_ref()
+            .expect("a v1 [subagents] table must still load");
+        assert_eq!(subagents.allowed, vec!["one", "two"]);
+        assert!(subagents.allow_global);
+        assert_eq!(subagents.max_depth, Some(2));
+        assert_eq!(subagents.effective_max_depth(), 2);
     }
 
     #[test]
-    fn the_subagents_stub_never_serialises() {
+    fn subagents_without_max_depth_defaults_to_one() {
+        let toml = "name = \"Demo\"\nsystem_prompt = \"hi\"\n\
+                    [subagents]\nallowed = [\"one\"]\n";
+        let config: AgentConfig = toml::from_str(toml).unwrap();
+        let subagents = config.subagents.as_ref().unwrap();
+        assert_eq!(subagents.max_depth, None);
+        assert!(!subagents.allow_global);
+        assert_eq!(subagents.effective_max_depth(), 1);
+    }
+
+    #[test]
+    fn subagents_max_depth_out_of_range_falls_back_to_one() {
+        for value in [0, 9, 100] {
+            let toml = format!(
+                "name = \"Demo\"\nsystem_prompt = \"hi\"\n\
+                 [subagents]\nallowed = [\"one\"]\nmax_depth = {value}\n"
+            );
+            let config: AgentConfig = toml::from_str(&toml).unwrap();
+            let subagents = config.subagents.as_ref().unwrap();
+            assert_eq!(
+                subagents.effective_max_depth(),
+                1,
+                "max_depth = {value} must fall back to 1, never be clamped"
+            );
+        }
+    }
+
+    #[test]
+    fn subagents_toml_roundtrip_preserves_all_fields() {
+        let toml = "name = \"Demo\"\nsystem_prompt = \"hi\"\n\
+                    [subagents]\nallowed = [\"one\", \"two\"]\nallow_global = true\nmax_depth = 3\n";
+        let config: AgentConfig = toml::from_str(toml).unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        let reparsed: AgentConfig = toml::from_str(&encoded).unwrap();
+        let original = config.subagents.as_ref().unwrap();
+        let reparsed_subagents = reparsed.subagents.as_ref().unwrap();
+        assert_eq!(reparsed_subagents.allowed, original.allowed);
+        assert_eq!(reparsed_subagents.allow_global, original.allow_global);
+        assert_eq!(reparsed_subagents.max_depth, original.max_depth);
+    }
+
+    #[test]
+    fn an_agent_without_subagents_emits_no_key() {
         let config = AgentConfig::default();
         let text = toml::to_string(&config).unwrap();
         assert!(
             !text.contains("subagents"),
-            "dead config must not leak back out: {text}"
+            "an agent without the table must not emit an empty [subagents] key: {text}"
         );
+    }
+
+    #[test]
+    fn subagents_table_serialises_when_present() {
+        let config: AgentConfig = toml::from_str(
+            "name = \"Demo\"\nsystem_prompt = \"hi\"\n\
+             [subagents]\nallowed = [\"one\"]\nallow_global = true\nmax_depth = 4\n",
+        )
+        .unwrap();
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("[subagents]"), "missing table: {text}");
+        assert!(
+            text.contains("allowed = [\"one\"]"),
+            "missing allowed: {text}"
+        );
+        assert!(
+            text.contains("allow_global = true"),
+            "missing allow_global: {text}"
+        );
+        assert!(text.contains("max_depth = 4"), "missing max_depth: {text}");
     }
 
     #[test]

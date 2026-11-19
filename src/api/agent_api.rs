@@ -1,5 +1,5 @@
 use crate::api::handlers::AppState;
-use crate::domain::agent::{Agent, OptimizeConfig, RoutingConfig};
+use crate::domain::agent::{Agent, OptimizeConfig, RoutingConfig, SubagentsConfig};
 use crate::domain::scope::AgentScope;
 use crate::error::AppError;
 use crate::services::validation::validate_identifier;
@@ -28,6 +28,10 @@ pub struct CreateAgentRequest {
     /// silently erases a hand-written `[routing] hint`.
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    /// Bounded subagent delegation policy. Carried through `PUT` so a rewrite
+    /// of the manifest never erases an operator's `[subagents]` settings.
+    #[serde(default)]
+    pub subagents: Option<SubagentsConfig>,
     #[serde(default)]
     pub project_id: Option<String>,
     #[serde(default)]
@@ -543,6 +547,22 @@ fn build_agent_toml(req: &CreateAgentRequest, project_id: Option<&str>) -> Strin
         }
     }
 
+    if let Some(subagents) = &req.subagents {
+        let allowed: Vec<String> = subagents
+            .allowed
+            .iter()
+            .map(|agent| format!("\"{}\"", agent.replace('"', "\\\"")))
+            .collect();
+        output.push_str(&format!(
+            "[subagents]\nallowed = [{}]\nallow_global = {}\n",
+            allowed.join(", "),
+            subagents.allow_global
+        ));
+        if let Some(max_depth) = subagents.max_depth {
+            output.push_str(&format!("max_depth = {}\n", max_depth));
+        }
+    }
+
     output
 }
 
@@ -578,5 +598,45 @@ mod tests {
             vec!["llama_r__skill", "llama_r__rag_query"]
         );
         assert_eq!(parsed.deferred_skills, vec!["reviewer-skill"]);
+    }
+
+    #[test]
+    fn build_agent_toml_preserves_subagents() {
+        let req: CreateAgentRequest = serde_json::from_value(serde_json::json!({
+            "id": "sub-agent",
+            "name": "Sub Agent",
+            "system_prompt": "sub agent",
+            "subagents": {
+                "allowed": ["one", "two"],
+                "allow_global": true,
+                "max_depth": 3
+            }
+        }))
+        .unwrap();
+
+        let toml_text = build_agent_toml(&req, None);
+        assert!(
+            toml_text.contains("[subagents]"),
+            "missing table: {toml_text}"
+        );
+        assert!(
+            toml_text.contains("allowed = [\"one\", \"two\"]"),
+            "missing allowed: {toml_text}"
+        );
+        assert!(
+            toml_text.contains("allow_global = true"),
+            "missing allow_global: {toml_text}"
+        );
+        assert!(
+            toml_text.contains("max_depth = 3"),
+            "missing max_depth: {toml_text}"
+        );
+
+        // The emitted TOML must round-trip back into the typed manifest.
+        let parsed: crate::domain::agent::AgentConfig = toml::from_str(&toml_text).unwrap();
+        let subagents = parsed.subagents.as_ref().unwrap();
+        assert_eq!(subagents.allowed, vec!["one", "two"]);
+        assert!(subagents.allow_global);
+        assert_eq!(subagents.max_depth, Some(3));
     }
 }
