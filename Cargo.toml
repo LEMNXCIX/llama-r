@@ -48,9 +48,10 @@ utoipa = { version = "5", features = ["chrono"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 rusqlite = { version = "0.43", features = ["bundled"], optional = true }
 rig-core = { version = "0.40", optional = true }
+# Used by the agent-case fixture in `src/evals` (also available to tests).
+tempfile = "3.15.0"
 
 [dev-dependencies]
-tempfile = "3.15.0"
 tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]

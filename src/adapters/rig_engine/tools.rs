@@ -89,17 +89,44 @@ impl McpToolBridge {
             b.try_consume()?;
         }
 
+        // Emit the public event-contract events for a tool that is actually
+        // about to run. The SSE surface ignores them today (Nivel-A), but the
+        // eval runner drains them to prove a `called_tool` check against a real
+        // tool loop. Nothing here carries raw output: `preview` is empty so a
+        // tool result cannot leak a credential into a stream or report.
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(AgentRunEvent::ToolCall {
+                    server_id: self.inner.def.server_id.clone(),
+                    tool_name: self.inner.def.name.clone(),
+                    arguments: args.clone(),
+                })
+                .await;
+        }
+
         // Wrap the actual MCP call, not the scope/approval/budget checks above:
         // a replay still goes through those, but never reaches the upstream.
         let tool_name = rig_tool_name(&self.inner.def.server_id, &self.inner.def.name);
         let invoke_args = args.clone();
-        operations::run_idempotent(
+        let outcome = operations::run_idempotent(
             self.operations.as_ref(),
             &tool_name,
             &args,
             self.inner.invoke(invoke_args),
         )
-        .await
+        .await;
+
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(AgentRunEvent::ToolResult {
+                    server_id: self.inner.def.server_id.clone(),
+                    tool_name: self.inner.def.name.clone(),
+                    is_error: outcome.is_err(),
+                    preview: String::new(),
+                })
+                .await;
+        }
+        outcome
     }
 }
 

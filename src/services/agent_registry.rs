@@ -27,6 +27,28 @@ impl AgentRegistry {
         }
     }
 
+    /// Register an already-built agent and its scope directly, without loading
+    /// TOML from disk.
+    ///
+    /// The normal path is [`Self::reload_all`]. In-process callers (eval fixtures,
+    /// embedded hosts) that construct an `Agent` in memory need a registry to
+    /// resolve it; going through `reload_all` would mean writing a manifest into
+    /// a temp dir and moving the process-wide `LLAMA_R_DIR`, which races with
+    /// every other caller. A lock failure is ignored: registration is best effort
+    /// and a failed insert simply means the agent cannot be resolved.
+    pub fn register(&self, agent: Agent, scope: AgentScope) {
+        let key = registry_key(agent.project_id.as_deref(), &agent.id);
+        let registered = RegisteredAgent {
+            agent,
+            scope,
+            path: PathBuf::new(),
+            version_hash: 0,
+        };
+        if let Ok(mut guard) = self.agents.write() {
+            guard.insert(key, registered);
+        }
+    }
+
     pub fn reload_all(&self, known_mcp_servers: &[String]) -> Result<usize, AppError> {
         let mut loaded = HashMap::new();
 

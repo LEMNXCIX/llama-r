@@ -72,6 +72,22 @@ pub fn redact_detail(text: &str) -> String {
     }
 }
 
+/// The qualified name a `called_tool` check matches against.
+///
+/// An MCP tool is named `server__tool` — the same format `rig_tool_name` builds
+/// and the same name a permission glob matches. A local tool carries an empty
+/// `server_id` and is matched by its bare id, exactly how an approval rule names
+/// it. The formatting lives here instead of importing the feature-gated adapter
+/// so this module (and the whole evals library) still compiles under
+/// `--no-default-features`.
+pub fn qualified_tool_name(server_id: &str, tool_name: &str) -> String {
+    if server_id.is_empty() {
+        tool_name.to_string()
+    } else {
+        format!("{server_id}__{tool_name}")
+    }
+}
+
 /// Parse evidence text as JSON when it is structured, so redaction can walk
 /// credential-bearing fields rather than treating the whole text as prose.
 fn evidence_value(evidence: &EvalEvidence) -> Value {
@@ -260,6 +276,17 @@ mod tests {
             apply_check(&EvalCheck::Contains { text: "x".into() }, &evidence),
             EvalCheckOutcome::Fail { .. }
         ));
+    }
+
+    #[test]
+    fn qualified_tool_name_follows_the_engine_scheme() {
+        // MCP tools use the qualified `server__tool` form; local tools use the
+        // bare id (empty server id) from `AgentRunEvent::ToolCall`.
+        assert_eq!(
+            qualified_tool_name("fudi", "list_orders"),
+            "fudi__list_orders"
+        );
+        assert_eq!(qualified_tool_name("", "llama_r__skill"), "llama_r__skill");
     }
 
     #[test]

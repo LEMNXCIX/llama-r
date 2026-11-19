@@ -311,24 +311,52 @@ mod bridge {
                 b.try_consume()?;
             }
 
+            // Emit the same public events as the MCP bridge for a tool that is
+            // actually about to run. A local tool has no server, so its
+            // `server_id` is empty and its qualified name is the bare id — the
+            // same scheme `called_tool` and the permission glob use for locals.
+            // No raw output goes into `preview`: a tool result may hold a secret.
+            if let Some(tx) = &self.event_tx {
+                let _ = tx
+                    .send(AgentRunEvent::ToolCall {
+                        server_id: String::new(),
+                        tool_name: self.tool.id.clone(),
+                        arguments: args.clone(),
+                    })
+                    .await;
+            }
+
             // The durable guard wraps only the actual dispatch: scope, approval
             // and the shared budget are still enforced above it on every call.
             // A replay returns the stored result without touching the executor.
             let tool_id = self.tool.id.clone();
             let dispatch_args = args.clone();
-            operations::run_idempotent(self.operations.as_ref(), &tool_id, &args, async {
-                match &self.tool.kind {
-                    LocalToolKind::BuiltinSkill => {
-                        Self::exec_skill(&self.deps, &tool_id, &dispatch_args)
+            let outcome =
+                operations::run_idempotent(self.operations.as_ref(), &tool_id, &args, async {
+                    match &self.tool.kind {
+                        LocalToolKind::BuiltinSkill => {
+                            Self::exec_skill(&self.deps, &tool_id, &dispatch_args)
+                        }
+                        LocalToolKind::RagQuery { source_id } => {
+                            // `source_id` is informational; scope stays authoritative.
+                            self.exec_rag_query(source_id.as_deref(), &dispatch_args)
+                                .await
+                        }
                     }
-                    LocalToolKind::RagQuery { source_id } => {
-                        // `source_id` is informational; scope stays authoritative.
-                        self.exec_rag_query(source_id.as_deref(), &dispatch_args)
-                            .await
-                    }
-                }
-            })
-            .await
+                })
+                .await;
+
+            if let Some(tx) = &self.event_tx {
+                let _ = tx
+                    .send(AgentRunEvent::ToolResult {
+                        server_id: String::new(),
+                        tool_name: self.tool.id.clone(),
+                        is_error: outcome.is_err(),
+                        preview: String::new(),
+                    })
+                    .await;
+            }
+            outcome
         }
 
         /// Load a declared skill's full `SKILL.md` on demand. An unknown or

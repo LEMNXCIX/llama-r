@@ -562,12 +562,15 @@ async fn one_budget_across_mcp_local_and_approval_path() {
     let decider = tokio::spawn(async move {
         // Approve both pending calls in the order they are emitted, hashing
         // the exact args carried by each event (the gate binds to them).
-        for _ in 0..2 {
-            match rx.recv().await.expect("ApprovalRequired event") {
-                AgentRunEvent::ApprovalRequired { id, args, .. } => {
-                    decide_gate.decide(id, true, args_hash(&args)).unwrap();
-                }
-                other => panic!("expected ApprovalRequired, got {other:?}"),
+        // `ToolCall`/`ToolResult` are informative events from the same channel;
+        // only `ApprovalRequired` carries a decision to make.
+        let mut decided = 0;
+        while decided < 2 {
+            if let AgentRunEvent::ApprovalRequired { id, args, .. } =
+                rx.recv().await.expect("bridge event")
+            {
+                decide_gate.decide(id, true, args_hash(&args)).unwrap();
+                decided += 1;
             }
         }
     });
@@ -605,10 +608,15 @@ async fn never_rule_executes_without_approval() {
         .invoke_json(json!({"table": "users"}))
         .await
         .expect("Never-policy tool executes directly");
-    assert!(
-        rx.try_recv().is_err(),
-        "no ApprovalRequired event for Never tools"
-    );
+    // Bridges also emit informative `ToolCall`/`ToolResult` events now; what
+    // must not appear is an approval request for a tool with no matching rule.
+    let mut saw_approval = false;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AgentRunEvent::ApprovalRequired { .. }) {
+            saw_approval = true;
+        }
+    }
+    assert!(!saw_approval, "no ApprovalRequired event for Never tools");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(budget.lock().await.used(), 1);
 }
@@ -660,14 +668,15 @@ async fn build_tool_bridges_carries_gate_to_both_bridge_kinds() {
 
     let decide_gate = gate.clone();
     let decider = tokio::spawn(async move {
-        // Both bridge kinds emit on the same channel; approve each with the
-        // exact args it carried.
-        for _ in 0..2 {
-            match rx.recv().await.expect("ApprovalRequired event") {
-                AgentRunEvent::ApprovalRequired { id, args, .. } => {
-                    decide_gate.decide(id, true, args_hash(&args)).unwrap();
-                }
-                other => panic!("expected ApprovalRequired, got {other:?}"),
+        // Both bridge kinds emit on the same channel; approve each approval
+        // request with the exact args it carried, ignoring informative events.
+        let mut decided = 0;
+        while decided < 2 {
+            if let AgentRunEvent::ApprovalRequired { id, args, .. } =
+                rx.recv().await.expect("bridge event")
+            {
+                decide_gate.decide(id, true, args_hash(&args)).unwrap();
+                decided += 1;
             }
         }
     });
