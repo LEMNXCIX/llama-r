@@ -56,6 +56,26 @@ pub fn redact_secrets(value: &Value) -> Value {
     }
 }
 
+/// Redact a structured trace payload while preserving its numeric token
+/// counters. `redact_secrets` matches the `token` substring, which would mask
+/// the numeric `input_tokens` / `output_tokens` fields every turn trace carries.
+/// Those values are counts, never credentials, so they are restored from the
+/// original value when (and only when) it is a number. A real secret — a string
+/// under a key/token/password field — stays redacted. Both the trace emitter
+/// and the SQLite store call this helper so the two cannot disagree about what
+/// reaches disk.
+pub fn redact_trace_payload(payload: &Value) -> Value {
+    let mut redacted = redact_secrets(payload);
+    for key in ["input_tokens", "output_tokens"] {
+        if let Some(value) = payload.get(key) {
+            if value.is_number() {
+                redacted[key] = value.clone();
+            }
+        }
+    }
+    redacted
+}
+
 /// SHA-256 over the canonical JSON of the arguments.
 ///
 /// `serde_json::Value` uses a `BTreeMap` for objects unless `preserve_order`
@@ -121,6 +141,23 @@ mod tests {
         let serialized = serde_json::to_string(&redact_secrets(&args)).unwrap();
         assert!(!serialized.contains("TOP-SECRET-VALUE"));
         assert!(!serialized.contains("ANOTHER-SECRET"));
+    }
+
+    #[test]
+    fn trace_redaction_keeps_numeric_counters_but_hides_string_secrets() {
+        let payload = json!({
+            "input_tokens": 2_000_000,
+            "output_tokens": 1000,
+            "api_key": "sk-secret",
+            "nested": {"token": "t"},
+            "provider": "ollama"
+        });
+        let out = redact_trace_payload(&payload);
+        assert_eq!(out["input_tokens"], 2_000_000);
+        assert_eq!(out["output_tokens"], 1000);
+        assert_eq!(out["api_key"], REDACTED_MARKER);
+        assert_eq!(out["nested"]["token"], REDACTED_MARKER);
+        assert_eq!(out["provider"], "ollama");
     }
 
     #[test]

@@ -13,7 +13,7 @@
 
 use crate::domain::execution::{AgentExecution, ExecutionEvent, ExecutionStatus};
 use crate::ports::execution::{ApprovalDecisionRecord, ExecutionStore, PendingApprovalRecord};
-use crate::services::redaction::redact_secrets;
+use crate::services::redaction::{redact_secrets, redact_trace_payload};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection};
@@ -196,7 +196,7 @@ impl ExecutionStore for SqliteExecutionStore {
 
     async fn append_event(&self, execution_id: Uuid, event: &ExecutionEvent) -> Result<(), String> {
         let kind = to_json_text(&event.kind)?;
-        let payload = to_json_text(&redact_secrets(&event.payload))?;
+        let payload = to_json_text(&redact_trace_payload(&event.payload))?;
         let created_at = ts_text(&Utc::now());
         let exec_id = execution_id.to_string();
 

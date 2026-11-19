@@ -83,6 +83,10 @@ pub enum EventKind {
     ExecutionFailed,
     /// Boot observed a mid-flight turn and marked it interrupted.
     Interrupted,
+    /// A structured cost/latency trace for a finished turn (Fase 6c). The unit
+    /// variant keeps `EventKind: Eq`; all trace data lives in the redacted
+    /// event payload, never in the kind itself.
+    TraceRecorded,
 }
 
 /// One append-only event within a turn.

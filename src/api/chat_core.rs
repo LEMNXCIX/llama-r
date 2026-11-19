@@ -2,14 +2,16 @@ use crate::api::handlers::AppState;
 use crate::api::route_resolution::{resolve_selection, AgentSelection, ResolvedSelection};
 use crate::domain::execution::{AgentExecution, EventKind, ExecutionEvent, ExecutionStatus};
 use crate::domain::models::{
-    ApprovalInfo, ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent,
+    ApprovalInfo, ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, Usage,
 };
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
 use crate::ports::engine::AgentRunEvent;
+use crate::ports::execution::ExecutionStore;
 use crate::services::agent_runtime::RuntimeChatRequest;
 use crate::services::approval::args_hash_hex;
-use serde_json::json;
+use crate::services::redaction::redact_trace_payload;
+use serde_json::{json, Value};
 use std::pin::Pin;
 use std::time::Instant;
 use tokio_stream::{Stream, StreamExt};
@@ -246,12 +248,49 @@ async fn record_resume(state: &AppState, execution: &AgentExecution) {
     }
 }
 
+/// Build the structured trace payload for a finished turn. Public so the
+/// redaction and cost contract can be exercised directly by integration tests.
+/// `cost_usd` comes straight from the response's `Usage` — never fabricated
+/// here; a model with no catalog price leaves it `null`.
+pub fn trace_payload(execution: &AgentExecution, usage: Option<&Usage>, latency_ms: u64) -> Value {
+    let (input_tokens, output_tokens, cost_usd) = match usage {
+        Some(usage) => (usage.input_tokens, usage.output_tokens, usage.cost_usd),
+        None => (0, 0, None),
+    };
+    json!({
+        "trace_id": execution.id,
+        "agent_qualified_id": execution.agent_qualified_id,
+        "provider": execution.provider,
+        "model": execution.model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": cost_usd,
+        "latency_ms": latency_ms,
+    })
+}
+
+/// Append a trace event for a finished turn, redacting its payload with the
+/// shared helper before it reaches the store. Best-effort: a store error is a
+/// warning, never a failed chat.
+pub async fn record_trace(store: &dyn ExecutionStore, execution: &AgentExecution, payload: &Value) {
+    let event = ExecutionEvent::new(
+        execution.id,
+        EventKind::TraceRecorded,
+        redact_trace_payload(payload),
+    );
+    if let Err(err) = store.append_event(execution.id, &event).await {
+        tracing::warn!(error = %err, "could not append execution TraceRecorded event");
+    }
+}
+
 /// Finalize the turn on every outcome — engine success, engine failure answered
 /// by the fallback, or an outright error — so no turn is left `Running`.
 async fn finish_execution(
     state: &AppState,
     execution: Option<&AgentExecution>,
     outcome: Result<(), String>,
+    usage: Option<&Usage>,
+    latency_ms: u64,
 ) {
     let Some(execution) = execution else {
         return;
@@ -278,6 +317,12 @@ async fn finish_execution(
     if let Err(err) = store.append_event(execution.id, &event).await {
         tracing::warn!(error = %err, "could not append execution terminal event");
     }
+    record_trace(
+        store,
+        execution,
+        &trace_payload(execution, usage, latency_ms),
+    )
+    .await;
 }
 
 /// Wrap the returned stream so a turn that ends (or errors) still records its
@@ -287,6 +332,7 @@ fn finalize_stream(
     state: &AppState,
     execution: Option<AgentExecution>,
     stream: AppChatStream,
+    started_at: Instant,
 ) -> AppChatStream {
     if execution.is_none() {
         return stream;
@@ -321,6 +367,12 @@ fn finalize_stream(
             .await;
         let event = ExecutionEvent::new(execution.id, kind, payload);
         let _ = store.append_event(execution.id, &event).await;
+        record_trace(
+            store.as_ref(),
+            &execution,
+            &trace_payload(&execution, None, started_at.elapsed().as_millis() as u64),
+        )
+        .await;
     })
 }
 
@@ -776,6 +828,9 @@ pub async fn execute_chat_with_id(
         .as_ref()
         .map(|e| e.id)
         .unwrap_or_else(Uuid::new_v4);
+    // One timer for the whole turn, shared by `record_chat_request` and the
+    // trace so the two always report the same latency.
+    let started_at = Instant::now();
     let outcome: Result<ChatResponse, AppError> = async {
         // Use agent engine when headers or model resolve an agent and runtime is available.
         if let Some((project_id, agent_id)) = engine_ids {
@@ -790,7 +845,6 @@ pub async fn execute_chat_with_id(
                     run_id,
                 )
                 .await?;
-                let started_at = Instant::now();
                 match runtime.chat(rt_req).await {
                     Ok(text) => {
                         let response = ChatResponse {
@@ -824,7 +878,6 @@ pub async fn execute_chat_with_id(
             }
         }
 
-        let started_at = Instant::now();
         let mut response = run_with_fallback(state, &services, prepared, &requested_model).await?;
         response.debug_prompt = debug_prompt;
         // The decision rides here too — `None` unless `X-Debug: true` asked for
@@ -850,6 +903,11 @@ pub async fn execute_chat_with_id(
         state,
         execution.as_ref(),
         outcome.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+        outcome
+            .as_ref()
+            .ok()
+            .and_then(|response| response.usage.as_ref()),
+        started_at.elapsed().as_millis() as u64,
     )
     .await;
     outcome
@@ -974,9 +1032,16 @@ pub async fn execute_chat_stream_with_id(
     .await;
 
     match outcome {
-        Ok(stream) => Ok(finalize_stream(state, execution, stream)),
+        Ok(stream) => Ok(finalize_stream(state, execution, stream, started_at)),
         Err(err) => {
-            finish_execution(state, execution.as_ref(), Err(err.to_string())).await;
+            finish_execution(
+                state,
+                execution.as_ref(),
+                Err(err.to_string()),
+                None,
+                started_at.elapsed().as_millis() as u64,
+            )
+            .await;
             Err(err)
         }
     }
