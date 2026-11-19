@@ -4,9 +4,11 @@
 //! `agent.stream_prompt()`), so it cannot reach the caller directly. It carries
 //! the run's [`ApprovalGate`] and an optional engine event sender: `Some` on the
 //! streaming path, where the `ApprovalRequired` event reaches the SSE caller,
-//! and `None` on the non-streaming path, which has no channel to deliver a
-//! decision to a human and therefore refuses an approval-gated tool with a
-//! named error rather than faking an event nobody can see.
+//! and `None` on the non-streaming path. Both paths register a pending in the
+//! gate and block on its oneshot; the channel only decides *how the human
+//! discovers* the pending. With a channel the SSE event carries the id; without
+//! one the client polls `GET /api/approvals` and posts a decision to
+//! `POST /api/approvals/:id`. Neither path executes the tool before a decision.
 //!
 //! Two invariants are enforced here, not in either bridge, so MCP and local
 //! tools cannot drift apart:
@@ -41,25 +43,25 @@ pub async fn authorize(
     match PermissionEngine::authorize(permission, tool_name) {
         PolicyDecision::Allow => Ok(()),
         PolicyDecision::Approve => {
-            let tx = event_tx.ok_or_else(|| {
-                format!(
-                    "tool '{tool_name}' requires human approval, but this agent run has no approval event channel; \
-                     HITL approval requires the streaming (SSE) path"
-                )
-            })?;
-
+            // Register first, then (if there is a channel) announce. Registering
+            // before the announcement means a non-streaming client can discover
+            // the pending via GET /api/approvals even though no SSE event exists
+            // for it. The gate stores the raw args for that list endpoint; the
+            // SSE event carries only non-secret id/name/hash.
             let (id, rx) = gate.request(tool_name, args);
-            // The full args travel to the caller in the event so a human can see
-            // what they are approving; the gate stores only their one-way hash.
-            tx.send(AgentRunEvent::ApprovalRequired {
-                id,
-                tool_name: tool_name.to_string(),
-                args: args.clone(),
-            })
-            .await
-            .map_err(|_| {
-                format!("tool '{tool_name}' was not executed: the approval event channel is closed")
-            })?;
+            if let Some(tx) = event_tx {
+                tx.send(AgentRunEvent::ApprovalRequired {
+                    id,
+                    tool_name: tool_name.to_string(),
+                    args: args.clone(),
+                })
+                .await
+                .map_err(|_| {
+                    format!(
+                        "tool '{tool_name}' was not executed: the approval event channel is closed"
+                    )
+                })?;
+            }
 
             match tokio::time::timeout(gate.timeout(), rx).await {
                 Ok(Ok(GateDecision::Approved)) => Ok(()),
@@ -84,6 +86,9 @@ pub async fn authorize(
 mod tests {
     use super::*;
     use crate::domain::policy::{ApprovalPolicy, ApprovalRule};
+    use crate::services::approval::args_hash;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn always() -> PermissionPolicy {
         PermissionPolicy {
@@ -96,13 +101,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_event_channel_is_a_named_refusal_not_a_hang() {
-        let gate = ApprovalGate::default();
-        let err = authorize(&gate, None, &always(), "db__drop", &serde_json::json!({}))
+    async fn no_event_channel_registers_a_discoverable_pending() {
+        // The non-streaming path has no SSE event carrying the id, so the human
+        // discovers the pending through the gate's list (surfaced by
+        // GET /api/approvals) and decides it there. The tool still waits.
+        let gate = Arc::new(ApprovalGate::default());
+        let args = serde_json::json!({"table": "users"});
+        let decide_gate = gate.clone();
+        let expected = args.clone();
+        let decider = tokio::spawn(async move {
+            let pending = loop {
+                let list = decide_gate.list_pending();
+                if let Some(p) = list.first() {
+                    break p.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            assert_eq!(pending.tool_name, "db__drop");
+            assert_eq!(pending.args, expected);
+            decide_gate
+                .decide(pending.id, true, args_hash(&expected))
+                .unwrap();
+        });
+
+        authorize(&gate, None, &always(), "db__drop", &args)
             .await
-            .unwrap_err();
-        assert!(err.contains("requires human approval"), "{err}");
-        assert!(err.contains("streaming"), "{err}");
+            .expect("approval through the list/decide path lets the tool run");
+        decider.await.unwrap();
     }
 
     #[tokio::test]

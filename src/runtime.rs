@@ -7,6 +7,7 @@ use crate::adapters::router::{LlamaCppRouter, OpenCodeRouter, OpenRouterRouter};
 use crate::api::agent_api::{
     create_agent, delete_agent, get_agent, get_agent_scope, list_agents_api, update_agent,
 };
+use crate::api::approval_api::{decide_approval, list_approvals};
 use crate::api::context_api::{
     analyze_project, create_context, delete_context, get_context, list_contexts, update_context,
 };
@@ -263,6 +264,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/models", get(list_models))
         .route("/api/chat", post(chat))
         .route("/api/agents", get(list_agents_api).post(create_agent))
+        .route("/api/approvals", get(list_approvals))
+        .route("/api/approvals/:id", post(decide_approval))
         .route("/api/agents/:id", get(get_agent).put(update_agent).delete(delete_agent))
         .route("/api/agents/:id/scope", get(get_agent_scope))
         .route("/api/contexts", get(list_contexts).post(create_context))

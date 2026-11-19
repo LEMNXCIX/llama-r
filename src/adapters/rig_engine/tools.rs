@@ -24,8 +24,8 @@ pub struct McpToolBridge {
     /// so a settings Apply cannot drop a pending decision.
     pub gate: Arc<ApprovalGate>,
     /// `Some` on the streaming path, where `ApprovalRequired` reaches the SSE
-    /// caller; `None` on the non-streaming path, where an approval-gated tool is
-    /// refused with a named error instead of faking an event nobody can see.
+    /// caller; `None` on the non-streaming path, where the pending is discovered
+    /// by polling `GET /api/approvals` instead. Both paths block on the gate.
     pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
 }
 

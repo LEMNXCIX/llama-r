@@ -47,6 +47,8 @@ pub enum AppError {
     ApprovalNotFound(String),
     #[error("Approval request expired: {0}")]
     ApprovalExpired(String),
+    #[error("Approval request already decided: {0}")]
+    ApprovalAlreadyDecided(String),
     #[error("Approval arguments changed: {0}")]
     ApprovalArgsChanged(String),
 }
@@ -69,6 +71,7 @@ impl AppError {
             Self::Runtime(_) => "runtime_error",
             Self::ApprovalNotFound(_) => "approval_not_found",
             Self::ApprovalExpired(_) => "approval_expired",
+            Self::ApprovalAlreadyDecided(_) => "approval_already_decided",
             Self::ApprovalArgsChanged(_) => "approval_args_changed",
         }
     }
@@ -84,6 +87,7 @@ impl AppError {
             Self::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Provider(_) => StatusCode::BAD_GATEWAY,
             Self::ApprovalNotFound(_) => StatusCode::NOT_FOUND,
+            Self::ApprovalAlreadyDecided(_) => StatusCode::CONFLICT,
             Self::ApprovalArgsChanged(_) => StatusCode::BAD_REQUEST,
             Self::ApprovalExpired(_) => StatusCode::GONE,
             Self::Io(_)

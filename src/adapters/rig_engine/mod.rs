@@ -395,9 +395,9 @@ impl RigAgentEngine {
             let target = self.target_for_request(&req)?;
             // The engine owns the executors' companions; each run clones them
             // into the bridges built for that request. The non-streaming path
-            // has no event channel, so `event_tx` is `None`: an approval-gated
-            // tool is refused with a named error rather than faking an event
-            // that can never reach a human. HITL approval requires the SSE path.
+            // has no SSE channel (`event_tx: None`), but the bridge still
+            // registers the pending in the shared gate; the client discovers it
+            // by polling GET /api/approvals and posts its decision there.
             let deps = LocalToolDeps {
                 skill_manager: self.skill_manager.clone(),
                 rag: self.rag.clone(),

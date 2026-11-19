@@ -1,4 +1,5 @@
 pub mod agent_api;
+pub mod approval_api;
 pub mod chat_core;
 pub mod context_api;
 pub mod docs;

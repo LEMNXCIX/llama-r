@@ -31,6 +31,33 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+// Task 5: approval API + end-to-end SSE proof.
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use llama_r::adapters::mcp::StaticMcpRegistry;
+use llama_r::adapters::rig_engine::{EngineTarget, RigAgentEngine};
+use llama_r::api::approval_api::REDACTED_MARKER;
+use llama_r::api::handlers::AppState;
+use llama_r::config::{Config, ProviderKind};
+use llama_r::context::store::ContextStore;
+use llama_r::domain::agent::{Agent, AgentConfig};
+use llama_r::domain::models::{ChatRequest, ChatResponse, ModelInfo};
+use llama_r::ports::engine::{AgentEngine, AgentRunRequest};
+use llama_r::ports::mcp::McpServerRegistry;
+use llama_r::providers::capabilities::capabilities_for;
+use llama_r::providers::LLMProvider;
+use llama_r::runtime::{build_app_state_with_gate, build_router};
+use llama_r::services::agent_registry::AgentRegistry;
+use llama_r::services::provider_stack::ProviderStack;
+use std::error::Error;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
+use tokio_stream::Stream;
+use tower::ServiceExt;
+
 #[test]
 fn request_returns_id_and_receiver() {
     let gate = ApprovalGate::default();
@@ -53,10 +80,11 @@ fn decide_approve_resolves_the_receiver() {
     assert!(matches!(rx.try_recv(), Ok(ApprovalDecision::Approved)));
 
     // Atomic decide: the entry was taken under the write lock, so a second
-    // decide cannot resolve the same oneshot (and cannot panic on double send).
+    // decide cannot resolve the same oneshot. The decided entry is retained
+    // briefly so a repeat is reported as a conflict, not a miss.
     assert!(matches!(
         gate.decide(id, true, args_hash(&args)),
-        Err(ApprovalError::NotFound(_))
+        Err(ApprovalError::AlreadyDecided(_))
     ));
 }
 
@@ -153,6 +181,10 @@ fn approval_errors_map_to_the_expected_http_statuses() {
     let expired: AppError = ApprovalError::Expired(id).into();
     assert_eq!(expired.status_code(), StatusCode::GONE);
     assert_eq!(expired.code(), "approval_expired");
+
+    let decided: AppError = ApprovalError::AlreadyDecided(id).into();
+    assert_eq!(decided.status_code(), StatusCode::CONFLICT);
+    assert_eq!(decided.code(), "approval_already_decided");
 
     let changed: AppError = ApprovalError::ArgsChanged.into();
     assert_eq!(changed.status_code(), StatusCode::BAD_REQUEST);
@@ -647,4 +679,467 @@ async fn build_tool_bridges_carries_gate_to_both_bridge_kinds() {
         .await
         .expect("gated local bridge runs after approval");
     decider.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: approval API + end-to-end SSE proof
+// ---------------------------------------------------------------------------
+
+type BoxErr = Box<dyn Error + Send + Sync>;
+
+/// A provider never reached by the approval endpoints — it only lets us build a
+/// minimal `AppState` around a caller-owned gate.
+struct NoopProvider;
+
+#[async_trait]
+impl LLMProvider for NoopProvider {
+    fn get_base_url(&self) -> String {
+        "http://noop".into()
+    }
+    async fn health_check(&self) -> Result<(), BoxErr> {
+        Ok(())
+    }
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, BoxErr> {
+        Ok(vec![])
+    }
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, BoxErr> {
+        Err("noop provider".into())
+    }
+    async fn chat_stream(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, BoxErr>> + Send>>, BoxErr> {
+        Err("noop provider".into())
+    }
+}
+
+fn api_state(gate: Arc<ApprovalGate>) -> Arc<AppState> {
+    build_app_state_with_gate(
+        gate,
+        ProviderStack::new(Arc::new(NoopProvider), "m"),
+        Arc::new(AgentRegistry::new()),
+        Arc::new(SkillManager::new()),
+        Arc::new(ContextStore::new()),
+        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        Vec::new(),
+        Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
+        None,
+    )
+}
+
+async fn call_api(
+    state: &Arc<AppState>,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> axum::response::Response {
+    let payload = body.map(|b| b.to_string()).unwrap_or_default();
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(payload))
+        .unwrap();
+    build_router(state.clone()).oneshot(request).await.unwrap()
+}
+
+#[tokio::test]
+async fn approval_routes_are_registered_and_list_redacts_secrets() {
+    let gate = Arc::new(ApprovalGate::default());
+    let state = api_state(gate.clone());
+    let args = json!({
+        "table": "users",
+        "api_token": "sk-DUMMY-SECRET",
+        "nested": {"password": "p"}
+    });
+    let (id, _rx) = gate.request("db__drop_table", &args);
+
+    // The route is registered (not a 404) and the pending is listed with its
+    // secret-bearing fields scrubbed — the gate holds the raw args, but the API
+    // must never echo them back to a caller.
+    let resp = call_api(&state, "GET", "/api/approvals", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let entry = &list[0];
+    assert_eq!(entry["id"], id.to_string());
+    assert_eq!(entry["tool_name"], "db__drop_table");
+    assert_eq!(entry["args"]["table"], "users");
+    assert_eq!(entry["args"]["api_token"], REDACTED_MARKER);
+    assert_eq!(entry["args"]["nested"]["password"], REDACTED_MARKER);
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.contains("sk-DUMMY-SECRET"), "secret leaked over HTTP");
+    // The hash is bound to what the human saw, but never published on this list.
+    assert!(!entry.as_object().unwrap().contains_key("args_hash"));
+}
+
+#[tokio::test]
+async fn decide_endpoint_maps_bad_hash_missing_and_already_decided() {
+    let gate = Arc::new(ApprovalGate::default());
+    let state = api_state(gate.clone());
+    let args = json!({"table": "users"});
+    let correct = args_hash_hex(&args);
+    let (id, _rx) = gate.request("db__drop_table", &args);
+
+    // Wrong hash -> 400, and the pending is left intact for a retry.
+    let resp = call_api(
+        &state,
+        "POST",
+        &format!("/api/approvals/{id}"),
+        Some(json!({"approve": true, "args_hash": "00".repeat(32)})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Unknown id -> 404.
+    let unknown = Uuid::new_v4();
+    let resp = call_api(
+        &state,
+        "POST",
+        &format!("/api/approvals/{unknown}"),
+        Some(json!({"approve": true, "args_hash": correct.clone()})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Omitted hash uses the gate's stored one -> 200 (this is how a
+    // non-streaming client, with no SSE event to echo, decides).
+    let resp = call_api(
+        &state,
+        "POST",
+        &format!("/api/approvals/{id}"),
+        Some(json!({"approve": true})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Deciding the same id again -> 409, distinguishable from 404 above.
+    let resp = call_api(
+        &state,
+        "POST",
+        &format!("/api/approvals/{id}"),
+        Some(json!({"approve": false, "args_hash": correct})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // The decided pending is no longer offered for a decision.
+    let resp = call_api(&state, "GET", "/api/approvals", None).await;
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 0);
+}
+
+// --- end-to-end: a gated tool driven through run_stream -> SSE -------------
+
+const E2E_SKILL: &str = "x";
+const E2E_SKILL_BODY: &str = "GATED SKILL BODY MARKER";
+const E2E_FINAL: &str = "done after approval";
+
+/// Fake Ollama playing both halves of the tool loop on a real socket: the first
+/// completion calls the gated local tool, the one after the tool result returns
+/// the final answer. Every raw request body is recorded so the test can prove
+/// whether the tool actually ran.
+struct GatedToolServer {
+    addr: SocketAddr,
+    bodies: Arc<std::sync::Mutex<Vec<String>>>,
+    handle: JoinHandle<()>,
+}
+
+impl GatedToolServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = bodies.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let Some(body) = read_http_body(&mut socket).await else {
+                    return;
+                };
+                let is_tool_result = body.contains("\"role\":\"tool\"");
+                sink.lock().unwrap().push(body.clone());
+                // Rig's Ollama streaming client reassembles NDJSON lines and
+                // only emits a frame once its trailing newline arrives.
+                let payload = if is_tool_result {
+                    json!({
+                        "model": "llama3.2",
+                        "created_at": "2024-01-01T00:00:00Z",
+                        "message": {"role": "assistant", "content": E2E_FINAL},
+                        "done": true
+                    })
+                } else {
+                    json!({
+                        "model": "llama3.2",
+                        "created_at": "2024-01-01T00:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "type": "function",
+                                "function": {
+                                    "name": BUILTIN_SKILL_ID,
+                                    "arguments": {"name": E2E_SKILL, "api_key": "sk-E2E-SECRET"}
+                                }
+                            }]
+                        },
+                        "done": true
+                    })
+                };
+                let payload = format!("{payload}\n");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        Self {
+            addr,
+            bodies,
+            handle,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn bodies(&self) -> Vec<String> {
+        self.bodies.lock().unwrap().clone()
+    }
+}
+
+impl Drop for GatedToolServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn read_http_body(socket: &mut TcpStream) -> Option<String> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    let header_end = loop {
+        let n = socket.read(&mut tmp).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let len = headers
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let total = header_end + len;
+    while buf.len() < total {
+        let n = socket.read(&mut tmp).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    Some(String::from_utf8_lossy(&buf[header_end..total]).to_string())
+}
+
+fn e2e_config(ollama_url: &str) -> Config {
+    Config {
+        port: 3000,
+        provider: ProviderKind::Ollama,
+        ollama_url: ollama_url.to_string(),
+        default_model: "llama3.2".to_string(),
+        embedding_model: "nomic-embed-text".to_string(),
+        embedding_dimensions: 768,
+        rag_enabled: true,
+        history_retention_days: 90,
+        openrouter_api_key: None,
+        opencode_api_key: None,
+        opencode_url: "http://127.0.0.1:4096".to_string(),
+        openai_base_url: None,
+    }
+}
+
+fn e2e_request() -> AgentRunRequest {
+    AgentRunRequest {
+        agent: Agent {
+            id: "a".to_string(),
+            project_id: None,
+            config: AgentConfig::default(),
+        },
+        scope: AgentScope {
+            agent_id: "a".to_string(),
+            project_id: None,
+            mcp_sources: HashSet::new(),
+            tools_allow: ToolsAllow::DenyAll,
+            local_tools_allow: ToolsAllow::AllFromSources,
+            rag_sources: HashSet::new(),
+            rag_write: RagWritePolicy::None,
+            max_tool_calls: 1,
+            max_iterations: 2,
+            timeout_secs: 10,
+            permission: always_for(BUILTIN_SKILL_ID),
+        },
+        model: "llama3.2".to_string(),
+        provider: ProviderKind::Ollama,
+        capabilities: capabilities_for(ProviderKind::Ollama, "llama3.2"),
+        system_prompt: "sys".to_string(),
+        user_message: "load the skill".to_string(),
+        history: Vec::new(),
+        conversation_id: None,
+    }
+}
+
+/// Drive one gated tool through the whole chain: real engine `run_stream` ->
+/// real bridge -> real gate -> engine event channel -> SSE mapping -> GET/POST
+/// endpoints -> tool loop continues. Returns the tokens, the raw model requests
+/// and any stream errors so each test can assert its own outcome.
+async fn drive_hitl(approve: bool) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let server = GatedToolServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join("skills").join(E2E_SKILL);
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("---\nname: {E2E_SKILL}\ndescription: demo\n---\n{E2E_SKILL_BODY}"),
+    )
+    .unwrap();
+    let skill_manager = Arc::new(SkillManager::with_paths(vec![dir.path().join("skills")]));
+    skill_manager.scan_and_load();
+
+    let gate = Arc::new(ApprovalGate::default());
+    let engine = RigAgentEngine::from_target(
+        EngineTarget::Ollama { url: server.url() },
+        Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
+        None,
+        e2e_config(&server.url()),
+        skill_manager,
+        Arc::new(LocalToolRegistry::builtins()),
+        gate.clone(),
+    );
+    // The same gate is installed on AppState, so the HTTP endpoints see the
+    // pending the engine registered and can unblock the waiting bridge.
+    let state = api_state(gate);
+
+    let rx = engine
+        .run_stream(e2e_request())
+        .await
+        .expect("run_stream must open the event channel");
+    let mut stream = engine_events_to_chat_stream("llama3.2".to_string(), rx);
+
+    // Consume the SSE stream until the approval event arrives. The bridge is
+    // blocked on the gate while the request stays open.
+    let (approval_id, approval_hash) = loop {
+        let item = stream
+            .next()
+            .await
+            .expect("the stream stays open while a human decides")
+            .expect("no stream error before the approval event");
+        if let Some(info) = item.approval {
+            break (info.id, info.args_hash);
+        }
+        if item.done {
+            panic!("the stream finished without an approval event");
+        }
+    };
+
+    // The client discovers the same pending through GET and sees a redacted
+    // argument, proving the non-streaming discovery path and the redaction
+    // requirement together.
+    let resp = call_api(&state, "GET", "/api/approvals", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let pending = &list[0];
+    assert_eq!(pending["id"], approval_id);
+    assert_eq!(pending["args"]["api_key"], REDACTED_MARKER);
+    assert!(!String::from_utf8_lossy(&bytes).contains("sk-E2E-SECRET"));
+
+    // Decide through POST with the hash echo from the SSE event.
+    let resp = call_api(
+        &state,
+        "POST",
+        &format!("/api/approvals/{approval_id}"),
+        Some(json!({"approve": approve, "args_hash": approval_hash})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Drain the rest of the stream.
+    let mut tokens = Vec::new();
+    let mut errors = Vec::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(event) => {
+                if event.done {
+                    break;
+                }
+                if !event.message.content.is_empty() {
+                    tokens.push(event.message.content);
+                }
+            }
+            Err(err) => errors.push(err.to_string()),
+        }
+    }
+    (tokens, server.bodies(), errors)
+}
+
+#[tokio::test]
+async fn gated_tool_approved_via_api_completes_the_sse_stream() {
+    let (tokens, bodies, errors) = drive_hitl(true).await;
+    assert!(
+        errors.is_empty(),
+        "the approved path must not error: {errors:?}"
+    );
+    assert_eq!(
+        tokens.concat(),
+        E2E_FINAL,
+        "final answer arrives after approval"
+    );
+    assert_eq!(bodies.len(), 2, "a tool call then a final answer");
+    assert!(
+        bodies[1].contains("\"role\":\"tool\"") && bodies[1].contains(E2E_SKILL_BODY),
+        "the gated tool actually executed and returned its body"
+    );
+}
+
+#[tokio::test]
+async fn gated_tool_denied_via_api_never_executes() {
+    let (_tokens, bodies, errors) = drive_hitl(false).await;
+    assert!(
+        errors.is_empty(),
+        "a denial is a named tool result, not a stream error: {errors:?}"
+    );
+    // Rig feeds a tool error back as a tool result and the model still produces
+    // a closing turn. What matters is that the *tool* never ran: the result is
+    // the denial, never the gated skill's body, and no secret is echoed.
+    assert_eq!(bodies.len(), 2, "the denial is reported back to the model");
+    assert!(
+        bodies[1].contains("approval denied"),
+        "the tool result names the denial"
+    );
+    assert!(
+        !bodies[1].contains(E2E_SKILL_BODY),
+        "the denied tool never loaded the skill body"
+    );
 }
