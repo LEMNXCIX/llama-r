@@ -13,11 +13,13 @@
 //!   decisions can never resolve the same oneshot.
 
 use crate::error::AppError;
+// The canonical argument hash lives in `services::redaction` so approval
+// binding and tool-call `operation_id` mint the same id from the same args.
+// Re-exported here: existing callers import it from this module.
+pub use crate::services::redaction::{args_hash, args_hash_hex};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::sync::RwLock;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -95,29 +97,6 @@ impl From<ApprovalError> for AppError {
             ApprovalError::ArgsChanged => AppError::ApprovalArgsChanged("arguments changed".into()),
         }
     }
-}
-
-/// SHA-256 over the canonical JSON of the arguments.
-///
-/// `serde_json::Value` uses a `BTreeMap` for objects unless `preserve_order`
-/// is enabled (it is not), so key order is sorted and a reordered payload
-/// hashes identically. A nondeterministic hash would reject legitimate
-/// approvals when the same arguments come back with different key order.
-pub fn args_hash(args: &Value) -> [u8; 32] {
-    let canonical = serde_json::to_vec(args).expect("a serde_json::Value always serializes");
-    let digest = Sha256::digest(&canonical);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
-}
-
-/// The lowercase hex form sent to (and compared from) HTTP clients.
-pub fn args_hash_hex(args: &Value) -> String {
-    let mut hex = String::with_capacity(64);
-    for byte in args_hash(args) {
-        let _ = write!(&mut hex, "{byte:02x}");
-    }
-    hex
 }
 
 impl Default for ApprovalGate {

@@ -25,57 +25,19 @@
 
 use crate::api::handlers::AppState;
 use crate::error::AppError;
+// Redaction now lives in `services::redaction`, shared with the execution
+// store. Re-exported so this endpoint's tests and external importers keep
+// seeing the same function at the same path, unchanged.
+pub use crate::services::redaction::{redact_secrets, REDACTED_MARKER};
 use axum::{
     extract::{Path, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::sync::Arc;
 use utoipa::ToSchema;
 use uuid::Uuid;
-
-/// Replaces the value of every secret-looking field on the list endpoint.
-pub const REDACTED_MARKER: &str = "[REDACTED]";
-
-/// Substrings that mark a field name as credential-bearing. Matched
-/// case-insensitively against the whole key, so `api_key`, `AccessToken` and
-/// `Authorization` are all caught, not just the bare spellings.
-const SECRET_KEY_FRAGMENTS: &[&str] = &["key", "token", "password", "secret", "authorization"];
-
-/// True when a field name looks like it holds a credential.
-fn is_secret_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    SECRET_KEY_FRAGMENTS
-        .iter()
-        .any(|fragment| lower.contains(fragment))
-}
-
-/// Recursively replace secret-bearing fields with [`REDACTED_MARKER`].
-///
-/// An object key whose name matches a credential fragment is replaced wholesale
-/// (its value is never inspected or copied), and every nested object and array
-/// is walked so a secret buried several levels down cannot slip through.
-pub fn redact_secrets(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let redacted: Map<String, Value> = map
-                .iter()
-                .map(|(key, child)| {
-                    let child = if is_secret_key(key) {
-                        Value::String(REDACTED_MARKER.to_string())
-                    } else {
-                        redact_secrets(child)
-                    };
-                    (key.clone(), child)
-                })
-                .collect();
-            Value::Object(redacted)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(redact_secrets).collect()),
-        other => other.clone(),
-    }
-}
 
 /// Decode the 64-character lowercase hex hash echoed back by an SSE client.
 fn parse_hash_hex(hex: &str) -> Result<[u8; 32], AppError> {

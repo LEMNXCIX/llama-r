@@ -5,6 +5,7 @@
 //! external apps.
 
 pub mod engine;
+pub mod execution;
 pub mod history;
 pub mod mcp;
 pub mod rag;

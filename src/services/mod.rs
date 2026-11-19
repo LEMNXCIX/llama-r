@@ -6,6 +6,7 @@ pub mod agent_skill_sync;
 pub mod approval;
 pub mod provider_stack;
 pub mod rag_ingest;
+pub mod redaction;
 pub mod route_candidates;
 pub mod router_config;
 pub mod scope_builder;
