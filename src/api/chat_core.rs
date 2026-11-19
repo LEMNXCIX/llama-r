@@ -317,6 +317,12 @@ async fn finish_execution(
     if let Err(err) = store.append_event(execution.id, &event).await {
         tracing::warn!(error = %err, "could not append execution terminal event");
     }
+    // One trace emission -> one cost observation. Only a real upstream figure
+    // is recorded (today `Usage::cost_usd` is `None` without catalog prices),
+    // so no cost is ever fabricated from token counts.
+    if let Some(cost_usd) = usage.and_then(|usage| usage.cost_usd) {
+        state.observability.record_cost(cost_usd);
+    }
     record_trace(
         store,
         execution,

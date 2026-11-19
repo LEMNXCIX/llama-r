@@ -1226,6 +1226,10 @@ pub struct CompanionHandles {
     /// settings Apply just like the gate, so an engine rebuild keeps the same
     /// `Auto` behaviour (and survives Apply).
     pub auto_decider: Option<Arc<dyn AutoDecider>>,
+    /// The app-wide counters, read from `AppState` on a settings Apply like the
+    /// gate and decider, so an engine rebuild keeps accumulating into the same
+    /// observability snapshot.
+    pub observability: Arc<AppObservability>,
     /// The boot-owned execution store, read from `AppState` on a settings Apply
     /// so completed tool operations survive an engine rebuild.
     pub execution_store: Arc<dyn ExecutionStore>,
@@ -1241,6 +1245,7 @@ impl CompanionHandles {
             history_store: state.history_store.clone(),
             approval_gate: state.approval_gate.clone(),
             auto_decider: state.auto_decider.clone(),
+            observability: state.observability.clone(),
             execution_store: state.execution_store.clone(),
         }
     }
@@ -1287,7 +1292,8 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
                     handles.approval_gate.clone(),
                 )
                 .with_execution_store(handles.execution_store.clone())
-                .with_auto_decider(handles.auto_decider.clone()),
+                .with_auto_decider(handles.auto_decider.clone())
+                .with_observability(Some(handles.observability.clone())),
             );
             Arc::new(AgentRuntime {
                 registry: handles.agent_registry.clone(),

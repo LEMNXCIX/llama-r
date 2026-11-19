@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use llama_r::adapters::auto::RouterAutoDecider;
+use llama_r::api::observability::AppObservability;
 use llama_r::error::AppError;
 use llama_r::ports::auto::{AutoDecider, AutoVerdict};
 use llama_r::ports::router::{Answer, DecisionRequest, DecisionResponse, DecisionRouter, Question};
@@ -392,6 +393,20 @@ async fn authorize_with_human(
     tool: &str,
     args: &Value,
 ) -> (Result<(), String>, Arc<AtomicBool>) {
+    authorize_with_human_recording(gate, permission, decider, tool, args, None).await
+}
+
+/// Same driver, but threads an observability recorder through to `authorize`
+/// so the task-4 counter tests can inspect what the gate recorded at the
+/// decision point.
+async fn authorize_with_human_recording(
+    gate: &Arc<ApprovalGate>,
+    permission: &PermissionPolicy,
+    decider: Option<&dyn AutoDecider>,
+    tool: &str,
+    args: &Value,
+    observability: Option<&AppObservability>,
+) -> (Result<(), String>, Arc<AtomicBool>) {
     let (tx, mut rx) = mpsc::channel(4);
     let seen = Arc::new(AtomicBool::new(false));
     let gate2 = gate.clone();
@@ -408,7 +423,17 @@ async fn authorize_with_human(
             }
         }
     });
-    let result = authorize(gate, Some(&tx), permission, tool, args, None, decider).await;
+    let result = authorize(
+        gate,
+        Some(&tx),
+        permission,
+        tool,
+        args,
+        None,
+        decider,
+        observability,
+    )
+    .await;
     drop(tx);
     let _ = resolver.await;
     (result, seen)
@@ -621,6 +646,7 @@ async fn policy_auto_threshold_override_reaches_the_decider() {
         &json!({"table": "users"}),
         None,
         Some(&decider),
+        None,
     )
     .await
     .expect("an Allow verdict executes the tool");
@@ -680,6 +706,7 @@ async fn out_of_range_auto_threshold_falls_back_fail_closed() {
             &args,
             None,
             Some(&decider),
+            None,
         )
         .with_subscriber(subscriber)
         .await
@@ -721,6 +748,7 @@ async fn no_override_falls_back_to_the_decider_min_confidence() {
         &json!({"table": "users"}),
         None,
         Some(&decider),
+        None,
     )
     .await
     .expect("an Allow verdict executes the tool");
@@ -745,6 +773,7 @@ async fn gate_redacts_secrets_before_calling_the_decider() {
         &args,
         None,
         Some(&decider),
+        None,
     )
     .await
     .expect("an Allow verdict executes the tool");
@@ -754,4 +783,130 @@ async fn gate_redacts_secrets_before_calling_the_decider() {
     assert_eq!(calls[0].2, args_hash_hex(&args), "canonical hash is passed");
     assert!(!calls[0].1.to_string().contains("SUPER-SECRET-VALUE"));
     assert!(calls[0].1.to_string().contains(REDACTED_MARKER));
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: observability counters recorded at the gate decision point. The
+// recorder is threaded into the gate itself (not wrapped around the decider),
+// so the no-decider case is counted too and every verdict lands exactly once.
+// ---------------------------------------------------------------------------
+
+fn auto_counts(obs: &AppObservability) -> (u64, u64, u64) {
+    let snap = obs.snapshot();
+    (snap.auto_approved, snap.auto_denied, snap.auto_unavailable)
+}
+
+#[tokio::test]
+async fn gate_records_auto_approved_for_an_allow_verdict() {
+    let (decider, calls) = recorder(AutoVerdict::Allow, 0.6);
+    let gate = Arc::new(ApprovalGate::default());
+    let obs = AppObservability::new();
+    let (result, human_seen) = authorize_with_human_recording(
+        &gate,
+        &auto_policy(None),
+        Some(&decider),
+        "db__drop",
+        &json!({"table": "users"}),
+        Some(&obs),
+    )
+    .await;
+    assert!(result.is_ok(), "an Allow verdict lets the tool run");
+    assert!(!human_seen.load(Ordering::SeqCst), "no human was involved");
+    assert_eq!(calls.lock().unwrap().len(), 1, "exactly one decision");
+    assert_eq!(auto_counts(&obs), (1, 0, 0));
+}
+
+#[tokio::test]
+async fn gate_records_auto_denied_for_a_deny_verdict() {
+    let (decider, calls) = recorder(AutoVerdict::Deny, 0.6);
+    let gate = Arc::new(ApprovalGate::default());
+    let obs = AppObservability::new();
+    let (result, human_seen) = authorize_with_human_recording(
+        &gate,
+        &auto_policy(None),
+        Some(&decider),
+        "db__drop",
+        &json!({"table": "users"}),
+        Some(&obs),
+    )
+    .await;
+    assert!(result.is_ok(), "the human approves after the refusal");
+    assert!(human_seen.load(Ordering::SeqCst));
+    assert_eq!(calls.lock().unwrap().len(), 1, "exactly one decision");
+    assert_eq!(auto_counts(&obs), (0, 1, 0));
+}
+
+#[tokio::test]
+async fn gate_records_auto_unavailable_for_an_unavailable_verdict() {
+    let (decider, calls) = recorder(AutoVerdict::Unavailable, 0.6);
+    let gate = Arc::new(ApprovalGate::default());
+    let obs = AppObservability::new();
+    let (result, human_seen) = authorize_with_human_recording(
+        &gate,
+        &auto_policy(None),
+        Some(&decider),
+        "db__drop",
+        &json!({"table": "users"}),
+        Some(&obs),
+    )
+    .await;
+    assert!(result.is_ok());
+    assert!(human_seen.load(Ordering::SeqCst));
+    assert_eq!(calls.lock().unwrap().len(), 1, "exactly one decision");
+    assert_eq!(auto_counts(&obs), (0, 0, 1));
+}
+
+#[tokio::test]
+async fn gate_records_auto_unavailable_when_no_decider_is_installed() {
+    let gate = Arc::new(ApprovalGate::default());
+    let obs = AppObservability::new();
+    let (result, human_seen) = authorize_with_human_recording(
+        &gate,
+        &auto_policy(None),
+        None,
+        "db__drop",
+        &json!({"table": "users"}),
+        Some(&obs),
+    )
+    .await;
+    assert!(result.is_ok());
+    assert!(
+        human_seen.load(Ordering::SeqCst),
+        "Auto with no decider = Always"
+    );
+    assert_eq!(auto_counts(&obs), (0, 0, 1));
+}
+
+#[tokio::test]
+async fn never_always_and_once_leave_auto_counters_at_zero() {
+    // None of these policies is an automatic decision, even when a decider is
+    // installed: the pure engine resolves them before the gate's `Auto` branch.
+    for policy in [
+        ApprovalPolicy::Never,
+        ApprovalPolicy::Always,
+        ApprovalPolicy::Once,
+    ] {
+        let (decider, calls) = recorder(AutoVerdict::Allow, 0.6);
+        let gate = Arc::new(ApprovalGate::default());
+        let obs = AppObservability::new();
+        let (result, _) = authorize_with_human_recording(
+            &gate,
+            &policy_with(policy),
+            Some(&decider),
+            "db__read",
+            &json!({"table": "users"}),
+            Some(&obs),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "{policy:?} must not consult the decider"
+        );
+        assert_eq!(
+            auto_counts(&obs),
+            (0, 0, 0),
+            "{policy:?} must not touch the auto counters"
+        );
+    }
 }

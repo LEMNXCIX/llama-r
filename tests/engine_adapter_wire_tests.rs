@@ -34,6 +34,7 @@ fn test_deps() -> LocalToolDeps {
         rag: None,
         gate: Arc::new(ApprovalGate::default()),
         auto_decider: None,
+        observability: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }

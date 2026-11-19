@@ -194,6 +194,7 @@ fn skill_deps(skills_root: &std::path::Path) -> LocalToolDeps {
         rag: None,
         gate: Arc::new(ApprovalGate::default()),
         auto_decider: None,
+        observability: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
@@ -205,6 +206,7 @@ fn empty_deps() -> LocalToolDeps {
         rag: None,
         gate: Arc::new(ApprovalGate::default()),
         auto_decider: None,
+        observability: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
@@ -305,6 +307,7 @@ fn rag_deps(rag: Arc<ScopingFakeRag>) -> LocalToolDeps {
         rag: Some(rag),
         gate: Arc::new(ApprovalGate::default()),
         auto_decider: None,
+        observability: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }

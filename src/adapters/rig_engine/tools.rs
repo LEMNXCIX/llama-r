@@ -2,6 +2,7 @@ use crate::adapters::rig_engine::approval;
 use crate::adapters::rig_engine::limits::ToolCallBudget;
 use crate::adapters::rig_engine::operations::{self, OperationContext};
 use crate::adapters::rig_engine::ScopedMcpTool;
+use crate::api::observability::AppObservability;
 use crate::ports::auto::AutoDecider;
 use crate::ports::engine::AgentRunEvent;
 use crate::services::approval::ApprovalGate;
@@ -28,6 +29,10 @@ pub struct McpToolBridge {
     /// The boot-owned `Auto` decider, shared with `LocalToolBridge` so both tool
     /// kinds agree on automatic approval. `None` keeps the human gate in place.
     pub auto_decider: Option<Arc<dyn AutoDecider>>,
+    /// The app-wide observability counters, shared with `LocalToolBridge` so
+    /// both tool kinds record their automatic decisions in the same place.
+    /// `None` for a directly built test bridge: no counters to record into.
+    pub observability: Option<Arc<AppObservability>>,
     /// `Some` on the streaming path, where `ApprovalRequired` reaches the SSE
     /// caller; `None` on the non-streaming path, where the pending is discovered
     /// by polling `GET /api/approvals` instead. Both paths block on the gate.
@@ -50,6 +55,7 @@ impl McpToolBridge {
             budget,
             gate,
             auto_decider: None,
+            observability: None,
             event_tx,
             operations: None,
         }
@@ -66,6 +72,13 @@ impl McpToolBridge {
     /// stable for directly built test bridges.
     pub fn with_auto_decider(mut self, decider: Option<Arc<dyn AutoDecider>>) -> Self {
         self.auto_decider = decider;
+        self
+    }
+
+    /// Install the app-wide observability counters. A setter keeps `new`'s
+    /// signature stable for directly built test bridges.
+    pub fn with_observability(mut self, observability: Option<Arc<AppObservability>>) -> Self {
+        self.observability = observability;
         self
     }
 
@@ -94,6 +107,7 @@ impl McpToolBridge {
             &args,
             self.operations.as_ref().map(|ctx| ctx.execution_id),
             self.auto_decider.as_deref(),
+            self.observability.as_deref(),
         )
         .await?;
 

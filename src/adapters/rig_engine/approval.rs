@@ -22,6 +22,7 @@
 //! reaper collects it (Fase 7 seeds a background reaper); the bridge's own
 //! timeout keeps that from hanging the tool call.
 
+use crate::api::observability::AppObservability;
 use crate::domain::policy::{
     ApprovalDecision as PolicyDecision, ApprovalPolicy, PermissionEngine, PermissionPolicy,
 };
@@ -44,6 +45,15 @@ use uuid::Uuid;
 /// outcome (a refusal, a low-confidence answer, an unavailable router, no
 /// decider, or any `Once`/`Always` rule) takes the unchanged human path below.
 /// The budget is never charged here — the caller does that only after `Ok`.
+///
+/// `observability`, when present, is incremented here — at the decision point,
+/// not by decorating the decider — so the no-decider case is counted as
+/// `auto_unavailable`. Only an `Auto` rule reaches these counters; `Never`,
+/// `Always` and `Once` never touch them.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one shared gate for both bridges: gate, event channel, policy, call identity and the two optional auto companions"
+)]
 pub async fn authorize(
     gate: &ApprovalGate,
     event_tx: Option<&mpsc::Sender<AgentRunEvent>>,
@@ -52,6 +62,7 @@ pub async fn authorize(
     args: &Value,
     execution_id: Option<Uuid>,
     auto_decider: Option<&dyn AutoDecider>,
+    observability: Option<&AppObservability>,
 ) -> Result<(), String> {
     match PermissionEngine::authorize(permission, tool_name) {
         PolicyDecision::Allow => Ok(()),
@@ -62,39 +73,54 @@ pub async fn authorize(
             // the decider's configured default. Args are redacted before they
             // leave this process even though the adapter redacts again.
             if permission.approval_for(tool_name) == ApprovalPolicy::Auto {
-                if let Some(decider) = auto_decider {
-                    let fallback = decider.min_confidence();
-                    // Fail closed: an out-of-range override (e.g. `0.0`, which
-                    // would make every "yes" auto-approve) is ignored so it can
-                    // never lower the bar below the configured default. Same
-                    // `(0.0, 1.0]` range RouterConfig::min_confidence validates.
-                    // The warning names only the number, never any argument.
-                    let threshold = match permission.auto_threshold {
-                        Some(value) if value.is_finite() && value > 0.0 && value <= 1.0 => value,
-                        Some(value) => {
-                            tracing::warn!(
-                                ?value,
-                                tool = %tool_name,
-                                "ignoring out-of-range auto_threshold (expected (0.0, 1.0]); using the configured default"
-                            );
-                            fallback
-                        }
-                        None => fallback,
-                    };
-                    let verdict = decider
-                        .should_allow(
-                            tool_name,
-                            &redact_secrets(args),
-                            &args_hash_hex(args),
-                            threshold,
-                        )
-                        .await;
-                    if verdict == AutoVerdict::Allow {
-                        return Ok(());
+                // One decision, one counter increment. The counter lives here
+                // rather than on the decider so a missing decider is still an
+                // observable `Unavailable` rather than an invisible no-op.
+                let verdict = match auto_decider {
+                    Some(decider) => {
+                        let fallback = decider.min_confidence();
+                        // Fail closed: an out-of-range override (e.g. `0.0`,
+                        // which would make every "yes" auto-approve) is ignored
+                        // so it can never lower the bar below the configured
+                        // default. Same `(0.0, 1.0]` range RouterConfig checks.
+                        // The warning names only the number, never any argument.
+                        let threshold = match permission.auto_threshold {
+                            Some(value) if value.is_finite() && value > 0.0 && value <= 1.0 => {
+                                value
+                            }
+                            Some(value) => {
+                                tracing::warn!(
+                                    ?value,
+                                    tool = %tool_name,
+                                    "ignoring out-of-range auto_threshold (expected (0.0, 1.0]); using the configured default"
+                                );
+                                fallback
+                            }
+                            None => fallback,
+                        };
+                        decider
+                            .should_allow(
+                                tool_name,
+                                &redact_secrets(args),
+                                &args_hash_hex(args),
+                                threshold,
+                            )
+                            .await
                     }
-                    // Deny / Unavailable: fall through to the human gate. Never
-                    // execute a tool the model refused or could not judge.
+                    None => AutoVerdict::Unavailable,
+                };
+                if let Some(obs) = observability {
+                    match verdict {
+                        AutoVerdict::Allow => obs.record_auto_approved(),
+                        AutoVerdict::Deny => obs.record_auto_denied(),
+                        AutoVerdict::Unavailable => obs.record_auto_unavailable(),
+                    }
                 }
+                if verdict == AutoVerdict::Allow {
+                    return Ok(());
+                }
+                // Deny / Unavailable: fall through to the human gate. Never
+                // execute a tool the model refused or could not judge.
             }
 
             // Register first, then (if there is a channel) announce. Registering
@@ -179,7 +205,7 @@ mod tests {
                 .unwrap();
         });
 
-        authorize(&gate, None, &always(), "db__drop", &args, None, None)
+        authorize(&gate, None, &always(), "db__drop", &args, None, None, None)
             .await
             .expect("approval through the list/decide path lets the tool run");
         decider.await.unwrap();
@@ -195,6 +221,7 @@ mod tests {
             &PermissionPolicy::default(),
             "db__drop",
             &serde_json::json!({}),
+            None,
             None,
             None,
         )

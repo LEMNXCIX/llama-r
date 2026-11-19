@@ -13,6 +13,7 @@ pub mod tools;
 #[cfg(feature = "rig-engine")]
 use crate::adapters::rig_engine::local_tools::LocalToolDeps;
 use crate::adapters::rig_engine::local_tools::{LocalTool, LocalToolRegistry};
+use crate::api::observability::AppObservability;
 use crate::config::{Config, ProviderKind, OPENROUTER_BASE_URL};
 use crate::domain::scope::AgentScope;
 use crate::ports::auto::AutoDecider;
@@ -230,6 +231,11 @@ pub struct RigAgentEngine {
     /// `None` (the default for direct/test constructors) means every `Auto`
     /// tool keeps asking a human, as before Fase 6.
     pub auto_decider: Option<Arc<dyn AutoDecider>>,
+    /// App-wide observability counters, shared with the gate via both tool
+    /// bridges so `Auto` decisions are recorded in one place. Owned like the
+    /// gate and decider, so a settings Apply keeps accumulating into the same
+    /// counters. `None` for direct/test constructors: no counters to record.
+    pub observability: Option<Arc<AppObservability>>,
     /// Durable execution store behind the tool-call idempotency guard. Built
     /// once at boot and shared, like the approval gate, so a settings Apply
     /// cannot lose the record of completed operations. A no-op store is the
@@ -319,6 +325,7 @@ impl RigAgentEngine {
             local_tools,
             gate,
             auto_decider: None,
+            observability: None,
             execution_store: Arc::new(crate::adapters::execution::NoOpExecutionStore),
         }
     }
@@ -337,6 +344,14 @@ impl RigAgentEngine {
     /// still routes every `Auto` tool to the human gate.
     pub fn with_auto_decider(mut self, decider: Option<Arc<dyn AutoDecider>>) -> Self {
         self.auto_decider = decider;
+        self
+    }
+
+    /// Install the app-wide observability counters. A setter (like the decider's)
+    /// keeps the many direct/test constructors unchanged; only the boot/Apply
+    /// path supplies the `AppState` counters.
+    pub fn with_observability(mut self, observability: Option<Arc<AppObservability>>) -> Self {
+        self.observability = observability;
         self
     }
 
@@ -435,6 +450,7 @@ impl RigAgentEngine {
                 rag: self.rag.clone(),
                 gate: self.gate.clone(),
                 auto_decider: self.auto_decider.clone(),
+                observability: self.observability.clone(),
                 event_tx: None,
                 operations: operations::OperationContext::new(
                     req.execution_id,
@@ -543,6 +559,7 @@ impl RigAgentEngine {
                 rag: self.rag.clone(),
                 gate: self.gate.clone(),
                 auto_decider: self.auto_decider.clone(),
+                observability: self.observability.clone(),
                 event_tx: Some(tx.clone()),
                 operations: operations::OperationContext::new(
                     req.execution_id,
@@ -654,6 +671,7 @@ impl AgentEngine for RigAgentEngine {
         // is open. AppState owns the single instance.
         let gate = self.gate.clone();
         let auto_decider = self.auto_decider.clone();
+        let observability = self.observability.clone();
         let execution_store = self.execution_store.clone();
         let timeout = effective_run_timeout(&req.scope, gate.timeout());
 
@@ -667,6 +685,7 @@ impl AgentEngine for RigAgentEngine {
                 local_tools,
                 gate,
                 auto_decider,
+                observability,
                 execution_store,
             };
             // The timeout covers the whole stream lifecycle, not just a single

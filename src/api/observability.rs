@@ -16,6 +16,14 @@ pub struct AppObservability {
     routed_to_general: AtomicU64,
     router_errors: AtomicU64,
     router_latency_ms_total: AtomicU64,
+    /// Automatic tool-approval decisions, counted at the gate decision point
+    /// (not by decorating the decider) so the no-decider case is visible too.
+    auto_approved: AtomicU64,
+    auto_denied: AtomicU64,
+    auto_unavailable: AtomicU64,
+    /// Upstream cost in microdollars. Stored as an integer because `AtomicF64`
+    /// does not exist; `record_cost` converts with a saturating float->int cast.
+    cost_usd_total_micros: AtomicU64,
 }
 
 impl AppObservability {
@@ -72,6 +80,32 @@ impl AppObservability {
             .fetch_add(latency_ms, Ordering::Relaxed);
     }
 
+    /// The automatic decision model approved the tool without a human.
+    pub fn record_auto_approved(&self) {
+        self.auto_approved.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The automatic decision model refused the tool; it fell back to a human.
+    pub fn record_auto_denied(&self) {
+        self.auto_denied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// No automatic verdict was available (router error, or no decider
+    /// installed at all); the tool fell back to a human.
+    pub fn record_auto_unavailable(&self) {
+        self.auto_unavailable.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Accumulate a real upstream cost (never fabricated) in microdollars.
+    /// Rust's `f64 as u64` saturates: `NaN -> 0`, negatives `-> 0`, `+inf ->
+    /// u64::MAX`, so a hostile or broken price can never contribute a wrapped
+    /// or negative value.
+    pub fn record_cost(&self, cost_usd: f64) {
+        let micros = (cost_usd * 1_000_000.0) as u64;
+        self.cost_usd_total_micros
+            .fetch_add(micros, Ordering::Relaxed);
+    }
+
     /// Decisions that reached an outcome (agent or general). The dashboard
     /// shows a routing *rate* from this rather than an absolute count.
     pub fn router_decisions(&self) -> u64 {
@@ -95,6 +129,10 @@ impl AppObservability {
             routed_to_general: self.routed_to_general.load(Ordering::Relaxed),
             router_errors: self.router_errors.load(Ordering::Relaxed),
             router_latency_ms_total: self.router_latency_ms_total.load(Ordering::Relaxed),
+            auto_approved: self.auto_approved.load(Ordering::Relaxed),
+            auto_denied: self.auto_denied.load(Ordering::Relaxed),
+            auto_unavailable: self.auto_unavailable.load(Ordering::Relaxed),
+            cost_usd_total_micros: self.cost_usd_total_micros.load(Ordering::Relaxed),
         }
     }
 }
@@ -113,6 +151,10 @@ pub struct ObservabilitySnapshot {
     pub routed_to_general: u64,
     pub router_errors: u64,
     pub router_latency_ms_total: u64,
+    pub auto_approved: u64,
+    pub auto_denied: u64,
+    pub auto_unavailable: u64,
+    pub cost_usd_total_micros: u64,
 }
 
 #[cfg(test)]
@@ -135,5 +177,35 @@ mod tests {
         // The dashboard's rate numerator: the two outcomes, and nothing else —
         // an error is not a decision, so it must not inflate the count.
         assert_eq!(obs.router_decisions(), 3);
+    }
+
+    #[test]
+    fn the_snapshot_counts_each_auto_decision_outcome_separately() {
+        let obs = AppObservability::new();
+        obs.record_auto_approved();
+        obs.record_auto_approved();
+        obs.record_auto_denied();
+        obs.record_auto_unavailable();
+        let snap = obs.snapshot();
+        assert_eq!(snap.auto_approved, 2);
+        assert_eq!(snap.auto_denied, 1);
+        assert_eq!(snap.auto_unavailable, 1);
+        // The pre-existing counters are untouched by the new decisions.
+        assert_eq!(snap.chat_requests, 0);
+    }
+
+    #[test]
+    fn cost_is_accumulated_in_saturating_microdollars() {
+        let obs = AppObservability::new();
+        obs.record_cost(2.5); // 2_500_000 micros
+        obs.record_cost(0.25); // 250_000 micros
+        obs.record_cost(f64::NAN); // saturates to 0
+        obs.record_cost(-1.0); // saturates to 0
+        assert_eq!(obs.snapshot().cost_usd_total_micros, 2_750_000);
+
+        // Infinity saturates the float->int cast to u64::MAX, never wraps.
+        let infinite = AppObservability::new();
+        infinite.record_cost(f64::INFINITY);
+        assert_eq!(infinite.snapshot().cost_usd_total_micros, u64::MAX);
     }
 }

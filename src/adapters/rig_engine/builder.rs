@@ -121,7 +121,8 @@ pub fn build_tool_bridges(
                     deps.event_tx.clone(),
                 )
                 .with_operations(deps.operations.clone())
-                .with_auto_decider(deps.auto_decider.clone()),
+                .with_auto_decider(deps.auto_decider.clone())
+                .with_observability(deps.observability.clone()),
             ) as Box<dyn ToolDyn>,
             ScopedTool::Local(local) => Box::new(LocalToolBridge::new(
                 local,
@@ -657,6 +658,7 @@ mod tests {
             rag: None,
             gate: Arc::new(crate::services::approval::ApprovalGate::default()),
             auto_decider: None,
+            observability: None,
             event_tx: None,
             operations: crate::adapters::rig_engine::operations::OperationContext::disabled(),
         }
