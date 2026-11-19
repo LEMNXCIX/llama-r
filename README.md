@@ -349,7 +349,7 @@ tool_pattern = "fudi__drop*"   # server__tool para MCP; id pelado para una tool 
 policy = "always"              # never | once | always | auto
 ```
 
-`tool_pattern` es un glob simple (`*` = cualquier secuencia, resto literal, toda la cadena) y **gana la primera regla que coincide**; sin coincidencia el default es `never` (sin aprobación). Hoy `auto` equivale a `always` — no hay modelo de decisión (Fase 6) y no hay supresión de `once` tras el primer uso, así que ninguno aprueba automáticamente. Sin reglas, ninguna tool pide aprobación.
+`tool_pattern` es un glob simple (`*` = cualquier secuencia, resto literal, toda la cadena) y **gana la primera regla que coincide**; sin coincidencia el default es `never` (sin aprobación). `once` y `always` siguen el camino humano (no hay supresión de `once` tras el primer uso, así que hoy `once` ≡ `always`). `auto` sí consulta el router de decisión (ver "Decisión `Auto`, trazas y coste" más abajo) y puede aprobar sin humano solo con un `yes` de alta confianza; sin router degrada a humano. Sin reglas, ninguna tool pide aprobación.
 
 La tool se bloquea hasta que alguien decide, con un `approval_id` (UUID) ligado al `args_hash` (SHA-256 de los argumentos canónicos). El presupuesto de llamadas **no se carga mientras espera**: una negativa, expiración o cambio de argumentos no gasta nada. El timeout por defecto es 120 s. En un chat con streaming llega un evento SSE con el campo `approval` (`id`, `tool_name`, `args_hash`; sin argumentos en crudo). Sin streaming, el cliente descubre el pendiente sondeando `GET /api/approvals` y decide con `POST /api/approvals/:id`:
 
@@ -380,7 +380,17 @@ curl -s http://127.0.0.1:3000/api/executions/<execution_id> -H 'X-Debug: true'
 curl -s -X POST http://127.0.0.1:3000/api/executions/<execution_id>/retry -H 'X-Debug: true'
 ```
 
-El reintento reutiliza el **mismo id** de ejecución: las herramientas ya completadas se replayan desde la caché (`operation_id = <execution_id>:<tool>:<args_hash_hex>`) en lugar de repetir sus efectos. Es recuperación **a nivel de turno**, no replay paso a paso: se re-ejecuta el turno desde el `user_message` guardado (`stream: false`, sin recargar el historial de conversación previo) y el modelo puede generar una respuesta distinta. El reintento da `200` si el turno se re-ejecuta, `400` id malformado, `403` sin `X-Debug` o fila legacy sin `user_message`, `404` id desconocido y `409` si el turno no está en estado reintentable. Sin store (build `--no-default-features` o fallo al abrirlo) la ejecución degrada a pass-through y el chat sigue funcionando. Queda diferido: backend Postgres/async, identidad de usuario en los endpoints, modelo de decisión `Auto` y replay exacto de pasos.
+El reintento reutiliza el **mismo id** de ejecución: las herramientas ya completadas se replayan desde la caché (`operation_id = <execution_id>:<tool>:<args_hash_hex>`) en lugar de repetir sus efectos. Es recuperación **a nivel de turno**, no replay paso a paso: se re-ejecuta el turno desde el `user_message` guardado (`stream: false`, sin recargar el historial de conversación previo) y el modelo puede generar una respuesta distinta. El reintento da `200` si el turno se re-ejecuta, `400` id malformado, `403` sin `X-Debug` o fila legacy sin `user_message`, `404` id desconocido y `409` si el turno no está en estado reintentable. Sin store (build `--no-default-features` o fallo al abrirlo) la ejecución degrada a pass-through y el chat sigue funcionando. Queda diferido: backend Postgres/async, identidad de usuario en los endpoints, supresión de `once` tras el primer uso, exportador OpenTelemetry y replay exacto de pasos. El modelo de decisión `Auto` ya está implementado (ver sección siguiente).
+
+### Decisión `Auto`, trazas y coste (Fase 6)
+
+**Aprobación `Auto`.** Con una regla `policy = "auto"`, el gate consulta el `AutoDecider` (`RouterAutoDecider`, montado sobre el mismo `DecisionRouter` d1 del routing de agentes) **solo si `ROUTER_ENABLED=true`**. Aprueba sin humano únicamente cuando el modelo responde `Choice{key:"yes"}` con `confidence >= umbral`; un `no`, baja confianza, `Noul`, respuesta inusable, error del router o ausencia de decider degradan al camino humano (nunca se aprueba automáticamente sin evidencia afirmativa). La pregunta al modelo lleva solo el nombre de la tool y el `args_hash` canónico — los argumentos se redactan con `redact_secrets` antes de salir del proceso, así que ningún secreto llega al modelo. En la práctica, como el d1 casi siempre está ausente, `Auto` ≈ `always`: el seam está implementado y probado con un router falso. El `[policy]` / `[[policy.approvals]]` acepta un campo opcional `auto_threshold` (`Option<f32>`): si está en `(0.0, 1.0]` sustituye el umbral por defecto del decider (`MIN_CONFIDENCE` del router, 0.60); un valor fuera de rango o no finito se ignora con un aviso que nombra solo el número y la tool, nunca argumentos. La función pura `PermissionEngine` sigue tratando `Auto` como `Approve`; el cambio está en el gate.
+
+**Trazas por turno.** Cada turno finalizado (éxito, fallback o error, con o sin streaming) emite un evento `TraceRecorded` —best-effort: un fallo al persistir es un aviso, nunca un chat fallido— consultable en `GET /api/executions/<execution_id>`. Su payload, redactado con `redact_trace_payload` (conserva los contadores numéricos y redacta secretos), contiene: `trace_id` (= `execution_id`), `agent_qualified_id`, `provider`, `model`, `input_tokens`, `output_tokens`, `cost_usd` y `latency_ms`.
+
+**Coste y observabilidad.** `cost_usd` sale de `Usage::from_counts` a partir de los precios de `ModelCapabilities`; hoy el catálogo no tiene precios, así que el coste es `null` en la práctica — el cálculo existe y se prueba con precios inyectados, pero no se inventa ningún coste. El snapshot de observabilidad (`campo observability` de `/health`, `ObservabilitySnapshot`) expone además `auto_approved`, `auto_denied` y `auto_unavailable` (contadores de las decisiones `Auto` en el gate —un decider ausente cuenta como `unavailable`; `never`/`always`/`once` no los tocan—) y `cost_usd_total_micros` (coste real acumulado en microdólares enteros, saturante; sin entrada mientras los precios sean `None`).
+
+**No se afirma:** ni integración con OpenTelemetry (los campos solo están listos para un futuro exportador, sin dependencia nueva), ni supresión de "primera vez" para `once`, ni coste real mientras el catálogo no tenga precios. El runner de evals tampoco incluye un check de aprobación `Auto` (`judge` solo califica respuestas).
 
 ## Contexto de proyecto
 
@@ -472,8 +482,10 @@ la suite, pero un `SKIP` nunca falla. Todo corre contra fixtures locales
 grabadas: sin claves reales, red ni modelo de decisión en CI, y los detalles del
 informe se redactan antes de imprimirse.
 
-El runner no incluye el modelo `Auto` de aprobación (Fase 6a pendiente, sigue
-comportándose como `Always`) ni OpenTelemetry/costo (Fase 6c pendiente).
+El runner no incluye un check del modelo `Auto` de aprobación (`judge` solo
+califica respuestas), aunque la política `Auto` ya existe en el gate. El coste
+por turno y las trazas sí existen en el log de ejecución y en el snapshot de
+observabilidad; OpenTelemetry sigue sin integrarse (solo contrato listo).
 
 ```bash
 cargo test --test provider_eval_smoke   # consume la suite incluida e imprime la tabla

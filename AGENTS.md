@@ -182,6 +182,8 @@ The response carries a `router` field: `{"enabled": bool, "healthy": bool, "url"
 
 It also carries a `provider` object: `{"name": …, "embeddings": bool, "reason": null|string, "agent_engine": bool, "agent_engine_reason": null|string}`. `name` is the selected `PROVIDER`; `reason` explains a missing embeddings capability (e.g. OpenCode with no `OLLAMA_URL` fallback), and `agent_engine` / `agent_engine_reason` report whether a Rig engine is attached and, if not, name the lost capabilities (tools/RAG/MCP). These are the same strings the chat-time degradation warning uses; no field ever carries a key.
 
+The response also carries an `observability` object (`ObservabilitySnapshot`, `src/api/observability.rs`) of atomic counters. Alongside the request/latency/routing counters it now exposes four Fase 6 fields: `auto_approved`, `auto_denied` and `auto_unavailable` count gate-time `Auto` decisions (`Allow`, `Deny`, and router error/no-decider respectively, including a missing decider as `auto_unavailable`), and `cost_usd_total_micros` accumulates real reported `cost_usd` in integer microdollars (saturating; no entry while catalog prices are `None`). Only an `Auto` rule reaches the `auto_*` counters — `Never`, `Always` and `Once` never touch them. The dashboard/TUI reads the same snapshot; no health contract change beyond these added fields, and no field carries a key.
+
 ### Basic Endpoints
 ```text
 GET  /
@@ -333,7 +335,8 @@ before they reach a table or a `FAIL` detail.
     `agent` case; a tool that never ran is a `FAIL`, not a green skip.
   - `judge { question }` — the existing decision router (`DecisionRouter`, d1)
     grades the answer as a `yes`/`no` `Choice`. This is grading only, **not** the
-    tool-approval `Auto` policy (which is Fase 6a and still behaves as `Always`).
+    tool-approval `Auto` policy, which is a separate gate-time approval feature
+    (see "Connections, permissions and human approval") and has no eval check here.
 
 ### Outcomes, strict mode and judge skips
 
@@ -347,9 +350,13 @@ router returns an unusable answer — so in fixture-only CI all judge rows absta
 and strict stays green. A malformed case is caught into a `FAIL` row naming its
 id; the rest of the suite still runs.
 
-There is no `Auto` decision model for tool approvals here (Fase 6a pending) and
-no OpenTelemetry/cost tracking (Fase 6c pending); neither is part of the eval
-runner and neither is claimed by these docs.
+The eval runner has no check for the `Auto` approval policy: `judge` grades
+answers, it does not decide tool approvals. The `Auto` policy does exist now, at
+the approval gate (see "Connections, permissions and human approval"), and turn
+traces plus cost tracking do exist now in the execution log and observability
+snapshot (see "Durable execution and recovery" and the health endpoints) — but
+none of that is an eval check. OpenTelemetry is still **not** integrated: the
+trace fields are only contract-ready for a future exporter.
 
 ## Storage Layout
 - `evals/`: declarative eval suites in TOML (`evals/providers/smoke.eval.toml` is the shipped smoke suite); loaded by `src/evals/` and run by the two eval test targets
@@ -418,7 +425,10 @@ Three capabilities added around the agent engine; all three are opt-in through c
 
 - An agent's `[policy]` table is compiled into `AgentScope.permission` by `ScopeBuilder` (`src/domain/policy.rs`, `src/services/scope_builder.rs`). It has `connections_allow` (declarative list of connection ids; actual tool visibility is still enforced by `mcp_sources`/`tools_override`/`allows_tool`, so a v1 manifest keeps exactly its old behavior) and ordered `[[policy.approvals]]` rules `{ tool_pattern, policy }`.
 - `tool_pattern` is a simple glob over the qualified tool name — `server__tool` for an MCP tool (`rig_tool_name`), or the bare id for a local tool. `*` matches any run of characters; everything else is literal; the whole string must match, case-sensitively. **First matching rule wins**, not the most specific; with no match the default is `Never`, which allows. `PermissionEngine::authorize` is a pure function (no I/O, no runtime), tested in `tests/permission_tests.rs`. **No tool requires approval by default.**
-- `ApprovalPolicy` is `Never` (execute without asking; the default), `Once`, `Always` or `Auto`. In this phase `Once` and **`Auto` both behave exactly like `Always`**: `Auto`'s automatic decision model is Fase 6 and there is no "first use only" suppression yet, so neither is a silent automatic approval. All three block the first call in the pure engine.
+- `ApprovalPolicy` is `Never` (execute without asking; the default), `Once`, `Always` or `Auto`. `PermissionEngine::authorize` stays pure: `Never` → `Allow`, and `Once`/`Always`/`Auto` → `Approve`, so all three block on the first call in that pure function. The behavior difference is at the **gate** (`src/adapters/rig_engine/approval.rs`), not in the pure engine:
+  - `Once` and `Always` take the unchanged human path (pending + long-poll/SSE). There is still no "first use only" suppression for `Once`, so `Once` behaves like `Always` today.
+  - `Auto` consults the injected `AutoDecider` (`src/ports/auto.rs`, `RouterAutoDecider` in `src/adapters/auto/router.rs`), built from the same `DecisionRouter` (d1) as agent routing and only when `ROUTER_ENABLED=true`. It auto-approves with **no human pending** only when the model answers `Choice{key:"yes"}` with `confidence >= threshold`; a `no`, low confidence, `Noul`, unusable answer, router error or absent decider all degrade to the human path (never an automatic approval without an affirmative decision). Because the d1 router is absent in most deployments, `Auto` ≈ `Always` in practice even though the seam is implemented and tested with a fake router. The question sent to the model carries only the tool name and the canonical `args_hash` — args are redacted with `redact_secrets` first, so no secret reaches the model.
+  - `[policy]` / `[[policy.approvals]]` accepts an optional `auto_threshold` (`Option<f32>`, serde default). When present and valid in `(0.0, 1.0]` it overrides the decider's default threshold (the router's `MIN_CONFIDENCE`, 0.60); an out-of-range or non-finite value is ignored with a warning naming only the number and the tool, never any argument. The pure `PermissionEngine` still treats `Auto` as `Approve`.
 
 ### Human-in-the-loop approval
 
@@ -433,13 +443,13 @@ Three capabilities added around the agent engine; all three are opt-in through c
 
 An `AgentExecution` (`src/domain/execution.rs`) is one agent **turn**, not one tool-loop step — Rig still owns the loop. The `ExecutionStore` port (`src/ports/execution.rs`) has a SQLite adapter (`src/adapters/execution/sqlite.rs`) over the same `data/history.db`, and a no-op adapter (`src/adapters/execution/noop.rs`, also used under `not(feature = "history")` or when the store cannot be opened). Durability is best effort everywhere: a missing/failed store never fails boot or chat, and observability/idempotency calls that error are logged and skipped.
 
-- **Lifecycle**: a turn is created `Running` when an agent resolves, then finalized to `Completed` or `Failed` on every outcome (engine success, fallback answer, or error). `Cancelled` is a defined status reserved for callers — there is no cancel endpoint today. At boot, one recovery pass (`mark_interrupted`, no background task) finds every turn left `Running`/`WaitingApproval` by a crash, marks it `Interrupted` with a warning, and leaves it retryable. The event log is append-only; shipped code currently appends `Started`, `ToolCallCompleted` (with a `replayed` flag), `ExecutionResumed`, `ExecutionCompleted` and `ExecutionFailed`. The `EventKind` enum also defines `ModelRequested`, `ToolCallRequested`, `WaitingApproval`, `ApprovalGranted`, `Interrupted` and an explicit `CheckpointCreated` marker for future step-level observability — they are not emitted today and `CheckpointCreated` performs no replay. `seq` is assigned atomically by the store; payloads are redacted on write.
+- **Lifecycle**: a turn is created `Running` when an agent resolves, then finalized to `Completed` or `Failed` on every outcome (engine success, fallback answer, or error). `Cancelled` is a defined status reserved for callers — there is no cancel endpoint today. At boot, one recovery pass (`mark_interrupted`, no background task) finds every turn left `Running`/`WaitingApproval` by a crash, marks it `Interrupted` with a warning, and leaves it retryable. The event log is append-only; shipped code currently appends `Started`, `ToolCallCompleted` (with a `replayed` flag), `ExecutionResumed`, `ExecutionCompleted`, `ExecutionFailed` and `TraceRecorded`. `TraceRecorded` is a unit variant emitted once per finished turn (engine success, fallback answer, or error × stream/non-stream); its data lives in the redacted `ExecutionEvent.payload` as `{trace_id (= execution_id), agent_qualified_id, provider, model, input_tokens, output_tokens, cost_usd, latency_ms}`. `cost_usd` comes straight from the response's `Usage::from_counts` and is `null` while catalog prices are `None` (the calculation exists but no cost is fabricated). `redact_trace_payload` keeps the numeric counters while redacting secrets, and persistence is best effort — a store error is a warning, never a failed chat. Traces are read through the existing `GET /api/executions/:id`; there is no new endpoint. The fields are contract-ready for a future OpenTelemetry exporter, but no OTel dependency or integration is added. The `EventKind` enum also defines `ModelRequested`, `ToolCallRequested`, `WaitingApproval`, `ApprovalGranted`, `Interrupted` and an explicit `CheckpointCreated` marker for future step-level observability — they are not emitted today and `CheckpointCreated` performs no replay. `seq` is assigned atomically by the store; payloads are redacted on write.
 - **Idempotency**: `operation_id = <execution_id>:<tool>:<args_hash_hex>` uses the same canonical-argument SHA-256 as approval binding, so a reordered JSON key hashes identically. Both tool bridges (`src/adapters/rig_engine/operations.rs`) replay a stored result before executing the tool, and record it after a first success; a no-op store is a transparent pass-through.
 - **Approvals persist across restart**: the gate mirrors pendings and decisions into the store and rehydrates them at boot without a oneshot; a decision made while no live request existed is consumed by a retry via `decision_for`. The `block_on` in the synchronous gate API is safe only because all current stores are immediately ready — revisit if a real async backend is added. Hash binding still rejects a decision for arguments the human never saw.
 - **Recovery is at TURN level — not step replay**: `POST /api/executions/:id/retry` re-runs the whole turn from the stored (redacted) `user_message` under the **original** execution id, with `stream: false` and no reload of prior conversation history. Reusing the id is what makes tool effects replay instead of repeating, but the model regenerates its answer and may take a different path; `current_step` and `CheckpointCreated` are observation only. Exact model/tool step replay is future work. A legacy row with no `user_message` is refused rather than retried with an empty prompt.
 - **Endpoints**: `GET /api/executions`, `GET /api/executions/:id`, `POST /api/executions/:id/retry` (X-Debug gated, redacted — see "Execution observability and retry" above).
 
-**Deferred / not done**: no Postgres or other async backend (the port is ready, SQLite is the only adapter); no user identity/auth on the approval or execution endpoints; no `Auto` decision model (Fase 6) and no "first use only" suppression for `Once`; no step replay. Rig still owns the tool loop, and the HTTP/gRPC/API ports are unchanged.
+**Deferred / not done**: no Postgres or other async backend (the port is ready, SQLite is the only adapter); no user identity/auth on the approval or execution endpoints; no "first use only" suppression for `Once` (it still behaves like `Always`); no OpenTelemetry exporter/integration (the trace fields are only contract-ready); no step-level replay. The `Auto` decision model itself **is** done (gate-time, router-backed, safe degradation). Rig still owns the tool loop, and the HTTP/gRPC/API ports are unchanged.
 
 Source modules: `src/domain/execution.rs`, `src/ports/execution.rs`, `src/adapters/execution/`, `src/adapters/rig_engine/operations.rs`, `src/api/execution_api.rs`, `src/services/approval.rs`, `src/runtime.rs` (boot recovery). End-to-end coverage: `tests/execution_store_tests.rs`, `tests/execution_api_tests.rs`, `tests/execution_recovery_tests.rs`, `tests/approval_tests.rs`.
 
