@@ -35,6 +35,7 @@ fn test_deps() -> LocalToolDeps {
         gate: Arc::new(ApprovalGate::default()),
         auto_decider: None,
         observability: None,
+        delegator: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
@@ -159,6 +160,7 @@ fn request(provider: ProviderKind, model: &str) -> AgentRunRequest {
         history: Vec::new(),
         conversation_id: None,
         execution_id: uuid::Uuid::new_v4(),
+        shared_budget: None,
     }
 }
 

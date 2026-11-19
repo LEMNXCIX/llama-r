@@ -10,6 +10,7 @@ use crate::domain::models::{
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::auto::AutoDecider;
+use crate::ports::delegation::Delegator;
 use crate::ports::execution::ExecutionStore;
 use crate::ports::mcp::McpServerRegistry;
 use crate::services::agent_registry::AgentRegistry;
@@ -28,7 +29,7 @@ use axum::{
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::RwLock as TokioRwLock;
 use tokio_stream::StreamExt as _;
 
@@ -82,6 +83,13 @@ pub struct AppState {
     /// A no-op store is installed when `history` is off or the SQLite store
     /// cannot be opened, so its presence never gates boot or a chat.
     pub execution_store: Arc<dyn ExecutionStore>,
+    /// Bounded subagent delegator. Installed once at boot: the `RuntimeDelegator`
+    /// holds a `Weak<AppState>` and a registry, so it must be built *after* this
+    /// `Arc<AppState>` exists — hence the `OnceLock` instead of a plain field.
+    /// It is not part of the hot-swapped `ProviderStack` (it holds no provider),
+    /// so a settings Apply cannot lose it. `None` until boot installs it; a
+    /// caller that finds it absent gets a named error, never a panic.
+    pub delegator: OnceLock<Arc<dyn Delegator>>,
 }
 
 impl AppState {
@@ -90,6 +98,18 @@ impl AppState {
     pub async fn services_snapshot(&self) -> Arc<ProviderStack> {
         let guard = self.services.read().await;
         Arc::clone(&*guard)
+    }
+
+    /// Install the boot-built delegator. Called exactly once, right after the
+    /// `Arc<AppState>` exists, so its `Weak` has something to upgrade. A second
+    /// call is ignored rather than replacing a live handle.
+    pub fn set_delegator(&self, delegator: Arc<dyn Delegator>) {
+        let _ = self.delegator.set(delegator);
+    }
+
+    /// Clone the installed delegator, or `None` before boot installs it.
+    pub fn delegator(&self) -> Option<Arc<dyn Delegator>> {
+        self.delegator.get().cloned()
     }
 
     /// Replace the whole provider stack. The write guard is released as soon as

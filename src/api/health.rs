@@ -226,6 +226,7 @@ mod tests {
             approval_gate: Arc::new(crate::services::approval::ApprovalGate::default()),
             auto_decider: None,
             execution_store: Arc::new(crate::adapters::execution::NoOpExecutionStore),
+            delegator: std::sync::OnceLock::new(),
         });
         (temp_dir, state)
     }

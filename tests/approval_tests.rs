@@ -367,6 +367,7 @@ fn local_bridge(
         gate,
         auto_decider: None,
         observability: None,
+        delegator: None,
         event_tx,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     };
@@ -642,6 +643,7 @@ async fn build_tool_bridges_carries_gate_to_both_bridge_kinds() {
         gate: gate.clone(),
         auto_decider: None,
         observability: None,
+        delegator: None,
         event_tx: Some(tx),
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     };
@@ -666,7 +668,7 @@ async fn build_tool_bridges_carries_gate_to_both_bridge_kinds() {
     let bridges = build_tool_bridges(
         vec![ScopedTool::Mcp(mcp_tool), ScopedTool::Local(local_tool)],
         &local_scope(always_for(BUILTIN_SKILL_ID)),
-        budget,
+        Some(budget),
         deps,
     );
     assert_eq!(bridges.len(), 2);
@@ -1023,6 +1025,7 @@ fn e2e_request() -> AgentRunRequest {
         history: Vec::new(),
         conversation_id: None,
         execution_id: Uuid::new_v4(),
+        shared_budget: None,
     }
 }
 

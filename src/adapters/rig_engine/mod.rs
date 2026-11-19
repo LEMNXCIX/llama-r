@@ -17,6 +17,7 @@ use crate::api::observability::AppObservability;
 use crate::config::{Config, ProviderKind, OPENROUTER_BASE_URL};
 use crate::domain::scope::AgentScope;
 use crate::ports::auto::AutoDecider;
+use crate::ports::delegation::Delegator;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
 use crate::ports::execution::ExecutionStore;
 use crate::ports::mcp::{McpCallRequest, McpClient, McpServerRegistry, McpToolDef};
@@ -241,6 +242,12 @@ pub struct RigAgentEngine {
     /// cannot lose the record of completed operations. A no-op store is the
     /// default: no `history` feature or a degraded boot simply replays nothing.
     pub execution_store: Arc<dyn ExecutionStore>,
+    /// Bounded subagent delegator, injected from `AppState` through
+    /// `CompanionHandles` so boot and a settings Apply share one handle. A
+    /// `RuntimeDelegator` holds only a `Weak<AppState>`, so this cannot close
+    /// the `AppState → engine → delegator → AppState` cycle. `None` for the
+    /// many direct/test constructors, which then have no delegation tool.
+    pub delegator: Option<Arc<dyn Delegator>>,
 }
 
 impl RigAgentEngine {
@@ -327,6 +334,7 @@ impl RigAgentEngine {
             auto_decider: None,
             observability: None,
             execution_store: Arc::new(crate::adapters::execution::NoOpExecutionStore),
+            delegator: None,
         }
     }
 
@@ -352,6 +360,13 @@ impl RigAgentEngine {
     /// path supplies the `AppState` counters.
     pub fn with_observability(mut self, observability: Option<Arc<AppObservability>>) -> Self {
         self.observability = observability;
+        self
+    }
+
+    /// Install the boot-owned delegator. A setter keeps every direct/test
+    /// constructor unchanged: only the boot/Apply path supplies one.
+    pub fn with_delegator(mut self, delegator: Option<Arc<dyn Delegator>>) -> Self {
+        self.delegator = delegator;
         self
     }
 
@@ -451,6 +466,7 @@ impl RigAgentEngine {
                 gate: self.gate.clone(),
                 auto_decider: self.auto_decider.clone(),
                 observability: self.observability.clone(),
+                delegator: self.delegator.clone(),
                 event_tx: None,
                 operations: operations::OperationContext::new(
                     req.execution_id,
@@ -560,6 +576,7 @@ impl RigAgentEngine {
                 gate: self.gate.clone(),
                 auto_decider: self.auto_decider.clone(),
                 observability: self.observability.clone(),
+                delegator: self.delegator.clone(),
                 event_tx: Some(tx.clone()),
                 operations: operations::OperationContext::new(
                     req.execution_id,
@@ -673,6 +690,7 @@ impl AgentEngine for RigAgentEngine {
         let auto_decider = self.auto_decider.clone();
         let observability = self.observability.clone();
         let execution_store = self.execution_store.clone();
+        let delegator = self.delegator.clone();
         let timeout = effective_run_timeout(&req.scope, gate.timeout());
 
         tokio::spawn(async move {
@@ -687,6 +705,7 @@ impl AgentEngine for RigAgentEngine {
                 auto_decider,
                 observability,
                 execution_store,
+                delegator,
             };
             // The timeout covers the whole stream lifecycle, not just a single
             // completion, and stays at the trait boundary as before. With

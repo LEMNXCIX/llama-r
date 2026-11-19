@@ -28,7 +28,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use tempfile::TempDir;
 use tokio::sync::{mpsc, RwLock as TokioRwLock};
 use tokio_stream::{Stream, StreamExt};
@@ -293,6 +293,7 @@ fn test_state_inner(
         approval_gate: Arc::new(crate::services::approval::ApprovalGate::default()),
         auto_decider: None,
         execution_store,
+        delegator: OnceLock::new(),
     });
     (temp_dir, state)
 }

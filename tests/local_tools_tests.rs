@@ -125,6 +125,7 @@ fn request(capabilities: ModelCapabilities, model: &str, local: ToolsAllow) -> A
         history: Vec::new(),
         conversation_id: None,
         execution_id: uuid::Uuid::new_v4(),
+        shared_budget: None,
     }
 }
 
@@ -195,6 +196,7 @@ fn skill_deps(skills_root: &std::path::Path) -> LocalToolDeps {
         gate: Arc::new(ApprovalGate::default()),
         auto_decider: None,
         observability: None,
+        delegator: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
@@ -207,6 +209,7 @@ fn empty_deps() -> LocalToolDeps {
         gate: Arc::new(ApprovalGate::default()),
         auto_decider: None,
         observability: None,
+        delegator: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
@@ -308,6 +311,7 @@ fn rag_deps(rag: Arc<ScopingFakeRag>) -> LocalToolDeps {
         gate: Arc::new(ApprovalGate::default()),
         auto_decider: None,
         observability: None,
+        delegator: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
@@ -544,7 +548,7 @@ async fn build_agent_attaches_both_bridge_kinds_with_one_budget() {
     let bridges = build_tool_bridges(
         vec![ScopedTool::Mcp(scoped_mcp), ScopedTool::Local(local)],
         &scope(ToolsAllow::AllFromSources),
-        budget.clone(),
+        Some(budget.clone()),
         empty_deps(),
     );
     assert_eq!(bridges.len(), 2);

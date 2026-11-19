@@ -230,6 +230,7 @@ async fn execute_agent_case(case: &EvalCase) -> Result<Execution, String> {
             system_prompt: Some("You are an eval fixture agent.".into()),
             default_model: "llama3.2".into(),
             execution_id: Uuid::new_v4(),
+            shared_budget: None,
         })
         .await
         .map_err(|err| format!("case '{}': {err}", case.id))?;

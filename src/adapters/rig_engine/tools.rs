@@ -1,14 +1,14 @@
 use crate::adapters::rig_engine::approval;
-use crate::adapters::rig_engine::limits::ToolCallBudget;
 use crate::adapters::rig_engine::operations::{self, OperationContext};
 use crate::adapters::rig_engine::ScopedMcpTool;
 use crate::api::observability::AppObservability;
 use crate::ports::auto::AutoDecider;
+use crate::ports::delegation::ToolBudget;
 use crate::ports::engine::AgentRunEvent;
 use crate::services::approval::ApprovalGate;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 pub fn rig_tool_name(server_id: &str, tool_name: &str) -> String {
     format!("{server_id}__{tool_name}")
@@ -22,7 +22,8 @@ pub fn parse_rig_tool_name(qualified: &str) -> Option<(String, String)> {
 
 pub struct McpToolBridge {
     pub inner: ScopedMcpTool,
-    pub budget: Arc<Mutex<ToolCallBudget>>,
+    /// The one allowance for the whole delegation tree, not a per-run mint.
+    pub budget: Arc<dyn ToolBudget>,
     /// The run's approval gate, owned by `AppState` (not the hot-swapped stack),
     /// so a settings Apply cannot drop a pending decision.
     pub gate: Arc<ApprovalGate>,
@@ -46,7 +47,7 @@ pub struct McpToolBridge {
 impl McpToolBridge {
     pub fn new(
         inner: ScopedMcpTool,
-        budget: Arc<Mutex<ToolCallBudget>>,
+        budget: Arc<dyn ToolBudget>,
         gate: Arc<ApprovalGate>,
         event_tx: Option<mpsc::Sender<AgentRunEvent>>,
     ) -> Self {
@@ -111,10 +112,7 @@ impl McpToolBridge {
         )
         .await?;
 
-        {
-            let mut b = self.budget.lock().await;
-            b.try_consume()?;
-        }
+        self.budget.try_consume().await?;
 
         // Emit the public event-contract events for a tool that is actually
         // about to run. The SSE surface ignores them today (Nivel-A), but the
@@ -199,12 +197,14 @@ impl rig_core::tool::ToolDyn for McpToolBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::rig_engine::limits::ToolCallBudget;
     use crate::domain::scope::{AgentScope, ToolsAllow};
     use crate::ports::mcp::{McpCallRequest, McpCallResult, McpClient, McpToolDef};
     use crate::services::approval::ApprovalGate;
     use async_trait::async_trait;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::sync::Mutex;
 
     struct MockMcpClient {
         call_count: Arc<AtomicU32>,

@@ -209,18 +209,18 @@ struct LocalToolManifest {
 mod bridge {
     use super::*;
     use crate::adapters::rig_engine::approval;
-    use crate::adapters::rig_engine::limits::ToolCallBudget;
     use crate::adapters::rig_engine::operations::{self, OperationContext};
     use crate::api::observability::AppObservability;
     use crate::domain::scope::AgentScope;
     use crate::ports::auto::AutoDecider;
+    use crate::ports::delegation::{Delegator, ToolBudget};
     use crate::ports::engine::AgentRunEvent;
     use crate::ports::rag::RagStore;
     use crate::services::approval::ApprovalGate;
     use crate::services::skill_manager::SkillManager;
     use rig_core::tool::{ToolDyn, ToolError};
     use std::sync::Arc;
-    use tokio::sync::{mpsc, Mutex};
+    use tokio::sync::mpsc;
 
     /// Upper bound — and the default — for `rag_query`'s `top_k`. The model must
     /// not be able to ask for an unbounded slice of the knowledge base through
@@ -244,6 +244,9 @@ mod bridge {
         /// The app-wide observability counters, shared with the MCP bridge so
         /// both tool kinds record their automatic decisions in one place.
         pub observability: Option<Arc<AppObservability>>,
+        /// The bounded subagent delegator, injected from `AppState` through the
+        /// engine. A delegate tool reads it from here; `None` means no delegation.
+        pub delegator: Option<Arc<dyn Delegator>>,
         /// `Some` on the streaming path (the `ApprovalRequired` event reaches
         /// the SSE caller); `None` on the non-streaming path.
         pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
@@ -258,7 +261,7 @@ mod bridge {
     pub struct LocalToolBridge {
         pub tool: LocalTool,
         pub scope: AgentScope,
-        pub budget: Arc<Mutex<ToolCallBudget>>,
+        pub budget: Arc<dyn ToolBudget>,
         pub deps: LocalToolDeps,
         /// Cloned from `deps` so the gate is an explicit part of the bridge,
         /// mirroring `McpToolBridge`.
@@ -280,7 +283,7 @@ mod bridge {
         pub fn new(
             tool: LocalTool,
             scope: AgentScope,
-            budget: Arc<Mutex<ToolCallBudget>>,
+            budget: Arc<dyn ToolBudget>,
             deps: LocalToolDeps,
         ) -> Self {
             let gate = deps.gate.clone();
@@ -326,10 +329,7 @@ mod bridge {
             )
             .await?;
 
-            {
-                let mut b = self.budget.lock().await;
-                b.try_consume()?;
-            }
+            self.budget.try_consume().await?;
 
             // Emit the same public events as the MCP bridge for a tool that is
             // actually about to run. A local tool has no server, so its

@@ -5,6 +5,7 @@ use crate::domain::models::ChatMessage;
 use crate::domain::scope::AgentScope;
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
+use crate::ports::delegation::ToolBudget;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest};
 use crate::ports::history::ConversationStore;
 use crate::ports::rag::RagStore;
@@ -48,6 +49,9 @@ pub struct RuntimeChatRequest {
     /// caller resolves the agent (`chat_core`) so the execution record, its
     /// events and the tool-operation ids all share one identity.
     pub execution_id: Uuid,
+    /// The one tool allowance shared by a whole delegation tree, carried from a
+    /// child turn's `DelegateRequest.budget`. `None` for an ordinary turn.
+    pub shared_budget: Option<Arc<dyn ToolBudget>>,
 }
 
 impl AgentRuntime {
@@ -107,6 +111,7 @@ impl AgentRuntime {
             history: req.history,
             conversation_id: req.conversation_id,
             execution_id: req.execution_id,
+            shared_budget: req.shared_budget,
         })
     }
 

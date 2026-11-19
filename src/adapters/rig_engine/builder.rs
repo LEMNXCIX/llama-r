@@ -4,6 +4,7 @@ use crate::adapters::rig_engine::tools::McpToolBridge;
 use crate::adapters::rig_engine::ScopedTool;
 use crate::domain::models::ChatMessage;
 use crate::domain::scope::AgentScope;
+use crate::ports::delegation::ToolBudget;
 use crate::ports::engine::{AgentRunEvent, AgentRunRequest, AgentRunResult};
 use futures::StreamExt;
 use rig_core::agent::{Agent, MultiTurnStreamItem, Text};
@@ -100,16 +101,29 @@ where
     .await
 }
 
+/// Resolve the one allowance a run spends from. A delegated child carries its
+/// parent's budget in `shared`, so this returns that very object; an ordinary
+/// turn mints one from its own scope. Either way the result is a single
+/// `Arc<dyn ToolBudget>` handed to *both* bridge kinds.
+pub(crate) fn resolve_budget(
+    shared: Option<Arc<dyn ToolBudget>>,
+    scope: &AgentScope,
+) -> Arc<dyn ToolBudget> {
+    shared.unwrap_or_else(|| Arc::new(Mutex::new(ToolCallBudget::new(scope.max_tool_calls))))
+}
+
 /// Wrap one run's scoped tools in their `ToolDyn` bridges. MCP and local tools
-/// get *the same* `Arc<Mutex<ToolCallBudget>>`, so a run has one tool-call
-/// allowance no matter which kind of tool spends it. Every local bridge also
-/// gets a clone of the executor dependencies (skill manager + RAG store).
+/// get *the same* `Arc<dyn ToolBudget>`, so a whole delegation tree has one
+/// tool-call allowance no matter how many turns or which kind of tool spends it.
+/// Every local bridge also gets a clone of the executor dependencies (skill
+/// manager + RAG store).
 pub fn build_tool_bridges(
     tools: Vec<ScopedTool>,
     scope: &AgentScope,
-    budget: Arc<Mutex<ToolCallBudget>>,
+    shared_budget: Option<Arc<dyn ToolBudget>>,
     deps: LocalToolDeps,
 ) -> Vec<Box<dyn ToolDyn>> {
+    let budget = resolve_budget(shared_budget, scope);
     tools
         .into_iter()
         .map(|t| match t {
@@ -147,7 +161,7 @@ fn build_agent<C, M>(
     system: &str,
     tools: Vec<ScopedTool>,
     scope: &AgentScope,
-    budget: Arc<Mutex<ToolCallBudget>>,
+    budget: Arc<dyn ToolBudget>,
     max_iterations: usize,
     temperature: Option<f64>,
     max_tokens: Option<u64>,
@@ -170,7 +184,7 @@ where
         }
         builder.build()
     } else {
-        let rig_tools = build_tool_bridges(tools, scope, budget, deps);
+        let rig_tools = build_tool_bridges(tools, scope, Some(budget), deps);
         let mut builder = client
             .agent(model_name)
             .preamble(system)
@@ -199,7 +213,7 @@ where
     C: CompletionClient<CompletionModel = M>,
     M: CompletionModel + 'static,
 {
-    let budget = Arc::new(Mutex::new(ToolCallBudget::new(req.scope.max_tool_calls)));
+    let budget = resolve_budget(req.shared_budget.clone(), &req.scope);
     let max_iterations = req.scope.max_iterations.max(1) as usize;
     let temperature = req.agent.config.temperature.map(|t| t as f64);
 
@@ -223,10 +237,7 @@ where
         .await
         .map_err(|e| format!("agent chat failed: {}", e))?;
 
-    let tool_calls = {
-        let b = budget.lock().await;
-        b.used()
-    };
+    let tool_calls = budget.used().await;
     // Approximate completed turns: one LLM turn plus one per tool call.
     let iterations = (1u32).saturating_add(tool_calls).min(max_iterations as u32);
 
@@ -265,7 +276,7 @@ where
     C: CompletionClient<CompletionModel = M>,
     M: CompletionModel + 'static,
 {
-    let budget = Arc::new(Mutex::new(ToolCallBudget::new(req.scope.max_tool_calls)));
+    let budget = resolve_budget(req.shared_budget.clone(), &req.scope);
     let max_iterations = req.scope.max_iterations.max(1) as usize;
     let temperature = req.agent.config.temperature.map(|t| t as f64);
 
@@ -306,7 +317,7 @@ where
         }
     }
 
-    let tool_calls = budget.lock().await.used();
+    let tool_calls = budget.used().await;
     let iterations = (1u32).saturating_add(tool_calls).min(max_iterations as u32);
     let result = AgentRunResult {
         text: full_text,
@@ -659,6 +670,7 @@ mod tests {
             gate: Arc::new(crate::services::approval::ApprovalGate::default()),
             auto_decider: None,
             observability: None,
+            delegator: None,
             event_tx: None,
             operations: crate::adapters::rig_engine::operations::OperationContext::disabled(),
         }
@@ -692,6 +704,7 @@ mod tests {
             history: Vec::new(),
             conversation_id: None,
             execution_id: uuid::Uuid::new_v4(),
+            shared_budget: None,
         }
     }
 

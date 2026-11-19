@@ -34,6 +34,7 @@ use crate::domain::execution::ExecutionStatus;
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::auto::AutoDecider;
+use crate::ports::delegation::Delegator;
 #[cfg(feature = "rig-engine")]
 use crate::ports::engine::AgentEngine;
 use crate::ports::execution::ExecutionStore;
@@ -64,7 +65,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::RwLock as TokioRwLock;
 use tonic::transport::Server as TonicServer;
 use tower_http::cors::{Any, CorsLayer};
@@ -244,9 +245,9 @@ pub fn build_app_state_with_gate(
     // every `Auto` tool keeps asking a human.
     let auto_decider = build_auto_decider(&router_config, stack.router.as_ref());
 
-    Arc::new(AppState {
+    let state = Arc::new(AppState {
         services: Arc::new(TokioRwLock::new(Arc::new(stack))),
-        agent_registry,
+        agent_registry: agent_registry.clone(),
         skill_manager,
         context_store,
         context_enricher: Mutex::new(context_enricher),
@@ -263,7 +264,18 @@ pub fn build_app_state_with_gate(
         approval_gate,
         auto_decider,
         execution_store,
-    })
+        delegator: OnceLock::new(),
+    });
+    // The delegator needs the *finished* Arc<AppState> so its Weak can upgrade
+    // at chat time. Building it here means every state factory (boot and tests)
+    // hands out a state whose delegator is already installed; the engine reads
+    // it from `CompanionHandles::from_state` when companions are built.
+    let delegator = Arc::new(crate::services::delegation::RuntimeDelegator::new(
+        agent_registry,
+        Arc::downgrade(&state),
+    ));
+    state.set_delegator(delegator);
+    state
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -1233,6 +1245,10 @@ pub struct CompanionHandles {
     /// The boot-owned execution store, read from `AppState` on a settings Apply
     /// so completed tool operations survive an engine rebuild.
     pub execution_store: Arc<dyn ExecutionStore>,
+    /// The bounded delegator, installed on `AppState` at boot. Read here on a
+    /// settings Apply so an engine rebuild keeps the same handle (and its
+    /// `Weak<AppState>` still points at the live state).
+    pub delegator: Option<Arc<dyn Delegator>>,
 }
 
 impl CompanionHandles {
@@ -1247,6 +1263,7 @@ impl CompanionHandles {
             auto_decider: state.auto_decider.clone(),
             observability: state.observability.clone(),
             execution_store: state.execution_store.clone(),
+            delegator: state.delegator(),
         }
     }
 }
@@ -1293,7 +1310,8 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
                 )
                 .with_execution_store(handles.execution_store.clone())
                 .with_auto_decider(handles.auto_decider.clone())
-                .with_observability(Some(handles.observability.clone())),
+                .with_observability(Some(handles.observability.clone()))
+                .with_delegator(handles.delegator.clone()),
             );
             Arc::new(AgentRuntime {
                 registry: handles.agent_registry.clone(),

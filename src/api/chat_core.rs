@@ -6,6 +6,7 @@ use crate::domain::models::{
 };
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
+use crate::ports::delegation::{DelegateRequest, DelegateResult, ToolBudget};
 use crate::ports::engine::AgentRunEvent;
 use crate::ports::execution::ExecutionStore;
 use crate::services::agent_runtime::RuntimeChatRequest;
@@ -13,6 +14,7 @@ use crate::services::approval::args_hash_hex;
 use crate::services::redaction::redact_trace_payload;
 use serde_json::{json, Value};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio_stream::{Stream, StreamExt};
 use uuid::Uuid;
@@ -113,6 +115,7 @@ async fn build_runtime_request(
     agent_id: Option<String>,
     conversation_id: Option<String>,
     execution_id: Uuid,
+    shared_budget: Option<Arc<dyn ToolBudget>>,
 ) -> Result<RuntimeChatRequest, AppError> {
     let (system, history, user_message) = split_engine_messages(&prepared.messages)?;
     Ok(RuntimeChatRequest {
@@ -125,6 +128,7 @@ async fn build_runtime_request(
         system_prompt: system,
         default_model: services.default_model.clone(),
         execution_id,
+        shared_budget,
     })
 }
 
@@ -764,6 +768,22 @@ pub async fn execute_chat_with_id(
     selection: AgentSelection<'_>,
     resume_execution_id: Option<Uuid>,
 ) -> Result<ChatResponse, AppError> {
+    execute_chat_with_id_and_budget(state, payload, selection, resume_execution_id, None).await
+}
+
+/// The delegation-aware core behind [`execute_chat_with_id`]. The extra field is
+/// the one tool allowance a whole delegation tree shares: a child turn carries
+/// its parent's `Arc<dyn ToolBudget>` here so both bridge kinds in the child
+/// spend from it instead of minting a fresh one. Ordinary callers pass `None`
+/// and keep the exact behaviour they always had. Kept separate so no existing
+/// public signature changes — only this internal entry point knows it.
+pub(crate) async fn execute_chat_with_id_and_budget(
+    state: &AppState,
+    payload: ChatRequest,
+    selection: AgentSelection<'_>,
+    resume_execution_id: Option<Uuid>,
+    shared_budget: Option<Arc<dyn ToolBudget>>,
+) -> Result<ChatResponse, AppError> {
     // ONE snapshot for the whole request. Every provider-dependent field below
     // — the agent runtime, the engine's default model, the chat provider and
     // its fallback model — is read from this single `Arc`. A settings Apply
@@ -849,6 +869,7 @@ pub async fn execute_chat_with_id(
                     agent_id,
                     conversation_id,
                     run_id,
+                    shared_budget,
                 )
                 .await?;
                 match runtime.chat(rt_req).await {
@@ -1005,6 +1026,9 @@ pub async fn execute_chat_stream_with_id(
                     agent_id,
                     conversation_id,
                     run_id,
+                    // Streaming delegation is not part of this slice: child
+                    // turns are always non-streaming, so no tree budget here.
+                    None,
                 )
                 .await?;
                 match runtime.chat_stream(rt_req).await {
@@ -1050,6 +1074,71 @@ pub async fn execute_chat_stream_with_id(
             .await;
             Err(err)
         }
+    }
+}
+
+/// Run one validated child turn and return its answer.
+///
+/// This is the re-entry point for delegation: a child is an ordinary chat turn
+/// with its own `execution_id`, its own manifest/scope and its own system
+/// prompt. Only three things are inherited, all of them bounds carried by the
+/// request: the shared tool budget, the deadline and the `task_id` used as the
+/// child conversation id. Nothing from the parent's prompt or scope is passed.
+///
+/// A failure is a *named* error for the caller (the delegate tool turns it into
+/// a `ToolResult`) — it never escapes as an error of the parent chat turn.
+pub async fn delegate_turn(
+    state: &AppState,
+    req: DelegateRequest,
+    agent: crate::domain::agent::Agent,
+) -> Result<DelegateResult, String> {
+    // Reject an already-expired deadline before doing any work. This is what
+    // guarantees "no child turn executed", rather than relying on tokio's
+    // timeout poll order (which may drive the future once before noticing).
+    if req.deadline <= Instant::now() {
+        return Err(format!(
+            "delegated turn to '{}' timed out: deadline expired before start",
+            agent.qualified_id()
+        ));
+    }
+
+    let task_id = req
+        .task_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let payload = ChatRequest {
+        model: agent.config.model.clone(),
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: req.message.clone(),
+        }],
+        stream: false,
+    };
+    // The child is resolved by its own manifest: a target in another project is
+    // rejected by validation, so its own project_id is the right scope here.
+    // A global target carries `None`, which dispatches outside any project.
+    let selection = AgentSelection {
+        project_id: agent.project_id.as_deref(),
+        agent_id: Some(agent.id.as_str()),
+        conversation_id: Some(task_id.as_str()),
+        debug: false,
+    };
+
+    let fut =
+        execute_chat_with_id_and_budget(state, payload, selection, None, Some(req.budget.clone()));
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(req.deadline), fut).await {
+        Ok(Ok(response)) => Ok(DelegateResult {
+            answer: response.message.content,
+            task_id,
+        }),
+        Ok(Err(err)) => Err(format!(
+            "delegated turn to '{}' failed: {err}",
+            agent.qualified_id()
+        )),
+        Err(_) => Err(format!(
+            "delegated turn to '{}' timed out: deadline exceeded",
+            agent.qualified_id()
+        )),
     }
 }
 

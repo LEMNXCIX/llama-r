@@ -19,6 +19,13 @@ use std::time::Instant;
 #[async_trait]
 pub trait ToolBudget: Send + Sync {
     async fn try_consume(&self) -> Result<(), String>;
+
+    /// Successful consumptions so far. Additive with a default so a caller's
+    /// fake budget stays valid; only used for the turn's `tool_calls`
+    /// telemetry, never for the allowance decision itself.
+    async fn used(&self) -> u32 {
+        0
+    }
 }
 
 /// One progressive event from a child turn, tagged with its origin.

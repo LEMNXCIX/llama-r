@@ -5,9 +5,13 @@
 //! function performs no I/O beyond the in-memory registry lookups and emits no
 //! prompts or arguments — it only decides whether a child may be spawned.
 
+use crate::api::chat_core::delegate_turn;
+use crate::api::handlers::AppState;
 use crate::domain::agent::Agent;
-use crate::ports::delegation::DelegateRequest;
+use crate::ports::delegation::{DelegateRequest, DelegateResult, Delegator};
 use crate::services::agent_registry::AgentRegistry;
+use async_trait::async_trait;
+use std::sync::{Arc, Weak};
 
 /// Resolve and authorize a delegation target.
 ///
@@ -103,4 +107,35 @@ pub fn validate_delegation(
     }
 
     Ok(target)
+}
+
+/// The concrete bounded delegator used by the runtime.
+///
+/// It holds a `Weak<AppState>` on purpose: `AppState` owns the engine, the
+/// engine owns this delegator (via `LocalToolDeps`), and a strong back-pointer
+/// would leak the whole state. An upgrade failure is a named error, never a
+/// panic — it can only happen after the state has been dropped, when no chat is
+/// running anyway.
+pub struct RuntimeDelegator {
+    registry: Arc<AgentRegistry>,
+    app: Weak<AppState>,
+}
+
+impl RuntimeDelegator {
+    pub fn new(registry: Arc<AgentRegistry>, app: Weak<AppState>) -> Self {
+        Self { registry, app }
+    }
+}
+
+#[async_trait]
+impl Delegator for RuntimeDelegator {
+    async fn delegate(&self, req: DelegateRequest) -> Result<DelegateResult, String> {
+        // Validate before spending any work: an unauthorised, cyclic or too-deep
+        // child is a named error with zero child turns executed.
+        let agent = validate_delegation(&self.registry, &req)?;
+        let state = self.app.upgrade().ok_or_else(|| {
+            "delegation unavailable: application state has already been dropped".to_string()
+        })?;
+        delegate_turn(&state, req, agent).await
+    }
 }

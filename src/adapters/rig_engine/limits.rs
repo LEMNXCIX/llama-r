@@ -8,6 +8,10 @@ impl ToolBudget for Mutex<ToolCallBudget> {
     async fn try_consume(&self) -> Result<(), String> {
         self.lock().await.try_consume()
     }
+
+    async fn used(&self) -> u32 {
+        self.lock().await.used()
+    }
 }
 
 pub struct ToolCallBudget {

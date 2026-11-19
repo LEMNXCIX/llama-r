@@ -169,6 +169,7 @@ fn run_request(model: &str, provider: ProviderKind) -> AgentRunRequest {
         history: Vec::new(),
         conversation_id: None,
         execution_id: uuid::Uuid::new_v4(),
+        shared_budget: None,
     }
 }
 

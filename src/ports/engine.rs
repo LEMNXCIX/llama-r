@@ -4,12 +4,38 @@ use crate::config::ProviderKind;
 use crate::domain::agent::Agent;
 use crate::domain::models::ChatMessage;
 use crate::domain::scope::AgentScope;
+use crate::ports::delegation::ToolBudget;
 use crate::providers::capabilities::ModelCapabilities;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+/// Hand-written `Debug`: every field is printable except the shared budget,
+/// whose trait object deliberately has no `Debug`. Log its presence, never its
+/// contents — an allowance is not a secret, but it is also not useful output.
+impl std::fmt::Debug for AgentRunRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentRunRequest")
+            .field("agent", &self.agent)
+            .field("scope", &self.scope)
+            .field("model", &self.model)
+            .field("provider", &self.provider)
+            .field("capabilities", &self.capabilities)
+            .field("system_prompt", &self.system_prompt)
+            .field("user_message", &self.user_message)
+            .field("history", &self.history)
+            .field("conversation_id", &self.conversation_id)
+            .field("execution_id", &self.execution_id)
+            .field(
+                "shared_budget",
+                &self.shared_budget.as_ref().map(|_| "<shared budget>"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct AgentRunRequest {
     pub agent: Agent,
     pub scope: AgentScope,
@@ -31,6 +57,12 @@ pub struct AgentRunRequest {
     /// supply one; a fresh `Uuid::new_v4()` is correct for a one-shot turn that
     /// has no execution record (e.g. the TUI).
     pub execution_id: Uuid,
+    /// The one tool-call allowance shared by a whole delegation tree. `Some` on
+    /// a child turn threaded from its parent's `DelegateRequest.budget`; `None`
+    /// for an ordinary turn, where the engine mints a fresh allowance from
+    /// `scope.max_tool_calls`. Additive by design: no existing engine signature
+    /// changes, and a plain turn keeps its old behaviour byte for byte.
+    pub shared_budget: Option<Arc<dyn ToolBudget>>,
 }
 
 #[derive(Debug, Clone)]
