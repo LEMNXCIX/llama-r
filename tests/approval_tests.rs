@@ -724,6 +724,7 @@ fn api_state(gate: Arc<ApprovalGate>) -> Arc<AppState> {
         Vec::new(),
         Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
         None,
+        Arc::new(llama_r::adapters::execution::NoOpExecutionStore),
     )
 }
 

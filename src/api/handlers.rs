@@ -9,6 +9,7 @@ use crate::domain::models::{
 };
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
+use crate::ports::execution::ExecutionStore;
 use crate::ports::mcp::McpServerRegistry;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::approval::ApprovalGate;
@@ -68,6 +69,12 @@ pub struct AppState {
     /// companions but must not drop pending decisions. A dropped request leaves
     /// its pending in the gate until timeout (Fase 7 seeds a background reaper).
     pub approval_gate: Arc<ApprovalGate>,
+    /// Durable execution store. Built once at boot from the history DB path and
+    /// deliberately NOT part of the hot-swapped `ProviderStack`: a TUI Apply
+    /// rebuilds the engine but must not swap out the record of in-flight turns.
+    /// A no-op store is installed when `history` is off or the SQLite store
+    /// cannot be opened, so its presence never gates boot or a chat.
+    pub execution_store: Arc<dyn ExecutionStore>,
 }
 
 impl AppState {

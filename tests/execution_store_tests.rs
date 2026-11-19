@@ -142,6 +142,118 @@ fn the_store_port_is_usable_as_a_thread_safe_trait_object() {
     let _ = (accepts, accepts_shared);
 }
 
+/// The no-op substitute is compiled under **every** feature combination: it is
+/// both the `--no-default-features` store and the degradation fallback when the
+/// SQLite store cannot be opened. Every read is empty, every write is a
+/// successful no-op — a caller never has to branch on which store it holds.
+#[tokio::test]
+async fn a_no_op_store_is_always_constructible_and_harmless() {
+    use llama_r::adapters::execution::NoOpExecutionStore;
+
+    let store = NoOpExecutionStore;
+    // Prove it satisfies the port as a trait object too — this is the exact
+    // shape `AppState.execution_store` holds in a `--no-default-features` build.
+    let shared: std::sync::Arc<dyn ExecutionStore> = std::sync::Arc::new(store);
+
+    let execution = sample_execution();
+    shared.create(&execution).await.unwrap();
+    let event = ExecutionEvent::new(execution.id, EventKind::Started, json!({"step": 1}));
+    shared.append_event(execution.id, &event).await.unwrap();
+    shared
+        .set_status(execution.id, ExecutionStatus::Completed, None)
+        .await
+        .unwrap();
+    assert!(shared.get(execution.id).await.unwrap().is_none());
+    assert!(shared.list_interrupted().await.unwrap().is_empty());
+    assert!(shared.list(10).await.unwrap().is_empty());
+    assert!(shared.get_events(execution.id).await.unwrap().is_empty());
+
+    shared
+        .record_operation("op-1", &json!({"result": "ok"}))
+        .await
+        .unwrap();
+    assert!(shared.get_operation("op-1").await.unwrap().is_none());
+
+    let record = PendingApprovalRecord {
+        id: Uuid::new_v4(),
+        execution_id: Some(execution.id),
+        tool_name: "mail__send".into(),
+        args: json!({"to": "a@example.com"}),
+        args_hash: [0xab; 32],
+        created_at: Utc::now(),
+        decided: false,
+        decision: None,
+        decided_at: None,
+    };
+    shared.save_pending_approval(&record).await.unwrap();
+    assert!(shared.load_pending_approvals().await.unwrap().is_empty());
+    shared
+        .decide_pending(record.id, ApprovalDecisionRecord::Approved, Utc::now())
+        .await
+        .unwrap();
+}
+
+/// Boot recovery: a turn left mid-flight by a crash is marked `Interrupted`
+/// once at boot. Gated on `history` only because seeding real rows needs the
+/// SQLite adapter — `mark_interrupted` itself is feature-agnostic.
+#[cfg(feature = "history")]
+mod boot_recovery {
+    use super::*;
+    use llama_r::adapters::execution::SqliteExecutionStore;
+    use llama_r::runtime::mark_interrupted;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn store_at(path: impl AsRef<std::path::Path>) -> Arc<SqliteExecutionStore> {
+        Arc::new(SqliteExecutionStore::new(path).expect("open execution store"))
+    }
+
+    #[tokio::test]
+    async fn boot_marks_running_and_waiting_as_interrupted() {
+        let dir = tempdir().unwrap();
+        let store = store_at(dir.path().join("history.db"));
+
+        let mut running = sample_execution();
+        running.status = ExecutionStatus::Running;
+        let mut waiting = sample_execution();
+        waiting.status = ExecutionStatus::WaitingApproval;
+        store.create(&running).await.unwrap();
+        store.create(&waiting).await.unwrap();
+
+        let count = mark_interrupted(store.as_ref()).await.unwrap();
+        assert_eq!(count, 2, "exactly the two mid-flight turns are marked");
+        assert_eq!(
+            store.get(running.id).await.unwrap().unwrap().status,
+            ExecutionStatus::Interrupted
+        );
+        assert_eq!(
+            store.get(waiting.id).await.unwrap().unwrap().status,
+            ExecutionStatus::Interrupted
+        );
+        assert!(
+            store.list_interrupted().await.unwrap().is_empty(),
+            "no mid-flight turns remain after boot recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_execution_is_untouched() {
+        let dir = tempdir().unwrap();
+        let store = store_at(dir.path().join("history.db"));
+
+        let mut completed = sample_execution();
+        completed.status = ExecutionStatus::Completed;
+        completed.finished_at = Some(Utc::now());
+        store.create(&completed).await.unwrap();
+
+        let count = mark_interrupted(store.as_ref()).await.unwrap();
+        assert_eq!(count, 0, "a finished turn is not recovery work");
+        let loaded = store.get(completed.id).await.unwrap().unwrap();
+        assert_eq!(loaded.status, ExecutionStatus::Completed);
+        assert_eq!(loaded.finished_at, completed.finished_at);
+    }
+}
+
 /// Adapter-backed contract. `rusqlite` is pulled in by the `history` feature,
 /// so the whole module is skipped under `--no-default-features` where the store
 /// adapter is not built.

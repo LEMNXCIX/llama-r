@@ -6,8 +6,14 @@
 //! so this adapter is gated on that feature exactly like the history adapter;
 //! a build without it has no durable store and uses the no-op substitute.
 
+/// The no-op substitute is always built: it is the `--no-default-features`
+/// store and the degradation fallback when SQLite cannot be opened.
+pub mod noop;
+
 #[cfg(feature = "history")]
 pub mod sqlite;
+
+pub use noop::NoOpExecutionStore;
 
 #[cfg(feature = "history")]
 pub use sqlite::SqliteExecutionStore;

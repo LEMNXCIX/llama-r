@@ -1,3 +1,4 @@
+use crate::adapters::execution::NoOpExecutionStore;
 use crate::adapters::mcp::{McpServerConfig, StaticMcpRegistry};
 use crate::adapters::rag::{
     FileRagStore, GeminiEmbeddings, OllamaEmbeddings, OpenAiCompatibleEmbeddings,
@@ -27,10 +28,12 @@ use crate::config::{Config, ProviderKind, OPENROUTER_BASE_URL};
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::ContextStore;
 use crate::core::hot_reload::HotReloader;
+use crate::domain::execution::ExecutionStatus;
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 #[cfg(feature = "rig-engine")]
 use crate::ports::engine::AgentEngine;
+use crate::ports::execution::ExecutionStore;
 use crate::ports::history::ConversationStore;
 use crate::ports::mcp::McpServerRegistry;
 use crate::ports::rag::{EmbeddingProvider, RagStore};
@@ -130,6 +133,10 @@ pub fn build_app_state(
         known_mcp_servers,
         mcp_registry,
         history_store,
+        // The convenience constructor (used by tests and non-boot callers) has
+        // no durable store to install. Boot calls `build_app_state_with_gate`
+        // directly with the real store built from the history DB path.
+        Arc::new(NoOpExecutionStore),
     )
 }
 
@@ -151,6 +158,7 @@ pub fn build_app_state_with_gate(
     known_mcp_servers: Vec<String>,
     mcp_registry: Arc<dyn McpServerRegistry>,
     history_store: Option<Arc<dyn ConversationStore>>,
+    execution_store: Arc<dyn ExecutionStore>,
 ) -> Arc<AppState> {
     let metrics = Arc::new(TokenMetrics::new());
     let default_model = stack.default_model.clone();
@@ -223,6 +231,7 @@ pub fn build_app_state_with_gate(
         router_config: Arc::new(router_config),
         router_healthy: AtomicBool::new(false),
         approval_gate,
+        execution_store,
     })
 }
 
@@ -477,6 +486,15 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         });
     }
 
+    // Durable execution store, built from the same `history.db` as above and
+    // owned by `AppState` (outside `ProviderStack`, so a hot Apply never drops
+    // it). An unopenable store degrades to the no-op one instead of failing boot.
+    // One recovery pass marks crash-interrupted turns; no background task.
+    let execution_store = build_execution_store();
+    if let Err(err) = mark_interrupted(execution_store.as_ref()).await {
+        tracing::warn!(error = %err, "Boot recovery could not list interrupted executions; continuing");
+    }
+
     // One `PROVIDER` selects chat, the decision router and embeddings. A
     // completed interactive setup already produced such a stack from the values
     // the user entered; otherwise build one from the boot configuration.
@@ -511,6 +529,7 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         known_mcp_servers,
         mcp_registry,
         history_store,
+        execution_store,
     );
 
     // One probe at startup, then last-known-value: the ladder updates the flag
@@ -1080,6 +1099,73 @@ fn build_history_store(
         tracing::info!("History feature disabled at compile time");
         None
     }
+}
+
+/// Build the durable execution store from the same `history.db` the conversation
+/// store uses, so an older database keeps its legacy rows untouched.
+///
+/// Never fatal: an unopenable store degrades to the no-op substitute with a
+/// warning, so boot and chats keep working without durability (Fase 7 adds no
+/// new hard failure mode). Under `--no-default-features` there is no `rusqlite`
+/// at all and the no-op store is the only option.
+fn build_execution_store() -> Arc<dyn ExecutionStore> {
+    #[cfg(feature = "history")]
+    {
+        use crate::adapters::execution::SqliteExecutionStore;
+
+        let path = crate::core::paths::get_history_db_path();
+        match SqliteExecutionStore::new(&path) {
+            Ok(store) => {
+                tracing::info!(path = %path.display(), "Execution store (SQLite) initialized");
+                Arc::new(store)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to open execution store; durable execution disabled (chat still works)"
+                );
+                Arc::new(NoOpExecutionStore)
+            }
+        }
+    }
+
+    #[cfg(not(feature = "history"))]
+    {
+        tracing::info!("Execution store disabled: history feature not compiled in");
+        Arc::new(NoOpExecutionStore)
+    }
+}
+
+/// Boot recovery: mark every turn left mid-flight by a crash (`Running` or
+/// `WaitingApproval`) as `Interrupted`, so it can be retried from scratch with
+/// tool effects still protected by their recorded `operation_id`.
+///
+/// Returns the number of turns marked. A turn that cannot be transitioned is
+/// logged and skipped rather than failing boot — recovery is best effort, like
+/// the store itself. Called once from [`build_runtime`]; no background task.
+pub async fn mark_interrupted(store: &dyn ExecutionStore) -> Result<usize, String> {
+    let interrupted = store.list_interrupted().await?;
+    let mut marked = 0usize;
+    for execution in interrupted {
+        match store
+            .set_status(execution.id, ExecutionStatus::Interrupted, None)
+            .await
+        {
+            Ok(()) => marked += 1,
+            Err(err) => tracing::warn!(
+                execution_id = %execution.id,
+                error = %err,
+                "Failed to mark an interrupted execution at boot"
+            ),
+        }
+    }
+    if marked > 0 {
+        tracing::warn!(
+            count = marked,
+            "Boot recovery marked interrupted agent turns; they can be retried"
+        );
+    }
+    Ok(marked)
 }
 
 /// Handles from `AppState` that the provider-dependent companions need. Kept as

@@ -224,6 +224,7 @@ mod tests {
             router_config: Arc::new(router_config),
             router_healthy: AtomicBool::new(router_healthy),
             approval_gate: Arc::new(crate::services::approval::ApprovalGate::default()),
+            execution_store: Arc::new(crate::adapters::execution::NoOpExecutionStore),
         });
         (temp_dir, state)
     }

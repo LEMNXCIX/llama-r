@@ -262,6 +262,7 @@ fn test_state_with_runtime_and_provider(
         router_config: Arc::new(RouterConfig::default()),
         router_healthy: AtomicBool::new(false),
         approval_gate: Arc::new(crate::services::approval::ApprovalGate::default()),
+        execution_store: Arc::new(crate::adapters::execution::NoOpExecutionStore),
     });
     (temp_dir, state)
 }
