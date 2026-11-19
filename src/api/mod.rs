@@ -3,6 +3,7 @@ pub mod approval_api;
 pub mod chat_core;
 pub mod context_api;
 pub mod docs;
+pub mod execution_api;
 pub mod grpc;
 pub mod handlers;
 pub mod health;

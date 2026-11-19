@@ -29,6 +29,7 @@ use crate::ports::engine::AgentRunEvent;
 use crate::services::approval::{ApprovalDecision as GateDecision, ApprovalGate};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 /// Authorize one tool call. `Ok(())` means "execute" (the caller then charges
 /// the shared budget and dispatches); `Err` is a named refusal carrying the tool
@@ -39,6 +40,7 @@ pub async fn authorize(
     permission: &PermissionPolicy,
     tool_name: &str,
     args: &Value,
+    execution_id: Option<Uuid>,
 ) -> Result<(), String> {
     match PermissionEngine::authorize(permission, tool_name) {
         PolicyDecision::Allow => Ok(()),
@@ -48,7 +50,7 @@ pub async fn authorize(
             // the pending via GET /api/approvals even though no SSE event exists
             // for it. The gate stores the raw args for that list endpoint; the
             // SSE event carries only non-secret id/name/hash.
-            let (id, rx) = gate.request(tool_name, args);
+            let (id, rx) = gate.request_for(execution_id, tool_name, args);
             if let Some(tx) = event_tx {
                 tx.send(AgentRunEvent::ApprovalRequired {
                     id,
@@ -124,7 +126,7 @@ mod tests {
                 .unwrap();
         });
 
-        authorize(&gate, None, &always(), "db__drop", &args)
+        authorize(&gate, None, &always(), "db__drop", &args, None)
             .await
             .expect("approval through the list/decide path lets the tool run");
         decider.await.unwrap();
@@ -140,6 +142,7 @@ mod tests {
             &PermissionPolicy::default(),
             "db__drop",
             &serde_json::json!({}),
+            None,
         )
         .await
         .unwrap();

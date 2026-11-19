@@ -80,6 +80,7 @@ impl McpToolBridge {
             &self.inner.scope.permission,
             &tool_name,
             &args,
+            self.operations.as_ref().map(|ctx| ctx.execution_id),
         )
         .await?;
 

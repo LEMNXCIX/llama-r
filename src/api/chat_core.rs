@@ -131,6 +131,7 @@ async fn build_runtime_request(
 /// engine runs — so the turn is observable even if the engine fails and the
 /// answer comes from the legacy fallback.
 fn new_execution(
+    id: Uuid,
     agent_qualified_id: String,
     provider: String,
     model: String,
@@ -139,7 +140,7 @@ fn new_execution(
 ) -> AgentExecution {
     let now = chrono::Utc::now();
     AgentExecution {
-        id: Uuid::new_v4(),
+        id,
         conversation_id,
         agent_qualified_id,
         provider,
@@ -174,7 +175,9 @@ async fn begin_turn_execution(
     engine_ids: Option<&(Option<String>, Option<String>)>,
     conversation_id: Option<&str>,
     prepared: &ChatRequest,
+    resume_execution_id: Option<Uuid>,
 ) -> Option<AgentExecution> {
+    let resuming = resume_execution_id.is_some();
     let execution = engine_ids.map(|(project_id, agent_id)| {
         let qualified_id = state
             .agent_registry
@@ -186,6 +189,10 @@ async fn begin_turn_execution(
                     .unwrap_or_else(|| project_id.clone().unwrap_or_default())
             });
         new_execution(
+            // A retry reuses the original id; that is the whole point — the
+            // idempotency guard keys its replay cache on it. A fresh turn mints
+            // a new id as before.
+            resume_execution_id.unwrap_or_else(Uuid::new_v4),
             qualified_id,
             services.provider_name.clone(),
             prepared.model.clone(),
@@ -194,7 +201,11 @@ async fn begin_turn_execution(
         )
     });
     if let Some(execution) = &execution {
-        record_start(state, execution).await;
+        if resuming {
+            record_resume(state, execution).await;
+        } else {
+            record_start(state, execution).await;
+        }
     }
     execution
 }
@@ -213,6 +224,25 @@ async fn record_start(state: &AppState, execution: &AgentExecution) {
         .await
     {
         tracing::warn!(error = %err, "could not append execution Started event");
+    }
+}
+
+/// Re-open an interrupted/failed turn for a retry. The row already exists (the
+/// retry endpoint loaded it), so this must NOT `create` again — a second insert
+/// with the same id would conflict. Instead flip it back to `Running` and append
+/// an `ExecutionResumed` marker. A store failure is a warning, never a failed
+/// chat, exactly like [`record_start`].
+async fn record_resume(state: &AppState, execution: &AgentExecution) {
+    let store = state.execution_store.as_ref();
+    if let Err(err) = store
+        .set_status(execution.id, ExecutionStatus::Running, None)
+        .await
+    {
+        tracing::warn!(error = %err, "could not mark execution as running on retry; continuing");
+    }
+    let event = ExecutionEvent::new(execution.id, EventKind::ExecutionResumed, json!({}));
+    if let Err(err) = store.append_event(execution.id, &event).await {
+        tracing::warn!(error = %err, "could not append execution ExecutionResumed event");
     }
 }
 
@@ -655,10 +685,26 @@ async fn run_stream_with_fallback(
     Err(AppError::Provider(error.to_string()))
 }
 
+/// Dispatch a normal chat turn (a fresh execution id is minted when an agent
+/// resolves). The retry endpoint calls [`execute_chat_with_id`] with the original
+/// id so the operation-id replay cache engages.
 pub async fn execute_chat(
     state: &AppState,
     payload: ChatRequest,
     selection: AgentSelection<'_>,
+) -> Result<ChatResponse, AppError> {
+    execute_chat_with_id(state, payload, selection, None).await
+}
+
+/// Same dispatch as [`execute_chat`], but with an explicit execution id to reuse.
+/// `Some(id)` is the retry path: it resumes that turn instead of creating a new
+/// one, so tool operations recorded under the id are replayed rather than
+/// repeated. `None` is an ordinary turn.
+pub async fn execute_chat_with_id(
+    state: &AppState,
+    payload: ChatRequest,
+    selection: AgentSelection<'_>,
+    resume_execution_id: Option<Uuid>,
 ) -> Result<ChatResponse, AppError> {
     // ONE snapshot for the whole request. Every provider-dependent field below
     // — the agent runtime, the engine's default model, the chat provider and
@@ -699,6 +745,7 @@ pub async fn execute_chat(
         engine_ids.as_ref(),
         selection.conversation_id,
         &prepared,
+        resume_execution_id,
     )
     .await;
 
@@ -808,10 +855,21 @@ pub async fn execute_chat(
     outcome
 }
 
+/// Streaming counterpart of [`execute_chat`]. A fresh id is minted per turn.
 pub async fn execute_chat_stream(
+    state: &AppState,
+    payload: ChatRequest,
+    selection: AgentSelection<'_>,
+) -> Result<AppChatStream, AppError> {
+    execute_chat_stream_with_id(state, payload, selection, None).await
+}
+
+/// Streaming dispatch with an explicit execution id to reuse (the retry path).
+pub async fn execute_chat_stream_with_id(
     state: &AppState,
     mut payload: ChatRequest,
     selection: AgentSelection<'_>,
+    resume_execution_id: Option<Uuid>,
 ) -> Result<AppChatStream, AppError> {
     // The one snapshot for this request, for the same reason as `execute_chat`:
     // every field the engine and fallback read comes from this single stack.
@@ -839,6 +897,7 @@ pub async fn execute_chat_stream(
         engine_ids.as_ref(),
         selection.conversation_id,
         &prepared,
+        resume_execution_id,
     )
     .await;
     let run_id = execution

@@ -302,6 +302,7 @@ mod bridge {
                 &self.scope.permission,
                 &self.tool.id,
                 &args,
+                self.operations.as_ref().map(|ctx| ctx.execution_id),
             )
             .await?;
 

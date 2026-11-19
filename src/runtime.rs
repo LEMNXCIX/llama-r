@@ -13,6 +13,7 @@ use crate::api::context_api::{
     analyze_project, create_context, delete_context, get_context, list_contexts, update_context,
 };
 use crate::api::docs::{serve_openapi_json, serve_scalar_ui};
+use crate::api::execution_api::{get_execution, list_executions, retry_execution};
 use crate::api::grpc::{pb::llama_gateway_server::LlamaGatewayServer, GrpcService};
 use crate::api::handlers::{chat, list_models, mcp_message, openai_chat, AppState};
 use crate::api::health::health;
@@ -280,6 +281,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/contexts", get(list_contexts).post(create_context))
         .route("/api/contexts/:id", get(get_context).put(update_context).delete(delete_context))
         .route("/api/contexts/:id/analyze", post(analyze_project))
+        .route("/api/executions", get(list_executions))
+        .route("/api/executions/:id", get(get_execution))
+        .route("/api/executions/:id/retry", post(retry_execution))
         .route("/api/rag/ingest", post(rag_ingest))
         .route("/api/rag/query", post(rag_query))
         .route("/api/rag/delete-document", post(rag_delete_document))

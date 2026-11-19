@@ -65,6 +65,11 @@ pub struct PendingApproval {
     pub tool_name: String,
     pub args: Value,
     pub args_hash: [u8; 32],
+    /// The turn that requested this approval. Set on live requests that carry a
+    /// durable `execution_id`, rehydrated from the store after a restart. It is
+    /// what scopes a persisted decision to a retry of *that* turn — without it
+    /// an approval from one turn could silently re-approve an unrelated one.
+    pub execution_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     /// Set once the decision was recorded. A decided entry is kept until reaped
     /// so a second decision can be told apart from an unknown id (409 vs 404).
@@ -165,26 +170,76 @@ impl ApprovalGate {
         self.timeout
     }
 
-    /// Register a pending approval. Reaps expired entries first, then returns
-    /// a fresh id and the receiver the caller awaits before executing a tool.
-    /// When a durable store is attached the pending is persisted here too, so
-    /// it survives a restart; a store failure is warned about and never fails
-    /// the request (durability is best effort, like the store itself).
+    /// Register a pending approval with no execution scope (live request outside
+    /// the durable engine, e.g. a unit test or the TUI). Kept as the unchanged
+    /// entry point so existing callers keep the same behaviour.
     pub fn request(
         &self,
         tool_name: impl Into<String>,
         args: &Value,
     ) -> (Uuid, oneshot::Receiver<ApprovalDecision>) {
+        self.request_for(None, tool_name, args)
+    }
+
+    /// Register a pending approval for one turn. Reaps expired entries first,
+    /// then returns a fresh id and the receiver the caller awaits before running
+    /// the tool. When a durable store is attached the pending (including its
+    /// execution id) is persisted, so it survives a restart; a store failure is
+    /// warned about and never fails the request (durability is best effort).
+    ///
+    /// When `execution_id` is `Some` and a decision for this exact
+    /// `(execution, tool, args)` was already recorded — a human decided after a
+    /// crash, while no live oneshot existed —
+    /// the persisted decision is consumed and returned through a resolved
+    /// receiver instead of asking again. This is the retry path's approval seam;
+    /// the binding is still the SHA-256 of the exact arguments, and the scope is
+    /// the execution id, so an approval can never leak into a different turn.
+    pub fn request_for(
+        &self,
+        execution_id: Option<Uuid>,
+        tool_name: impl Into<String>,
+        args: &Value,
+    ) -> (Uuid, oneshot::Receiver<ApprovalDecision>) {
         self.prune_expired();
-        let id = Uuid::new_v4();
-        let (tx, rx) = oneshot::channel();
         let tool_name = tool_name.into();
         let args_hash = args_hash(args);
         let created_at = Utc::now();
+
+        // Read candidate ids under one lock, then resolve them through the
+        // public accessor. Two lock acquisitions rather than a recursive read
+        // (which can deadlock on some platforms with a waiting writer).
+        if let Some(execution_id) = execution_id {
+            let reusable: Vec<Uuid> = {
+                let pending = self.pending.read().expect("approval gate lock poisoned");
+                pending
+                    .iter()
+                    .filter(|(_, entry)| {
+                        entry.execution_id == Some(execution_id)
+                            && entry.tool_name == tool_name
+                            && entry.args_hash == args_hash
+                            && entry.decided
+                    })
+                    .map(|(id, _)| *id)
+                    .collect()
+            };
+            if let Some(id) = reusable.into_iter().next() {
+                if let Some(decision) = self.decision_for(id) {
+                    // A pre-resolved receiver: the bridge proceeds immediately,
+                    // so the retry does not re-ask a human who already answered.
+                    let (tx, rx) = oneshot::channel();
+                    let _ = tx.send(decision);
+                    return (id, rx);
+                }
+            }
+        }
+
+        let id = Uuid::new_v4();
+        let (tx, rx) = oneshot::channel();
         let entry = PendingApproval {
             tool_name: tool_name.clone(),
             args: args.clone(),
             args_hash,
+            execution_id,
             created_at,
             decided: false,
             decision: None,
@@ -200,7 +255,7 @@ impl ApprovalGate {
             // fields before persistence (one shared implementation, Task 1/2).
             let record = PendingApprovalRecord {
                 id,
-                execution_id: None,
+                execution_id,
                 tool_name,
                 args: args.clone(),
                 args_hash,
@@ -352,6 +407,7 @@ impl ApprovalGate {
                 tool_name: record.tool_name,
                 args: record.args,
                 args_hash: record.args_hash,
+                execution_id: record.execution_id,
                 created_at: record.created_at,
                 decided: record.decided,
                 decision: record.decision.as_ref().map(decision_from_record),
