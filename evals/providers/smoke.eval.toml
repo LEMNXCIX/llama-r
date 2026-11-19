@@ -1,7 +1,9 @@
 # Multi-provider eval smoke cases.
 #
-# The runner in tests/provider_eval_smoke.rs executes every case against every
-# provider below. It ALWAYS uses recorded fixtures served from a local listener:
+# The declarative runner in src/evals/ executes each provider-class case against
+# every provider below; an `agent` case runs once through the real tool-loop
+# runner. The smoke test in tests/provider_eval_smoke.rs is a thin consumer of
+# that runner. It ALWAYS uses recorded fixtures served from a local listener:
 # no live keys, no network, no secrets. This is the only mode CI runs.
 #
 # LIVE SMOKE (optional, never in CI, NOT performed by this harness):
@@ -15,6 +17,9 @@ id = "plain-greeting"
 kind = "plain"
 prompt = "Reply with a short greeting that contains the word hello."
 expect = "hello"
+# The recorded answer is "fixture answer: hello": assert it carries none of the
+# forbidden token. Explicit checks run before the `expect`-derived Contains.
+checks = [{ type = "not_contains", text = "goodbye" }]
 
 # This case checks that the adapter returns the expected answer text for a
 # prompt that REQUESTS a tool. It does NOT verify tool invocation: direct-chat
@@ -30,6 +35,26 @@ id = "streaming"
 kind = "stream"
 prompt = "Stream a short response containing the token one."
 expect = "one"
+
+# A judge check with no decision router injected by the smoke's options. It is
+# SKIPPED (never auto-passed) in CI, so all six rows abstain and strict stays
+# green. A caller that injects a router can turn the same check into a verdict.
+[[cases]]
+id = "judge-answer"
+kind = "plain"
+prompt = "Reply with a short greeting."
+checks = [{ type = "judge", question = "Is the answer a polite greeting?" }]
+
+# A real agent turn against the fake Ollama socket. The first completion calls
+# the built-in `llama_r__skill` local tool (bare id, no server), the engine
+# executes it and the second completion answers. Runner checks require that the
+# tool call actually happened; a missing call is a FAIL, not a green SKIP.
+[[cases]]
+id = "agent-tool-call"
+kind = "agent"
+prompt = "Call the eval skill tool and report the result."
+agent = "eval-agent"
+checks = [{ type = "called_tool", name = "llama_r__skill" }]
 
 [[providers]]
 name = "ollama"

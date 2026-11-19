@@ -258,11 +258,16 @@ fn apply_check_redacts_structured_evidence() {
 
 #[tokio::test]
 async fn the_v1_smoke_suite_runs_green_through_the_runner() {
-    // The exact scenario Task 4 will use: six providers × three cases, with no
-    // router injected. Judge checks would skip; the v1 file has none, so every
-    // row is a pass or an expected streaming-unavailable skip.
+    // The exact scenario the smoke test uses: six providers × four
+    // provider-class cases plus one agent case, with no router injected. The
+    // judge case SKIPs, streaming-unavailable rows SKIP, and the agent case
+    // calls a real tool — every other row is a pass. Skips never fail strict.
     let report = run_suite(load_eval(), RunOptions::default()).await;
-    assert_eq!(report.rows.len(), 18, "3 cases × 6 providers");
+    assert_eq!(
+        report.rows.len(),
+        25,
+        "4 provider cases × 6 providers + 1 agent case"
+    );
     assert!(report.all_passed(true), "v1 fixture suite must stay green");
     let table = report.render_table();
     assert!(!table.contains("-eval-dummy"), "no dummy key may leak");
@@ -274,17 +279,22 @@ async fn the_v1_smoke_suite_runs_green_through_the_runner() {
 #[test]
 fn load_eval_parses_the_v1_smoke_toml() {
     let suite = load_eval();
-    assert_eq!(suite.cases.len(), 3, "three smoke cases in the TOML");
+    assert_eq!(suite.cases.len(), 5, "five smoke cases in the TOML");
     assert_eq!(
         suite.providers.len(),
         6,
         "six provider profiles in the TOML"
     );
     assert_eq!(suite.mode, EvalMode::Strict);
-    // expect sugar was folded into a Contains check at load time.
+    // Explicit checks keep their written order; expect sugar is folded into a
+    // Contains check appended at load time.
     assert!(matches!(
-        suite.cases[0].checks.as_slice(),
-        [EvalCheck::Contains { .. }]
+        suite.cases[0].checks.first(),
+        Some(EvalCheck::NotContains { .. })
+    ));
+    assert!(matches!(
+        suite.cases[0].checks.last(),
+        Some(EvalCheck::Contains { .. })
     ));
 }
 
