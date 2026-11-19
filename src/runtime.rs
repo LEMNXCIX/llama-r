@@ -508,8 +508,13 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     // so the two cannot disagree about which upstream the engine targets.
     // One gate for the process lifetime, created before either the engine or
     // `AppState` needs it. Sharing the same `Arc` is what makes a settings Apply
-    // safe: it rebuilds the engine but leaves pending decisions intact.
-    let approval_gate = Arc::new(ApprovalGate::default());
+    // safe: it rebuilds the engine but leaves pending decisions intact. The
+    // durable store is attached so pendings/decisions survive a restart; a boot
+    // reload rehydrates them without a oneshot (there is no live request yet).
+    let approval_gate = Arc::new(ApprovalGate::default().with_store(execution_store.clone()));
+    if let Err(err) = approval_gate.load_from_store().await {
+        tracing::warn!(error = %err, "Boot could not reload pending approvals; continuing");
+    }
     let handles = CompanionHandles {
         mcp_registry: mcp_registry.clone(),
         agent_registry: agent_registry.clone(),

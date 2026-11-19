@@ -16,19 +16,22 @@ use llama_r::adapters::rig_engine::operations::{operation_id, run_idempotent, Op
 use llama_r::domain::execution::{AgentExecution, EventKind, ExecutionEvent, ExecutionStatus};
 use llama_r::ports::engine::AgentRunRequest;
 use llama_r::ports::execution::{ApprovalDecisionRecord, ExecutionStore, PendingApprovalRecord};
+use llama_r::services::approval::{args_hash, ApprovalDecision, ApprovalError, ApprovalGate};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 /// A tiny in-memory store so the idempotency guard can be tested under every
 /// feature combination (the SQLite adapter needs the `history` feature). It
-/// keeps the same "first result wins" and append-only semantics as the port.
+/// keeps the same "first result wins" and append-only semantics as the port,
+/// including the durable pending-approval record (with a real decision).
 #[derive(Default)]
 struct FakeStore {
     operations: Mutex<HashMap<String, Value>>,
     events: Mutex<Vec<ExecutionEvent>>,
     executions: Mutex<HashMap<Uuid, AgentExecution>>,
+    pendings: Mutex<HashMap<Uuid, PendingApprovalRecord>>,
 }
 
 #[async_trait]
@@ -90,18 +93,31 @@ impl ExecutionStore for FakeStore {
     async fn get_operation(&self, operation_id: &str) -> Result<Option<Value>, String> {
         Ok(self.operations.lock().unwrap().get(operation_id).cloned())
     }
-    async fn save_pending_approval(&self, _record: &PendingApprovalRecord) -> Result<(), String> {
+    async fn save_pending_approval(&self, record: &PendingApprovalRecord) -> Result<(), String> {
+        self.pendings
+            .lock()
+            .unwrap()
+            .insert(record.id, record.clone());
         Ok(())
     }
     async fn load_pending_approvals(&self) -> Result<Vec<PendingApprovalRecord>, String> {
-        Ok(Vec::new())
+        let mut all: Vec<_> = self.pendings.lock().unwrap().values().cloned().collect();
+        all.sort_by_key(|record| record.created_at);
+        Ok(all)
     }
     async fn decide_pending(
         &self,
-        _id: Uuid,
-        _decision: ApprovalDecisionRecord,
-        _decided_at: DateTime<Utc>,
+        id: Uuid,
+        decision: ApprovalDecisionRecord,
+        decided_at: DateTime<Utc>,
     ) -> Result<(), String> {
+        let mut pendings = self.pendings.lock().unwrap();
+        let record = pendings
+            .get_mut(&id)
+            .ok_or_else(|| format!("no pending approval with id {id}"))?;
+        record.decided = true;
+        record.decision = Some(decision);
+        record.decided_at = Some(decided_at);
         Ok(())
     }
 }
@@ -364,4 +380,154 @@ fn an_agent_run_request_carries_an_execution_id() {
     };
     assert_eq!(req.execution_id, execution_id);
     assert_ne!(req.execution_id, Uuid::nil());
+}
+
+// ── Task 5: approvals survive a restart ─────────────────────────────────────
+
+#[tokio::test]
+async fn a_pending_survives_gate_drop_and_reload() {
+    let store = Arc::new(FakeStore::default());
+    let args = json!({"table": "users"});
+
+    let id = {
+        let gate = ApprovalGate::default().with_store(store.clone());
+        let (id, _rx) = gate.request("db__drop_table", &args);
+        // The live request was persisted at request time.
+        assert_eq!(store.load_pending_approvals().await.unwrap().len(), 1);
+        id
+    }; // the owning gate (and its oneshot) is dropped, simulating a restart
+
+    let reloaded = ApprovalGate::default().with_store(store.clone());
+    assert_eq!(reloaded.load_from_store().await.unwrap(), 1);
+
+    // The rehydrated pending carries no oneshot but is fully observable: its
+    // hash still binds a later decision to the exact arguments on file.
+    assert_eq!(reloaded.stored_hash(id), Some(args_hash(&args)));
+    let pending = reloaded.list_pending();
+    assert_eq!(
+        pending.len(),
+        1,
+        "the pending is discoverable after restart"
+    );
+    assert_eq!(pending[0].id, id);
+    assert_eq!(pending[0].tool_name, "db__drop_table");
+}
+
+#[tokio::test]
+async fn a_decision_after_restart_is_consumed_by_the_retry() {
+    let store = Arc::new(FakeStore::default());
+    let args = json!({"table": "users"});
+
+    let id = {
+        let gate = ApprovalGate::default().with_store(store.clone());
+        let (id, _rx) = gate.request("db__drop_table", &args);
+        id
+    };
+
+    // No live oneshot exists after the restart, yet the HTTP decision must
+    // still be accepted, persisted and made observable to the retry path.
+    let gate = ApprovalGate::default().with_store(store.clone());
+    gate.load_from_store().await.unwrap();
+    gate.decide(id, true, args_hash(&args))
+        .expect("deciding a rehydrated pending must succeed");
+    assert_eq!(gate.decision_for(id), Some(ApprovalDecision::Approved));
+
+    // A fresh gate (the retry's view) loads the persisted decision from disk.
+    let retry_gate = ApprovalGate::default().with_store(store.clone());
+    retry_gate.load_from_store().await.unwrap();
+    assert_eq!(
+        retry_gate.decision_for(id),
+        Some(ApprovalDecision::Approved),
+        "the retry observes the decision made while no live request existed"
+    );
+
+    let records = store.load_pending_approvals().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].decided);
+    assert_eq!(records[0].decision, Some(ApprovalDecisionRecord::Approved));
+}
+
+#[tokio::test]
+async fn a_wrong_hash_after_reload_is_rejected() {
+    let store = Arc::new(FakeStore::default());
+    let args = json!({"amount": 100});
+
+    let id = {
+        let gate = ApprovalGate::default().with_store(store.clone());
+        let (id, _rx) = gate.request("pay__send", &args);
+        id
+    };
+
+    let gate = ApprovalGate::default().with_store(store.clone());
+    gate.load_from_store().await.unwrap();
+
+    let tampered = json!({"amount": 200});
+    assert!(matches!(
+        gate.decide(id, true, args_hash(&tampered)),
+        Err(ApprovalError::ArgsChanged)
+    ));
+    assert_eq!(
+        gate.decision_for(id),
+        None,
+        "a rejected hash yields no decision"
+    );
+    assert!(
+        !store.load_pending_approvals().await.unwrap()[0].decided,
+        "a rejected decision is never persisted"
+    );
+
+    // The correct hash still resolves the exact arguments on file, and a denial
+    // is just as observable to the retry as an approval.
+    gate.decide(id, false, args_hash(&args)).unwrap();
+    assert_eq!(
+        gate.decision_for(id),
+        Some(ApprovalDecision::Denied {
+            reason: "denied by human".into()
+        })
+    );
+}
+
+#[cfg(feature = "history")]
+#[tokio::test]
+async fn the_gate_persists_through_the_real_sqlite_store() {
+    // Production path: the gate is driven from async handlers, so its store
+    // writes run through `block_on`. SQLite uses a std mutex + synchronous
+    // rusqlite (no tokio I/O), so this never parks. This test proves the real
+    // adapter round-trips a pending and its decision through the gate, and
+    // that the store — not the gate — redacts secret-bearing args (Task 2).
+    use llama_r::adapters::execution::SqliteExecutionStore;
+    use llama_r::services::redaction::REDACTED_MARKER;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(SqliteExecutionStore::new(dir.path().join("history.db")).unwrap());
+    let args = json!({"table": "users", "api_key": "sk-super-secret"});
+
+    let id = {
+        let gate = ApprovalGate::default().with_store(store.clone());
+        let (id, _rx) = gate.request("db__drop_table", &args);
+        id
+    };
+
+    let reloaded = ApprovalGate::default().with_store(store.clone());
+    assert_eq!(reloaded.load_from_store().await.unwrap(), 1);
+    let pending = reloaded.list_pending();
+    assert_eq!(pending.len(), 1);
+    // The store redacts secret-bearing args on disk (one shared implementation,
+    // no duplicate in the gate), so a rehydrated entry carries redacted args.
+    assert_eq!(pending[0].args["api_key"], REDACTED_MARKER);
+    assert_eq!(pending[0].args["table"], "users");
+    let records = store.load_pending_approvals().await.unwrap();
+    assert_eq!(records[0].args["api_key"], REDACTED_MARKER);
+    assert!(!serde_json::to_string(&records[0])
+        .unwrap()
+        .contains("sk-super-secret"));
+
+    reloaded.decide(id, true, args_hash(&args)).unwrap();
+    let retry_gate = ApprovalGate::default().with_store(store.clone());
+    retry_gate.load_from_store().await.unwrap();
+    assert_eq!(
+        retry_gate.decision_for(id),
+        Some(ApprovalDecision::Approved)
+    );
 }

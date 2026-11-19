@@ -11,16 +11,31 @@
 //!   rejected rather than executing something the human never saw;
 //! - `decide` takes the pending entry under the write lock, so two concurrent
 //!   decisions can never resolve the same oneshot.
+//!
+//! # Durability (Fase 7)
+//!
+//! The oneshot is process-local, so a restart loses it. The gate is therefore a
+//! *hybrid*: it also mirrors every pending and decision into the durable
+//! [`ExecutionStore`](crate::ports::execution::ExecutionStore) when one is
+//! attached (`.with_store(...)`). At boot [`ApprovalGate::load_from_store`]
+//! rehydrates the pendings **without** a oneshot — there is no live request to
+//! unblock after a restart. A human decision on such an entry is persisted and
+//! recorded in memory, and [`ApprovalGate::decision_for`] exposes it to the
+//! retry path, which consumes it before re-running the tool. The store's
+//! futures are bounded synchronous work (`Mutex<Connection>` + rusqlite, or a
+//! no-op), so the synchronous gate API can drive them with `block_on` without
+//! ever parking on a tokio primitive.
 
 use crate::error::AppError;
 // The canonical argument hash lives in `services::redaction` so approval
 // binding and tool-call `operation_id` mint the same id from the same args.
 // Re-exported here: existing callers import it from this module.
+use crate::ports::execution::{ApprovalDecisionRecord, ExecutionStore, PendingApprovalRecord};
 pub use crate::services::redaction::{args_hash, args_hash_hex};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -51,9 +66,15 @@ pub struct PendingApproval {
     pub args: Value,
     pub args_hash: [u8; 32],
     pub created_at: DateTime<Utc>,
-    /// Set once the oneshot has fired. A decided entry is kept until reaped so
-    /// a second decision can be told apart from an unknown id (409 vs 404).
+    /// Set once the decision was recorded. A decided entry is kept until reaped
+    /// so a second decision can be told apart from an unknown id (409 vs 404).
     pub decided: bool,
+    /// The recorded answer, if any. Rehydrated entries carry the decision read
+    /// from the store; live entries get it when `decide` runs. `decision_for`
+    /// exposes it to the retry path after a restart.
+    pub decision: Option<ApprovalDecision>,
+    /// `Some` for a live request (the oneshot awaited by the bridge); `None`
+    /// for a rehydrated entry with no live request after a restart.
     tx: Option<oneshot::Sender<ApprovalDecision>>,
 }
 
@@ -69,10 +90,24 @@ pub struct PendingApprovalView {
 
 /// Registry of pending approvals, with a reaper that runs on `request` and
 /// `decide` (there is no background task to schedule or shut down).
-#[derive(Debug)]
 pub struct ApprovalGate {
     pending: RwLock<HashMap<Uuid, PendingApproval>>,
     timeout: Duration,
+    /// Durable mirror, when one was installed. `None` keeps the primitive
+    /// usable in tests and in degraded/no-store deployments.
+    store: Option<Arc<dyn ExecutionStore>>,
+}
+
+impl std::fmt::Debug for ApprovalGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The store is a trait object without `Debug`; report only whether one
+        // is attached, never its contents.
+        f.debug_struct("ApprovalGate")
+            .field("pending", &self.pending)
+            .field("timeout", &self.timeout)
+            .field("durable", &self.store.is_some())
+            .finish()
+    }
 }
 
 /// Why a decision could not be applied.
@@ -110,7 +145,16 @@ impl ApprovalGate {
         Self {
             pending: RwLock::new(HashMap::new()),
             timeout,
+            store: None,
         }
+    }
+
+    /// Attach the durable store used to mirror pendings and decisions. Boot
+    /// installs the same `Arc` that `AppState` owns; callers without a store
+    /// (tests, degraded/no-history builds) keep the pure in-memory behaviour.
+    pub fn with_store(mut self, store: Arc<dyn ExecutionStore>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// How long a pending decision stays valid. The bridge wraps its `rx.await`
@@ -123,6 +167,9 @@ impl ApprovalGate {
 
     /// Register a pending approval. Reaps expired entries first, then returns
     /// a fresh id and the receiver the caller awaits before executing a tool.
+    /// When a durable store is attached the pending is persisted here too, so
+    /// it survives a restart; a store failure is warned about and never fails
+    /// the request (durability is best effort, like the store itself).
     pub fn request(
         &self,
         tool_name: impl Into<String>,
@@ -131,18 +178,45 @@ impl ApprovalGate {
         self.prune_expired();
         let id = Uuid::new_v4();
         let (tx, rx) = oneshot::channel();
+        let tool_name = tool_name.into();
+        let args_hash = args_hash(args);
+        let created_at = Utc::now();
         let entry = PendingApproval {
-            tool_name: tool_name.into(),
+            tool_name: tool_name.clone(),
             args: args.clone(),
-            args_hash: args_hash(args),
-            created_at: Utc::now(),
+            args_hash,
+            created_at,
             decided: false,
+            decision: None,
             tx: Some(tx),
         };
         self.pending
             .write()
             .expect("approval gate lock poisoned")
             .insert(id, entry);
+
+        if let Some(store) = &self.store {
+            // `args` is forwarded verbatim: the store redacts secret-bearing
+            // fields before persistence (one shared implementation, Task 1/2).
+            let record = PendingApprovalRecord {
+                id,
+                execution_id: None,
+                tool_name,
+                args: args.clone(),
+                args_hash,
+                created_at,
+                decided: false,
+                decision: None,
+                decided_at: None,
+            };
+            if let Err(err) = futures::executor::block_on(store.save_pending_approval(&record)) {
+                tracing::warn!(
+                    error = %err,
+                    approval_id = %id,
+                    "Failed to persist pending approval; continuing without durability"
+                );
+            }
+        }
         (id, rx)
     }
 
@@ -204,8 +278,10 @@ impl ApprovalGate {
             pending.remove(&id);
             return Err(ApprovalError::Expired(id));
         }
-        // Reap the rest while the write lock is already held.
-        pending.retain(|_, entry| !is_expired(entry, now, self.timeout));
+        // Reap the rest while the write lock is already held. Decided entries
+        // are kept: a repeated decision is a conflict, not a miss, and the
+        // retry path needs the recorded decision to stay observable.
+        pending.retain(|_, entry| entry.decided || !is_expired(entry, now, self.timeout));
 
         let entry = pending.get_mut(&id).ok_or(ApprovalError::NotFound(id))?;
         if entry.decided {
@@ -215,14 +291,10 @@ impl ApprovalGate {
         if entry.args_hash != submitted_hash {
             return Err(ApprovalError::ArgsChanged);
         }
-        // Mark decided and take the sender so the oneshot can fire at most once,
-        // but keep the entry until the reaper collects it so a second decision
-        // is distinguishable from an unknown id.
+        // Mark decided and record the answer. Take the sender (if any) so the
+        // oneshot fires at most once; a rehydrated entry has no sender because
+        // there is no live request after a restart.
         entry.decided = true;
-        let tx = entry
-            .tx
-            .take()
-            .expect("an undecided entry still owns its sender");
         let decision = if approve {
             ApprovalDecision::Approved
         } else {
@@ -230,17 +302,95 @@ impl ApprovalGate {
                 reason: "denied by human".to_string(),
             }
         };
-        // The receiver may have been dropped (client disconnected); that must
-        // not turn a valid decision into an error.
-        let _ = tx.send(decision);
+        entry.decision = Some(decision.clone());
+        if let Some(tx) = entry.tx.take() {
+            // The receiver may have been dropped (client disconnected); that
+            // must not turn a valid decision into an error.
+            let _ = tx.send(decision.clone());
+        }
+        // Persist under the SAME lock that fired the oneshot: the durable record
+        // and the in-memory resolution cannot diverge for concurrent decisions.
+        if let Some(store) = &self.store {
+            if let Err(err) = futures::executor::block_on(store.decide_pending(
+                id,
+                decision_record(&decision),
+                now,
+            )) {
+                tracing::warn!(
+                    error = %err,
+                    approval_id = %id,
+                    "Failed to persist approval decision; continuing"
+                );
+            }
+        }
         Ok(())
     }
 
-    /// Drop every pending approval older than the configured timeout.
+    /// Drop every *undecided* pending approval older than the configured
+    /// timeout. Decided entries are retained so their decision stays visible
+    /// to `decision_for` and the retry path.
     pub fn prune_expired(&self) {
         let now = Utc::now();
         let mut pending = self.pending.write().expect("approval gate lock poisoned");
-        pending.retain(|_, entry| !is_expired(entry, now, self.timeout));
+        pending.retain(|_, entry| entry.decided || !is_expired(entry, now, self.timeout));
+    }
+
+    /// Rehydrate pendings from the attached store at boot. Entries loaded this
+    /// way have **no oneshot**: there is no live bridge to unblock after a
+    /// restart, so a decision made through HTTP is persisted and exposed via
+    /// [`ApprovalGate::decision_for`] to the retry path instead. Returns the
+    /// number of entries loaded (0 when there is no store).
+    pub async fn load_from_store(&self) -> Result<usize, String> {
+        let Some(store) = &self.store else {
+            return Ok(0);
+        };
+        let records = store.load_pending_approvals().await?;
+        let mut pending = self.pending.write().expect("approval gate lock poisoned");
+        let mut loaded = 0usize;
+        for record in records {
+            let entry = PendingApproval {
+                tool_name: record.tool_name,
+                args: record.args,
+                args_hash: record.args_hash,
+                created_at: record.created_at,
+                decided: record.decided,
+                decision: record.decision.as_ref().map(decision_from_record),
+                tx: None, // no live request after a restart
+            };
+            pending.insert(record.id, entry);
+            loaded += 1;
+        }
+        Ok(loaded)
+    }
+
+    /// The decision recorded for an approval, if it has been decided. This is
+    /// the accessor the retry path uses after a restart: a decision made while
+    /// no live oneshot existed is observable here (and in the store), so the
+    /// retry can proceed with Approved/Denied instead of hanging or re-asking.
+    pub fn decision_for(&self, id: Uuid) -> Option<ApprovalDecision> {
+        self.pending
+            .read()
+            .expect("approval gate lock poisoned")
+            .get(&id)
+            .and_then(|entry| entry.decision.clone())
+    }
+}
+
+fn decision_record(decision: &ApprovalDecision) -> ApprovalDecisionRecord {
+    match decision {
+        ApprovalDecision::Approved => ApprovalDecisionRecord::Approved,
+        ApprovalDecision::Denied { reason } => ApprovalDecisionRecord::Denied {
+            reason: reason.clone(),
+        },
+    }
+}
+
+fn decision_from_record(record: &ApprovalDecisionRecord) -> ApprovalDecision {
+    match record {
+        ApprovalDecisionRecord::Approved => ApprovalDecision::Approved,
+        ApprovalDecisionRecord::Denied { reason } => ApprovalDecision::Denied {
+            reason: reason.clone(),
+        },
     }
 }
 
