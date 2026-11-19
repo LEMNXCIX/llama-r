@@ -154,6 +154,35 @@ fn other_project_rejected() {
 }
 
 #[test]
+fn other_project_rejected_even_with_allow_global() {
+    // `allow_global` opens the door to global agents only. An agent that lives
+    // in a different project is never reachable, even with the flag set.
+    let caller = agent(
+        "parent",
+        Some("proj"),
+        Some(SubagentsConfig {
+            allowed: vec!["elsewhere".into()],
+            allow_global: true,
+            ..Default::default()
+        }),
+    );
+    let elsewhere = agent("elsewhere", Some("other"), None);
+    let registry = registry_with(vec![caller, elsewhere]);
+
+    let err = validate_delegation(&registry, &request("elsewhere", "parent", Some("proj")))
+        .expect_err("another project's agent must stay rejected even with allow_global");
+
+    assert!(
+        err.contains("cross-project"),
+        "error must name the cross-project reason: {err}"
+    );
+    assert!(
+        !err.contains("allow_global"),
+        "must not be mistaken for a global agent: {err}"
+    );
+}
+
+#[test]
 fn global_without_allow_global_rejected() {
     let caller = agent(
         "parent",
