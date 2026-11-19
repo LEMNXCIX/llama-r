@@ -292,9 +292,67 @@ cargo check
 cargo test --target-dir target-tests
 # Multi-provider eval smoke (fixture mode by default; no live key/network):
 cargo test --test provider_eval_smoke
+# Declarative eval runner (checks, strict mode, called_tool, judge):
+cargo test --test evals_tests
 ```
 
+## Declarative evals
+
+A reusable eval runner lives in `src/evals/` (`cases`, `check`, `runner`, `report`,
+`fixture` and, under `rig-engine`, `agent_fixture`). Suites are TOML files under
+`evals/`; the shipped one is `evals/providers/smoke.eval.toml`. Both test targets
+above are consumers of the runner, not separate harnesses. Everything runs
+against **recorded local fixtures** — a one-shot HTTP listener per provider case
+and a fake Ollama socket for agent cases — so CI needs no live key, network or
+decision model. Report details are redacted through the shared `redact_secrets`
+before they reach a table or a `FAIL` detail.
+
+### Suite and case format
+
+- `[[cases]]` — each has `id`, `kind`, `prompt`, optional `expect`, `checks` and
+  optional `agent`.
+  - `kind` is `plain`, `tool` or `stream` (provider-class cases, run against every
+    entry in `[[providers]]`) or `agent` (a case run once through a real tool loop).
+  - `expect = "text"` is v1 sugar for a `contains` check: it is folded into
+    `checks` as a `Contains` appended after the explicit checks, so it is a final
+    backstop. A case with no `checks` (and no `expect`) becomes a `FAIL` row, not
+    a silent pass.
+  - `agent = "<id>"` names the in-memory agent for an `agent` case (defaults to
+    `eval-agent` when omitted).
+  - `[[providers]]` entries carry `name` and `kind` (one of the six
+    `PROVIDER` spellings). A top-level `mode` field (`strict` | `lenient`,
+    default `strict`) is parsed for compatibility, but `run_suite` does not read
+    it: the gate is decided by the caller through `RunOptions.mode` and
+    `EvalReport::all_passed(strict)`.
+- `checks` is an array of tagged objects (`type = ...`). The four types are:
+  - `contains { text }` — the answer must contain `text`.
+  - `not_contains { text }` — the answer must not contain `text`.
+  - `called_tool { name }` — the turn must have emitted a tool call with that
+    qualified name (`server__tool` for an MCP tool, the bare id for a local
+    tool). Evidence comes from **real** `AgentRunEvent::ToolCall` events of an
+    `agent` case; a tool that never ran is a `FAIL`, not a green skip.
+  - `judge { question }` — the existing decision router (`DecisionRouter`, d1)
+    grades the answer as a `yes`/`no` `Choice`. This is grading only, **not** the
+    tool-approval `Auto` policy (which is Fase 6a and still behaves as `Always`).
+
+### Outcomes, strict mode and judge skips
+
+Each row aggregates its case's checks: a `FAIL` wins over a `SKIP`, which wins
+over a `PASS`. Default mode is **strict**: `EvalReport::all_passed(strict)` is
+false if any row is `FAIL`; lenient mode reports failures but passes. A `SKIP`
+never fails in either mode. A `judge` check **skips with a reason** instead of
+passing whenever there is no injected router (`router_unavailable`), its
+confidence is below the threshold (default `0.6`, `low_confidence`), or the
+router returns an unusable answer — so in fixture-only CI all judge rows abstain
+and strict stays green. A malformed case is caught into a `FAIL` row naming its
+id; the rest of the suite still runs.
+
+There is no `Auto` decision model for tool approvals here (Fase 6a pending) and
+no OpenTelemetry/cost tracking (Fase 6c pending); neither is part of the eval
+runner and neither is claimed by these docs.
+
 ## Storage Layout
+- `evals/`: declarative eval suites in TOML (`evals/providers/smoke.eval.toml` is the shipped smoke suite); loaded by `src/evals/` and run by the two eval test targets
 - `agents/`: editable global agent TOML files
 - `mcp-servers/` (optional): one `*.toml` per external connection. The classic fields are `id`, `transport` (`http` | `sse`/`streaming` | `stdio` | `openapi`), `url`, `command`/`args` (stdio), `timeout_secs`, `tool_namespace`, `enabled`, and `auth_env` (the **name** of the env var holding the credential, never the secret). Typed-connection fields: `headers` (array of `[name, value]` pairs; a `$VAR` value is resolved from the environment at build time), `auth` (`bearer` | `basic` | `none`, defaults to `bearer` so a v1 config with only `auth_env` keeps working; `none` must be explicit), and `auth_user_env` (env var name for the Basic username; the password still comes from `auth_env`). All new fields are `#[serde(default)]`, so v1 manifests load unchanged. With `transport = "openapi"`, `url` is a path to a JSON OpenAPI 3.x / Swagger 2.0 spec (see "Connections, permissions and human approval" below).
 - `tools/` (optional): local tool manifests, one `*.toml` per file (`type` = `builtin:skill` or `rag_query`, plus `id`, `description`, `input_schema`, `source_id`); overlays the two built-ins, malformed files are warned about and ignored at boot

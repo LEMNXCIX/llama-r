@@ -433,6 +433,51 @@ cargo check
 cargo fmt
 cargo test --target-dir target-tests
 cargo test --test provider_eval_smoke   # smoke multi-provider (fixture, sin red)
+cargo test --test evals_tests           # runner declarativo (checks, strict, called_tool, judge)
+```
+
+### Evals declarativas
+
+Las evaluaciones se definen en archivos TOML bajo `evals/` (la incluida es
+`evals/providers/smoke.eval.toml`). Cada `[[cases]]` lleva `id`, `kind`
+(`plain`/`tool`/`stream`/`agent`), `prompt`, `checks` y, para casos `agent`, un
+`agent`. Ejemplo mínimo:
+
+```toml
+[[cases]]
+id = "greeting"
+kind = "plain"
+prompt = "Saluda brevemente"
+expect = "hola"                       # azúcar para un check `contains`
+checks = [{ type = "not_contains", text = "adiós" }]
+
+[[cases]]
+id = "uses-skill"
+kind = "agent"
+prompt = "Usa la skill de evaluación"
+agent = "eval-agent"
+checks = [{ type = "called_tool", name = "llama_r__skill" }]
+
+[[providers]]
+name = "ollama"
+kind = "ollama"
+```
+
+Los cuatro tipos de `checks` son `contains` / `not_contains` (texto),
+`called_tool` (nombre cualificado `servidor__herramienta`, o el id simple de una
+herramienta local, tomado de eventos reales del agente) y `judge` (califica con
+el router de decisión existente; sin router o con baja confianza se marca
+`SKIP`, nunca `PASS`). El modo por defecto es `strict`: cualquier `FAIL` falla
+la suite, pero un `SKIP` nunca falla. Todo corre contra fixtures locales
+grabadas: sin claves reales, red ni modelo de decisión en CI, y los detalles del
+informe se redactan antes de imprimirse.
+
+El runner no incluye el modelo `Auto` de aprobación (Fase 6a pendiente, sigue
+comportándose como `Always`) ni OpenTelemetry/costo (Fase 6c pendiente).
+
+```bash
+cargo test --test provider_eval_smoke   # consume la suite incluida e imprime la tabla
+cargo test --test evals_tests           # pruebas del runner y sus checks
 ```
 
 ## Instalación
