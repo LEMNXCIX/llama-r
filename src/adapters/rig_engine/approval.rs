@@ -63,9 +63,24 @@ pub async fn authorize(
             // leave this process even though the adapter redacts again.
             if permission.approval_for(tool_name) == ApprovalPolicy::Auto {
                 if let Some(decider) = auto_decider {
-                    let threshold = permission
-                        .auto_threshold
-                        .unwrap_or_else(|| decider.min_confidence());
+                    let fallback = decider.min_confidence();
+                    // Fail closed: an out-of-range override (e.g. `0.0`, which
+                    // would make every "yes" auto-approve) is ignored so it can
+                    // never lower the bar below the configured default. Same
+                    // `(0.0, 1.0]` range RouterConfig::min_confidence validates.
+                    // The warning names only the number, never any argument.
+                    let threshold = match permission.auto_threshold {
+                        Some(value) if value.is_finite() && value > 0.0 && value <= 1.0 => value,
+                        Some(value) => {
+                            tracing::warn!(
+                                ?value,
+                                tool = %tool_name,
+                                "ignoring out-of-range auto_threshold (expected (0.0, 1.0]); using the configured default"
+                            );
+                            fallback
+                        }
+                        None => fallback,
+                    };
                     let verdict = decider
                         .should_allow(
                             tool_name,

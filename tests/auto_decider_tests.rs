@@ -633,6 +633,82 @@ async fn policy_auto_threshold_override_reaches_the_decider() {
     );
 }
 
+/// A shared buffer usable as a `tracing` writer and read back as text, so the
+/// fail-closed warning can be asserted rather than assumed.
+#[derive(Clone, Default)]
+struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+    type Writer = SharedBuf;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn out_of_range_auto_threshold_falls_back_fail_closed() {
+    use tracing::instrument::WithSubscriber;
+
+    // 0.0 would make every "yes" pass; 1.5 is above the (0.0, 1.0] range that
+    // RouterConfig::min_confidence also enforces. Both must be ignored.
+    for bad in [0.0_f32, 1.5] {
+        let (decider, calls) = recorder(AutoVerdict::Allow, 0.42);
+        let args = json!({"table": "users", "api_key": "SUPER-SECRET-VALUE"});
+        let gate = ApprovalGate::default();
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .without_time()
+            .with_target(false)
+            .finish();
+
+        authorize(
+            &gate,
+            None,
+            &auto_policy(Some(bad)),
+            "db__drop",
+            &args,
+            None,
+            Some(&decider),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .expect("an Allow verdict executes the tool");
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].3, 0.42,
+            "out-of-range override {bad} must fall back to the configured default"
+        );
+        drop(calls);
+
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("auto_threshold"),
+            "warning must name the offending field: {log:?}"
+        );
+        assert!(
+            log.contains(&format!("{bad:?}")),
+            "warning must name the offending value: {log:?}"
+        );
+        assert!(
+            !log.contains("SUPER-SECRET-VALUE"),
+            "warning leaked a secret: {log:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn no_override_falls_back_to_the_decider_min_confidence() {
     let (decider, calls) = recorder(AutoVerdict::Allow, 0.42);
