@@ -21,6 +21,10 @@ pub struct CreateAgentRequest {
     pub name: String,
     #[serde(default)]
     pub model: String,
+    /// Optional complexity-selection candidates. Carried through `PUT` so a
+    /// rewrite of the manifest never erases the operator's candidate list.
+    #[serde(default)]
+    pub model_candidates: Vec<String>,
     pub system_prompt: String,
     #[serde(default)]
     pub description: String,
@@ -468,6 +472,15 @@ fn build_agent_toml(req: &CreateAgentRequest, project_id: Option<&str>) -> Strin
         ));
     }
 
+    if !req.model_candidates.is_empty() {
+        let candidates: Vec<String> = req
+            .model_candidates
+            .iter()
+            .map(|model| format!("\"{}\"", model.replace('"', "\\\"")))
+            .collect();
+        output.push_str(&format!("model_candidates = [{}]\n", candidates.join(", ")));
+    }
+
     if let Some(hint) = req
         .routing
         .as_ref()
@@ -638,5 +651,25 @@ mod tests {
         assert_eq!(subagents.allowed, vec!["one", "two"]);
         assert!(subagents.allow_global);
         assert_eq!(subagents.max_depth, Some(3));
+    }
+
+    #[test]
+    fn put_agent_preserves_model_candidates() {
+        let req: CreateAgentRequest = serde_json::from_value(serde_json::json!({
+            "id": "selector-agent",
+            "name": "Selector Agent",
+            "system_prompt": "selector agent",
+            "model_candidates": ["cheap-model", "pricey-model"]
+        }))
+        .unwrap();
+
+        let toml_text = build_agent_toml(&req, None);
+        assert!(
+            toml_text.contains("model_candidates = [\"cheap-model\", \"pricey-model\"]"),
+            "generated TOML missing model_candidates: {toml_text}"
+        );
+
+        let parsed: crate::domain::agent::AgentConfig = toml::from_str(&toml_text).unwrap();
+        assert_eq!(parsed.model_candidates, vec!["cheap-model", "pricey-model"]);
     }
 }

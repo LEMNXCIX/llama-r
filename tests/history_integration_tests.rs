@@ -818,6 +818,7 @@ fn chat_world(persist_history: bool) -> ChatWorld {
         rag: None,
         enricher: enricher.clone(),
         compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
     });
 
     let mut stack = ProviderStack::new(Arc::new(StubProvider), "fallback-model".to_string());
@@ -843,6 +844,7 @@ fn chat_world(persist_history: bool) -> ChatWorld {
         approval_gate: Arc::new(ApprovalGate::default()),
         auto_decider: None,
         compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
         execution_store: Arc::new(NoOpExecutionStore),
         delegator: std::sync::OnceLock::new(),
     });
@@ -1003,6 +1005,7 @@ fn runtime_with(store: Arc<RecordingStore>, engine: Arc<dyn AgentEngine>) -> Age
             ProviderKind::Ollama,
         )),
         compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
     }
 }
 
@@ -1371,6 +1374,7 @@ async fn non_streaming_turn_summarizes_persisted_conversation_id() {
             ProviderKind::Ollama,
         )),
         compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
     };
 
     let mut req = runtime_request();
@@ -1410,6 +1414,7 @@ async fn summarize_uses_none_when_append_failed() {
             ProviderKind::Ollama,
         )),
         compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
     };
 
     let mut req = runtime_request();

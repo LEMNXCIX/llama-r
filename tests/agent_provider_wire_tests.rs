@@ -206,6 +206,7 @@ fn boot_ollama_runtime(config: &Config, base_dir: &std::path::Path, agent: &str)
         rag: None,
         enricher: Arc::new(enricher),
         compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
     }
 }
 

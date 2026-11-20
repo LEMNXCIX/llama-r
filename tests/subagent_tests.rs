@@ -534,6 +534,7 @@ fn test_state(
         rag: None,
         enricher: enricher.clone(),
         compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
     }));
     Arc::new(AppState {
         services: Arc::new(TokioRwLock::new(Arc::new(stack))),
@@ -554,6 +555,7 @@ fn test_state(
         approval_gate: Arc::new(ApprovalGate::default()),
         auto_decider: None,
         compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
         execution_store: Arc::new(NoOpExecutionStore),
         delegator: OnceLock::new(),
     })
@@ -679,6 +681,58 @@ async fn child_scope_is_deny_all_and_prompt_has_no_parent_sections() {
     assert!(!child.system_prompt.contains("PARENT_RULE_MARKER"));
     assert!(!child.system_prompt.contains("parent-context"));
     assert!(!child.system_prompt.contains("parent-server"));
+}
+
+#[tokio::test]
+async fn delegated_child_does_not_inherit_parent_context() {
+    let registry = Arc::new(AgentRegistry::new());
+    register_real(
+        &registry,
+        parent_with(
+            &["child"],
+            AgentConfig {
+                rules: vec!["PARENT_ONLY_RULE".into()],
+                context_project: Some("parent-context".into()),
+                ..Default::default()
+            },
+        ),
+    );
+    let mut child = agent("child", Some("proj"), None);
+    child.config.rules = vec!["CHILD_OWN_RULE".into()];
+    register_real(&registry, child);
+
+    let runs = RecordedRuns::default();
+    let state = test_state(
+        registry.clone(),
+        Arc::new(RecordingEngine {
+            runs: runs.clone(),
+            answer: "ok".into(),
+            fail_on: None,
+            spend_budget: false,
+        }),
+        Arc::new(FakeProvider { fail: false }),
+    );
+    let delegator = RuntimeDelegator::new(registry, Arc::downgrade(&state));
+
+    delegator
+        .delegate(request_child("do the thing"))
+        .await
+        .expect("delegation succeeds");
+
+    let guard = runs.0.lock().unwrap();
+    let child = &guard[0];
+    assert!(
+        child.system_prompt.contains("CHILD_OWN_RULE"),
+        "the child must assemble its OWN context from its own manifest"
+    );
+    assert!(
+        !child.system_prompt.contains("PARENT_ONLY_RULE"),
+        "the parent's rules must not leak into the child turn"
+    );
+    assert!(
+        !child.system_prompt.contains("parent-context"),
+        "the parent's project context must not leak into the child turn"
+    );
 }
 
 #[tokio::test]

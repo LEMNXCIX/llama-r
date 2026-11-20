@@ -10,6 +10,7 @@ use crate::ports::compaction::ContextCompactor;
 use crate::ports::delegation::{DelegationContext, ToolBudget};
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, ToolEvent};
 use crate::ports::history::ConversationStore;
+use crate::ports::model_selection::ModelSelector;
 use crate::ports::rag::RagStore;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::context_assembler::ContextAssembler;
@@ -36,6 +37,10 @@ pub struct AgentRuntime {
     /// settings Apply. The runtime pairs it with `enricher` to assemble one
     /// `ActiveContext` per turn; `NoopCompactor` is the default.
     pub compactor: Arc<dyn ContextCompactor>,
+    /// Complexity model selector, carried as a companion from boot and a
+    /// settings Apply (the same router Arc routing uses). The assembler consults
+    /// it only when the agent declares `model_candidates`.
+    pub selector: Arc<dyn ModelSelector>,
 }
 
 pub struct RuntimeChatRequest {
@@ -126,7 +131,14 @@ impl AgentRuntime {
         // prompt the caller already measured), an optional memory section, and
         // history compacted against the smaller of the catalog's and the
         // agent's context windows.
-        let assembler = ContextAssembler::new(self.enricher.clone(), self.compactor.clone());
+        // The relative-cost table is ordinal-only and cheap to read; reloading
+        // it per turn means an operator editing `models.toml` needs no restart.
+        // The selector itself is one shared companion handle from boot/Apply.
+        let relative_costs =
+            crate::providers::model_costs::load_relative_costs(&crate::core::paths::get_base_dir());
+        let assembler = ContextAssembler::new(self.enricher.clone(), self.compactor.clone())
+            .with_selector(self.selector.clone(), relative_costs)
+            .with_prompt_hint(req.user_message.clone());
         let assembled = assembler
             .assemble_with_instructions(
                 &agent,

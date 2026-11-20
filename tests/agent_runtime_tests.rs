@@ -111,6 +111,7 @@ fn world_with_agent(
         rag: None,
         enricher: Arc::new(enricher()),
         compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
     };
     (runtime, seen)
 }
@@ -588,6 +589,7 @@ fn a_deferred_skill_is_announced_offered_and_loaded_on_demand() {
                 rag: None,
                 enricher: Arc::new(enricher),
                 compactor: Arc::new(NoopCompactor),
+                selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
             };
 
             let answer = runtime.chat(request()).await.unwrap().text;

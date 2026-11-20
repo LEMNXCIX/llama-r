@@ -392,6 +392,7 @@ async fn a_non_streaming_provider_returns_unavailable_before_connecting() {
         rag: None,
         enricher: state.context_enricher_snapshot(),
         compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
     };
     let mut new_stack = (*state.services_snapshot().await).clone();
     new_stack.agent_runtime = Some(Arc::new(runtime));

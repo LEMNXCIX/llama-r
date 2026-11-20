@@ -1,5 +1,5 @@
 use crate::adapters::auto::RouterAutoDecider;
-use crate::adapters::context::NoopCompactor;
+use crate::adapters::context::{CurrentModelSelector, NoopCompactor, RouterModelSelector};
 use crate::adapters::execution::NoOpExecutionStore;
 use crate::adapters::mcp::{McpServerConfig, StaticMcpRegistry};
 use crate::adapters::rag::{
@@ -42,6 +42,7 @@ use crate::ports::engine::AgentEngine;
 use crate::ports::execution::ExecutionStore;
 use crate::ports::history::ConversationStore;
 use crate::ports::mcp::McpServerRegistry;
+use crate::ports::model_selection::ModelSelector;
 use crate::ports::rag::{EmbeddingProvider, RagStore};
 use crate::ports::router::DecisionRouter;
 use crate::providers::anthropic::AnthropicProvider;
@@ -133,6 +134,27 @@ fn build_auto_decider(
             router_config.min_confidence,
         )) as Arc<dyn AutoDecider>
     })
+}
+
+/// Build the complexity selector from the **same** `DecisionRouter` agent
+/// routing (and `Auto`) use, so no second router instance is created. Routing
+/// off, or no router available, installs `CurrentModelSelector`: an agent that
+/// declares candidates but runs in a deployment without a decision model keeps
+/// exactly the model it had before this phase. Pure helper, testable without
+/// boot/env; boot and a settings Apply share the resulting handle on AppState.
+fn build_model_selector(
+    router_config: &RouterConfig,
+    router: Option<&Arc<dyn DecisionRouter>>,
+) -> Arc<dyn ModelSelector> {
+    if router_config.enabled {
+        if let Some(router) = router {
+            return Arc::new(RouterModelSelector::new(
+                router.clone(),
+                router_config.min_confidence,
+            ));
+        }
+    }
+    Arc::new(CurrentModelSelector)
 }
 
 #[allow(
@@ -247,6 +269,12 @@ pub fn build_app_state_with_gate(
     // every `Auto` tool keeps asking a human.
     let auto_decider = build_auto_decider(&router_config, stack.router.as_ref());
 
+    // The model selector wraps the very router above when routing is enabled;
+    // otherwise it is the fail-closed `CurrentModelSelector`. Stored on AppState
+    // so a settings Apply builds the engine from the same handle, exactly like
+    // the gate, decider and compactor.
+    let selector = build_model_selector(&router_config, stack.router.as_ref());
+
     // Compaction is transparent by default: without a usable summarizer there
     // is no summary to inject, and an unknown context window already means no
     // compaction. Stored on AppState so a settings Apply builds the engine from
@@ -272,6 +300,7 @@ pub fn build_app_state_with_gate(
         approval_gate,
         auto_decider,
         compactor,
+        selector,
         execution_store,
         delegator: OnceLock::new(),
     });
@@ -1313,6 +1342,9 @@ pub struct CompanionHandles {
     /// The context-compaction strategy, read from `AppState` on a settings Apply
     /// so an engine rebuild keeps the same assembler inputs.
     pub compactor: Arc<dyn ContextCompactor>,
+    /// The complexity model selector, read from `AppState` on a settings Apply
+    /// so an engine rebuild keeps the same selector (and the same router Arc).
+    pub selector: Arc<dyn ModelSelector>,
     /// The app-wide counters, read from `AppState` on a settings Apply like the
     /// gate and decider, so an engine rebuild keeps accumulating into the same
     /// observability snapshot.
@@ -1337,6 +1369,7 @@ impl CompanionHandles {
             approval_gate: state.approval_gate.clone(),
             auto_decider: state.auto_decider.clone(),
             compactor: state.compactor.clone(),
+            selector: state.selector.clone(),
             observability: state.observability.clone(),
             execution_store: state.execution_store.clone(),
             delegator: state.delegator(),
@@ -1406,6 +1439,9 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
                 // Default NoopCompactor, shared by boot and Apply through
                 // AppState so a provider swap cannot drop the strategy.
                 compactor: handles.compactor.clone(),
+                // Same selector (and router Arc) on boot and Apply, so a
+                // provider swap cannot drop complexity selection.
+                selector: handles.selector.clone(),
             })
         })
     };

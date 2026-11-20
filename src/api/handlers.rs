@@ -13,6 +13,7 @@ use crate::ports::auto::AutoDecider;
 use crate::ports::delegation::Delegator;
 use crate::ports::execution::ExecutionStore;
 use crate::ports::mcp::McpServerRegistry;
+use crate::ports::model_selection::ModelSelector;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::approval::ApprovalGate;
 use crate::services::provider_stack::ProviderStack;
@@ -82,6 +83,11 @@ pub struct AppState {
     /// `NoopCompactor` by default; it lives outside the hot-swapped stack so a
     /// settings Apply rebuilds the engine with the same strategy.
     pub compactor: Arc<dyn ContextCompactor>,
+    /// Best-effort model selector built at boot from the same decision router
+    /// agent routing uses (or `CurrentModelSelector` when routing is off). Like
+    /// the compactor, it lives outside the hot-swapped stack so a settings Apply
+    /// rebuilds the engine with the same selector.
+    pub selector: Arc<dyn ModelSelector>,
     /// Durable execution store. Built once at boot from the history DB path and
     /// deliberately NOT part of the hot-swapped `ProviderStack`: a TUI Apply
     /// rebuilds the engine but must not swap out the record of in-flight turns.

@@ -7,7 +7,7 @@
 //! using candidate labels — never a hardcoded model. Fake collaborators capture
 //! their inputs so nothing depends on a live model.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -960,4 +960,141 @@ async fn assembler_failure_falls_back_to_original_prompt() {
     assert_eq!(pairs(&assembled.context.history), pairs(&expected));
     assert_eq!(assembled.context.memory, None);
     assert_eq!(assembled.model, "current-model");
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: the assembler drives model selection from the manifest's candidates.
+//
+// The selector is injected, so these tests use the real `RouterModelSelector`
+// with a fake router that answers `simple`/`complex`. The relative-cost table
+// is loaded from a real `models.toml` in a temp dir, proving the ordinal rank
+// reaches the selector (never a price, never `cost_usd`). A caller-supplied
+// instruction block must still pass through verbatim when candidates exist.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn assembler_uses_selected_model_when_candidates_exist() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("models.toml"),
+        "cheap-model = 1\npricey-model = 5\n",
+    )
+    .expect("write models.toml");
+    let costs = load_relative_costs(dir.path());
+
+    let (router, seen) = fake_selector_router(SelectorReply::Choice {
+        key: "complex",
+        confidence: 0.9,
+    });
+    let selector: Arc<dyn ModelSelector> = Arc::new(RouterModelSelector::new(router, 0.6));
+    let assembler = default_assembler(Arc::new(NoopCompactor))
+        .with_selector(selector, costs)
+        .with_prompt_hint("explain this hard architecture decision".to_string());
+
+    let subject = agent(AgentConfig {
+        model: "current-model".into(),
+        model_candidates: vec!["cheap-model".into(), "pricey-model".into()],
+        ..config_with_budget(4_096)
+    });
+    let assembled = assembler
+        .assemble(
+            &subject,
+            &capabilities(Some(4_096)),
+            vec![message("user", "an unrelated earlier turn")],
+            "current-model".into(),
+        )
+        .await
+        .expect("assembly succeeds");
+
+    assert_eq!(
+        assembled.model, "pricey-model",
+        "the complex tier picks the highest relative_cost candidate"
+    );
+    // The decision router saw the real tier keys and the candidate labels.
+    let req = seen.lock().unwrap().clone().expect("a decision was spent");
+    assert_labelled_question(&req, &["cheap-model", "pricey-model"]);
+    let state = req.state.as_str();
+    assert!(
+        state.contains("hard architecture decision"),
+        "the current user prompt must reach the router, got {state:?}"
+    );
+    assert!(
+        !state.contains("an unrelated earlier turn"),
+        "a prior history turn must not be classified instead, got {state:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_candidates_keeps_current_model() {
+    let (router, seen) = fake_selector_router(SelectorReply::Choice {
+        key: "complex",
+        confidence: 0.9,
+    });
+    let selector: Arc<dyn ModelSelector> = Arc::new(RouterModelSelector::new(router, 0.6));
+    let assembler =
+        default_assembler(Arc::new(NoopCompactor)).with_selector(selector, HashMap::new());
+
+    let subject = agent(AgentConfig {
+        model: "current-model".into(),
+        ..config_with_budget(4_096)
+    });
+    let assembled = assembler
+        .assemble(
+            &subject,
+            &capabilities(Some(4_096)),
+            vec![message("user", "hi")],
+            "current-model".into(),
+        )
+        .await
+        .expect("assembly succeeds");
+
+    assert_eq!(assembled.model, "current-model");
+    assert!(
+        seen.lock().unwrap().is_none(),
+        "no candidates means no decision is spent"
+    );
+}
+
+#[tokio::test]
+async fn caller_supplied_prompt_not_rebuilt_when_candidates_exist() {
+    let (router, _) = fake_selector_router(SelectorReply::Choice {
+        key: "simple",
+        confidence: 0.9,
+    });
+    let selector: Arc<dyn ModelSelector> = Arc::new(RouterModelSelector::new(router, 0.6));
+    let costs = HashMap::from([
+        ("cheap-model".to_string(), 1),
+        ("pricey-model".to_string(), 5),
+    ]);
+    let assembler = default_assembler(Arc::new(NoopCompactor)).with_selector(selector, costs);
+
+    let subject = agent(AgentConfig {
+        rules: vec!["MANIFEST_RULE_MUST_NOT_APPEAR".into()],
+        model_candidates: vec!["cheap-model".into(), "pricey-model".into()],
+        ..config_with_budget(4_096)
+    });
+    let measured_prompt = "CALLER_SUPPLIED measured instructions — keep me byte-for-byte";
+    let assembled = assembler
+        .assemble_with_instructions(
+            &subject,
+            &capabilities(Some(4_096)),
+            vec![message("user", "hi")],
+            "current-model".into(),
+            Some(measured_prompt.to_string()),
+        )
+        .await
+        .expect("assembly succeeds");
+
+    assert_eq!(
+        assembled.context.system_prompt, measured_prompt,
+        "a caller-supplied, already-measured prompt is never rebuilt from the manifest"
+    );
+    assert!(
+        !assembled
+            .context
+            .system_prompt
+            .contains("MANIFEST_RULE_MUST_NOT_APPEAR"),
+        "the manifest's sections must not be injected over a supplied prompt"
+    );
+    assert_eq!(assembled.model, "cheap-model", "selection still happens");
 }

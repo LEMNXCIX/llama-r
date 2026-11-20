@@ -226,6 +226,7 @@ mod tests {
             approval_gate: Arc::new(crate::services::approval::ApprovalGate::default()),
             auto_decider: None,
             compactor: Arc::new(crate::adapters::context::NoopCompactor),
+            selector: Arc::new(crate::adapters::context::CurrentModelSelector),
             execution_store: Arc::new(crate::adapters::execution::NoOpExecutionStore),
             delegator: std::sync::OnceLock::new(),
         });

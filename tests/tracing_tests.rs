@@ -274,6 +274,7 @@ fn build_state(
         rag: None,
         enricher: test_enricher(),
         compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
     };
     let mut stack = ProviderStack::new(provider, "model-a");
     stack.provider_name = "ollama".into();

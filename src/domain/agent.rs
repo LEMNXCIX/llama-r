@@ -17,6 +17,12 @@ pub struct AgentConfig {
     /// Model to use. If empty, falls back to the global DEFAULT_MODEL.
     #[serde(default)]
     pub model: String,
+    /// Optional model ids the complexity selector may choose between. Empty
+    /// means no change: the turn runs on `model` (or `DEFAULT_MODEL`) as before.
+    /// Ids are matched against the optional `models.toml` rank table only to
+    /// break ties inside a complexity tier — never as a price.
+    #[serde(default)]
+    pub model_candidates: Vec<String>,
     /// Provider hint for multi-provider routing (`ollama` today).
     #[serde(default = "default_provider")]
     pub provider: String,
@@ -102,6 +108,7 @@ impl Default for AgentConfig {
             name: String::new(),
             description: String::new(),
             model: String::new(),
+            model_candidates: Vec::new(),
             provider: default_provider(),
             system_prompt: String::new(),
             context_project: None,
@@ -479,5 +486,26 @@ deferred_skills = ["reviewer-skill"]
         let reparsed: AgentConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(reparsed.tools_local, cfg.tools_local);
         assert_eq!(reparsed.deferred_skills, cfg.deferred_skills);
+    }
+
+    #[test]
+    fn model_candidates_default_empty_and_round_trip() {
+        // A v1 manifest has no candidates: selection is a no-op for it.
+        assert!(AgentConfig::default().model_candidates.is_empty());
+
+        let raw = r#"
+name = "Selector"
+system_prompt = "hi"
+model_candidates = ["cheap-model", "pricey-model"]
+"#;
+        let cfg: AgentConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.model_candidates, vec!["cheap-model", "pricey-model"]);
+
+        let encoded = toml::to_string(&cfg).unwrap();
+        let reparsed: AgentConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            reparsed.model_candidates,
+            vec!["cheap-model", "pricey-model"]
+        );
     }
 }

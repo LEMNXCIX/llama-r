@@ -218,6 +218,7 @@ async fn execute_agent_case(case: &EvalCase) -> Result<Execution, String> {
         rag: None,
         enricher: Arc::new(enricher),
         compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(crate::adapters::context::CurrentModelSelector),
     };
 
     // A prebuilt prompt keeps the turn off the enricher's disk path; the tool is
