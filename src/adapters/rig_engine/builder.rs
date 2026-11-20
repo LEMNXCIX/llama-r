@@ -671,6 +671,7 @@ mod tests {
             auto_decider: None,
             observability: None,
             delegator: None,
+            delegate_bounds: None,
             event_tx: None,
             operations: crate::adapters::rig_engine::operations::OperationContext::disabled(),
         }

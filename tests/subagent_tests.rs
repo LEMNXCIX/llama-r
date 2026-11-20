@@ -865,6 +865,69 @@ async fn child_request_is_non_streaming_and_uses_the_target_model() {
     );
 }
 
+#[test]
+fn boot_and_apply_keep_the_delegator_on_the_engine() {
+    let registry = Arc::new(AgentRegistry::new());
+    let state = test_state(
+        registry.clone(),
+        Arc::new(RecordingEngine {
+            runs: RecordedRuns::default(),
+            answer: "ok".into(),
+            fail_on: None,
+            spend_budget: false,
+        }),
+        Arc::new(FakeProvider { fail: false }),
+    );
+    let delegator: Arc<dyn Delegator> =
+        Arc::new(RuntimeDelegator::new(registry, Arc::downgrade(&state)));
+    state.set_delegator(delegator);
+
+    // Boot and a settings Apply both read the same installed handle from state.
+    let boot_handles = llama_r::runtime::CompanionHandles::from_state(&state);
+    let apply_handles = llama_r::runtime::CompanionHandles::from_state(&state);
+    let boot = boot_handles
+        .delegator
+        .as_ref()
+        .expect("boot has the delegator");
+    let apply = apply_handles
+        .delegator
+        .as_ref()
+        .expect("Apply keeps the delegator");
+    assert!(Arc::ptr_eq(boot, apply), "the same Arc survives an Apply");
+
+    // `build_companions` installs that handle on the engine with this setter on
+    // both paths; the engine field is what `LocalToolDeps` reads per run.
+    let engine = llama_r::adapters::rig_engine::RigAgentEngine::from_target(
+        llama_r::adapters::rig_engine::EngineTarget::Ollama {
+            url: "http://localhost:11434".into(),
+        },
+        Arc::new(StaticMcpRegistry::new()),
+        None,
+        llama_r::config::Config {
+            port: 3000,
+            provider: ProviderKind::Ollama,
+            ollama_url: "http://localhost:11434".into(),
+            default_model: "llama3.2".into(),
+            embedding_model: "nomic-embed-text".into(),
+            embedding_dimensions: 768,
+            rag_enabled: false,
+            history_retention_days: 0,
+            openrouter_api_key: None,
+            opencode_api_key: None,
+            opencode_url: "http://127.0.0.1:4096".into(),
+            openai_base_url: None,
+        },
+        Arc::new(SkillManager::new()),
+        Arc::new(llama_r::adapters::rig_engine::local_tools::LocalToolRegistry::builtins()),
+        Arc::new(ApprovalGate::default()),
+    )
+    .with_delegator(boot_handles.delegator.clone());
+    assert!(
+        engine.delegator.is_some(),
+        "the engine holds the delegator the tool reads"
+    );
+}
+
 #[tokio::test]
 async fn global_target_runs_unscoped_without_project_context() {
     let registry = Arc::new(AgentRegistry::new());

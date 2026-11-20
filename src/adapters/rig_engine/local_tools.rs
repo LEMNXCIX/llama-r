@@ -6,22 +6,25 @@
 //! repeats the two disciplines `McpToolBridge` already enforces — a fresh scope
 //! check and a charged `ToolCallBudget` on every call.
 //!
-//! Two executors live behind the bridge: `BuiltinSkill` loads a `SKILL.md` from
-//! the `SkillManager`, and `RagQuery` runs a scope-bounded RAG query. Both hold
-//! the same two disciplines as MCP: the scope is re-checked and the shared
-//! `ToolCallBudget` is charged before any executor runs. A missing skill, an
-//! empty RAG scope or a missing store is a named refusal, never a silent no-op
-//! that looks like a successful tool call.
+//! Three executors live behind the bridge: `BuiltinSkill` loads a `SKILL.md`
+//! from the `SkillManager`, `RagQuery` runs a scope-bounded RAG query, and
+//! `Delegate` runs one bounded child turn through the injected `Delegator`.
+//! All three hold the same two disciplines as MCP: the scope is re-checked and
+//! the shared `ToolCallBudget` is charged before any executor runs. A missing
+//! skill, an empty RAG scope, a missing store or an empty `[subagents]` policy
+//! is a named refusal, never a silent no-op that looks like a successful call.
 
+use crate::domain::agent::Agent;
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
-/// The two ids are stable API: agent manifests name them in `tools_local`.
+/// These ids are stable API: agent manifests name them in `tools_local`.
 pub const BUILTIN_SKILL_ID: &str = "llama_r__skill";
 pub const BUILTIN_RAG_QUERY_ID: &str = "llama_r__rag_query";
+pub const BUILTIN_DELEGATE_ID: &str = "llama_r__delegate";
 
 /// One tool the model can call. `id` is the name in the Rig tool catalog and the
 /// key `AgentScope::allows_local_tool` checks; it is the file stem for a
@@ -46,6 +49,42 @@ pub enum LocalToolKind {
     /// request's [`AgentScope`], which is the authoritative isolation boundary.
     /// A manifest can never widen a query beyond `scope.rag_sources`.
     RagQuery { source_id: Option<String> },
+    /// Delegate one child turn through the injected `Delegator`. The bounds are
+    /// derived from the calling agent's manifest by the engine, never invented
+    /// here; the tool only adds `depth + 1`.
+    Delegate,
+}
+
+/// Bounds a delegate call inherits from the calling agent's `[subagents]`
+/// policy. Built by the engine from the running agent, so the bridge never
+/// guesses a target, a depth or a recursion limit of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegateBounds {
+    /// The target id from `[subagents].allowed`. `None` means no target was
+    /// declared; the call then fails with a named error instead of delegating
+    /// to an agent the manifest never authorised.
+    pub target_agent_id: Option<String>,
+    /// Qualified ids of the ancestors, starting with the caller.
+    pub chain: Vec<String>,
+    /// The caller's depth (0 at the root); the tool sends `depth + 1`.
+    pub depth: u32,
+    /// The caller's validated maximum depth from its manifest.
+    pub effective_max_depth: u32,
+}
+
+impl DelegateBounds {
+    /// Derive the bounds from the calling agent's own manifest. An agent with
+    /// no `[subagents]` policy has no bounds and no target, so dispatch refuses
+    /// with a named error rather than silently delegating somewhere.
+    pub fn for_agent(agent: &Agent) -> Option<Self> {
+        let policy = agent.config.subagents.as_ref()?;
+        Some(Self {
+            target_agent_id: policy.allowed.first().cloned(),
+            chain: vec![agent.qualified_id()],
+            depth: 0,
+            effective_max_depth: policy.effective_max_depth(),
+        })
+    }
 }
 
 /// Built-ins plus any `tools/*.toml` overlay found under the base directory.
@@ -88,6 +127,19 @@ impl LocalToolRegistry {
                         "required": ["query"]
                     }),
                     kind: LocalToolKind::RagQuery { source_id: None },
+                },
+                LocalTool {
+                    id: BUILTIN_DELEGATE_ID.to_string(),
+                    description: "Delegate a task to a configured subagent.".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "message": { "type": "string" },
+                            "task_id": { "type": "string" }
+                        },
+                        "required": ["message"]
+                    }),
+                    kind: LocalToolKind::Delegate,
                 },
             ],
         }
@@ -177,8 +229,9 @@ impl LocalToolRegistry {
                     .clone()
                     .filter(|id| !id.trim().is_empty()),
             }),
+            "delegate" | "builtin:delegate" => Ok(LocalToolKind::Delegate),
             other => Err(AppError::Config(format!(
-                "{}: unknown tool type '{}' (expected 'builtin:skill' or 'rag_query')",
+                "{}: unknown tool type '{}' (expected 'builtin:skill', 'rag_query' or 'delegate')",
                 path.display(),
                 other
             ))),
@@ -213,19 +266,24 @@ mod bridge {
     use crate::api::observability::AppObservability;
     use crate::domain::scope::AgentScope;
     use crate::ports::auto::AutoDecider;
-    use crate::ports::delegation::{Delegator, ToolBudget};
+    use crate::ports::delegation::{DelegateRequest, Delegator, ToolBudget};
     use crate::ports::engine::AgentRunEvent;
     use crate::ports::rag::RagStore;
     use crate::services::approval::ApprovalGate;
     use crate::services::skill_manager::SkillManager;
     use rig_core::tool::{ToolDyn, ToolError};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 
     /// Upper bound — and the default — for `rag_query`'s `top_k`. The model must
     /// not be able to ask for an unbounded slice of the knowledge base through
     /// a tool call; `prepare` uses the same ceiling for injected context.
     const RAG_QUERY_TOP_K_CAP: usize = 6;
+
+    /// Room left for the parent's loop after a child's deadline, so the child's
+    /// named timeout arrives before the parent's own run is cancelled.
+    const DELEGATE_DEADLINE_MARGIN_SECS: u64 = 5;
 
     /// The in-process companions the executors need, cloned from the engine into
     /// every bridge built for a run. `SkillManager` loads a skill's `SKILL.md`;
@@ -247,6 +305,10 @@ mod bridge {
         /// The bounded subagent delegator, injected from `AppState` through the
         /// engine. A delegate tool reads it from here; `None` means no delegation.
         pub delegator: Option<Arc<dyn Delegator>>,
+        /// Bounds for a delegate call, derived by the engine from the calling
+        /// agent's `[subagents]` manifest. `None` means that agent has no
+        /// delegation policy, so the tool refuses instead of inventing a target.
+        pub delegate_bounds: Option<DelegateBounds>,
         /// `Some` on the streaming path (the `ApprovalRequired` event reaches
         /// the SSE caller); `None` on the non-streaming path.
         pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
@@ -362,6 +424,7 @@ mod bridge {
                             self.exec_rag_query(source_id.as_deref(), &dispatch_args)
                                 .await
                         }
+                        LocalToolKind::Delegate => self.exec_delegate(&dispatch_args).await,
                     }
                 })
                 .await;
@@ -377,6 +440,81 @@ mod bridge {
                     .await;
             }
             outcome
+        }
+
+        /// Delegate one child turn through the injected `Delegator`. The caller
+        /// identity and project come from the bridge's own scope, the recursion
+        /// bounds from the engine-derived manifest context, and the shared
+        /// allowance from this bridge's budget. The target is the first allowed
+        /// id in the caller's `[subagents]` policy — there is no schema field to
+        /// pick a different one, so an empty allowlist is a named refusal.
+        ///
+        /// Child-event forwarding is deliberately `None` here: the `EventForwarder`
+        /// that enriches approval payloads with `task_id`/`depth` is wired in a
+        /// later slice. The child still answers and returns its effective task id.
+        async fn exec_delegate(&self, args: &Value) -> Result<String, String> {
+            let tool_id = &self.tool.id;
+            let message = args
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+                .ok_or_else(|| {
+                    format!("local tool '{tool_id}' requires a non-empty string 'message' argument")
+                })?;
+            let task_id = match args.get("task_id") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(id)) if !id.trim().is_empty() => Some(id.clone()),
+                Some(_) => {
+                    return Err(format!(
+                        "local tool '{tool_id}': 'task_id' must be a non-empty string when present"
+                    ));
+                }
+            };
+
+            let delegator = self.deps.delegator.as_ref().ok_or_else(|| {
+                format!(
+                    "local tool '{tool_id}': no delegator is configured; delegation is unavailable"
+                )
+            })?;
+            let bounds = self.deps.delegate_bounds.as_ref().ok_or_else(|| {
+                format!("local tool '{tool_id}': the calling agent has no [subagents] policy; delegation is unavailable")
+            })?;
+            let target = bounds
+                .target_agent_id
+                .as_ref()
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    format!("local tool '{tool_id}': the calling agent's [subagents].allowed is empty; no delegation target")
+                })?;
+
+            let request = DelegateRequest {
+                agent_id: target.clone(),
+                caller_agent_id: self.scope.agent_id.clone(),
+                project_id: self.scope.project_id.clone(),
+                message: message.to_string(),
+                task_id,
+                chain: bounds.chain.clone(),
+                depth: bounds.depth + 1,
+                effective_max_depth: bounds.effective_max_depth,
+                // Leave the parent's own loop some room: the child's named
+                // timeout must arrive before the parent's run is cancelled.
+                deadline: Instant::now()
+                    + Duration::from_secs(
+                        self.scope
+                            .timeout_secs
+                            .saturating_sub(DELEGATE_DEADLINE_MARGIN_SECS)
+                            .max(1),
+                    ),
+                budget: self.budget.clone(),
+                event_tx: None,
+            };
+
+            let result = delegator.delegate(request).await?;
+            Ok(serde_json::json!({
+                "answer": result.answer,
+                "task_id": result.task_id,
+            })
+            .to_string())
         }
 
         /// Load a declared skill's full `SKILL.md` on demand. An unknown or
@@ -500,7 +638,7 @@ mod tests {
     #[test]
     fn builtin_schemas_are_typed_objects() {
         let registry = LocalToolRegistry::builtins();
-        assert_eq!(registry.tools().len(), 2);
+        assert_eq!(registry.tools().len(), 3);
         for tool in registry.tools() {
             assert_eq!(tool.input_schema["type"], Value::String("object".into()));
             assert!(tool.input_schema["properties"].is_object());

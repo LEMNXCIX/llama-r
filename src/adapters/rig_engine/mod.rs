@@ -11,7 +11,7 @@ pub mod operations;
 pub mod tools;
 
 #[cfg(feature = "rig-engine")]
-use crate::adapters::rig_engine::local_tools::LocalToolDeps;
+use crate::adapters::rig_engine::local_tools::{DelegateBounds, LocalToolDeps};
 use crate::adapters::rig_engine::local_tools::{LocalTool, LocalToolRegistry};
 use crate::api::observability::AppObservability;
 use crate::config::{Config, ProviderKind, OPENROUTER_BASE_URL};
@@ -467,6 +467,9 @@ impl RigAgentEngine {
                 auto_decider: self.auto_decider.clone(),
                 observability: self.observability.clone(),
                 delegator: self.delegator.clone(),
+                // Bounds come from the calling agent's own manifest; the tool
+                // never invents a target, depth or recursion limit.
+                delegate_bounds: DelegateBounds::for_agent(&req.agent),
                 event_tx: None,
                 operations: operations::OperationContext::new(
                     req.execution_id,
@@ -577,6 +580,9 @@ impl RigAgentEngine {
                 auto_decider: self.auto_decider.clone(),
                 observability: self.observability.clone(),
                 delegator: self.delegator.clone(),
+                // Bounds come from the calling agent's own manifest; the tool
+                // never invents a target, depth or recursion limit.
+                delegate_bounds: DelegateBounds::for_agent(&req.agent),
                 event_tx: Some(tx.clone()),
                 operations: operations::OperationContext::new(
                     req.execution_id,

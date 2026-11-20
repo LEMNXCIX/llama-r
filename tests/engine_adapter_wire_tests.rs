@@ -36,6 +36,7 @@ fn test_deps() -> LocalToolDeps {
         auto_decider: None,
         observability: None,
         delegator: None,
+        delegate_bounds: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
