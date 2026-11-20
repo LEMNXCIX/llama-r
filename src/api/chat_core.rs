@@ -1221,10 +1221,24 @@ pub async fn delegate_turn(
         let forward_agent = agent.qualified_id();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
+                // A deeper level may already have stamped the approval's true
+                // origin onto the event. Preserve those tags so the root sees
+                // where the request came from; only fall back to this child's
+                // identity when the event is still untagged (the level directly
+                // below this forwarder). Re-tagging a tagged event made a
+                // grandchild approval appear to originate one hop too shallow.
+                let (task_id, depth) = match &event {
+                    AgentRunEvent::ApprovalRequired {
+                        task_id: Some(origin_task),
+                        depth: Some(origin_depth),
+                        ..
+                    } => (origin_task.clone(), *origin_depth),
+                    _ => (forward_task_id.clone(), forward_depth),
+                };
                 forwarder(ChildEvent {
                     event,
-                    task_id: forward_task_id.clone(),
-                    depth: forward_depth,
+                    task_id,
+                    depth,
                     agent_qualified_id: forward_agent.clone(),
                 });
             }

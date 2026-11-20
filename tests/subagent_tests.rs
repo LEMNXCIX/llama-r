@@ -1555,3 +1555,215 @@ async fn delegate_turn_drives_the_parent_forwarder_with_task_id_and_depth() {
         other => panic!("expected a forwarded approval, got {other:?}"),
     }
 }
+
+// Fix round 1: a grandchild approval must keep its origin through two hops.
+
+/// Mirrors the forwarder `exec_delegate` builds: re-emit a child approval into
+/// the given channel with the `ChildEvent`'s (origin) tags attached.
+fn channel_forwarder(tx: tokio::sync::mpsc::Sender<AgentRunEvent>) -> EventForwarder {
+    Arc::new(move |child: ChildEvent| {
+        if let AgentRunEvent::ApprovalRequired {
+            id,
+            tool_name,
+            args,
+            ..
+        } = child.event
+        {
+            let _ = tx.try_send(AgentRunEvent::ApprovalRequired {
+                id,
+                tool_name,
+                args,
+                task_id: Some(child.task_id),
+                depth: Some(child.depth),
+            });
+        }
+    }) as EventForwarder
+}
+
+/// The middle turn's engine: it delegates one level deeper using the channel
+/// its own `delegate_turn` created, so the grandchild's approval is forwarded
+/// through the real forwarder task under test.
+struct DelegatingEngine {
+    state: Arc<AppState>,
+    agent: Agent,
+    context: DelegationContext,
+    task_id: String,
+    parent_id: Uuid,
+    root_id: Uuid,
+}
+
+#[async_trait]
+impl AgentEngine for DelegatingEngine {
+    async fn run(
+        &self,
+        req: llama_r::ports::engine::AgentRunRequest,
+    ) -> Result<AgentRunResult, String> {
+        let channel = req
+            .approval_event_tx
+            .clone()
+            .ok_or("a delegated turn must carry its approval channel")?;
+        let child_req = DelegateRequest {
+            agent_id: self.agent.id.clone(),
+            caller_agent_id: "a".into(),
+            project_id: Some("proj".into()),
+            message: "go".into(),
+            task_id: Some(self.task_id.clone()),
+            chain: self.context.chain.clone(),
+            depth: self.context.depth,
+            effective_max_depth: self.context.effective_max_depth,
+            deadline: Instant::now() + std::time::Duration::from_secs(10),
+            budget: budget(),
+            event_tx: Some(channel_forwarder(channel)),
+            parent_execution_id: self.parent_id,
+            root_execution_id: self.root_id,
+        };
+        let result = llama_r::api::chat_core::delegate_turn(
+            &self.state,
+            child_req,
+            self.agent.clone(),
+            self.context.clone(),
+        )
+        .await?;
+        Ok(AgentRunResult {
+            text: result.answer,
+            tool_calls: 0,
+            iterations: 1,
+            model: req.model,
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        req: llama_r::ports::engine::AgentRunRequest,
+    ) -> Result<tokio::sync::mpsc::Receiver<AgentRunEvent>, String> {
+        let result = self.run(req).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let _ = tx.send(AgentRunEvent::Completed { result }).await;
+        Ok(rx)
+    }
+}
+
+/// The root's delegate tool hands its `DelegateRequest` (whose `event_tx` is
+/// the forwarder built by `exec_delegate`) straight into the middle turn.
+struct RootDelegator {
+    state: Arc<AppState>,
+    agent: Agent,
+    context: DelegationContext,
+}
+
+#[async_trait]
+impl Delegator for RootDelegator {
+    async fn delegate(&self, req: DelegateRequest) -> Result<DelegateResult, String> {
+        llama_r::api::chat_core::delegate_turn(
+            &self.state,
+            req,
+            self.agent.clone(),
+            self.context.clone(),
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn deep_approval_keeps_origin_tags_through_two_forwarding_hops() {
+    let root_id = Uuid::new_v4();
+
+    // Root (depth 0): the delegate tool builds the first forwarder from the
+    // SSE sender we hand it via `delegate_bridge_observing`.
+    let root_registry = Arc::new(AgentRegistry::new());
+    register_real(&root_registry, parent_with(&["a"], AgentConfig::default()));
+    register_real(&root_registry, agent("a", Some("proj"), None));
+    let root_state = test_state(
+        root_registry.clone(),
+        Arc::new(RecordingEngine {
+            runs: RecordedRuns::default(),
+            answer: "unused".into(),
+            fail_on: None,
+            spend_budget: false,
+        }),
+        Arc::new(FakeProvider { fail: false }),
+    );
+
+    // Deepest level (depth 2, agent B): its engine emits an UNTAGGED approval.
+    let b_registry = Arc::new(AgentRegistry::new());
+    register_real(&b_registry, agent("b", Some("proj"), None));
+    let b_state = test_state(
+        b_registry.clone(),
+        Arc::new(ApprovalEmittingEngine),
+        Arc::new(FakeProvider { fail: false }),
+    );
+    let b_agent = b_registry.get_project_agent("proj", "b").unwrap();
+    let b_context = DelegationContext {
+        chain: vec!["proj/parent".into(), "proj/a".into()],
+        depth: 2,
+        effective_max_depth: 3,
+        parent_execution_id: Some(Uuid::new_v4()),
+        root_execution_id: Some(root_id),
+    };
+
+    // Middle level (depth 1, agent A): delegating to B here forces the
+    // grandchild's tagged approval back through A's real forwarder task.
+    let a_registry = Arc::new(AgentRegistry::new());
+    register_real(&a_registry, agent("a", Some("proj"), None));
+    let a_state = test_state(
+        a_registry.clone(),
+        Arc::new(DelegatingEngine {
+            state: b_state,
+            agent: b_agent,
+            context: b_context,
+            task_id: "task-B".into(),
+            parent_id: Uuid::new_v4(),
+            root_id,
+        }),
+        Arc::new(FakeProvider { fail: false }),
+    );
+    let a_agent = a_registry.get_project_agent("proj", "a").unwrap();
+    let a_context = DelegationContext {
+        chain: vec!["proj/parent".into()],
+        depth: 1,
+        effective_max_depth: 3,
+        parent_execution_id: Some(Uuid::new_v4()),
+        root_execution_id: Some(root_id),
+    };
+
+    let (root_tx, mut root_rx) = tokio::sync::mpsc::channel(32);
+    let bridge = delegate_bridge_observing(
+        &root_state,
+        &root_registry,
+        "parent",
+        root_context(3),
+        Arc::new(RootDelegator {
+            state: a_state,
+            agent: a_agent,
+            context: a_context,
+        }),
+        Some(root_tx),
+    );
+    bridge
+        .invoke_json(serde_json::json!({"message": "go", "task_id": "task-A"}))
+        .await
+        .expect("the root delegate tool runs");
+
+    // The bridge also emits ToolCall/ToolResult into the sender; keep reading
+    // until the forwarded approval (the SSE mapper ignores those other events).
+    let event = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), root_rx.recv())
+            .await
+            .expect("the deep approval reaches the root SSE")
+            .expect("a forwarded event");
+        if matches!(event, AgentRunEvent::ApprovalRequired { .. }) {
+            break event;
+        }
+    };
+    match event {
+        AgentRunEvent::ApprovalRequired { task_id, depth, .. } => {
+            assert_eq!(
+                task_id.as_deref(),
+                Some("task-B"),
+                "origin task wins over hop"
+            );
+            assert_eq!(depth, Some(2), "origin depth wins over hop");
+        }
+        other => panic!("expected a forwarded approval, got {other:?}"),
+    }
+}
