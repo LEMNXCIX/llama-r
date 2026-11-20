@@ -545,14 +545,21 @@ curl -s http://127.0.0.1:3000/api/rag/query \
 
 ## Conversation history
 
+All eight known gaps from the Fase 5 plan (§0.7) are closed — seven in code, gap 8 by documented decision plus a concurrency test. The store architecture is unchanged.
+
 - Feature: `history` (default ON). Disable: `cargo build --no-default-features --features rig-engine`
-- DB: `{LLAMA_R_DIR}/data/history.db`
-- Continue a thread: request header `X-Conversation-Id` (gRPC metadata with the same name)
-- Persist follows the agent `[memory] persist_history` flag
-- Summaries: set `index_summaries = true`; chunks go to `summary_collection` or `agent.memory_source_id()` if RAG write policy allows
+- DB: `{LLAMA_R_DIR}/data/history.db` (gitignored). The schema is additive / `IF NOT EXISTS`: no destructive migration, and an old `history.db` opens unchanged.
+- Continue a thread: request header `X-Conversation-Id` (gRPC metadata with the same name). When a conversation is actually persisted and no id was supplied, the server generates a UUID.
+- Return id: `ChatResponse.conversation_id: Option<String>` (`skip_serializing_if = "Option::is_none"`) **and** an `X-Conversation-Id` response header on both the JSON and SSE chat paths, so a client can send the id back. Absent when persistence is off or nothing was written. Every write — and the emitted id — is gated on the id `append_user` actually returned (`persisted_conv_id`), so a failed store never yields a phantom id. An old client that omits the field still parses.
+- Persist follows the agent `[memory] persist_history` flag. Best-effort everywhere: a summarize, append, tool-event or purge failure logs a warning and never fails the chat.
+- Identity: the persisted `agent_id` is the agent's file id (`agent.id`, filename without `.toml`), never the display `name`; two agents sharing a display name keep separate histories.
+- Summaries: set `index_summaries = true`; chunks go to `summary_collection` or `agent.memory_source_id()` if RAG write policy allows. `maybe_summarize_and_index` takes the current turn's `conversation_id`, so a summary targets **that** conversation (not the agent's most recent one) and is idempotent per `turn_range_end`. The summarizer is an injected `Summarizer` trait (`src/ports/history.rs`): the Ollama boot provider gets `OllamaSummarizer` (Ollama-wire `/api/chat`), every other provider gets `NoopSummarizer` with a warning naming the lost capability. Conversations still persist with no summarizer; `FakeSummarizer` covers the happy path in tests without a network.
+- Tool events: `append_tool_event(conversation_id, tool_name, success)` stores the tool name and success flag **only** — never arguments or output, so no secret can reach the table. An additive `AgentRunRequest.tool_event_tx` sink is shared by the MCP and local tool bridges; streaming and non-streaming turns use the same mechanism.
+- Retention: `HISTORY_RETENTION_DAYS` (default 90); purge on boot and daily. An agent's `[memory] retention_days` overrides the global value for its own conversations; the per-agent map is rebuilt from `AgentRegistry::list()` at boot and on every daily tick, so a hot reload is honoured without a restart. `HISTORY_RETENTION_DAYS=0` is an **absolute kill-switch**: purging is disabled entirely and per-agent entries cannot re-enable it.
+- Concurrency (gap 8 — decision, not refactor): the store keeps one `std::sync::Mutex<Connection>` in WAL mode; short synchronous work holds no lock across `.await`. There is deliberately no `tokio::sync::Mutex`, no per-query `spawn_blocking` and no async refactor — those are reconsidered only with **measured** contention. `concurrent_appends_keep_both_rows` pins that two independent callers both land their rows.
 - Admin API: `GET/DELETE /api/conversations`, `GET /api/conversations/:id/messages`, `POST /api/conversations/:id/export`
-- Retention: `HISTORY_RETENTION_DAYS` (default 90); purge on boot and daily. `0` disables purging entirely.
-- Execution plan (verify remaining gaps): [`PHASE_5_HISTORY_PLAN.md`](./PHASE_5_HISTORY_PLAN.md)
+- Not done (deferred, unchanged): no re-injection of summaries into prompts, no compaction / active-memory split, no model routing by complexity, no OpenTelemetry, no auth on the history endpoints.
+- Execution plan: [`PHASE_5_HISTORY_PLAN.md`](./PHASE_5_HISTORY_PLAN.md)
 
 ## Notes For Contributors
 - Prefer documenting commands that exist in `src/cli/commands.rs`.

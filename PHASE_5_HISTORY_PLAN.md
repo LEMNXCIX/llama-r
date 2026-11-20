@@ -125,18 +125,18 @@ RAG query B             → no ve chunks summary-* de A
                   → 5.10 Tests aislamiento + docs
 ```
 
-### 0.7 Bugs / huecos conocidos a corregir (si el código ya está)
+### 0.7 Bugs / huecos conocidos — TODOS CERRADOS (Fase 5, pieza 1)
 
-Revisa estos puntos **antes** de marcar DoD. Si ya están arreglados, tilda y sigue.
+Los ocho puntos se verificaron y cerraron: siete en código y el octavo con decisión documentada + test. Se conservan como registro de lo que se corrigió.
 
-1. **`agent_id` en INSERT usa `agent.config.name`** (`sqlite.rs` `ensure_conversation`). Debe ser `agent.id` (filename sin `.toml`). `name` es display y puede colisionar.
-2. **`maybe_summarize_and_index` elige “la conversación más reciente del agente”** (`ORDER BY updated_at DESC LIMIT 1`) en vez de recibir `conversation_id`. Pásale el id del run actual (extiende el trait **solo si hace falta**; preferible añadir argumento `conversation_id: Option<&str>` o un método nuevo con default).
-3. **Summarizer pega a Ollama real** — unit tests no cubren el camino feliz sin red. Extrae `Summarizer` trait / fn inyectable (o feature test hook) y cubre con mock.
-4. **Tabla `tool_events` no se escribe.** Mínimo: documentar como P2 **o** persistir nombre de tool + success **sin** args si `log_tool_args=false`. No bloquea D1–D15 si lo dejas explícito en ROADMAP como pendiente Fase 6/audit.
-5. **`ChatResponse` no devuelve `conversation_id`.** El cliente no puede reanudar salvo que genere el UUID él. Añade campo opcional al DTO **o** header de respuesta `X-Conversation-Id`. Preferible **ambos** (header + campo serde skip_if none) sin romper clientes viejos.
-6. **`chat_stream` puede no persistir assistant** al completar. Verifica que el texto final se `append_assistant` (hook en `Completed` o después de drenar el stream).
-7. **Purge global ignora `memory.retention_days` por agente.** Aceptable en Fase 5 usar solo `HISTORY_RETENTION_DAYS` global; documentarlo.
-8. **Lock `Mutex<Connection>` en async.** Está bien para Fase 5 (un proceso, WAL). No introduzcas `tokio::sync::Mutex` + `block_in_place` salvo deadlock real. No uses `spawn_blocking` en cada query a menos que midas contención.
+- [x] **1. `agent_id` en INSERT usa `agent.config.name`.** Corregido: `ensure_conversation` persiste `agent.id` (filename sin `.toml`), nunca el display `name` (colisionable).
+- [x] **2. `maybe_summarize_and_index` elige “la conversación más reciente del agente”.** Corregido: el trait recibe `conversation_id: Option<&str>` y resume **esa** conversación; el intervalo se cuenta por conversación. Con `None` conserva el comportamiento legacy.
+- [x] **3. Summarizer pega a Ollama real sin seam inyectable.** Corregido: `trait Summarizer` en `src/ports/history.rs` más `OllamaSummarizer` / `NoopSummarizer` en `src/adapters/history/`, inyectados desde `build_history_store` (`src/runtime.rs`). Boot con Ollama → summarizer Ollama-wire; cualquier otro provider → `NoopSummarizer` + warning. `FakeSummarizer` cubre el happy path sin red.
+- [x] **4. Tabla `tool_events` no se escribe.** Corregido: `append_tool_event(conversation_id, tool_name, success)` guarda nombre + éxito, **sin args** (no existe `log_tool_args`). Se alimenta con un sink aditivo `AgentRunRequest.tool_event_tx` compartido por ambos bridges; streaming y no-streaming usan el mismo mecanismo.
+- [x] **5. `ChatResponse` no devuelve `conversation_id`.** Corregido: campo opcional con `skip_serializing_if` **más** header `X-Conversation-Id` en JSON y SSE (`handlers.rs`). El servidor genera UUID si no viene el header; un cliente viejo sin el campo sigue parseando. El id solo se emite si la conversación se persistió de verdad (`persisted_conv_id`).
+- [x] **6. `chat_stream` puede no persistir assistant.** Corregido: el texto final del assistant se `append_assistant` al completar, con el mismo `conversation_id` que `append_user`, antes de reenviar el evento.
+- [x] **7. Purge global ignora `memory.retention_days` por agente.** Corregido: `purge_old_conversations(days, per_agent_map)` aplica el `retention_days` de cada agente a sus propias conversaciones; el mapa se reconstruye desde `AgentRegistry::list()` en el boot y en cada tick diario (hot reload incluido). `HISTORY_RETENTION_DAYS=0` sigue siendo kill-switch absoluto: ningún override por agente puede reactivarlo.
+- [x] **8. Lock `Mutex<Connection>` en async.** Decidido (no refactor): se mantiene `std::sync::Mutex<Connection>` + WAL (un proceso); sin `tokio::sync::Mutex`, sin `spawn_blocking` por query y sin refactor async. El test `concurrent_appends_keep_both_rows` comprueba que dos appends independientes conservan ambas filas. Solo se reconsideraría con contención **medida**.
 
 ---
 

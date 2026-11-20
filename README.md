@@ -232,6 +232,29 @@ POST /api/mcp
 ```
 Endpoint JSON-RPC para interactuar con el gateway como servidor MCP.
 
+## Historial de conversaciones
+
+Cada turno de agente se persiste en SQLite cuando el agente tiene `[memory] persist_history = true` (feature `history`, activa por defecto; DB en `{LLAMA_R_DIR}/data/history.db`, ignorada por git). El esquema es aditivo (`IF NOT EXISTS`): un `history.db` antiguo se abre sin migración destructiva. Los ocho huecos conocidos del plan están cerrados (siete en código, el octavo por decisión documentada + test); ver [`PHASE_5_HISTORY_PLAN.md`](./PHASE_5_HISTORY_PLAN.md).
+
+- **Reanudar un hilo:** envía `X-Conversation-Id` (en gRPC, metadato con el mismo nombre). Si se persiste una conversación y no envías id, el servidor genera un UUID.
+- **Id de vuelta:** la respuesta JSON trae `conversation_id: Option<String>` (omitido si es `None`) **y** el header `X-Conversation-Id`, tanto en la respuesta JSON como en la SSE, para que el cliente pueda reenviarlo. Si la persistencia está desactivada o no se escribió nada, no hay campo ni header: todas las escrituras —y el id emitido— están condicionadas al id que `append_user` devolvió de verdad, así que un store caído nunca devuelve un id fantasma. Un cliente antiguo que no envía el campo sigue funcionando.
+- **Identidad:** el `agent_id` guardado es el id de archivo del agente (`agent.id`, sin `.toml`), nunca el `name` de display: dos agentes con el mismo nombre visible mantienen historiales separados.
+- **Resúmenes:** con `index_summaries = true` se indexa en `summary_collection` (o `agent.memory_source_id()` si la política RAG de escritura lo permite). El resumen se aplica a la conversación **del turno**, no a la más reciente del agente, y es idempotente por rango de turnos. El summarizer es inyectable (`trait Summarizer` en `src/ports/history.rs`): el provider Ollama usa `OllamaSummarizer` (wire `/api/chat` de Ollama); cualquier otro usa `NoopSummarizer` con un aviso. Sin summarizer las conversaciones siguen persistiendo; los tests cubren el camino feliz con un `FakeSummarizer`, sin red.
+- **Eventos de herramientas:** se guardan el nombre de la herramienta y su éxito (`append_tool_event(conversation_id, tool_name, success)`), **sin argumentos ni salida**: ningún secreto puede llegar a esa tabla. Un sink aditivo en `AgentRunRequest` alimenta por igual los bridges MCP y los locales, en streaming y sin streaming.
+- **Retención:** `HISTORY_RETENTION_DAYS` (default 90), purge al arrancar y cada 24 h. El `retention_days` de `[memory]` de cada agente gana sobre el valor global para sus propias conversaciones; el mapa se reconstruye desde `AgentRegistry::list()` en el boot y en cada tick diario, así que un hot reload se aplica sin reiniciar. **`HISTORY_RETENTION_DAYS=0` es un kill-switch absoluto:** desactiva el purge por completo y ningún valor por agente puede reactivarlo.
+- **Concurrencia (gap 8 — decisión, no refactor):** se mantiene un `Mutex<Connection>` con WAL; no hay `tokio::sync::Mutex`, ni `spawn_blocking` por query, ni refactor async: solo se reconsiderarían con contención **medida**. Un test de dos appends concurrentes comprueba que ambas filas sobreviven.
+- **Best-effort:** fallos de persistencia, resumen o purge avisan con un warning y nunca rompen el chat. Esto es todo lo que hay: no se reinyectan resúmenes en el prompt, no hay compaction, ni model routing por complejidad, ni OpenTelemetry, ni auth en los endpoints de historial.
+
+API de administración:
+
+```
+GET    /api/conversations
+GET    /api/conversations/:id
+GET    /api/conversations/:id/messages
+POST   /api/conversations/:id/export
+DELETE /api/conversations/:id
+```
+
 ## gRPC API
 
 Puerto `50051`. Proto definido en `proto/llamar.proto`.
