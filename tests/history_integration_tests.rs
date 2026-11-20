@@ -551,6 +551,34 @@ async fn purge_respects_per_agent_retention() {
 }
 
 #[tokio::test]
+async fn zero_global_retention_is_an_absolute_kill_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("retention_zero_override.db");
+    let store = SqliteConversationStore::open(&db, "http://127.0.0.1:1", "m").unwrap();
+
+    let agent = named_agent("agent-a", "A", Some("proj"));
+    let conv = store.append_user(None, &agent, "old turn").await.unwrap();
+    age_conversation(&db, &conv, 100);
+
+    let mut per_agent = HashMap::new();
+    per_agent.insert(agent.qualified_id(), 7); // would purge if the global were nonzero
+
+    let deleted = store
+        .purge_old_conversations(0, Some(&per_agent))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        deleted, 0,
+        "a 0 global retention purges nothing, even with a per-agent override"
+    );
+    assert!(
+        store.get_conversation(&conv).await.unwrap().is_some(),
+        "the conversation must survive the absolute kill-switch"
+    );
+}
+
+#[tokio::test]
 async fn ollama_summarizer_wire() {
     let (url, seen, handle) = one_shot_ollama("The user prefers tea.").await;
     let summarizer = OllamaSummarizer::new(url, "llama3.2".to_string());

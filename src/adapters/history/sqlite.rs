@@ -65,7 +65,12 @@ impl SqliteConversationStore {
     ) -> Result<Self, String> {
         let strategy: Arc<dyn Summarizer> = match summarizer {
             Some((url, model)) => Arc::new(OllamaSummarizer::new(url, model)),
-            None => Arc::new(NoopSummarizer),
+            None => {
+                tracing::warn!(
+                    "history summaries disabled: no provider serves the Ollama summarizer endpoint; conversations still persist"
+                );
+                Arc::new(NoopSummarizer)
+            }
         };
         Self::with_summarizer(path, strategy)
     }
@@ -187,7 +192,7 @@ impl SqliteConversationStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, role, content, created_at FROM messages \
-                 WHERE conversation_id = ?1 ORDER BY created_at ASC",
+                 WHERE conversation_id = ?1 ORDER BY created_at ASC, rowid ASC",
             )
             .map_err(|e| format!("db prepare error: {e}"))?;
         let rows = stmt
@@ -479,6 +484,12 @@ impl ConversationStore for SqliteConversationStore {
         retention_days: u32,
         per_agent_days: Option<&HashMap<String, u32>>,
     ) -> Result<u64, String> {
+        // `HISTORY_RETENTION_DAYS=0` is an absolute kill-switch: purging is
+        // disabled entirely, and per-agent overrides cannot re-enable it.
+        if retention_days == 0 {
+            return Ok(0);
+        }
+
         let now = chrono::Utc::now().timestamp();
         // One lock across the read → delete pass keeps this atomic with respect
         // to other store operations: a concurrent append cannot refresh a row's
@@ -490,7 +501,7 @@ impl ConversationStore for SqliteConversationStore {
 
         // Resolve an effective retention per conversation: the per-agent map
         // keyed by `agent_qualified_id` wins, the global value is the default.
-        // A 0 (global or per-agent) means "never purge".
+        // A 0 means "never purge" for that conversation.
         let to_delete: Vec<String> = {
             let mut stmt = conn
                 .prepare("SELECT id, agent_qualified_id, updated_at FROM conversations")
