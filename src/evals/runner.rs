@@ -13,6 +13,8 @@ use std::sync::Arc;
 use tokio_stream::StreamExt;
 
 #[cfg(feature = "rig-engine")]
+use crate::adapters::context::NoopCompactor;
+#[cfg(feature = "rig-engine")]
 use crate::adapters::mcp::StaticMcpRegistry;
 #[cfg(feature = "rig-engine")]
 use crate::adapters::rig_engine::RigAgentEngine;
@@ -215,6 +217,7 @@ async fn execute_agent_case(case: &EvalCase) -> Result<Execution, String> {
         history: None,
         rag: None,
         enricher: Arc::new(enricher),
+        compactor: Arc::new(NoopCompactor),
     };
 
     // A prebuilt prompt keeps the turn off the enricher's disk path; the tool is

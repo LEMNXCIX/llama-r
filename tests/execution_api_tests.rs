@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
+use llama_r::adapters::context::NoopCompactor;
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::adapters::rig_engine::operations::{operation_id, OperationContext};
 use llama_r::api::chat_core::execute_chat_with_id;
@@ -287,6 +288,7 @@ fn test_state(
         history: None,
         rag: None,
         enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
     };
     let mut stack = ProviderStack::new(Arc::new(StubProvider), "model-a");
     stack.provider_name = "ollama".into();

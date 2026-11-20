@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use llama_r::adapters::context::NoopCompactor;
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::api::chat_core::{execute_chat, execute_chat_stream, record_trace, trace_payload};
 use llama_r::api::handlers::AppState;
@@ -272,6 +273,7 @@ fn build_state(
         history: None,
         rag: None,
         enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
     };
     let mut stack = ProviderStack::new(provider, "model-a");
     stack.provider_name = "ollama".into();

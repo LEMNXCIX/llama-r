@@ -225,6 +225,7 @@ mod tests {
             router_healthy: AtomicBool::new(router_healthy),
             approval_gate: Arc::new(crate::services::approval::ApprovalGate::default()),
             auto_decider: None,
+            compactor: Arc::new(crate::adapters::context::NoopCompactor),
             execution_store: Arc::new(crate::adapters::execution::NoOpExecutionStore),
             delegator: std::sync::OnceLock::new(),
         });

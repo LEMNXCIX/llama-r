@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::RwLock as TokioRwLock;
 use tokio_stream::StreamExt as _;
 
+use crate::ports::compaction::ContextCompactor;
 use crate::ports::history::ConversationStore;
 
 pub struct AppState {
@@ -77,6 +78,10 @@ pub struct AppState {
     /// settings Apply cannot drop it. `None` means every `Auto` tool keeps
     /// asking a human (the pre-Fase-6 behaviour).
     pub auto_decider: Option<Arc<dyn AutoDecider>>,
+    /// Context-compaction strategy used by the assembler on every agent turn.
+    /// `NoopCompactor` by default; it lives outside the hot-swapped stack so a
+    /// settings Apply rebuilds the engine with the same strategy.
+    pub compactor: Arc<dyn ContextCompactor>,
     /// Durable execution store. Built once at boot from the history DB path and
     /// deliberately NOT part of the hot-swapped `ProviderStack`: a TUI Apply
     /// rebuilds the engine but must not swap out the record of in-flight turns.

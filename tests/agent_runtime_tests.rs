@@ -6,12 +6,15 @@
 //! the model itself. The TOML writer is covered by the round-trip in
 //! `src/domain/agent.rs`; this file covers the two hops after it.
 
+use llama_r::adapters::context::NoopCompactor;
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::adapters::rig_engine::local_tools::LocalToolRegistry;
 use llama_r::adapters::rig_engine::RigAgentEngine;
 use llama_r::config::{Config, ProviderKind};
 use llama_r::context::analyzer::ContextEnricher;
 use llama_r::context::store::ContextStore;
+use llama_r::domain::models::ChatMessage;
+use llama_r::ports::compaction::{CompactRequest, CompactResult, ContextCompactor};
 use llama_r::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
 use llama_r::ports::mcp::McpServerRegistry;
 use llama_r::providers::registry::ProviderRegistry;
@@ -107,6 +110,7 @@ fn world_with_agent(
         history: None,
         rag: None,
         enricher: Arc::new(enricher()),
+        compactor: Arc::new(NoopCompactor),
     };
     (runtime, seen)
 }
@@ -583,6 +587,7 @@ fn a_deferred_skill_is_announced_offered_and_loaded_on_demand() {
                 history: None,
                 rag: None,
                 enricher: Arc::new(enricher),
+                compactor: Arc::new(NoopCompactor),
             };
 
             let answer = runtime.chat(request()).await.unwrap().text;
@@ -648,4 +653,60 @@ fn a_deferred_skill_is_announced_offered_and_loaded_on_demand() {
                 "calling llama_r__skill must yield the full SKILL.md: {tool_result}"
             );
         });
+}
+
+/// A compactor installed as a companion must actually run: its memory reaches
+/// the engine's prompt after the instructions and its compacted history is what
+/// the model sees. Without this seam the assembler would be inert at runtime.
+struct DroppingCompactor;
+
+#[async_trait::async_trait]
+impl ContextCompactor for DroppingCompactor {
+    async fn compact(&self, req: CompactRequest) -> Result<CompactResult, String> {
+        let keep_from = req.history.len().saturating_sub(1);
+        Ok(CompactResult {
+            memory: Some("Dropped old turns.".to_string()),
+            history: req.history[keep_from..].to_vec(),
+        })
+    }
+}
+
+#[test]
+fn a_turn_uses_the_compactor_companion() {
+    let _guard = env_lock().lock().unwrap();
+    let (mut runtime, seen) = world(&["Keep this rule"], &[]);
+    runtime.compactor = Arc::new(DroppingCompactor);
+
+    let mut req = request();
+    req.history = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: "old question".into(),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: "old answer".into(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: "new question".into(),
+        },
+    ];
+    chat_blocking(&runtime, req);
+
+    let seen = seen.lock().unwrap();
+    let run = seen.as_ref().expect("the engine ran");
+    assert!(
+        run.system_prompt.contains("Keep this rule"),
+        "the agent's rule must survive compaction: {:?}",
+        run.system_prompt
+    );
+    assert!(
+        run.system_prompt
+            .contains("\n## Conversation memory\nDropped old turns."),
+        "the summary must be injected after the instructions: {:?}",
+        run.system_prompt
+    );
+    assert_eq!(run.history.len(), 1, "only the newest turn survives");
+    assert_eq!(run.history[0].content, "new question");
 }

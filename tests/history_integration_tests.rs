@@ -680,6 +680,7 @@ use axum::{
     routing::post,
     Router,
 };
+use llama_r::adapters::context::NoopCompactor;
 use llama_r::adapters::execution::NoOpExecutionStore;
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::api::handlers::{chat, AppState};
@@ -816,6 +817,7 @@ fn chat_world(persist_history: bool) -> ChatWorld {
         history: Some(store.clone()),
         rag: None,
         enricher: enricher.clone(),
+        compactor: Arc::new(NoopCompactor),
     });
 
     let mut stack = ProviderStack::new(Arc::new(StubProvider), "fallback-model".to_string());
@@ -840,6 +842,7 @@ fn chat_world(persist_history: bool) -> ChatWorld {
         router_healthy: false.into(),
         approval_gate: Arc::new(ApprovalGate::default()),
         auto_decider: None,
+        compactor: Arc::new(NoopCompactor),
         execution_store: Arc::new(NoOpExecutionStore),
         delegator: std::sync::OnceLock::new(),
     });
@@ -999,6 +1002,7 @@ fn runtime_with(store: Arc<RecordingStore>, engine: Arc<dyn AgentEngine>) -> Age
             Arc::new(ProviderRegistry::default()),
             ProviderKind::Ollama,
         )),
+        compactor: Arc::new(NoopCompactor),
     }
 }
 
@@ -1366,6 +1370,7 @@ async fn non_streaming_turn_summarizes_persisted_conversation_id() {
             Arc::new(ProviderRegistry::default()),
             ProviderKind::Ollama,
         )),
+        compactor: Arc::new(NoopCompactor),
     };
 
     let mut req = runtime_request();
@@ -1404,6 +1409,7 @@ async fn summarize_uses_none_when_append_failed() {
             Arc::new(ProviderRegistry::default()),
             ProviderKind::Ollama,
         )),
+        compactor: Arc::new(NoopCompactor),
     };
 
     let mut req = runtime_request();

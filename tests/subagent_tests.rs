@@ -286,6 +286,7 @@ fn chain_cycle_rejected_naming_id() {
 // ---------------------------------------------------------------------------
 
 use async_trait::async_trait;
+use llama_r::adapters::context::NoopCompactor;
 use llama_r::adapters::execution::NoOpExecutionStore;
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::adapters::rig_engine::local_tools::{
@@ -532,6 +533,7 @@ fn test_state(
         history: None,
         rag: None,
         enricher: enricher.clone(),
+        compactor: Arc::new(NoopCompactor),
     }));
     Arc::new(AppState {
         services: Arc::new(TokioRwLock::new(Arc::new(stack))),
@@ -551,6 +553,7 @@ fn test_state(
         router_healthy: AtomicBool::new(false),
         approval_gate: Arc::new(ApprovalGate::default()),
         auto_decider: None,
+        compactor: Arc::new(NoopCompactor),
         execution_store: Arc::new(NoOpExecutionStore),
         delegator: OnceLock::new(),
     })

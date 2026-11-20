@@ -1,5 +1,6 @@
 #![allow(clippy::await_holding_lock)] // env guard held deliberately across .await to serialise tests
 use super::{execute_chat, execute_chat_stream};
+use crate::adapters::context::NoopCompactor;
 use crate::adapters::mcp::StaticMcpRegistry;
 use crate::api::handlers::AppState;
 use crate::api::observability::AppObservability;
@@ -293,6 +294,7 @@ fn test_state_inner(
         router_healthy: AtomicBool::new(false),
         approval_gate: Arc::new(crate::services::approval::ApprovalGate::default()),
         auto_decider: None,
+        compactor: Arc::new(NoopCompactor),
         execution_store,
         delegator: OnceLock::new(),
     });
@@ -516,6 +518,7 @@ async fn agent_runtime_returns_engine_text() {
         history: None,
         rag: None,
         enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
     });
     let provider = Arc::new(FakeProvider {
         fail_primary_once: AtomicBool::new(false),
@@ -579,6 +582,7 @@ async fn chat_uses_engine_when_agent_present() {
         history: None,
         rag: None,
         enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
     });
     let provider = Arc::new(FakeProvider {
         fail_primary_once: AtomicBool::new(false),
@@ -638,6 +642,7 @@ async fn chat_falls_back_when_engine_fails() {
         history: None,
         rag: None,
         enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
     });
     let provider = Arc::new(FakeProvider {
         fail_primary_once: AtomicBool::new(false),
@@ -730,6 +735,7 @@ async fn engine_receives_prior_history_turns() {
         history: None,
         rag: None,
         enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
     });
     let provider = Arc::new(FakeProvider {
         fail_primary_once: AtomicBool::new(false),
@@ -805,6 +811,7 @@ async fn streaming_uses_engine_when_agent_present() {
         history: None,
         rag: None,
         enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
     });
     let provider = Arc::new(FakeProvider {
         fail_primary_once: AtomicBool::new(false),
@@ -879,6 +886,7 @@ async fn engine_used_when_model_is_global_agent_id() {
         history: None,
         rag: None,
         enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
     });
     let provider = Arc::new(FakeProvider {
         fail_primary_once: AtomicBool::new(false),
@@ -999,6 +1007,7 @@ async fn non_streaming_model_stream_is_rejected_with_501_without_calling_engine(
         history: None,
         rag: None,
         enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
     });
     // The agent resolves against OpenRouter (whose catalog says streaming is
     // false), and the provider's chat_stream rejects streaming the way the real
@@ -1069,6 +1078,7 @@ async fn ollama_engine_stream_is_still_taken() {
         history: None,
         rag: None,
         enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
     });
     let (_dir, state) = test_state_with_runtime_and_provider(
         Arc::new(UnavailableStreamProvider),
@@ -1221,6 +1231,7 @@ async fn a_mid_request_swap_cannot_change_the_fallback_stack() {
         history: None,
         rag: None,
         enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
     });
     let (_dir, state) = test_state_with_runtime(Arc::new(TagProvider("A")), Some(runtime));
 
@@ -1321,6 +1332,7 @@ fn execution_test_rig(
         history: None,
         rag: None,
         enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
     });
     let provider = Arc::new(FakeProvider {
         fail_primary_once: AtomicBool::new(false),

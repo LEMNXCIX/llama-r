@@ -9,6 +9,7 @@
 
 #![allow(clippy::await_holding_lock)] // the env lock is held for the whole test by design
 
+use llama_r::adapters::context::NoopCompactor;
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::adapters::rig_engine::local_tools::LocalToolRegistry;
 use llama_r::adapters::rig_engine::{engine_target_for, RigAgentEngine};
@@ -204,6 +205,7 @@ fn boot_ollama_runtime(config: &Config, base_dir: &std::path::Path, agent: &str)
         history: None,
         rag: None,
         enricher: Arc::new(enricher),
+        compactor: Arc::new(NoopCompactor),
     }
 }
 

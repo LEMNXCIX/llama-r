@@ -7,6 +7,7 @@
 //!   capability gate *before* the engine or the provider opens a connection.
 
 use async_trait::async_trait;
+use llama_r::adapters::context::NoopCompactor;
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::adapters::rig_engine::local_tools::LocalToolRegistry;
 use llama_r::adapters::rig_engine::{EngineTarget, RigAgentEngine};
@@ -390,6 +391,7 @@ async fn a_non_streaming_provider_returns_unavailable_before_connecting() {
         history: None,
         rag: None,
         enricher: state.context_enricher_snapshot(),
+        compactor: Arc::new(NoopCompactor),
     };
     let mut new_stack = (*state.services_snapshot().await).clone();
     new_stack.agent_runtime = Some(Arc::new(runtime));

@@ -4,6 +4,7 @@ pub mod agent_router;
 pub mod agent_runtime;
 pub mod agent_skill_sync;
 pub mod approval;
+pub mod context_assembler;
 pub mod delegation;
 pub mod provider_stack;
 pub mod rag_ingest;

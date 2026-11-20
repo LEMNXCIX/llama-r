@@ -1,10 +1,11 @@
-//! Context pipeline: `ContextCompactor` (Task 1) and `ModelSelector` (Task 2).
+//! Context pipeline: `ContextCompactor`, `ModelSelector` and `ContextAssembler`.
 //!
-//! These tests pin the ports without any runtime wiring: only history is ever
-//! compacted, the injected `Summarizer` sees exactly the oldest messages, and
-//! model selection always goes through the injected, configurable
-//! `DecisionRouter` using candidate labels — never a hardcoded model. Fake
-//! collaborators capture their inputs so nothing depends on a live model.
+//! These tests pin the ports and the assembler without any runtime wiring: only
+//! history is ever compacted, the injected `Summarizer` sees exactly the oldest
+//! messages, instruction sections survive compaction byte-for-byte, and model
+//! selection always goes through the injected, configurable `DecisionRouter`
+//! using candidate labels — never a hardcoded model. Fake collaborators capture
+//! their inputs so nothing depends on a live model.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -14,15 +15,25 @@ use llama_r::adapters::context::router_model_selector::QUESTION_KEY;
 use llama_r::adapters::context::{
     CurrentModelSelector, NoopCompactor, RouterModelSelector, SummarizingCompactor,
 };
+use llama_r::config::ProviderKind;
+use llama_r::context::active::DEFAULT_RESERVED_TOKENS;
+use llama_r::context::analyzer::ContextEnricher;
+use llama_r::context::store::ContextStore;
+use llama_r::domain::agent::{Agent, AgentConfig};
 use llama_r::domain::models::ChatMessage;
 use llama_r::error::AppError;
-use llama_r::ports::compaction::{CompactRequest, ContextCompactor};
+use llama_r::ports::compaction::{CompactRequest, CompactResult, ContextCompactor};
 use llama_r::ports::history::{ExportMessage, Summarizer};
 use llama_r::ports::model_selection::{
     ModelCandidate, ModelSelection, ModelSelectionRequest, ModelSelector, SelectionReason,
 };
 use llama_r::ports::router::{Answer, DecisionRequest, DecisionResponse, DecisionRouter, Question};
+use llama_r::providers::capabilities::ModelCapabilities;
 use llama_r::providers::model_costs::load_relative_costs;
+use llama_r::providers::registry::ProviderRegistry;
+use llama_r::services::context_assembler::ContextAssembler;
+use llama_r::services::skill_manager::SkillManager;
+use tempfile::TempDir;
 
 /// A summarizer with a fixed reply that records every batch it was handed.
 struct FakeSummarizer {
@@ -646,4 +657,307 @@ fn valid_models_toml_loads_relative_costs() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: `ActiveContext` + `ContextAssembler`.
+//
+// The assembler is driven with a real `ContextEnricher` (no network: no
+// embeddings) and a controllable compactor that records the exact
+// `CompactRequest`. The catalog is injected as `ModelCapabilities` so all three
+// budget branches can be exercised without editing the static capability table.
+// ---------------------------------------------------------------------------
+
+/// A compactor whose behaviour is chosen per test and whose calls are recorded.
+#[derive(Clone, Debug)]
+enum CompactorBehaviour {
+    /// Hand history back untouched, as `NoopCompactor` does.
+    Copy,
+    /// Fail with a named error, to prove the assembler degrades best-effort.
+    Fail(&'static str),
+}
+
+struct CapturingCompactor {
+    behaviour: CompactorBehaviour,
+    seen: Arc<Mutex<Vec<CompactRequest>>>,
+}
+
+impl CapturingCompactor {
+    fn new(behaviour: CompactorBehaviour) -> (Arc<Self>, Arc<Mutex<Vec<CompactRequest>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(Self {
+                behaviour,
+                seen: seen.clone(),
+            }),
+            seen,
+        )
+    }
+}
+
+#[async_trait]
+impl ContextCompactor for CapturingCompactor {
+    async fn compact(&self, req: CompactRequest) -> Result<CompactResult, String> {
+        self.seen.lock().expect("capture lock").push(req.clone());
+        match &self.behaviour {
+            CompactorBehaviour::Copy => Ok(CompactResult {
+                memory: None,
+                history: req.history,
+            }),
+            CompactorBehaviour::Fail(err) => Err((*err).to_string()),
+        }
+    }
+}
+
+fn capabilities(max_context_tokens: Option<u32>) -> ModelCapabilities {
+    ModelCapabilities {
+        max_context_tokens,
+        ..Default::default()
+    }
+}
+
+fn test_enricher(skills: Arc<SkillManager>) -> Arc<ContextEnricher> {
+    Arc::new(ContextEnricher::new(
+        Arc::new(ContextStore::new()),
+        skills,
+        "fallback-model".to_string(),
+        Arc::new(ProviderRegistry::default()),
+        ProviderKind::Ollama,
+    ))
+}
+
+fn assembler_with(
+    enricher: Arc<ContextEnricher>,
+    compactor: Arc<dyn ContextCompactor>,
+) -> ContextAssembler {
+    ContextAssembler::new(enricher, compactor)
+}
+
+fn default_assembler(compactor: Arc<dyn ContextCompactor>) -> ContextAssembler {
+    assembler_with(test_enricher(Arc::new(SkillManager::new())), compactor)
+}
+
+fn agent(config: AgentConfig) -> Agent {
+    Agent {
+        id: "test-agent".to_string(),
+        project_id: None,
+        config,
+    }
+}
+
+fn config_with_budget(max_context_tokens: usize) -> AgentConfig {
+    AgentConfig {
+        name: "Test".to_string(),
+        system_prompt: "Base instructions.".to_string(),
+        max_context_tokens,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn budget_is_min_of_catalog_and_agent() {
+    let (compactor, seen) = CapturingCompactor::new(CompactorBehaviour::Copy);
+    let assembler = default_assembler(compactor);
+    let subject = agent(config_with_budget(9_000));
+
+    assembler
+        .assemble(
+            &subject,
+            &capabilities(Some(1_234)),
+            vec![message("user", "hi")],
+            "current-model".to_string(),
+        )
+        .await
+        .expect("assembly is best-effort but this path cannot fail");
+
+    let requests = seen.lock().expect("capture lock");
+    assert_eq!(requests.len(), 1, "one budgeted compaction attempt");
+    assert_eq!(
+        requests[0].budget_tokens, 1_234,
+        "the smaller catalog budget wins"
+    );
+    assert_eq!(
+        requests[0].reserved_tokens, DEFAULT_RESERVED_TOKENS,
+        "tools and RAG keep their reserved allowance"
+    );
+}
+
+#[tokio::test]
+async fn no_catalog_uses_agent_budget() {
+    let (compactor, seen) = CapturingCompactor::new(CompactorBehaviour::Copy);
+    let assembler = default_assembler(compactor);
+    let subject = agent(config_with_budget(777));
+
+    assembler
+        .assemble(
+            &subject,
+            &capabilities(None),
+            vec![message("user", "hi")],
+            "current-model".to_string(),
+        )
+        .await
+        .expect("assembly succeeds");
+
+    let requests = seen.lock().expect("capture lock");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].budget_tokens, 777,
+        "no catalog entry means the agent's own budget applies"
+    );
+}
+
+#[tokio::test]
+async fn no_budget_at_all_means_no_compaction() {
+    let (compactor, seen) = CapturingCompactor::new(CompactorBehaviour::Fail("should not be used"));
+    let assembler = default_assembler(compactor);
+    let subject = agent(config_with_budget(0));
+    let history = long_history();
+    let expected = history.clone();
+
+    let assembled = assembler
+        .assemble(
+            &subject,
+            &capabilities(None),
+            history,
+            "current-model".to_string(),
+        )
+        .await
+        .expect("no budget is not an error");
+
+    assert!(
+        seen.lock().expect("capture lock").is_empty(),
+        "with no budget at all the compactor is not consulted"
+    );
+    assert_eq!(pairs(&assembled.context.history), pairs(&expected));
+    assert_eq!(assembled.context.memory, None);
+    assert_eq!(assembled.model, "current-model");
+}
+
+#[tokio::test]
+async fn compaction_keeps_instruction_sections_byte_for_byte() {
+    let dir = TempDir::new().unwrap();
+    let context_file = dir.path().join("context.md");
+    std::fs::write(&context_file, "RAG policy: cite every source.").expect("write context file");
+    let skill_dir = dir.path().join("skills").join("demo-skill");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: Demo\ndescription: A demo skill\n---\n\nSkill body line.\n",
+    )
+    .expect("write skill");
+    let skills = Arc::new(SkillManager::with_paths(vec![dir.path().join("skills")]));
+    skills.scan_and_load();
+    let enricher = test_enricher(skills);
+
+    let subject = agent(AgentConfig {
+        rules: vec!["Regla A".to_string(), "Regla B".to_string()],
+        skills: vec!["demo-skill".to_string()],
+        rag_sources: vec!["knowledge-base".to_string()],
+        context_files: vec![context_file.to_string_lossy().into_owned()],
+        // A tight budget forces all four old turns into the summary while the
+        // instruction sections still fit well within the enricher's pruner.
+        ..config_with_budget(1_500)
+    });
+    let history = long_history();
+    let newest = history[4..].to_vec();
+
+    let plain = assembler_with(enricher.clone(), Arc::new(NoopCompactor))
+        .assemble(
+            &subject,
+            &capabilities(Some(1_500)),
+            history.clone(),
+            "current-model".into(),
+        )
+        .await
+        .expect("plain assembly");
+    let summarizer = Arc::new(FakeSummarizer::ok("Old turns discussed refunds."));
+    let compacted = assembler_with(
+        enricher,
+        Arc::new(SummarizingCompactor::new(summarizer.clone())),
+    )
+    .assemble(
+        &subject,
+        &capabilities(Some(1_500)),
+        history,
+        "current-model".into(),
+    )
+    .await
+    .expect("compacted assembly");
+
+    let instructions = plain.context.system_prompt.as_str();
+    assert!(
+        instructions.contains("Regla A")
+            && instructions.contains("Regla B")
+            && instructions.contains("Skill body line.")
+            && instructions.contains("RAG policy: cite every source."),
+        "every instruction section must be present: {instructions:?}"
+    );
+
+    let (before_memory, memory) = compacted
+        .context
+        .system_prompt
+        .split_once("\n## Conversation memory\n")
+        .expect("compaction injects a Conversation memory section");
+    assert_eq!(
+        before_memory, instructions,
+        "instruction sections must be byte-for-byte identical with and without compaction"
+    );
+    assert_eq!(memory, "Old turns discussed refunds.");
+    assert_eq!(compacted.context.memory.as_deref(), Some(memory));
+    assert!(
+        before_memory.contains("Regla A") && before_memory.contains("Skill body line."),
+        "memory is injected after the rules and skills, not over them"
+    );
+    assert_eq!(
+        pairs(&compacted.context.history),
+        pairs(&newest),
+        "only the oldest turns are dropped"
+    );
+    assert_eq!(
+        pairs(&plain.context.history).len(),
+        6,
+        "the plain copy is intact"
+    );
+    assert_eq!(compacted.model, "current-model");
+    assert_eq!(summarizer.captured().len(), 1);
+}
+
+#[tokio::test]
+async fn assembler_failure_falls_back_to_original_prompt() {
+    let (compactor, seen) = CapturingCompactor::new(CompactorBehaviour::Fail("compactor exploded"));
+    let assembler = default_assembler(compactor);
+    let subject = agent(AgentConfig {
+        rules: vec!["Keep this rule".to_string()],
+        ..config_with_budget(4_096)
+    });
+    let expected_prompt = {
+        let plain = default_assembler(Arc::new(NoopCompactor))
+            .assemble(
+                &subject,
+                &capabilities(Some(4_096)),
+                Vec::new(),
+                "current-model".into(),
+            )
+            .await
+            .expect("plain assembly");
+        plain.context.system_prompt
+    };
+    let history = long_history();
+    let expected = history.clone();
+
+    let assembled = assembler
+        .assemble(
+            &subject,
+            &capabilities(Some(4_096)),
+            history,
+            "current-model".to_string(),
+        )
+        .await
+        .expect("a compactor error must not fail a chat");
+
+    assert_eq!(seen.lock().expect("capture lock").len(), 1);
+    assert_eq!(assembled.context.system_prompt, expected_prompt);
+    assert_eq!(pairs(&assembled.context.history), pairs(&expected));
+    assert_eq!(assembled.context.memory, None);
+    assert_eq!(assembled.model, "current-model");
 }

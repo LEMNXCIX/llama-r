@@ -6,11 +6,13 @@ use crate::domain::models::ChatMessage;
 use crate::domain::scope::AgentScope;
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
+use crate::ports::compaction::ContextCompactor;
 use crate::ports::delegation::{DelegationContext, ToolBudget};
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, ToolEvent};
 use crate::ports::history::ConversationStore;
 use crate::ports::rag::RagStore;
 use crate::services::agent_registry::AgentRegistry;
+use crate::services::context_assembler::ContextAssembler;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -30,6 +32,10 @@ pub struct AgentRuntime {
     /// differently depending on which client asked, and a rule typed into the form
     /// simply never arrived.
     pub enricher: Arc<ContextEnricher>,
+    /// Budget-aware compaction strategy, carried as a companion from boot and a
+    /// settings Apply. The runtime pairs it with `enricher` to assemble one
+    /// `ActiveContext` per turn; `NoopCompactor` is the default.
+    pub compactor: Arc<dyn ContextCompactor>,
 }
 
 pub struct RuntimeChatRequest {
@@ -103,20 +109,7 @@ impl AgentRuntime {
         let scope: AgentScope = registered.scope.clone();
         let agent = registered.agent.clone();
 
-        let system_prompt = match req.system_prompt {
-            Some(prompt) => prompt,
-            None => self.enricher.build_system_prompt(&agent).await,
-        };
-        // Applied here rather than by the caller, so every client that reaches an
-        // engine gets the same prompt. `chat_core` used to do this itself and the
-        // TUI did not, which meant the agent's configured optimizations applied to
-        // HTTP requests and to nothing else — the same shape of disagreement as the
-        // system prompt had.
-        let optimizer = TokenOptimizer::new(agent.config.optimize.clone());
-        let system_prompt = optimizer.optimize(&system_prompt);
-        let user_message = optimizer.optimize(&req.user_message);
-
-        let model = req.model_override.unwrap_or_else(|| {
+        let current_model = req.model_override.unwrap_or_else(|| {
             if agent.config.model.is_empty() {
                 req.default_model.clone()
             } else {
@@ -124,21 +117,44 @@ impl AgentRuntime {
             }
         });
 
-        // Resolve the provider/capabilities for this agent from the same source
-        // the system prompt used. `model_override` above keeps its precedence:
-        // the resolved model id is transport metadata here, not the name the
-        // engine will actually ask for.
+        // Resolve capabilities from the same source the enricher uses. The
+        // resolved model id is transport metadata here, not the name the engine
+        // will actually ask for — that one comes back from the assembler.
         let resolved = self.enricher.resolve(&agent);
+
+        // One active context per turn: instructions (from the enricher, or the
+        // prompt the caller already measured), an optional memory section, and
+        // history compacted against the smaller of the catalog's and the
+        // agent's context windows.
+        let assembler = ContextAssembler::new(self.enricher.clone(), self.compactor.clone());
+        let assembled = assembler
+            .assemble_with_instructions(
+                &agent,
+                &resolved.capabilities,
+                req.history,
+                current_model,
+                req.system_prompt,
+            )
+            .await?;
+
+        // Applied here rather than by the caller, so every client that reaches an
+        // engine gets the same prompt. `chat_core` used to do this itself and the
+        // TUI did not, which meant the agent's configured optimizations applied to
+        // HTTP requests and to nothing else — the same shape of disagreement as the
+        // system prompt had.
+        let optimizer = TokenOptimizer::new(agent.config.optimize.clone());
+        let system_prompt = optimizer.optimize(&assembled.context.system_prompt);
+        let user_message = optimizer.optimize(&req.user_message);
 
         Ok(AgentRunRequest {
             agent,
             scope,
-            model,
+            model: assembled.model,
             provider: resolved.provider,
             capabilities: resolved.capabilities,
             system_prompt,
             user_message,
-            history: req.history,
+            history: assembled.context.history,
             conversation_id: req.conversation_id,
             execution_id: req.execution_id,
             shared_budget: req.shared_budget,

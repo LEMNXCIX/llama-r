@@ -1,4 +1,5 @@
 use crate::adapters::auto::RouterAutoDecider;
+use crate::adapters::context::NoopCompactor;
 use crate::adapters::execution::NoOpExecutionStore;
 use crate::adapters::mcp::{McpServerConfig, StaticMcpRegistry};
 use crate::adapters::rag::{
@@ -34,6 +35,7 @@ use crate::domain::execution::ExecutionStatus;
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::auto::AutoDecider;
+use crate::ports::compaction::ContextCompactor;
 use crate::ports::delegation::Delegator;
 #[cfg(feature = "rig-engine")]
 use crate::ports::engine::AgentEngine;
@@ -245,6 +247,12 @@ pub fn build_app_state_with_gate(
     // every `Auto` tool keeps asking a human.
     let auto_decider = build_auto_decider(&router_config, stack.router.as_ref());
 
+    // Compaction is transparent by default: without a usable summarizer there
+    // is no summary to inject, and an unknown context window already means no
+    // compaction. Stored on AppState so a settings Apply builds the engine from
+    // the same handle, exactly like the gate and the auto decider.
+    let compactor: Arc<dyn ContextCompactor> = Arc::new(NoopCompactor);
+
     let state = Arc::new(AppState {
         services: Arc::new(TokioRwLock::new(Arc::new(stack))),
         agent_registry: agent_registry.clone(),
@@ -263,6 +271,7 @@ pub fn build_app_state_with_gate(
         router_healthy: AtomicBool::new(false),
         approval_gate,
         auto_decider,
+        compactor,
         execution_store,
         delegator: OnceLock::new(),
     });
@@ -1301,6 +1310,9 @@ pub struct CompanionHandles {
     /// settings Apply just like the gate, so an engine rebuild keeps the same
     /// `Auto` behaviour (and survives Apply).
     pub auto_decider: Option<Arc<dyn AutoDecider>>,
+    /// The context-compaction strategy, read from `AppState` on a settings Apply
+    /// so an engine rebuild keeps the same assembler inputs.
+    pub compactor: Arc<dyn ContextCompactor>,
     /// The app-wide counters, read from `AppState` on a settings Apply like the
     /// gate and decider, so an engine rebuild keeps accumulating into the same
     /// observability snapshot.
@@ -1324,6 +1336,7 @@ impl CompanionHandles {
             history_store: state.history_store.clone(),
             approval_gate: state.approval_gate.clone(),
             auto_decider: state.auto_decider.clone(),
+            compactor: state.compactor.clone(),
             observability: state.observability.clone(),
             execution_store: state.execution_store.clone(),
             delegator: state.delegator(),
@@ -1390,6 +1403,9 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
                     config.provider,
                     stack.embeddings.clone(),
                 ),
+                // Default NoopCompactor, shared by boot and Apply through
+                // AppState so a provider swap cannot drop the strategy.
+                compactor: handles.compactor.clone(),
             })
         })
     };
