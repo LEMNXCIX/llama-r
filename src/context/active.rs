@@ -2,8 +2,10 @@
 //!
 //! `ActiveContext` is assembled once per turn. Its instruction sections
 //! (system prompt, rules, skills, project context and RAG configuration) are
-//! built by `ContextEnricher` and are never handed to a compactor: only
-//! `history` may be compacted. A compactor's summary arrives as `memory` and is
+//! built by `ContextEnricher`. The compactor sees them only as context for its
+//! budget math and cannot change them — `CompactResult` has no prompt field, so
+//! only `history` may be compacted and the assembler re-injects the instructions
+//! verbatim. A compactor's summary arrives as `memory` and is
 //! rendered into the prompt by the assembler *after* the instructions, so the
 //! instruction bytes are identical whether or not compaction happened.
 
