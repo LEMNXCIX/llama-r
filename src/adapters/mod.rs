@@ -3,6 +3,7 @@
 //! Keep external-system details here so the core stays free of app-specific code.
 
 pub mod auto;
+pub mod context;
 pub mod execution;
 pub mod history;
 pub mod mcp;
