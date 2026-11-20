@@ -232,6 +232,7 @@ async fn execute_agent_case(case: &EvalCase) -> Result<Execution, String> {
             execution_id: Uuid::new_v4(),
             shared_budget: None,
             delegation_context: None,
+            approval_event_tx: None,
         })
         .await
         .map_err(|err| format!("case '{}': {err}", case.id))?;

@@ -207,6 +207,8 @@ async fn approval_required_event_maps_to_sse_without_breaking_other_events() {
         id,
         tool_name: "db__drop_table".to_string(),
         args: args.clone(),
+        task_id: None,
+        depth: None,
     })
     .await
     .unwrap();
@@ -1031,6 +1033,7 @@ fn e2e_request() -> AgentRunRequest {
         execution_id: Uuid::new_v4(),
         shared_budget: None,
         delegation_context: None,
+        approval_event_tx: None,
     }
 }
 

@@ -11,6 +11,7 @@ use crate::ports::engine::AgentRunEvent;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Instant;
+use uuid::Uuid;
 
 /// The recursion bounds a turn carries through a delegation tree.
 ///
@@ -24,6 +25,13 @@ pub struct DelegationContext {
     pub chain: Vec<String>,
     pub depth: u32,
     pub effective_max_depth: u32,
+    /// Execution id of the turn that delegated this one. `None` at the root,
+    /// where there is no parent. Feeds the child's `TraceRecorded` payload so
+    /// the tree can be reconstructed from the execution log alone.
+    pub parent_execution_id: Option<Uuid>,
+    /// Execution id of the root turn of the whole tree. `None` until the first
+    /// delegation; the root's own trace uses its own id (see `trace_payload_for`).
+    pub root_execution_id: Option<Uuid>,
 }
 
 impl DelegationContext {
@@ -35,6 +43,8 @@ impl DelegationContext {
             chain: Vec::new(),
             depth: 0,
             effective_max_depth: policy.effective_max_depth(),
+            parent_execution_id: None,
+            root_execution_id: None,
         })
     }
 }
@@ -88,7 +98,16 @@ pub struct DelegateRequest {
     pub effective_max_depth: u32,
     pub deadline: Instant,
     pub budget: Arc<dyn ToolBudget>,
+    /// Carries the child's `ApprovalRequired` events to the root's SSE. Built
+    /// by the delegate tool from its own `LocalToolDeps.event_tx`. `None` on a
+    /// non-streaming path, where the pending is discoverable via the gate.
     pub event_tx: Option<EventForwarder>,
+    /// Execution id of the turn asking for this delegation. The child's trace
+    /// uses it as `parent_execution_id`.
+    pub parent_execution_id: Uuid,
+    /// Execution id of the root of the delegation tree. The child's trace uses
+    /// it as `root_execution_id`.
+    pub root_execution_id: Uuid,
 }
 
 #[derive(Debug, Clone)]

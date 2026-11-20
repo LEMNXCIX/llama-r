@@ -574,3 +574,115 @@ async fn a_failing_store_does_not_fail_the_chat() {
         "the terminal event and the trace were both attempted"
     );
 }
+
+// ── Task 5: hierarchical traces ─────────────────────────────────────────────
+
+use llama_r::api::chat_core::trace_payload_for;
+use llama_r::ports::delegation::DelegationContext;
+
+fn trace_context(
+    chain: Vec<String>,
+    depth: u32,
+    parent: Option<Uuid>,
+    root: Option<Uuid>,
+) -> DelegationContext {
+    DelegationContext {
+        chain,
+        depth,
+        effective_max_depth: 2,
+        parent_execution_id: parent,
+        root_execution_id: root,
+    }
+}
+
+#[test]
+fn hierarchical_trace_fields_reconstruct_a_two_level_tree() {
+    let root = sample_execution();
+    let child = sample_execution();
+    let grandchild = sample_execution();
+
+    // Root: no parent, its own root, depth 0.
+    let root_ctx = trace_context(Vec::new(), 0, None, None);
+    let root_payload = trace_payload_for(&root, None, 1, Some(&root_ctx));
+    assert!(root_payload["parent_execution_id"].is_null());
+    assert_eq!(root_payload["root_execution_id"], root.id.to_string());
+    assert_eq!(root_payload["depth"], 0);
+
+    // Child of the root.
+    let child_ctx = trace_context(
+        vec![root.agent_qualified_id.clone()],
+        1,
+        Some(root.id),
+        Some(root.id),
+    );
+    let child_payload = trace_payload_for(&child, None, 2, Some(&child_ctx));
+    assert_eq!(child_payload["parent_execution_id"], root.id.to_string());
+    assert_eq!(child_payload["root_execution_id"], root.id.to_string());
+    assert_eq!(child_payload["depth"], 1);
+
+    // Grandchild: parent is the child, root is still the root.
+    let grandchild_ctx = trace_context(
+        vec![
+            root.agent_qualified_id.clone(),
+            child.agent_qualified_id.clone(),
+        ],
+        2,
+        Some(child.id),
+        Some(root.id),
+    );
+    let grandchild_payload = trace_payload_for(&grandchild, None, 3, Some(&grandchild_ctx));
+    assert_eq!(
+        grandchild_payload["parent_execution_id"],
+        child.id.to_string()
+    );
+    assert_eq!(grandchild_payload["root_execution_id"], root.id.to_string());
+    assert_eq!(grandchild_payload["depth"], 2);
+
+    // The whole tree is reconstructable from the three payloads alone.
+    let by_id: HashMap<String, &Value> = [&root_payload, &child_payload, &grandchild_payload]
+        .into_iter()
+        .map(|p| (p["trace_id"].as_str().unwrap().to_string(), p))
+        .collect();
+    assert_eq!(by_id.len(), 3);
+    let gc = &by_id[&grandchild.id.to_string()];
+    let parent = &by_id[gc["parent_execution_id"].as_str().unwrap()];
+    let root_of_gc = &by_id[gc["root_execution_id"].as_str().unwrap()];
+    assert_eq!(parent["trace_id"], child.id.to_string());
+    assert_eq!(root_of_gc["trace_id"], root.id.to_string());
+    assert_eq!(parent["depth"], 1);
+    assert_eq!(root_of_gc["depth"], 0);
+}
+
+#[tokio::test]
+async fn hierarchical_trace_payload_is_redacted_before_reaching_the_store() {
+    let store = Arc::new(FakeStore::default());
+    let child = sample_execution();
+    let ctx = trace_context(
+        vec!["root".into()],
+        1,
+        Some(Uuid::new_v4()),
+        Some(Uuid::new_v4()),
+    );
+    let mut payload = trace_payload_for(&child, None, 5, Some(&ctx));
+    // A secret smuggled into the payload must not survive persistence, while
+    // the hierarchy counters (plain scalars) are kept.
+    payload["api_key"] = json!("sk-SHOULD-NOT-PERSIST");
+    payload["depth"] = json!(1);
+
+    record_trace(store.as_ref(), &child, &payload).await;
+
+    let events = store.get_events(child.id).await.unwrap();
+    let trace = only_trace(&events);
+    assert_eq!(trace.payload["api_key"], "[REDACTED]");
+    assert_eq!(trace.payload["depth"], 1);
+    assert_eq!(
+        trace.payload["parent_execution_id"],
+        ctx.parent_execution_id.unwrap().to_string()
+    );
+    assert_eq!(
+        trace.payload["root_execution_id"],
+        ctx.root_execution_id.unwrap().to_string()
+    );
+    let serialized = serde_json::to_string(&trace.payload).unwrap();
+    assert!(!serialized.contains("sk-SHOULD-NOT-PERSIST"));
+}

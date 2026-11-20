@@ -68,6 +68,11 @@ pub struct AgentRunRequest {
     /// `None` for an ordinary root turn, where the engine derives the bounds
     /// from the resolved agent's own manifest. Additive, like `shared_budget`.
     pub delegation_context: Option<DelegationContext>,
+    /// Event channel for a child turn whose approvals must be forwarded to the
+    /// root's SSE. `delegate_turn` creates it and drives a forwarder task; the
+    /// non-streaming `run_inner` wires it into `LocalToolDeps.event_tx` so a
+    /// child tool's `ApprovalRequired` is not lost. `None` on ordinary turns.
+    pub approval_event_tx: Option<tokio::sync::mpsc::Sender<AgentRunEvent>>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +113,13 @@ pub enum AgentRunEvent {
         id: Uuid,
         tool_name: String,
         args: Value,
+        /// Present on a child turn's approval re-emitted into the root's SSE:
+        /// the effective task id from the `DelegateRequest`. `None` for a
+        /// normal (non-delegated) approval.
+        task_id: Option<String>,
+        /// Present on a forwarded child approval: the delegation depth. `None`
+        /// for a normal approval.
+        depth: Option<u32>,
     },
 }
 

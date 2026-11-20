@@ -646,6 +646,7 @@ impl TuiApp {
                             execution_id: uuid::Uuid::new_v4(),
                             shared_budget: None,
                             delegation_context: None,
+                            approval_event_tx: None,
                         })
                         .await
                         .map_err(|e| e.to_string())

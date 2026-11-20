@@ -264,7 +264,9 @@ mod bridge {
     use crate::api::observability::AppObservability;
     use crate::domain::scope::AgentScope;
     use crate::ports::auto::AutoDecider;
-    use crate::ports::delegation::{DelegateRequest, DelegationContext, Delegator, ToolBudget};
+    use crate::ports::delegation::{
+        ChildEvent, DelegateRequest, DelegationContext, Delegator, EventForwarder, ToolBudget,
+    };
     use crate::ports::engine::AgentRunEvent;
     use crate::ports::rag::RagStore;
     use crate::services::approval::ApprovalGate;
@@ -273,6 +275,7 @@ mod bridge {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
+    use uuid::Uuid;
 
     /// Upper bound — and the default — for `rag_query`'s `top_k`. The model must
     /// not be able to ask for an unbounded slice of the knowledge base through
@@ -453,9 +456,13 @@ mod bridge {
         /// chosen id against the same allowlist, so a non-allowed id is a named
         /// error rather than a silent fallback.
         ///
-        /// Child-event forwarding is deliberately `None` here: the `EventForwarder`
-        /// that enriches approval payloads with `task_id`/`depth` is wired in a
-        /// later slice. The child still answers and returns its effective task id.
+        /// Delegate one child turn. When this run has an SSE channel (a streaming
+        /// parent), build an `EventForwarder` from it so any approval the child
+        /// raises is re-emitted into the parent's stream with `task_id`/`depth`
+        /// attached. Without a channel the pending stays in the shared gate and
+        /// is discoverable through `GET /api/approvals`. The child's trace ids
+        /// come from this turn's `OperationContext` (parent) and the delegation
+        /// context (root), never from a separate source of truth.
         async fn exec_delegate(&self, args: &Value) -> Result<String, String> {
             let tool_id = &self.tool.id;
             let message = args
@@ -508,6 +515,42 @@ mod bridge {
             let mut chain = context.chain.clone();
             chain.push(bounds.caller_qualified_id.clone());
 
+            // The parent's streaming SSE sender lives on `LocalToolDeps`. When
+            // present, capture it in a forwarder: a child `ApprovalRequired`
+            // event is re-emitted with the child's task id and depth so the
+            // human knows where in the tree the request originated. `try_send`
+            // keeps the synchronous `Fn(ChildEvent)` contract; a full channel
+            // is a dropped notification, never a failed tool call.
+            let event_tx: Option<EventForwarder> = self.deps.event_tx.as_ref().map(|parent_tx| {
+                let parent_tx = parent_tx.clone();
+                Arc::new(move |child: ChildEvent| {
+                    if let AgentRunEvent::ApprovalRequired {
+                        id,
+                        tool_name,
+                        args,
+                        ..
+                    } = child.event
+                    {
+                        let _ = parent_tx.try_send(AgentRunEvent::ApprovalRequired {
+                            id,
+                            tool_name,
+                            args,
+                            task_id: Some(child.task_id),
+                            depth: Some(child.depth),
+                        });
+                    }
+                }) as EventForwarder
+            });
+
+            // This turn's execution is the child's parent; the tree's root is
+            // already on the context (or is this turn when we are the root).
+            let execution_id = self
+                .operations
+                .as_ref()
+                .map(|ctx| ctx.execution_id)
+                .unwrap_or_else(Uuid::nil);
+            let root_execution_id = context.root_execution_id.unwrap_or(execution_id);
+
             let request = DelegateRequest {
                 agent_id: target,
                 caller_agent_id: self.scope.agent_id.clone(),
@@ -527,7 +570,9 @@ mod bridge {
                             .max(1),
                     ),
                 budget: self.budget.clone(),
-                event_tx: None,
+                event_tx,
+                parent_execution_id: execution_id,
+                root_execution_id,
             };
 
             let result = delegator.delegate(request).await?;

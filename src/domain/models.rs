@@ -160,6 +160,14 @@ pub struct ApprovalInfo {
     pub id: String,
     pub tool_name: String,
     pub args_hash: String,
+    /// Delegation task id, present only when the approval came from a child
+    /// turn. Additive and skipped when absent so ordinary SSE clients see an
+    /// unchanged payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Delegation depth, present only when the approval came from a child turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]

@@ -83,6 +83,8 @@ fn request_with(
         deadline: Instant::now() + std::time::Duration::from_secs(30),
         budget: budget(),
         event_tx: None,
+        parent_execution_id: Uuid::nil(),
+        root_execution_id: Uuid::nil(),
     }
 }
 
@@ -1040,6 +1042,8 @@ fn root_context(max_depth: u32) -> DelegationContext {
         chain: Vec::new(),
         depth: 0,
         effective_max_depth: max_depth,
+        parent_execution_id: None,
+        root_execution_id: None,
     }
 }
 
@@ -1214,4 +1218,340 @@ async fn cycle_back_to_the_coordinator_is_rejected_at_level_two() {
         "error names the cycle id: {err}"
     );
     assert_eq!(runs.0.lock().unwrap().len(), 1, "no third turn ran");
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: child approvals reach the root SSE; tree hierarchy is threaded.
+// ---------------------------------------------------------------------------
+
+use llama_r::api::chat_core::engine_events_to_chat_stream;
+use llama_r::ports::delegation::{ChildEvent, DelegateResult, EventForwarder};
+use llama_r::services::approval::args_hash;
+use tokio_stream::StreamExt;
+
+/// A delegator that fires a synthetic child `ApprovalRequired` into the
+/// request's forwarder before returning. Stands in for a real child turn whose
+/// tool hit an approval rule deep in its own Rig loop.
+struct FiringDelegator {
+    /// When set, registers a real pending in the gate with no SSE channel
+    /// (the non-streaming child path) instead of firing a child event.
+    poll_gate: Option<Arc<ApprovalGate>>,
+}
+
+#[async_trait]
+impl Delegator for FiringDelegator {
+    async fn delegate(&self, req: DelegateRequest) -> Result<DelegateResult, String> {
+        if let Some(gate) = &self.poll_gate {
+            // A non-streaming child has no event channel: the approval is only
+            // discoverable through the gate's list (GET /api/approvals).
+            let args = serde_json::json!({"query": "drop table users", "api_key": "SECRET"});
+            let _rx = gate.request_for(Some(req.parent_execution_id), "child__danger", &args);
+        } else {
+            let forwarder: EventForwarder = req
+                .event_tx
+                .clone()
+                .expect("a streaming child carries a forwarder");
+            let id = Uuid::new_v4();
+            forwarder(ChildEvent {
+                event: AgentRunEvent::ApprovalRequired {
+                    id,
+                    tool_name: "child__danger".into(),
+                    args: serde_json::json!({"query": "delete all"}),
+                    task_id: None,
+                    depth: None,
+                },
+                task_id: req.task_id.clone().unwrap_or_else(|| "task-42".into()),
+                depth: req.depth,
+                agent_qualified_id: "proj/child".into(),
+            });
+        }
+        Ok(DelegateResult {
+            answer: "ok".into(),
+            task_id: req.task_id.unwrap_or_else(|| "task-42".into()),
+        })
+    }
+}
+
+/// A delegate bridge with a caller-supplied delegator and an optional SSE
+/// sender (the parent's stream). Mirrors `delegate_bridge` but lets the test
+/// observe child events and the pending gate directly.
+fn delegate_bridge_observing(
+    state: &Arc<AppState>,
+    registry: &Arc<AgentRegistry>,
+    caller_id: &str,
+    context: DelegationContext,
+    delegator: Arc<dyn Delegator>,
+    event_tx: Option<tokio::sync::mpsc::Sender<AgentRunEvent>>,
+) -> LocalToolBridge {
+    let caller = registry
+        .get_project_agent("proj", caller_id)
+        .unwrap_or_else(|| panic!("caller {caller_id} must be registered in proj"));
+    let bounds = DelegateBounds::for_agent(&caller).expect("caller has a [subagents] policy");
+    let deps = LocalToolDeps {
+        skill_manager: Arc::new(SkillManager::new()),
+        rag: None,
+        gate: state.approval_gate.clone(),
+        auto_decider: None,
+        observability: None,
+        delegator: Some(delegator),
+        delegate_bounds: Some(bounds),
+        delegation_context: Some(context),
+        event_tx,
+        operations: OperationContext::disabled(),
+    };
+    let tool = LocalToolRegistry::builtins()
+        .tools()
+        .iter()
+        .find(|t| t.id == BUILTIN_DELEGATE_ID)
+        .unwrap()
+        .clone();
+    let mut scoped = scope(caller_id, Some("proj"));
+    scoped.local_tools_allow = ToolsAllow::AllFromSources;
+    LocalToolBridge::new(
+        tool,
+        scoped,
+        Arc::new(Mutex::new(ToolCallBudget::new(8))),
+        deps,
+    )
+}
+
+#[tokio::test]
+async fn child_approval_reaches_parent_sse_with_task_id_and_depth() {
+    let registry = Arc::new(AgentRegistry::new());
+    register_real(&registry, parent_with(&["child"], AgentConfig::default()));
+    register_real(&registry, agent("child", Some("proj"), None));
+    let state = test_state(
+        registry.clone(),
+        Arc::new(RecordingEngine {
+            runs: RecordedRuns::default(),
+            answer: "unused".into(),
+            fail_on: None,
+            spend_budget: false,
+        }),
+        Arc::new(FakeProvider { fail: false }),
+    );
+
+    // The parent's SSE channel: the root stream reads this receiver.
+    let (parent_tx, parent_rx) = tokio::sync::mpsc::channel(32);
+    let bridge = delegate_bridge_observing(
+        &state,
+        &registry,
+        "parent",
+        root_context(2),
+        Arc::new(FiringDelegator { poll_gate: None }),
+        Some(parent_tx),
+    );
+
+    bridge
+        .invoke_json(serde_json::json!({"message": "x", "task_id": "task-42"}))
+        .await
+        .expect("the delegate tool runs");
+
+    let mut stream = engine_events_to_chat_stream("model".into(), parent_rx);
+    let event = stream
+        .next()
+        .await
+        .expect("the child approval reaches the parent stream")
+        .expect("a valid SSE event");
+    let approval = event
+        .approval
+        .as_ref()
+        .expect("the event carries approval info");
+    assert_eq!(approval.task_id.as_deref(), Some("task-42"));
+    assert_eq!(approval.depth, Some(1));
+    // The approval id remains the global UUID; it is not prefixed with the task.
+    assert_eq!(approval.id.len(), 36, "approval id is a bare UUID");
+}
+
+#[tokio::test]
+async fn child_approval_is_pollable_without_stream() {
+    let registry = Arc::new(AgentRegistry::new());
+    register_real(&registry, parent_with(&["child"], AgentConfig::default()));
+    register_real(&registry, agent("child", Some("proj"), None));
+    let gate = Arc::new(ApprovalGate::default());
+    let state = test_state(
+        registry.clone(),
+        Arc::new(RecordingEngine {
+            runs: RecordedRuns::default(),
+            answer: "unused".into(),
+            fail_on: None,
+            spend_budget: false,
+        }),
+        Arc::new(FakeProvider { fail: false }),
+    );
+
+    // No SSE sender: a non-streaming child has no channel to emit into.
+    let bridge = delegate_bridge_observing(
+        &state,
+        &registry,
+        "parent",
+        root_context(2),
+        Arc::new(FiringDelegator {
+            poll_gate: Some(gate.clone()),
+        }),
+        None,
+    );
+    bridge
+        .invoke_json(serde_json::json!({"message": "x", "task_id": "task-poll"}))
+        .await
+        .expect("the delegate tool runs");
+
+    // GET /api/approvals lists exactly this pending, with secrets redacted.
+    let pending = gate.list_pending();
+    assert_eq!(pending.len(), 1, "one discoverable pending approval");
+    let view = &pending[0];
+    assert_eq!(view.tool_name, "child__danger");
+    let redacted = llama_r::services::redaction::redact_secrets(&view.args);
+    assert_eq!(redacted["api_key"], "[REDACTED]");
+    // A decision with the stored hash unblocks the waiting child call.
+    gate.decide(view.id, true, args_hash(&view.args))
+        .expect("a poll-path decision is accepted");
+}
+
+#[tokio::test]
+async fn delegate_turn_threads_parent_and_root_ids_into_the_child_context() {
+    let registry = Arc::new(AgentRegistry::new());
+    register_real(&registry, parent_with(&["child"], AgentConfig::default()));
+    register_real(&registry, agent("child", Some("proj"), None));
+    let runs = RecordedRuns::default();
+    let state = test_state(
+        registry.clone(),
+        Arc::new(RecordingEngine {
+            runs: runs.clone(),
+            answer: "ok".into(),
+            fail_on: None,
+            spend_budget: false,
+        }),
+        Arc::new(FakeProvider { fail: false }),
+    );
+
+    let root_id = Uuid::new_v4();
+    let parent_id = Uuid::new_v4();
+    let child_context = DelegationContext {
+        chain: vec!["proj/parent".into()],
+        depth: 1,
+        effective_max_depth: 2,
+        parent_execution_id: Some(parent_id),
+        root_execution_id: Some(root_id),
+    };
+    let mut req = request_child("level-1");
+    req.parent_execution_id = parent_id;
+    req.root_execution_id = root_id;
+    let child_agent = registry.get_project_agent("proj", "child").unwrap();
+
+    llama_r::api::chat_core::delegate_turn(&state, req, child_agent, child_context)
+        .await
+        .expect("the child turn runs");
+
+    let guard = runs.0.lock().unwrap();
+    let seen = guard[0]
+        .delegation_context
+        .as_ref()
+        .expect("the engine sees the child context");
+    assert_eq!(seen.depth, 1);
+    assert_eq!(seen.parent_execution_id, Some(parent_id));
+    assert_eq!(seen.root_execution_id, Some(root_id));
+}
+
+/// An engine that emits an `ApprovalRequired` into the child turn's forwarded
+/// event channel. Lets a test verify `delegate_turn` really drives the forwarder
+/// it was handed, not just that the tool builds one.
+struct ApprovalEmittingEngine;
+
+#[async_trait]
+impl AgentEngine for ApprovalEmittingEngine {
+    async fn run(
+        &self,
+        req: llama_r::ports::engine::AgentRunRequest,
+    ) -> Result<AgentRunResult, String> {
+        if let Some(tx) = &req.approval_event_tx {
+            let _ = tx
+                .send(AgentRunEvent::ApprovalRequired {
+                    id: Uuid::new_v4(),
+                    tool_name: "child__danger".into(),
+                    args: serde_json::json!({"query": "delete all"}),
+                    task_id: None,
+                    depth: None,
+                })
+                .await;
+        }
+        Ok(AgentRunResult {
+            text: "ok".into(),
+            tool_calls: 0,
+            iterations: 1,
+            model: req.model,
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        req: llama_r::ports::engine::AgentRunRequest,
+    ) -> Result<tokio::sync::mpsc::Receiver<AgentRunEvent>, String> {
+        let result = self.run(req).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let _ = tx.send(AgentRunEvent::Completed { result }).await;
+        Ok(rx)
+    }
+}
+
+#[tokio::test]
+async fn delegate_turn_drives_the_parent_forwarder_with_task_id_and_depth() {
+    let registry = Arc::new(AgentRegistry::new());
+    register_real(&registry, parent_with(&["child"], AgentConfig::default()));
+    register_real(&registry, agent("child", Some("proj"), None));
+    let state = test_state(
+        registry.clone(),
+        Arc::new(ApprovalEmittingEngine),
+        Arc::new(FakeProvider { fail: false }),
+    );
+
+    let (parent_tx, mut parent_rx) = tokio::sync::mpsc::channel(32);
+    let forwarder: EventForwarder = Arc::new(move |child: ChildEvent| {
+        if let AgentRunEvent::ApprovalRequired {
+            id,
+            tool_name,
+            args,
+            ..
+        } = child.event
+        {
+            let _ = parent_tx.try_send(AgentRunEvent::ApprovalRequired {
+                id,
+                tool_name,
+                args,
+                task_id: Some(child.task_id),
+                depth: Some(child.depth),
+            });
+        }
+    });
+
+    let root_id = Uuid::new_v4();
+    let parent_id = Uuid::new_v4();
+    let child_context = DelegationContext {
+        chain: vec!["proj/parent".into()],
+        depth: 2,
+        effective_max_depth: 2,
+        parent_execution_id: Some(parent_id),
+        root_execution_id: Some(root_id),
+    };
+    let mut req = request_child("level-2-task");
+    req.event_tx = Some(forwarder);
+    req.parent_execution_id = parent_id;
+    req.root_execution_id = root_id;
+    let child_agent = registry.get_project_agent("proj", "child").unwrap();
+
+    llama_r::api::chat_core::delegate_turn(&state, req, child_agent, child_context)
+        .await
+        .expect("the child turn runs");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), parent_rx.recv())
+        .await
+        .expect("the forwarded approval arrives")
+        .expect("a forwarded event");
+    match event {
+        AgentRunEvent::ApprovalRequired { task_id, depth, .. } => {
+            assert_eq!(task_id.as_deref(), Some("task-42"));
+            assert_eq!(depth, Some(2));
+        }
+        other => panic!("expected a forwarded approval, got {other:?}"),
+    }
 }

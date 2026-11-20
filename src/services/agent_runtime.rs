@@ -54,6 +54,9 @@ pub struct RuntimeChatRequest {
     pub shared_budget: Option<Arc<dyn ToolBudget>>,
     /// The delegation bounds carried from a parent turn; `None` at the root.
     pub delegation_context: Option<DelegationContext>,
+    /// Event channel for a child turn whose approvals must be forwarded to the
+    /// root's SSE. `None` for an ordinary or streaming-root turn.
+    pub approval_event_tx: Option<tokio::sync::mpsc::Sender<crate::ports::engine::AgentRunEvent>>,
 }
 
 impl AgentRuntime {
@@ -115,6 +118,7 @@ impl AgentRuntime {
             execution_id: req.execution_id,
             shared_budget: req.shared_budget,
             delegation_context: req.delegation_context,
+            approval_event_tx: req.approval_event_tx,
         })
     }
 

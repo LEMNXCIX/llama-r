@@ -134,6 +134,8 @@ pub async fn authorize(
                     id,
                     tool_name: tool_name.to_string(),
                     args: args.clone(),
+                    task_id: None,
+                    depth: None,
                 })
                 .await
                 .map_err(|_| {

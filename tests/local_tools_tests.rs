@@ -137,6 +137,7 @@ fn request(capabilities: ModelCapabilities, model: &str, local: ToolsAllow) -> A
         execution_id: uuid::Uuid::new_v4(),
         shared_budget: None,
         delegation_context: None,
+        approval_event_tx: None,
     }
 }
 
@@ -845,6 +846,8 @@ fn root_context() -> DelegationContext {
         chain: Vec::new(),
         depth: 0,
         effective_max_depth: 2,
+        parent_execution_id: None,
+        root_execution_id: None,
     }
 }
 
@@ -1275,6 +1278,8 @@ async fn delegate_bridge_extends_the_chain_and_depth_from_its_context() {
         chain: vec!["proj/coordinator".into()],
         depth: 1,
         effective_max_depth: 3,
+        parent_execution_id: None,
+        root_execution_id: None,
     };
     let bridge = LocalToolBridge::new(
         builtin(BUILTIN_DELEGATE_ID),

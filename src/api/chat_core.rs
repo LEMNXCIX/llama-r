@@ -6,7 +6,9 @@ use crate::domain::models::{
 };
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
-use crate::ports::delegation::{DelegateRequest, DelegateResult, DelegationContext, ToolBudget};
+use crate::ports::delegation::{
+    ChildEvent, DelegateRequest, DelegateResult, DelegationContext, EventForwarder, ToolBudget,
+};
 use crate::ports::engine::AgentRunEvent;
 use crate::ports::execution::ExecutionStore;
 use crate::services::agent_runtime::RuntimeChatRequest;
@@ -121,6 +123,7 @@ async fn build_runtime_request(
     execution_id: Uuid,
     shared_budget: Option<Arc<dyn ToolBudget>>,
     delegation_context: Option<DelegationContext>,
+    approval_event_tx: Option<tokio::sync::mpsc::Sender<AgentRunEvent>>,
 ) -> Result<RuntimeChatRequest, AppError> {
     let (system, history, user_message) = split_engine_messages(&prepared.messages)?;
     Ok(RuntimeChatRequest {
@@ -135,6 +138,7 @@ async fn build_runtime_request(
         execution_id,
         shared_budget,
         delegation_context,
+        approval_event_tx,
     })
 }
 
@@ -263,9 +267,39 @@ async fn record_resume(state: &AppState, execution: &AgentExecution) {
 /// `cost_usd` comes straight from the response's `Usage` — never fabricated
 /// here; a model with no catalog price leaves it `null`.
 pub fn trace_payload(execution: &AgentExecution, usage: Option<&Usage>, latency_ms: u64) -> Value {
+    trace_payload_for(execution, usage, latency_ms, None)
+}
+
+/// Build a trace payload with the delegation-tree hierarchy attached. Public
+/// so the additive hierarchy contract can be exercised directly by tests.
+///
+/// `context` is the turn's `DelegationContext` (already threaded by the chat
+/// dispatch), never a second source of truth. A root turn passes `None` and
+/// gets `parent_execution_id: null`, `root_execution_id` = its own id and
+/// `depth: 0`; a child turn passes `Some(context)` and the three fields come
+/// from the context's parent/root ids and depth.
+pub fn trace_payload_for(
+    execution: &AgentExecution,
+    usage: Option<&Usage>,
+    latency_ms: u64,
+    context: Option<&DelegationContext>,
+) -> Value {
     let (input_tokens, output_tokens, cost_usd) = match usage {
         Some(usage) => (usage.input_tokens, usage.output_tokens, usage.cost_usd),
         None => (0, 0, None),
+    };
+    let (parent_execution_id, root_execution_id, depth) = match context {
+        Some(context) => (
+            context.parent_execution_id.map(|id| id.to_string()),
+            Some(
+                context
+                    .root_execution_id
+                    .unwrap_or(execution.id)
+                    .to_string(),
+            ),
+            context.depth,
+        ),
+        None => (None, Some(execution.id.to_string()), 0u32),
     };
     json!({
         "trace_id": execution.id,
@@ -276,6 +310,9 @@ pub fn trace_payload(execution: &AgentExecution, usage: Option<&Usage>, latency_
         "output_tokens": output_tokens,
         "cost_usd": cost_usd,
         "latency_ms": latency_ms,
+        "parent_execution_id": parent_execution_id,
+        "root_execution_id": root_execution_id,
+        "depth": depth,
     })
 }
 
@@ -301,6 +338,7 @@ async fn finish_execution(
     outcome: Result<(), String>,
     usage: Option<&Usage>,
     latency_ms: u64,
+    delegation_context: Option<&DelegationContext>,
 ) {
     let Some(execution) = execution else {
         return;
@@ -336,7 +374,7 @@ async fn finish_execution(
     record_trace(
         store,
         execution,
-        &trace_payload(execution, usage, latency_ms),
+        &trace_payload_for(execution, usage, latency_ms, delegation_context),
     )
     .await;
 }
@@ -349,6 +387,7 @@ fn finalize_stream(
     execution: Option<AgentExecution>,
     stream: AppChatStream,
     started_at: Instant,
+    delegation_context: Option<DelegationContext>,
 ) -> AppChatStream {
     if execution.is_none() {
         return stream;
@@ -386,7 +425,12 @@ fn finalize_stream(
         record_trace(
             store.as_ref(),
             &execution,
-            &trace_payload(&execution, None, started_at.elapsed().as_millis() as u64),
+            &trace_payload_for(
+                &execution,
+                None,
+                started_at.elapsed().as_millis() as u64,
+                delegation_context.as_ref(),
+            ),
         )
         .await;
     })
@@ -441,10 +485,12 @@ pub fn engine_events_to_chat_stream(
                 AgentRunEvent::Error { message } => {
                     yield Err(AppError::Runtime(message));
                 }
-                AgentRunEvent::ApprovalRequired { id, tool_name, args } => {
+                AgentRunEvent::ApprovalRequired { id, tool_name, args, task_id, depth } => {
                     // Signal the pending decision without leaking the raw
                     // arguments into the stream. The client gets the id and
-                    // the hash it must echo back with its decision.
+                    // the hash it must echo back with its decision. A child
+                    // turn's approval also carries its task id and depth so a
+                    // human can tell where in the tree the request came from.
                     yield Ok(ChatStreamEvent {
                         model: model.clone(),
                         created_at: chrono::Utc::now().to_rfc3339(),
@@ -457,6 +503,8 @@ pub fn engine_events_to_chat_stream(
                             id: id.to_string(),
                             tool_name,
                             args_hash: args_hash_hex(&args),
+                            task_id,
+                            depth,
                         }),
                     });
                 }
@@ -774,8 +822,16 @@ pub async fn execute_chat_with_id(
     selection: AgentSelection<'_>,
     resume_execution_id: Option<Uuid>,
 ) -> Result<ChatResponse, AppError> {
-    execute_chat_with_id_and_budget(state, payload, selection, resume_execution_id, None, None)
-        .await
+    execute_chat_with_id_and_budget(
+        state,
+        payload,
+        selection,
+        resume_execution_id,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 /// The delegation-aware core behind [`execute_chat_with_id`]. The extra field is
@@ -791,6 +847,7 @@ pub(crate) async fn execute_chat_with_id_and_budget(
     resume_execution_id: Option<Uuid>,
     shared_budget: Option<Arc<dyn ToolBudget>>,
     delegation_context: Option<DelegationContext>,
+    approval_event_tx: Option<tokio::sync::mpsc::Sender<AgentRunEvent>>,
 ) -> Result<ChatResponse, AppError> {
     // ONE snapshot for the whole request. Every provider-dependent field below
     // — the agent runtime, the engine's default model, the chat provider and
@@ -878,7 +935,8 @@ pub(crate) async fn execute_chat_with_id_and_budget(
                     conversation_id,
                     run_id,
                     shared_budget,
-                    delegation_context,
+                    delegation_context.clone(),
+                    approval_event_tx,
                 )
                 .await?;
                 match runtime.chat(rt_req).await {
@@ -944,6 +1002,7 @@ pub(crate) async fn execute_chat_with_id_and_budget(
             .ok()
             .and_then(|response| response.usage.as_ref()),
         started_at.elapsed().as_millis() as u64,
+        delegation_context.as_ref(),
     )
     .await;
     outcome
@@ -1041,6 +1100,9 @@ pub async fn execute_chat_stream_with_id(
                     // The root of a tree is non-streaming; a streaming turn
                     // has no parent context to carry.
                     None,
+                    // No child-event channel at the root: there is no parent
+                    // whose SSE could forward this turn's approvals.
+                    None,
                 )
                 .await?;
                 match runtime.chat_stream(rt_req).await {
@@ -1074,7 +1136,7 @@ pub async fn execute_chat_stream_with_id(
     .await;
 
     match outcome {
-        Ok(stream) => Ok(finalize_stream(state, execution, stream, started_at)),
+        Ok(stream) => Ok(finalize_stream(state, execution, stream, started_at, None)),
         Err(err) => {
             finish_execution(
                 state,
@@ -1082,6 +1144,7 @@ pub async fn execute_chat_stream_with_id(
                 Err(err.to_string()),
                 None,
                 started_at.elapsed().as_millis() as u64,
+                None,
             )
             .await;
             Err(err)
@@ -1139,6 +1202,36 @@ pub async fn delegate_turn(
         debug: false,
     };
 
+    // Enrich the child's bounds with the execution identities its trace needs.
+    // These come from the one `DelegationContext`/`DelegateRequest` already
+    // threaded through the tree, never from a second source of truth.
+    let mut child_context = child_context;
+    child_context.parent_execution_id = Some(req.parent_execution_id);
+    child_context.root_execution_id = Some(req.root_execution_id);
+
+    // A streaming parent gave us an `EventForwarder` that writes into its SSE.
+    // Drive it from a channel wired into this child's (non-streaming) tool
+    // bridges: every `ApprovalRequired` a child tool emits is re-emitted into
+    // the root's stream, tagged with the effective task id and depth. With no
+    // forwarder the pending stays discoverable through `GET /api/approvals`.
+    let approval_event_tx = req.event_tx.clone().map(|forwarder: EventForwarder| {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let forward_task_id = task_id.clone();
+        let forward_depth = child_context.depth;
+        let forward_agent = agent.qualified_id();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                forwarder(ChildEvent {
+                    event,
+                    task_id: forward_task_id.clone(),
+                    depth: forward_depth,
+                    agent_qualified_id: forward_agent.clone(),
+                });
+            }
+        });
+        tx
+    });
+
     let fut = execute_chat_with_id_and_budget(
         state,
         payload,
@@ -1146,6 +1239,7 @@ pub async fn delegate_turn(
         None,
         Some(req.budget.clone()),
         Some(child_context),
+        approval_event_tx,
     );
     match tokio::time::timeout_at(tokio::time::Instant::from_std(req.deadline), fut).await {
         Ok(Ok(response)) => Ok(DelegateResult {

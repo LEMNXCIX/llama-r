@@ -458,10 +458,12 @@ impl RigAgentEngine {
         {
             let target = self.target_for_request(&req)?;
             // The engine owns the executors' companions; each run clones them
-            // into the bridges built for that request. The non-streaming path
-            // has no SSE channel (`event_tx: None`), but the bridge still
-            // registers the pending in the shared gate; the client discovers it
-            // by polling GET /api/approvals and posts its decision there.
+            // into the bridges built for that request. A normal non-streaming
+            // run has no event channel (`approval_event_tx: None`) and the
+            // client discovers pendings by polling GET /api/approvals. A child
+            // turn carries a channel that forwards its approvals to the root's
+            // SSE; wiring it here is what keeps a delegated approval from being
+            // lost in the non-streaming child loop.
             let deps = LocalToolDeps {
                 skill_manager: self.skill_manager.clone(),
                 rag: self.rag.clone(),
@@ -479,7 +481,7 @@ impl RigAgentEngine {
                     .delegation_context
                     .clone()
                     .or_else(|| DelegationContext::root_for(&req.agent)),
-                event_tx: None,
+                event_tx: req.approval_event_tx.clone(),
                 operations: operations::OperationContext::new(
                     req.execution_id,
                     self.execution_store.clone(),

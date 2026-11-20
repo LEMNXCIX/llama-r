@@ -147,6 +147,11 @@ impl Delegator for RuntimeDelegator {
             chain: req.chain.clone(),
             depth: req.depth,
             effective_max_depth: req.effective_max_depth.min(target_limit),
+            // `delegate_turn` overwrites these with the request's ids before
+            // the child turn (and its trace) begins; seeded here so the context
+            // stays a single, complete source of tree identity.
+            parent_execution_id: Some(req.parent_execution_id),
+            root_execution_id: Some(req.root_execution_id),
         };
         let state = self.app.upgrade().ok_or_else(|| {
             "delegation unavailable: application state has already been dropped".to_string()
