@@ -192,8 +192,9 @@ impl AgentRuntime {
                     .append_assistant(run_req.conversation_id.as_deref(), &agent, &result.text)
                     .await;
                 if agent.config.memory.index_summaries {
+                    // `None` selects the legacy latest-conversation path.
                     let _ = history
-                        .maybe_summarize_and_index(&agent, &scope, self.rag.clone())
+                        .maybe_summarize_and_index(None, &agent, &scope, self.rag.clone())
                         .await;
                 }
             }

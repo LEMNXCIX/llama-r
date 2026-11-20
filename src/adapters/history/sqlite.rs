@@ -10,6 +10,7 @@ use crate::ports::history::{
 use crate::ports::rag::{RagStore, RagUpsert};
 use async_trait::async_trait;
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -417,7 +418,13 @@ impl ConversationStore for SqliteConversationStore {
         })
     }
 
-    async fn purge_old_conversations(&self, retention_days: u32) -> Result<u64, String> {
+    // STUB: the per-agent map is part of the port, but this adapter still
+    // applies only the global retention.
+    async fn purge_old_conversations(
+        &self,
+        retention_days: u32,
+        _per_agent_days: Option<&HashMap<String, u32>>,
+    ) -> Result<u64, String> {
         // 0 means "never purge" (documented in .env.example / AGENTS.md).
         // Without this guard the cutoff would be `now`, deleting every conversation.
         if retention_days == 0 {
@@ -439,8 +446,11 @@ impl ConversationStore for SqliteConversationStore {
         Ok(deleted as u64)
     }
 
+    // STUB: the turn conversation id is part of the port, but this adapter
+    // still summarizes the agent's latest conversation.
     async fn maybe_summarize_and_index(
         &self,
+        _conversation_id: Option<&str>,
         agent: &Agent,
         scope: &AgentScope,
         rag: Option<Arc<dyn RagStore>>,
@@ -617,6 +627,17 @@ impl ConversationStore for SqliteConversationStore {
             turn_count,
         }))
     }
+
+    // STUB: name + success are the only observable fields; no arguments are
+    // recorded and no row is written yet.
+    async fn append_tool_event(
+        &self,
+        _conversation_id: &str,
+        _tool_name: &str,
+        _success: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -669,7 +690,7 @@ mod tests {
         }
 
         // retention_days = 0 must mean "never purge", not "delete everything".
-        let deleted = store.purge_old_conversations(0).await.expect("purge");
+        let deleted = store.purge_old_conversations(0, None).await.expect("purge");
         assert_eq!(deleted, 0, "retention 0 must not delete any conversation");
 
         let after = store.get_conversation(&conv).await.expect("get");
@@ -703,7 +724,7 @@ mod tests {
             .unwrap();
         }
 
-        let deleted = store.purge_old_conversations(1).await.expect("purge");
+        let deleted = store.purge_old_conversations(1, None).await.expect("purge");
         assert_eq!(deleted, 1, "a conversation older than 1 day must be purged");
         assert!(store.get_conversation(&old).await.expect("get").is_none());
     }
@@ -798,7 +819,7 @@ mod tests {
             .unwrap();
         }
 
-        let purged_count = store.purge_old_conversations(90).await.unwrap();
+        let purged_count = store.purge_old_conversations(90, None).await.unwrap();
         assert_eq!(purged_count, 1);
 
         let record = store.get_conversation(&conv_id).await.unwrap();

@@ -512,7 +512,7 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         let retention = config.history_retention_days;
         let h1 = history_arc.clone();
         tokio::spawn(async move {
-            match h1.purge_old_conversations(retention).await {
+            match h1.purge_old_conversations(retention, None).await {
                 Ok(n) => tracing::info!(deleted = n, "History purge on startup completed"),
                 Err(e) => tracing::warn!(error = %e, "History purge on startup failed"),
             }
@@ -524,7 +524,7 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
             interval.tick().await;
             loop {
                 interval.tick().await;
-                match h2.purge_old_conversations(retention).await {
+                match h2.purge_old_conversations(retention, None).await {
                     Ok(n) => tracing::info!(deleted = n, "History purge completed"),
                     Err(e) => tracing::warn!(error = %e, "History purge failed"),
                 }
