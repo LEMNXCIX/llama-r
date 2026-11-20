@@ -1,11 +1,12 @@
 //! SQLite adapter for conversation history and continuous learning.
 
+use super::summarizer::{NoopSummarizer, OllamaSummarizer};
 use crate::domain::agent::Agent;
 use crate::domain::models::ChatMessage;
 use crate::domain::scope::AgentScope;
 use crate::ports::history::{
     ConversationExport, ConversationRecord, ConversationStore, ConversationSummary, ExportMessage,
-    ExportSummary,
+    ExportSummary, Summarizer,
 };
 use crate::ports::rag::{RagStore, RagUpsert};
 use async_trait::async_trait;
@@ -17,28 +18,17 @@ use uuid::Uuid;
 
 pub struct SqliteConversationStore {
     conn: Mutex<Connection>,
-    /// `(url, model)` for the Ollama-wire summarizer. `None` when the selected
-    /// provider cannot speak that wire format: summaries are best-effort and
-    /// gated by `index_summaries`, so disabling them is honest, whereas POSTing
-    /// to a wrong/empty URL is not. Conversations still persist either way.
-    summarizer: Option<(String, String)>,
+    /// Injected summary strategy. A `NoopSummarizer` is used when no provider
+    /// speaks the Ollama wire format: conversations still persist, summaries
+    /// are best-effort and simply skipped (empty string) in that case.
+    summarizer: Arc<dyn Summarizer>,
 }
 
 impl SqliteConversationStore {
-    /// Open with an Ollama-wire summarizer. Kept for existing callers/tests.
-    pub fn open(
+    /// Primary constructor: inject any summarizer strategy.
+    pub fn with_summarizer(
         path: impl AsRef<Path>,
-        ollama_url: impl Into<String>,
-        summarizer_model: impl Into<String>,
-    ) -> Result<Self, String> {
-        Self::open_with_summarizer(path, Some((ollama_url.into(), summarizer_model.into())))
-    }
-
-    /// Open with an optional summarizer endpoint. Pass `None` when no provider
-    /// can serve the Ollama `/api/chat` wire format.
-    pub fn open_with_summarizer(
-        path: impl AsRef<Path>,
-        summarizer: Option<(String, String)>,
+        summarizer: Arc<dyn Summarizer>,
     ) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("failed to open history db: {e}"))?;
 
@@ -52,6 +42,32 @@ impl SqliteConversationStore {
 
         store.run_migrations()?;
         Ok(store)
+    }
+
+    /// Open with an Ollama-wire summarizer. Kept for existing callers/tests.
+    pub fn open(
+        path: impl AsRef<Path>,
+        ollama_url: impl Into<String>,
+        summarizer_model: impl Into<String>,
+    ) -> Result<Self, String> {
+        Self::with_summarizer(
+            path,
+            Arc::new(OllamaSummarizer::new(ollama_url, summarizer_model)),
+        )
+    }
+
+    /// Open with an optional summarizer endpoint, kept as a wrapper for the
+    /// existing boot caller. `None` maps to the quiet `NoopSummarizer` rather
+    /// than POSTing to a wrong/empty URL.
+    pub fn open_with_summarizer(
+        path: impl AsRef<Path>,
+        summarizer: Option<(String, String)>,
+    ) -> Result<Self, String> {
+        let strategy: Arc<dyn Summarizer> = match summarizer {
+            Some((url, model)) => Arc::new(OllamaSummarizer::new(url, model)),
+            None => Arc::new(NoopSummarizer),
+        };
+        Self::with_summarizer(path, strategy)
     }
 
     fn run_migrations(&self) -> Result<(), String> {
@@ -138,7 +154,7 @@ impl SqliteConversationStore {
 
                 conn.execute(
                     "INSERT INTO conversations (id, agent_qualified_id, project_id, agent_id, turn_count, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
-                    params![cid, agent_qid, agent.config.context_project.as_deref(), agent.config.name, now, now],
+                    params![cid, agent_qid, agent.config.context_project.as_deref(), agent.id, now, now],
                 )
                 .map_err(|e| format!("db insert conversation error: {e}"))?;
 
@@ -149,11 +165,51 @@ impl SqliteConversationStore {
         let new_id = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO conversations (id, agent_qualified_id, project_id, agent_id, turn_count, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
-            params![new_id, agent_qid, agent.config.context_project.as_deref(), agent.config.name, now, now],
+            params![new_id, agent_qid, agent.config.context_project.as_deref(), agent.id, now, now],
         )
         .map_err(|e| format!("db insert conversation error: {e}"))?;
 
         Ok(new_id)
+    }
+
+    /// Fetch the last `limit` messages of a conversation, oldest first, with
+    /// their ids/timestamps intact so they can be handed to a `Summarizer` as
+    /// `ExportMessage`s rather than re-derived from the `ChatMessage` view.
+    fn recent_export_messages(
+        &self,
+        conversation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ExportMessage>, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| format!("lock poisoned: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, role, content, created_at FROM messages \
+                 WHERE conversation_id = ?1 ORDER BY created_at ASC",
+            )
+            .map_err(|e| format!("db prepare error: {e}"))?;
+        let rows = stmt
+            .query_map(params![conversation_id], |row| {
+                Ok(ExportMessage {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| format!("db query map error: {e}"))?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row.map_err(|e| format!("db row read error: {e}"))?);
+        }
+        if limit > 0 && messages.len() > limit {
+            let start = messages.len() - limit;
+            messages = messages.split_off(start);
+        }
+        Ok(messages)
     }
 }
 
@@ -418,39 +474,68 @@ impl ConversationStore for SqliteConversationStore {
         })
     }
 
-    // STUB: the per-agent map is part of the port, but this adapter still
-    // applies only the global retention.
     async fn purge_old_conversations(
         &self,
         retention_days: u32,
-        _per_agent_days: Option<&HashMap<String, u32>>,
+        per_agent_days: Option<&HashMap<String, u32>>,
     ) -> Result<u64, String> {
-        // 0 means "never purge" (documented in .env.example / AGENTS.md).
-        // Without this guard the cutoff would be `now`, deleting every conversation.
-        if retention_days == 0 {
-            return Ok(0);
-        }
-        let cutoff = chrono::Utc::now().timestamp() - (retention_days as i64 * 86_400);
+        let now = chrono::Utc::now().timestamp();
+        // One lock across the read → delete pass keeps this atomic with respect
+        // to other store operations: a concurrent append cannot refresh a row's
+        // `updated_at` after it was selected for deletion.
         let conn = self
             .conn
             .lock()
             .map_err(|e| format!("lock poisoned: {e}"))?;
 
-        let deleted = conn
-            .execute(
-                "DELETE FROM conversations WHERE updated_at < ?1",
-                params![cutoff],
-            )
-            .map_err(|e| format!("purge db error: {e}"))?;
+        // Resolve an effective retention per conversation: the per-agent map
+        // keyed by `agent_qualified_id` wins, the global value is the default.
+        // A 0 (global or per-agent) means "never purge".
+        let to_delete: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT id, agent_qualified_id, updated_at FROM conversations")
+                .map_err(|e| format!("db prepare error: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let id: String = row.get(0)?;
+                    let agent_qid: String = row.get(1)?;
+                    let updated_at: i64 = row.get(2)?;
+                    Ok((id, agent_qid, updated_at))
+                })
+                .map_err(|e| format!("db query map error: {e}"))?;
 
-        Ok(deleted as u64)
+            let mut expired = Vec::new();
+            for row in rows {
+                let (id, agent_qid, updated_at) =
+                    row.map_err(|e| format!("db row read error: {e}"))?;
+                let days = per_agent_days
+                    .and_then(|m| m.get(&agent_qid).copied())
+                    .unwrap_or(retention_days);
+                if days == 0 {
+                    continue;
+                }
+                let cutoff = now - (days as i64 * 86_400);
+                if updated_at < cutoff {
+                    expired.push(id);
+                }
+            }
+            expired
+        };
+
+        // `stmt` was dropped at the end of the block above; deleting with FKs
+        // ON cascades to messages, summaries and tool_events for the same turn.
+        let mut deleted = 0u64;
+        for id in to_delete {
+            deleted += conn
+                .execute("DELETE FROM conversations WHERE id = ?1", params![id])
+                .map_err(|e| format!("purge db error: {e}"))? as u64;
+        }
+        Ok(deleted)
     }
 
-    // STUB: the turn conversation id is part of the port, but this adapter
-    // still summarizes the agent's latest conversation.
     async fn maybe_summarize_and_index(
         &self,
-        _conversation_id: Option<&str>,
+        conversation_id: Option<&str>,
         agent: &Agent,
         scope: &AgentScope,
         rag: Option<Arc<dyn RagStore>>,
@@ -459,39 +544,46 @@ impl ConversationStore for SqliteConversationStore {
             return Ok(None);
         }
 
-        // No upstream that speaks the Ollama wire format: summaries are
-        // best-effort, so skip them rather than call a wrong/empty URL.
-        let Some((ollama_url, summarizer_model)) = &self.summarizer else {
-            tracing::warn!(
-                "history summaries are disabled: no provider serves the Ollama summarizer endpoint"
-            );
-            return Ok(None);
-        };
-
         let qid = agent.qualified_id();
         let interval = agent.config.memory.summarize_every_n_turns.max(1);
 
+        // `Some(id)` targets exactly the turn's conversation; `None` keeps the
+        // legacy "latest conversation for this agent" behaviour for older
+        // callers/adapters.
         let (conv_id, turn_count) = {
             let conn = self
                 .conn
                 .lock()
                 .map_err(|e| format!("lock poisoned: {e}"))?;
-            let mut stmt = conn
-                .prepare("SELECT id, turn_count FROM conversations WHERE agent_qualified_id = ?1 ORDER BY updated_at DESC LIMIT 1")
-                .map_err(|e| format!("db prepare error: {e}"))?;
-
-            let mut rows = stmt
-                .query_map(params![qid], |row| {
+            if let Some(cid) = conversation_id.filter(|id| !id.trim().is_empty()) {
+                let mut stmt = conn
+                    .prepare("SELECT id, turn_count FROM conversations WHERE id = ?1")
+                    .map_err(|e| format!("db prepare error: {e}"))?;
+                match stmt.query_row(params![cid], |row| {
                     let id: String = row.get(0)?;
                     let turns: u32 = row.get(1)?;
                     Ok((id, turns))
-                })
-                .map_err(|e| format!("query error: {e}"))?;
-
-            if let Some(r) = rows.next() {
-                r.map_err(|e| format!("row read error: {e}"))?
+                }) {
+                    Ok(row) => row,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                    Err(e) => return Err(format!("query error: {e}")),
+                }
             } else {
-                return Ok(None);
+                let mut stmt = conn
+                    .prepare("SELECT id, turn_count FROM conversations WHERE agent_qualified_id = ?1 ORDER BY updated_at DESC LIMIT 1")
+                    .map_err(|e| format!("db prepare error: {e}"))?;
+                let mut rows = stmt
+                    .query_map(params![qid], |row| {
+                        let id: String = row.get(0)?;
+                        let turns: u32 = row.get(1)?;
+                        Ok((id, turns))
+                    })
+                    .map_err(|e| format!("query error: {e}"))?;
+                if let Some(r) = rows.next() {
+                    r.map_err(|e| format!("row read error: {e}"))?
+                } else {
+                    return Ok(None);
+                }
             }
         };
 
@@ -518,64 +610,16 @@ impl ConversationStore for SqliteConversationStore {
             }
         }
 
-        let recent_msgs = self.get_history(&conv_id, (interval * 2) as usize).await?;
+        let recent_msgs = self.recent_export_messages(&conv_id, (interval * 2) as usize)?;
         if recent_msgs.is_empty() {
             return Ok(None);
         }
 
-        let mut prompt = String::from(
-            "Summarize the following conversation turns in 2-3 sentences, focusing on key decisions and context for future reference:\n\n",
-        );
-        for m in &recent_msgs {
-            prompt.push_str(&format!("{}: {}\n", m.role, m.content));
-        }
-
-        let url = if ollama_url.ends_with('/') {
-            format!("{}api/chat", ollama_url)
-        } else {
-            format!("{}/api/chat", ollama_url)
-        };
-
-        let body = serde_json::json!({
-            "model": summarizer_model,
-            "messages": [
-                { "role": "user", "content": prompt }
-            ],
-            "stream": false
-        });
-
-        let http_client = reqwest::Client::new();
-        let resp = match http_client
-            .post(&url)
-            .timeout(std::time::Duration::from_secs(30))
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return Err(format!("summarizer http request error: {e}")),
-        };
-
-        if !resp.status().is_success() {
-            return Err(format!("summarizer http error status: {}", resp.status()));
-        }
-
-        let json_val: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => return Err(format!("summarizer json parse error: {e}")),
-        };
-
-        let summary_text = json_val
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-
-        if summary_text.is_empty() {
+        let summary_text = self.summarizer.summarize(&recent_msgs).await?;
+        if summary_text.trim().is_empty() {
             return Ok(None);
         }
+        let summary_text = summary_text.trim().to_string();
 
         let summary_id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
@@ -628,14 +672,26 @@ impl ConversationStore for SqliteConversationStore {
         }))
     }
 
-    // STUB: name + success are the only observable fields; no arguments are
-    // recorded and no row is written yet.
     async fn append_tool_event(
         &self,
-        _conversation_id: &str,
-        _tool_name: &str,
-        _success: bool,
+        conversation_id: &str,
+        tool_name: &str,
+        success: bool,
     ) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| format!("lock poisoned: {e}"))?;
+        let id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        // Deliberately no args: the port carries only a name + success flag, so
+        // no tool input/output (and therefore no secret) can reach this table.
+        conn.execute(
+            "INSERT INTO tool_events (id, conversation_id, message_id, tool_name, tool_input, tool_output, success, created_at) \
+             VALUES (?1, ?2, '', ?3, NULL, NULL, ?4, ?5)",
+            params![id, conversation_id, tool_name, if success { 1 } else { 0 }, now],
+        )
+        .map_err(|e| format!("db insert tool event error: {e}"))?;
         Ok(())
     }
 }
