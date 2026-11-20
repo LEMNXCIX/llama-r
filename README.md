@@ -392,6 +392,28 @@ El reintento reutiliza el **mismo id** de ejecución: las herramientas ya comple
 
 **No se afirma:** ni integración con OpenTelemetry (los campos solo están listos para un futuro exportador, sin dependencia nueva), ni supresión de "primera vez" para `once`, ni coste real mientras el catálogo no tenga precios. El runner de evals tampoco incluye un check de aprobación `Auto` (`judge` solo califica respuestas).
 
+## Subagentes (Fase 4)
+
+Un agente puede delegar un turno a otros agentes solo con TOML. La tabla `[subagents]` deja de ser un stub inerte y pasa a ser una política tipada en `AgentConfig` (`Option<SubagentsConfig>`):
+
+```toml
+[subagents]
+allowed = ["especialista-a", "especialista-b"]  # ids del mismo proyecto; vacío = deny-all
+allow_global = false                            # permite delegar a agentes globales de agents/ (default false)
+max_depth = 2                                   # niveles máximos desde el coordinador raíz; default 1, rango 1..=8
+```
+
+- **`max_depth`** es el número de niveles de delegación desde el raíz. Si se omite vale `1`; el rango válido es `1..=8` (techo duro `8`). Un valor fuera de rango se ignora con un aviso que nombra `subagents.max_depth` y el valor, y cae a `1` — nunca se recorta en silencio. El **límite efectivo** es el mínimo de `max_depth` a lo largo de toda la cadena (raíz más cada ancestro), con techo `8`: cada salto lo endurece con el límite del agente destino, así que ningún hijo puede ampliar su propio permiso. Todos los campos son `#[serde(default)]`, así que un manifiesto v1 que declara `[subagents]` sigue cargando, y la tabla **sí se serializa** en `PUT /api/agents/:id` para preservar allowlist y profundidad.
+- **La herramienta** `llama_r__delegate` tiene esquema `{message (requerido), agent_id?, task_id?}`. `message` debe ser una cadena no vacía; `agent_id` y `task_id`, si aparecen, también. Un `agent_id` explícito se valida contra la allowlist; sin él se usa el primer id de `allowed` como destino, y una allowlist vacía es un rechazo nombrado. Es una herramienta local, así que el agente debe poner `llama_r__delegate` en su `tools_local` para usarla — las herramientas locales son deny-all por defecto.
+- **Herencia cero.** El hijo se resuelve solo por su id, validado contra la allowlist y el mismo proyecto (o `agents/` si `allow_global = true`). No recibe el contexto de proyecto, skills, fuentes RAG ni tools del padre: su propio manifiesto y `ScopeBuilder` producen un scope `DenyAll`. Un id no permitido es un `ToolError` nombrado, nunca una delegación.
+- **Profundidad y ciclos.** Un salto con `depth > effective_max_depth`, o cuyo id cualificado ya está en la cadena de ancestros, se rechaza con un `ToolError` nombrado y cero turnos hijos ejecutados.
+- **Un solo presupuesto.** Todos los turnos del árbol cargan del mismo `Arc<ToolCallBudget>` que lleva el `DelegateRequest`: hay una sola asignación para todo el árbol, sin importar la profundidad. Agotarlo da un `ToolError` nombrado que sube por la cadena; la carga sigue ocurriendo solo tras `authorize → Ok`.
+- **Aprobaciones.** El hijo usa el mismo `ApprovalGate` global. Desde cualquier nivel, un evento `ApprovalRequired` se reenvía al SSE del coordinador raíz con `task_id` y `depth` en el payload de `approval` (campos opcionales y aditivos), preservando el origen a través de niveles más profundos. Sin streaming no hay sender: el pendiente sigue apareciendo en `GET /api/approvals` y se decide con `POST`, sin cambios.
+- **Trazas jerárquicas.** Cada turno emite su propio `TraceRecorded`; el payload gana los campos opcionales `parent_execution_id`, `root_execution_id` y `depth`, de modo que `GET /api/executions/<execution_id>` reconstruye el árbol. Se redacta con el mismo `redact_trace_payload` de Fase 6; sin backend nuevo.
+- **Aislamiento de fallos.** Un hijo ausente, provider caído, presupuesto agotado o timeout es un `ToolError` nombrado; el bucle del padre continúa y el modelo decide cómo responder, nunca un error del chat raíz. La idempotencia por `operation_id` hace que un reintento reprice los efectos de las tools del hijo en vez de repetirlos, y el deadline recursivo (`restante − 5 s`) hace que el timeout nombrado del hijo llegue antes de que se cancele el bucle del padre.
+
+**No se afirma:** ni agentes remotos ni sandbox (Fase 8), ni *steering* de mensajes a un hijo en vuelo, ni cambios en la TUI, ni dependencia o integración con OpenTelemetry (los campos de traza solo están listos para un futuro exportador), ni cambio alguno en agentes que no declaren `[subagents]` (v1 intacto), ni un endpoint nuevo.
+
 ## Contexto de proyecto
 
 El `ProjectContext` se genera automáticamente via LLM:
