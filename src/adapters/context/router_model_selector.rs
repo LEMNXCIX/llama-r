@@ -3,8 +3,10 @@
 //! The decision model is whatever [`DecisionRouter`] the caller injects — the
 //! same one agent routing and `Auto` use, configured through `ROUTER_URL` /
 //! `router.toml`. No model name is hardcoded here: the `Choice` criteria are
-//! keyed by candidate labels (`candidate-0`, `candidate-1`, …) and the model
-//! ids appear only inside the descriptions the router reads.
+//! keyed by the two tier labels `simple` and `complex` and the model
+//! ids appear only inside the descriptions the router reads. Both tier keys
+//! are real criteria keys, so a conforming router (which returns one of the
+//! keys it was given) can actually choose the complex tier.
 //!
 //! The verdict ladder is fail-closed, exactly like Fase 6a's `Auto`: a single
 //! high-confidence `complex` answer is the only path to a different model.
@@ -28,8 +30,8 @@ use crate::ports::router::{Answer, DecisionRequest, DecisionRouter, Question};
 pub const QUESTION_KEY: &str = "complexity";
 
 const INSTRUCTIONS: &str = "Classify this request by complexity. Answer `complex` when it needs \
-     the most capable candidate. Otherwise answer the label of the simple, cheap candidate. \
-     Choose a label, never a model name of your own.";
+     the most capable candidate, otherwise answer `simple` for the cheap one. Return one of the \
+     criteria keys, never a model name of your own.";
 
 pub struct RouterModelSelector {
     router: Arc<dyn DecisionRouter>,
@@ -41,31 +43,48 @@ impl RouterModelSelector {
         Self { router, threshold }
     }
 
-    /// One candidate label per candidate. The model id (and its rank) travel
-    /// only as description text — they are never keys the router returns.
+    /// Two real criteria keys — the tiers the router chooses between. Model
+    /// ids (and their ranks) travel only as description text; they are never
+    /// keys, so no decision model is hardcoded and a conforming router can
+    /// answer `complex` and actually reach the complex tier.
     fn question(candidates: &[ModelCandidate]) -> Question {
-        let criteria: BTreeMap<String, String> = candidates
+        let options: Vec<String> = candidates
             .iter()
             .enumerate()
             .map(|(index, candidate)| {
                 let hint = candidate.provider_hint.as_deref().unwrap_or("unspecified");
-                let description = format!(
+                format!(
                     "candidate {index}: model '{}', provider hint {hint}, relative_cost {}",
                     candidate.model, candidate.relative_cost
-                );
-                (format!("candidate-{index}"), description)
+                )
             })
             .collect();
+        let choices = options.join("; ");
+        let criteria = BTreeMap::from([
+            (
+                "simple".to_string(),
+                format!(
+                    "Simple tier: use the lowest relative_cost candidate. Candidates: {choices}"
+                ),
+            ),
+            (
+                "complex".to_string(),
+                format!(
+                    "Complex tier: use the highest relative_cost candidate. Candidates: {choices}"
+                ),
+            ),
+        ]);
         Question::Choice {
             instructions: INSTRUCTIONS.to_string(),
             criteria,
         }
     }
 
-    /// `complex` picks the highest relative_cost, any other key the lowest.
-    /// Both scan in declaration order with a strict comparison, so a tie
-    /// always resolves to the first declared candidate of that tier — which is
-    /// also why a missing cost table (all ranks 1) always picks the first.
+    /// `complex` picks the highest relative_cost; `simple` (or any other
+    /// conforming key) the lowest. Both scan in declaration order with a strict
+    /// comparison, so a tie always resolves to the first declared candidate of
+    /// that tier — which is also why a missing cost table (all ranks 1) always
+    /// picks the first.
     fn pick<'a>(candidates: &'a [ModelCandidate], key: &str) -> &'a ModelCandidate {
         let want_highest = key == "complex";
         candidates

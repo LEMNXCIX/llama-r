@@ -237,13 +237,15 @@ async fn summarizer_error_is_a_named_error() {
 // Task 2: `ModelSelector` port, its two adapters, and the optional cost table.
 //
 // The fake router returns a fixed reply and records the `DecisionRequest` so
-// the tests can assert the criteria are candidate labels (model ids appear
-// only in descriptions) and that no decision is spent when there is nothing
-// to decide. No live model is involved.
+// the tests can assert the criteria are the real `simple`/`complex` tier keys
+// (model ids appear only in descriptions), that the answer key is one the
+// router was actually given, and that no decision is spent when there is
+// nothing to decide. No live model is involved.
 // ---------------------------------------------------------------------------
 
-/// What the fake router answers. `key` is an arbitrary router label; the
-/// selector's mapping is `complex` → complex tier, anything else → simple.
+/// What the fake router answers. `key` must be one of the criteria keys the
+/// selector actually sent (`simple` or `complex`) — a conforming router never
+/// invents a label, and the fake enforces that on every decision.
 #[derive(Debug)]
 enum SelectorReply {
     Choice {
@@ -266,6 +268,24 @@ struct SelectorFakeRouter {
 #[async_trait]
 impl DecisionRouter for SelectorFakeRouter {
     async fn decide(&self, req: DecisionRequest) -> Result<DecisionResponse, AppError> {
+        // A real router may only return a key from the criteria it was given.
+        // Enforce that here so a question that omits `complex` (making the
+        // tier unreachable) fails the test instead of being masked by a
+        // fabricated answer key.
+        if let SelectorReply::Choice { key, .. } = &self.reply {
+            let question = req
+                .questions
+                .values()
+                .next()
+                .expect("selector asked exactly one question");
+            let Question::Choice { criteria, .. } = question else {
+                panic!("expected a Choice question, got {question:?}");
+            };
+            assert!(
+                criteria.contains_key(*key),
+                "fake router answered '{key}', which is not a criteria key: {criteria:?}"
+            );
+        }
         *self.seen.lock().unwrap() = Some(req);
         if matches!(self.reply, SelectorReply::Fail) {
             return Err(AppError::Provider("fake router unreachable".into()));
@@ -332,8 +352,9 @@ async fn select_with(
     (selection, seen)
 }
 
-/// The outgoing question must name candidates by label, never by model: a
-/// model id is only ever a description the router reads, not a key it returns.
+/// The outgoing question must offer the two real tier keys (`simple` and
+/// `complex`), with model ids only inside descriptions — never as keys a
+/// conforming router could return.
 fn assert_labelled_question(req: &DecisionRequest, models: &[&str]) {
     let question = req
         .questions
@@ -347,14 +368,11 @@ fn assert_labelled_question(req: &DecisionRequest, models: &[&str]) {
         panic!("expected a Choice question, got {question:?}");
     };
     assert!(!instructions.trim().is_empty(), "instructions required");
-    assert_eq!(criteria.len(), models.len(), "one label per candidate");
-    let labels: Vec<_> = (0..models.len())
-        .map(|i| format!("candidate-{i}"))
-        .collect();
-    for label in &labels {
+    assert_eq!(criteria.len(), 2, "exactly the simple and complex tiers");
+    for key in ["simple", "complex"] {
         let description = criteria
-            .get(label)
-            .unwrap_or_else(|| panic!("missing candidate label {label}"));
+            .get(key)
+            .unwrap_or_else(|| panic!("missing tier key {key}"));
         assert!(
             description.contains("relative_cost"),
             "description must carry the cost: {description}"
@@ -399,7 +417,7 @@ async fn selector_returns_current_without_candidates() {
 async fn simple_picks_first_candidate() {
     let (selection, seen) = select_with(
         SelectorReply::Choice {
-            key: "candidate-0",
+            key: "simple",
             confidence: 0.9,
         },
         selection_request(&[("cheap-model", 1), ("pricey-model", 3)]),
@@ -416,7 +434,7 @@ async fn simple_picks_first_candidate() {
 
 #[tokio::test]
 async fn complex_picks_complex_candidate() {
-    let (selection, _) = select_with(
+    let (selection, seen) = select_with(
         SelectorReply::Choice {
             key: "complex",
             confidence: 0.9,
@@ -427,6 +445,20 @@ async fn complex_picks_complex_candidate() {
 
     assert_eq!(selection.model, "pricey-model");
     assert_eq!(selection.reason, SelectionReason::Chosen);
+    // The complex tier is reachable because `complex` is a real criteria key.
+    let req = seen.lock().unwrap().clone().expect("router was called");
+    assert_labelled_question(&req, &["cheap-model", "pricey-model"]);
+    let question = req
+        .questions
+        .get(QUESTION_KEY)
+        .expect("complexity question");
+    let Question::Choice { criteria, .. } = question else {
+        panic!("expected a Choice question, got {question:?}");
+    };
+    assert!(
+        criteria.contains_key("complex"),
+        "complex must be a criteria key"
+    );
 }
 
 #[tokio::test]
@@ -476,7 +508,7 @@ async fn selector_degrades_to_current_model_without_router() {
 async fn no_cost_table_means_first_candidate_wins() {
     // With no cost table every candidate carries 1, so "complex" and "simple"
     // both land on the one cost tier and the first declared candidate wins.
-    for key in ["complex", "candidate-0"] {
+    for key in ["complex", "simple"] {
         let (selection, _) = select_with(
             SelectorReply::Choice {
                 key,
@@ -509,7 +541,7 @@ async fn relative_cost_breaks_ties_only() {
     let req = selection_request(&[("pricey-model", 3), ("cheap-model", 1)]);
     let (simple, _) = select_with(
         SelectorReply::Choice {
-            key: "candidate-0",
+            key: "simple",
             confidence: 0.9,
         },
         req.clone(),
