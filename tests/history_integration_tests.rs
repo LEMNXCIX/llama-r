@@ -61,6 +61,7 @@ struct RecordedCalls {
     tool_events: Vec<(String, String, bool)>,
     tool_event_attempts: usize,
     fail_tool_events: bool,
+    fail_append_user: bool,
     purges: Vec<(u32, Option<HashMap<String, u32>>)>,
 }
 
@@ -81,6 +82,14 @@ impl RecordingStore {
     fn failing_tool_events() -> Self {
         let store = Self::new();
         store.calls.lock().unwrap().fail_tool_events = true;
+        store
+    }
+
+    /// A store whose `append_user` always fails: a client id may be supplied,
+    /// but no conversation row exists for later writes to attach to.
+    fn failing_append_user() -> Self {
+        let store = Self::new();
+        store.calls.lock().unwrap().fail_append_user = true;
         store
     }
 
@@ -117,7 +126,11 @@ impl ConversationStore for RecordingStore {
         _agent: &Agent,
         _content: &str,
     ) -> Result<String, String> {
-        self.calls.lock().unwrap().append_user_calls += 1;
+        let mut calls = self.calls.lock().unwrap();
+        calls.append_user_calls += 1;
+        if calls.fail_append_user {
+            return Err("append_user is down".into());
+        }
         Ok(conversation_id.unwrap_or("generated-id").to_string())
     }
 
@@ -1159,4 +1172,41 @@ async fn tool_event_failure_is_best_effort() {
         .expect("a store error must not fail the chat");
     assert_eq!(reply.text, "done");
     wait_for(|| store.tool_event_attempts() >= 1).await;
+}
+
+#[tokio::test]
+async fn failed_append_user_never_writes_assistant_or_tool_rows() {
+    let store = Arc::new(RecordingStore::failing_append_user());
+    let runtime = runtime_with(
+        store.clone(),
+        Arc::new(ToolEventEngine {
+            tool_name: "fake__tool".into(),
+            final_text: "still answered".into(),
+        }),
+    );
+
+    let mut req = runtime_request();
+    req.conversation_id = Some("client-supplied".into());
+    let result = runtime
+        .chat_stream(req)
+        .await
+        .expect("a failed append must not fail the stream");
+    // Only an actually-persisted id is advertised back to the client.
+    assert!(result.conversation_id.is_none());
+    let mut events = result.events;
+    while events.recv().await.is_some() {}
+
+    // Give any background forwarder a window to write into the wrong id.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(store.append_user_calls(), 1);
+    assert!(
+        store.assistant_messages().is_empty(),
+        "no user row was persisted, so no assistant row may be written: {:?}",
+        store.assistant_messages()
+    );
+    assert_eq!(
+        store.tool_event_attempts(),
+        0,
+        "a conversation that was never created must not collect tool events"
+    );
 }

@@ -262,9 +262,11 @@ impl AgentRuntime {
             }
         }
 
-        // One sink for both bridge kinds, bound to the id the user message was
-        // persisted under. The tools never see the store itself.
-        let tool_event_tx = self.tool_event_sink(persist_history, resolved_conv_id.clone());
+        // One sink for both bridge kinds, bound to the id `append_user` actually
+        // returned. A client-supplied id whose append failed has no user row, so
+        // it must not collect assistant or tool rows either. The tools never see
+        // the store itself.
+        let tool_event_tx = self.tool_event_sink(persist_history, persisted_conv_id.clone());
 
         let mut updated_req = req;
         updated_req.conversation_id = resolved_conv_id;
@@ -359,7 +361,7 @@ impl AgentRuntime {
             }
         }
 
-        let tool_event_tx = self.tool_event_sink(persist_history, resolved_conv_id.clone());
+        let tool_event_tx = self.tool_event_sink(persist_history, persisted_conv_id.clone());
 
         let mut updated_req = req;
         updated_req.conversation_id = resolved_conv_id.clone();
@@ -384,8 +386,12 @@ impl AgentRuntime {
         // The engine's receiver is drained by a forwarder that writes the final
         // answer before handing `Completed` to the caller, so the SSE `done`
         // event and the persisted assistant row always agree.
-        let events =
-            self.forward_stream_persistence(events, agent, persist_history, resolved_conv_id);
+        let events = self.forward_stream_persistence(
+            events,
+            agent,
+            persist_history,
+            persisted_conv_id.clone(),
+        );
         Ok(RuntimeStreamResult {
             events,
             conversation_id: persisted_conv_id,
