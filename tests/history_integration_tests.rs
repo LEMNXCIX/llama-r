@@ -55,6 +55,7 @@ fn sample_scope() -> AgentScope {
 /// Everything a fake store needs to remember for this task's contract tests.
 #[derive(Default)]
 struct RecordedCalls {
+    append_user_calls: usize,
     summarize_ids: Vec<Option<String>>,
     tool_events: Vec<(String, String, bool)>,
     purges: Vec<(u32, Option<HashMap<String, u32>>)>,
@@ -71,6 +72,10 @@ impl RecordingStore {
         Self {
             calls: Arc::new(Mutex::new(RecordedCalls::default())),
         }
+    }
+
+    fn append_user_calls(&self) -> usize {
+        self.calls.lock().unwrap().append_user_calls
     }
 
     fn summarize_ids(&self) -> Vec<Option<String>> {
@@ -94,6 +99,7 @@ impl ConversationStore for RecordingStore {
         _agent: &Agent,
         _content: &str,
     ) -> Result<String, String> {
+        self.calls.lock().unwrap().append_user_calls += 1;
         Ok(conversation_id.unwrap_or("generated-id").to_string())
     }
 
@@ -739,6 +745,7 @@ impl LLMProvider for StubProvider {
 
 struct ChatWorld {
     state: Arc<AppState>,
+    store: Arc<RecordingStore>,
 }
 
 /// A real `AgentRuntime` + real chat dispatch, wired to a fake store and a fake
@@ -764,7 +771,7 @@ fn chat_world(persist_history: bool) -> ChatWorld {
         engine: Arc::new(FixedEngine {
             text: "hello from engine".into(),
         }),
-        history: Some(store),
+        history: Some(store.clone()),
         rag: None,
         enricher: enricher.clone(),
     });
@@ -794,7 +801,7 @@ fn chat_world(persist_history: bool) -> ChatWorld {
         execution_store: Arc::new(NoOpExecutionStore),
         delegator: std::sync::OnceLock::new(),
     });
-    ChatWorld { state }
+    ChatWorld { state, store }
 }
 
 async fn post_chat(state: Arc<AppState>, conversation_id: Option<&str>, stream: bool) -> Response {
@@ -873,6 +880,25 @@ async fn no_persist_history_means_no_id_and_no_header() {
     assert!(
         body.get("conversation_id").is_none(),
         "nothing was persisted, so the field is omitted: {body}"
+    );
+}
+
+#[tokio::test]
+async fn no_persist_history_with_supplied_id_still_no_header() {
+    let world = chat_world(false);
+    let resp = post_chat(world.state.clone(), Some("client-supplied-42"), false).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(world.store.append_user_calls(), 0, "no history was written");
+
+    assert!(
+        response_header(&resp).is_none(),
+        "a supplied id must not be echoed when nothing was persisted"
+    );
+
+    let body = json_body(resp).await;
+    assert!(
+        body.get("conversation_id").is_none(),
+        "the supplied id must not reach the DTO when nothing was persisted: {body}"
     );
 }
 
