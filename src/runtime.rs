@@ -61,7 +61,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -510,21 +510,36 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
 
     if let Some(history_arc) = history_store.clone() {
         let retention = config.history_retention_days;
+        // The per-agent overrides are derived from the registry, not from a
+        // static global: an agent's `[memory] retention_days` wins over the
+        // global value for its own conversations. The map is rebuilt from the
+        // registry at boot and on every daily tick so a hot reload that changes
+        // an agent's retention is honoured without a restart.
         let h1 = history_arc.clone();
+        let startup_registry = agent_registry.clone();
         tokio::spawn(async move {
-            match h1.purge_old_conversations(retention, None).await {
+            let per_agent = build_agent_retention_map(&startup_registry);
+            match h1
+                .purge_old_conversations(retention, per_agent.as_ref())
+                .await
+            {
                 Ok(n) => tracing::info!(deleted = n, "History purge on startup completed"),
                 Err(e) => tracing::warn!(error = %e, "History purge on startup failed"),
             }
         });
 
         let h2 = history_arc.clone();
+        let daily_registry = agent_registry.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(86_400));
             interval.tick().await;
             loop {
                 interval.tick().await;
-                match h2.purge_old_conversations(retention, None).await {
+                let per_agent = build_agent_retention_map(&daily_registry);
+                match h2
+                    .purge_old_conversations(retention, per_agent.as_ref())
+                    .await
+                {
                     Ok(n) => tracing::info!(deleted = n, "History purge completed"),
                     Err(e) => tracing::warn!(error = %e, "History purge failed"),
                 }
@@ -1108,13 +1123,69 @@ fn build_rag(
     (Some(store), Some(ingest))
 }
 
-/// Build history store (SQLite) when feature is enabled.
+/// Select the injected summarizer strategy at boot.
 ///
-/// The summarizer POSTs an Ollama-wire `/api/chat`, so it is only configured for
-/// the Ollama provider. Other providers still persist conversations; only the
+/// The summarizer POSTs an Ollama-wire `/api/chat`, so it is only wired for the
+/// Ollama provider. Other providers still persist conversations; only the
 /// best-effort summaries are disabled (with a warning), never pointed at a
 /// wrong/empty URL. This is a boot-time decision: history lives on `AppState`,
-/// not on the hot-swapped stack.
+/// not on the hot-swapped stack. Exposed for the integration tests that pin
+/// this degradation rule.
+#[cfg(feature = "history")]
+#[doc(hidden)]
+pub fn build_summarizer(
+    provider: ProviderKind,
+    ollama_url: &str,
+    default_model: &str,
+) -> Arc<dyn crate::ports::history::Summarizer> {
+    use crate::adapters::history::summarizer::{NoopSummarizer, OllamaSummarizer};
+
+    if provider == ProviderKind::Ollama {
+        Arc::new(OllamaSummarizer::new(ollama_url, default_model))
+    } else {
+        tracing::warn!(
+            provider = %provider,
+            "history summaries disabled: the summarizer speaks the Ollama wire format; conversations still persist"
+        );
+        Arc::new(NoopSummarizer)
+    }
+}
+
+/// Build the per-agent retention overrides the history purge applies.
+///
+/// Keyed by `agent_qualified_id` — the exact column the SQLite purge reads — so
+/// an agent's `[memory] retention_days` wins for its own conversations without
+/// affecting other agents. A value of `0` is invalid (it is reserved for the
+/// global kill-switch): warn and omit that entry so the global value applies,
+/// never clamp it to a positive number. `None` when no agent has a usable
+/// override, preserving the legacy "global only" path. Rebuilt from the live
+/// registry on every purge so hot reloads are honoured.
+pub fn build_agent_retention_map(registry: &AgentRegistry) -> Option<HashMap<String, u32>> {
+    let mut per_agent = HashMap::new();
+    for registered in registry.list() {
+        let days = registered.agent.config.memory.retention_days;
+        if days == 0 {
+            tracing::warn!(
+                agent_id = %registered.agent.qualified_id(),
+                "agent [memory] retention_days is 0; ignoring the override and using the global retention"
+            );
+            continue;
+        }
+        per_agent.insert(registered.agent.qualified_id(), days);
+    }
+    if per_agent.is_empty() {
+        None
+    } else {
+        Some(per_agent)
+    }
+}
+
+/// Build history store (SQLite) when feature is enabled.
+///
+/// The summarizer is injected from [`build_summarizer`] so the boot provider
+/// decides the strategy: Ollama gets the Ollama-wire summarizer, every other
+/// provider gets the quiet one. This is a boot-time decision: history lives on
+/// `AppState`, not on the hot-swapped stack.
 fn build_history_store(
     config: &Config,
     provider: ProviderKind,
@@ -1124,16 +1195,8 @@ fn build_history_store(
         use crate::adapters::history::SqliteConversationStore;
 
         let path = crate::core::paths::get_history_db_path();
-        let summarizer = if provider == ProviderKind::Ollama {
-            Some((config.ollama_url.clone(), config.default_model.clone()))
-        } else {
-            tracing::warn!(
-                provider = %provider,
-                "history summaries disabled: the summarizer speaks the Ollama wire format; conversations still persist"
-            );
-            None
-        };
-        match SqliteConversationStore::open_with_summarizer(&path, summarizer) {
+        let summarizer = build_summarizer(provider, &config.ollama_url, &config.default_model);
+        match SqliteConversationStore::with_summarizer(&path, summarizer) {
             Ok(store) => {
                 tracing::info!(path = %path.display(), "History store (SQLite) initialized");
                 Some(Arc::new(store))

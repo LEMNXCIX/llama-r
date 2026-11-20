@@ -17,6 +17,14 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 pub struct SqliteConversationStore {
+    // Gap-8 decision: one `std::sync::Mutex<Connection>` in WAL mode is the
+    // whole concurrency story. Every store method does short, synchronous
+    // SQLite work and the guard is always dropped before an `.await` (the async
+    // `fn`s here have no await points at all), so a single lock cannot deadlock
+    // a current-thread runtime and WAL lets readers coexist with the writer.
+    // Deliberately no `tokio::sync::Mutex`, no `spawn_blocking`, no async
+    // refactor: `concurrent_appends_keep_both_rows` pins that two independent
+    // callers both land their rows.
     conn: Mutex<Connection>,
     /// Injected summary strategy. A `NoopSummarizer` is used when no provider
     /// speaks the Ollama wire format: conversations still persist, summaries

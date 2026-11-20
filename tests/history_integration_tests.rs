@@ -17,6 +17,7 @@ use llama_r::ports::history::{
     ConversationExport, ConversationRecord, ConversationStore, ConversationSummary, ExportMessage,
     ExportSummary, Summarizer,
 };
+use llama_r::runtime::{build_agent_retention_map, build_summarizer};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1208,5 +1209,213 @@ async fn failed_append_user_never_writes_assistant_or_tool_rows() {
         store.tool_event_attempts(),
         0,
         "a conversation that was never created must not collect tool events"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Boot wiring, purge map and gap-8 concurrency (Task 5).
+// ---------------------------------------------------------------------------
+
+/// Two independent callers append to one store at once. The store keeps a
+/// `Mutex<Connection>` in WAL mode: both writes must land, neither lost. This is
+/// the deliberate concurrency decision for gap 8 — no async mutex, no
+/// spawn_blocking, no refactor of the synchronous SQLite operations.
+#[tokio::test]
+async fn concurrent_appends_keep_both_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("concurrent.db");
+    let store = Arc::new(SqliteConversationStore::open(&db, "http://127.0.0.1:1", "m").unwrap());
+    let agent = named_agent("agent-a", "A", None);
+
+    let s1 = store.clone();
+    let a1 = agent.clone();
+    let s2 = store.clone();
+    let a2 = agent.clone();
+    let first = tokio::spawn(async move { s1.append_user(None, &a1, "one").await.unwrap() });
+    let second = tokio::spawn(async move { s2.append_user(None, &a2, "two").await.unwrap() });
+    let (c1, c2) = tokio::join!(first, second);
+    let (c1, c2) = (c1.unwrap(), c2.unwrap());
+
+    assert_ne!(c1, c2, "each append must create its own conversation id");
+
+    let e1 = store.export_conversation(&c1).await.unwrap();
+    let e2 = store.export_conversation(&c2).await.unwrap();
+    assert_eq!(e1.messages.len(), 1, "first append's row survived");
+    assert_eq!(e1.messages[0].content, "one");
+    assert_eq!(e2.messages.len(), 1, "second append's row survived");
+    assert_eq!(e2.messages[0].content, "two");
+}
+
+/// An Ollama boot installs the Ollama-wire summarizer: calling it must actually
+/// POST to `/api/chat`, which the one-shot listener proves.
+#[tokio::test]
+async fn boot_builds_ollama_summarizer_for_ollama() {
+    let (url, seen, handle) = one_shot_ollama("boot summary").await;
+    let summarizer = build_summarizer(ProviderKind::Ollama, &url, "llama3.2");
+    let messages = vec![ExportMessage {
+        id: "m1".into(),
+        role: "user".into(),
+        content: "remember this".into(),
+        created_at: 1,
+    }];
+
+    let out = summarizer
+        .summarize(&messages)
+        .await
+        .expect("the Ollama summarizer must speak the Ollama wire format");
+    assert_eq!(out, "boot summary");
+
+    let (path, body) = seen.lock().unwrap().clone().expect("one request recorded");
+    assert_eq!(path, "/api/chat");
+    assert_eq!(body["model"], "llama3.2");
+    handle.await.unwrap();
+}
+
+/// Any other provider gets the quiet summarizer. Pointing a bogus Ollama URL at
+/// it would still return `Ok("")` — a real OllamaSummarizer would have failed to
+/// connect, so the empty answer proves the no-op strategy was installed.
+#[tokio::test]
+async fn boot_builds_noop_summarizer_for_non_ollama() {
+    let summarizer = build_summarizer(ProviderKind::OpenRouter, "http://127.0.0.1:1", "m");
+    let messages = vec![ExportMessage {
+        id: "m1".into(),
+        role: "user".into(),
+        content: "remember this".into(),
+        created_at: 1,
+    }];
+
+    let out = summarizer
+        .summarize(&messages)
+        .await
+        .expect("the no-op summarizer never errors, never dials out");
+    assert_eq!(
+        out, "",
+        "a non-Ollama boot must not POST to an Ollama endpoint"
+    );
+}
+
+/// The purge map is built from `AgentRegistry::list()`, keyed by the same
+/// `agent_qualified_id` the SQLite purge reads. A zero (invalid) per-agent
+/// retention is warned about and dropped so the global value applies — never
+/// clamped. The resulting map is what drives a real purge.
+#[tokio::test]
+async fn daily_purge_uses_registry_retention_map() {
+    let registry = AgentRegistry::new();
+    let mut keeper = named_agent("keeper", "Keeper", Some("proj"));
+    keeper.config.memory.retention_days = 365;
+    let mut invalid = named_agent("invalid", "Invalid", Some("proj"));
+    invalid.config.memory.retention_days = 0; // invalid → warning + global
+    registry.register(keeper.clone(), sample_scope());
+    registry.register(invalid.clone(), sample_scope());
+
+    let map = build_agent_retention_map(&registry).expect("one valid agent yields a map");
+    assert_eq!(map.get(&keeper.qualified_id()), Some(&365));
+    assert!(
+        !map.contains_key(&invalid.qualified_id()),
+        "a 0 retention_days is invalid and must fall back to the global value"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("registry_purge.db");
+    let store = SqliteConversationStore::open(&db, "http://127.0.0.1:1", "m").unwrap();
+    let other = named_agent("other", "Other", Some("proj")); // absent → global
+    let c_keep = store.append_user(None, &keeper, "keep").await.unwrap();
+    let c_invalid = store.append_user(None, &invalid, "invalid").await.unwrap();
+    let c_other = store.append_user(None, &other, "other").await.unwrap();
+    for c in [&c_keep, &c_invalid, &c_other] {
+        age_conversation(&db, c, 100);
+    }
+
+    let deleted = store.purge_old_conversations(30, Some(&map)).await.unwrap();
+    assert!(
+        store.get_conversation(&c_keep).await.unwrap().is_some(),
+        "the 365-day per-agent override survives"
+    );
+    assert!(
+        store.get_conversation(&c_invalid).await.unwrap().is_none(),
+        "the invalid agent falls back to the global 30 days and is purged"
+    );
+    assert!(
+        store.get_conversation(&c_other).await.unwrap().is_none(),
+        "an agent absent from the map uses the global 30 days"
+    );
+    assert_eq!(deleted, 2);
+}
+
+/// A non-streaming turn summarizes the conversation it actually persisted, not
+/// an id synthesized for the summary call or the "latest conversation" fallback.
+#[tokio::test]
+async fn non_streaming_turn_summarizes_persisted_conversation_id() {
+    let store = Arc::new(RecordingStore::new());
+    let registry = Arc::new(AgentRegistry::new());
+    let mut agent = sample_agent();
+    agent.config.memory.persist_history = true;
+    agent.config.memory.index_summaries = true;
+    registry.register(agent, sample_scope());
+    let runtime = AgentRuntime {
+        registry,
+        engine: Arc::new(FixedEngine {
+            text: "answer".into(),
+        }),
+        history: Some(store.clone()),
+        rag: None,
+        enricher: Arc::new(ContextEnricher::new(
+            Arc::new(ContextStore::new()),
+            Arc::new(SkillManager::new()),
+            "fallback-model".into(),
+            Arc::new(ProviderRegistry::default()),
+            ProviderKind::Ollama,
+        )),
+    };
+
+    let mut req = runtime_request();
+    req.conversation_id = Some("turn-77".into());
+    let result = runtime.chat(req).await.expect("chat");
+    assert_eq!(result.conversation_id.as_deref(), Some("turn-77"));
+    assert_eq!(
+        store.summarize_ids(),
+        vec![Some("turn-77".to_string())],
+        "summarization must target the exact conversation this turn persisted"
+    );
+}
+
+/// The same persisted-id gate: a failed append leaves no id, so summarization
+/// receives `None` (the legacy "latest conversation" path) rather than echoing a
+/// client-supplied id that was never written.
+#[tokio::test]
+async fn summarize_uses_none_when_append_failed() {
+    let store = Arc::new(RecordingStore::failing_append_user());
+    let registry = Arc::new(AgentRegistry::new());
+    let mut agent = sample_agent();
+    agent.config.memory.persist_history = true;
+    agent.config.memory.index_summaries = true;
+    registry.register(agent, sample_scope());
+    let runtime = AgentRuntime {
+        registry,
+        engine: Arc::new(FixedEngine {
+            text: "answer".into(),
+        }),
+        history: Some(store.clone()),
+        rag: None,
+        enricher: Arc::new(ContextEnricher::new(
+            Arc::new(ContextStore::new()),
+            Arc::new(SkillManager::new()),
+            "fallback-model".into(),
+            Arc::new(ProviderRegistry::default()),
+            ProviderKind::Ollama,
+        )),
+    };
+
+    let mut req = runtime_request();
+    req.conversation_id = Some("client-supplied".into());
+    let result = runtime
+        .chat(req)
+        .await
+        .expect("a failed append must not fail chat");
+    assert_eq!(result.conversation_id, None);
+    assert_eq!(
+        store.summarize_ids(),
+        vec![None],
+        "no row was persisted, so no id may reach summarization"
     );
 }
