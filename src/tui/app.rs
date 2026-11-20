@@ -649,6 +649,7 @@ impl TuiApp {
                             approval_event_tx: None,
                         })
                         .await
+                        .map(|result| result.text)
                         .map_err(|e| e.to_string())
                 } else {
                     Err("Agent runtime not available (rig-engine feature disabled)".to_string())

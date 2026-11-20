@@ -241,7 +241,7 @@ async fn execute_agent_case(case: &EvalCase) -> Result<Execution, String> {
     let mut tool_calls = Vec::new();
     let mut failed_tools = Vec::new();
     let mut stream_error = None;
-    while let Some(event) = rx.recv().await {
+    while let Some(event) = rx.events.recv().await {
         match event {
             AgentRunEvent::Token { text: delta } => text.push_str(&delta),
             AgentRunEvent::ToolCall {

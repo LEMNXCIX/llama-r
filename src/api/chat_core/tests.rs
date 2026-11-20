@@ -181,6 +181,7 @@ impl LLMProvider for FakeProvider {
             served_by: None,
             debug_prompt: None,
             debug_route: None,
+            conversation_id: None,
         })
     }
 
@@ -1153,6 +1154,7 @@ impl LLMProvider for TagProvider {
             served_by: None,
             debug_prompt: None,
             debug_route: None,
+            conversation_id: None,
         })
     }
     async fn chat_stream(

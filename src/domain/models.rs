@@ -83,6 +83,12 @@ pub struct ChatResponse {
     /// gRPC `ChatResponse` deliberately do not carry it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_route: Option<RoutedDebug>,
+    /// The conversation the turn was persisted under, when history was enabled
+    /// and an agent resolved. The client can echo this back as `X-Conversation-Id`
+    /// to continue the thread; it is absent when nothing was persisted (direct
+    /// model request, no agent, or `persist_history = false`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
 }
 
 /// The routing decision, for the debug surface: what was offered, what the
@@ -296,6 +302,7 @@ mod tests {
             served_by: None,
             debug_prompt: None,
             debug_route: None,
+            conversation_id: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert!(json.get("usage").is_none());

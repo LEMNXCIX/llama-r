@@ -1,4 +1,4 @@
-use crate::api::chat_core::{execute_chat, execute_chat_stream};
+use crate::api::chat_core::{execute_chat, execute_chat_stream_with_conversation_id};
 use crate::api::mcp_api;
 use crate::api::observability::AppObservability;
 use crate::api::route_resolution::AgentSelection;
@@ -209,8 +209,14 @@ pub async fn chat(
     };
 
     if payload.stream {
-        let stream = execute_chat_stream(&state, payload, selection).await?;
-        let sse_stream = stream.map(|res| match res {
+        let result = execute_chat_stream_with_conversation_id(&state, payload, selection).await?;
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(cid) = &result.conversation_id {
+            if let Ok(value) = axum::http::HeaderValue::from_str(cid) {
+                headers.insert("x-conversation-id", value);
+            }
+        }
+        let sse_stream = result.stream.map(|res| match res {
             Ok(event) => match serde_json::to_string(&event) {
                 Ok(json_str) => Ok::<_, Infallible>(Event::default().data(json_str)),
                 Err(error) => Ok::<_, Infallible>(
@@ -219,10 +225,16 @@ pub async fn chat(
             },
             Err(error) => Ok::<_, Infallible>(Event::default().data(format!("Error: {}", error))),
         });
-        Ok(Sse::new(sse_stream).into_response())
+        Ok((headers, Sse::new(sse_stream)).into_response())
     } else {
         let response = execute_chat(&state, payload, selection).await?;
-        Ok(Json(response).into_response())
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(cid) = &response.conversation_id {
+            if let Ok(value) = axum::http::HeaderValue::from_str(cid) {
+                headers.insert("x-conversation-id", value);
+            }
+        }
+        Ok((headers, Json(response)).into_response())
     }
 }
 

@@ -584,7 +584,7 @@ fn a_deferred_skill_is_announced_offered_and_loaded_on_demand() {
                 enricher: Arc::new(enricher),
             };
 
-            let answer = runtime.chat(request()).await.unwrap();
+            let answer = runtime.chat(request()).await.unwrap().text;
             assert_eq!(answer, FINAL_ANSWER, "the loop must finish with the model's answer");
 
             let bodies = server.bodies();

@@ -419,6 +419,7 @@ impl LLMProvider for FakeProvider {
             served_by: None,
             debug_prompt: None,
             debug_route: None,
+            conversation_id: None,
         })
     }
 
@@ -490,6 +491,7 @@ impl LLMProvider for RecordingProvider {
             served_by: None,
             debug_prompt: None,
             debug_route: None,
+            conversation_id: None,
         })
     }
 

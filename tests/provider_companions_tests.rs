@@ -164,6 +164,7 @@ impl LLMProvider for LocalProvider {
             served_by: None,
             debug_prompt: None,
             debug_route: None,
+            conversation_id: None,
         })
     }
     async fn chat_stream(

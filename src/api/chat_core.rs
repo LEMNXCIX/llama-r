@@ -23,6 +23,14 @@ use uuid::Uuid;
 
 pub type AppChatStream = Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, AppError>> + Send>>;
 
+/// A stream plus the conversation the turn persisted under, if any. The SSE
+/// surface has no response body to carry the id before the stream starts, so
+/// the HTTP handler reads this field to build the `X-Conversation-Id` header.
+pub struct ChatStreamResponse {
+    pub stream: AppChatStream,
+    pub conversation_id: Option<String>,
+}
+
 /// The raw stream a `LLMProvider` returns, before its errors are mapped into
 /// `AppError`. Named so the fallback's stream type stays readable.
 type ProviderChatStream = Pin<
@@ -940,13 +948,13 @@ pub(crate) async fn execute_chat_with_id_and_budget(
                 )
                 .await?;
                 match runtime.chat(rt_req).await {
-                    Ok(text) => {
+                    Ok(result) => {
                         let response = ChatResponse {
                             model: prepared.model.clone(),
                             created_at: chrono::Utc::now().to_rfc3339(),
                             message: ChatMessage {
                                 role: "assistant".to_string(),
-                                content: text,
+                                content: result.text,
                             },
                             done: true,
                             // The engine path has no token accounting surface yet.
@@ -954,6 +962,7 @@ pub(crate) async fn execute_chat_with_id_and_budget(
                             served_by: None,
                             debug_prompt,
                             debug_route,
+                            conversation_id: result.conversation_id,
                         };
                         state
                             .observability
@@ -1020,10 +1029,36 @@ pub async fn execute_chat_stream(
 /// Streaming dispatch with an explicit execution id to reuse (the retry path).
 pub async fn execute_chat_stream_with_id(
     state: &AppState,
-    mut payload: ChatRequest,
+    payload: ChatRequest,
     selection: AgentSelection<'_>,
     resume_execution_id: Option<Uuid>,
 ) -> Result<AppChatStream, AppError> {
+    Ok(
+        execute_chat_stream_detail(state, payload, selection, resume_execution_id)
+            .await?
+            .stream,
+    )
+}
+
+/// Like [`execute_chat_stream`], but also returns the conversation id the turn
+/// persisted so the HTTP handler can echo it as a `X-Conversation-Id` header.
+/// Callers that do not need the id (`execute_chat_stream`, gRPC, evals) keep the
+/// simpler stream-returning signature.
+pub async fn execute_chat_stream_with_conversation_id(
+    state: &AppState,
+    payload: ChatRequest,
+    selection: AgentSelection<'_>,
+) -> Result<ChatStreamResponse, AppError> {
+    execute_chat_stream_detail(state, payload, selection, None).await
+}
+
+/// The streaming dispatch body, shared by the public wrappers above.
+async fn execute_chat_stream_detail(
+    state: &AppState,
+    mut payload: ChatRequest,
+    selection: AgentSelection<'_>,
+    resume_execution_id: Option<Uuid>,
+) -> Result<ChatStreamResponse, AppError> {
     // The one snapshot for this request, for the same reason as `execute_chat`:
     // every field the engine and fallback read comes from this single stack.
     let services = state.services_snapshot().await;
@@ -1083,6 +1118,10 @@ pub async fn execute_chat_stream_with_id(
         })
         .unwrap_or(false);
 
+    // Captured by the outcome block below so the header-aware caller can echo
+    // the id the engine turn persisted. The legacy stream never writes history,
+    // so it leaves this `None`.
+    let mut stream_conversation_id: Option<String> = None;
     let outcome: Result<AppChatStream, AppError> = async {
         if let Some((project_id, agent_id)) = engine_ids.filter(|_| streaming) {
             if let Some(runtime) = &services.agent_runtime {
@@ -1106,7 +1145,8 @@ pub async fn execute_chat_stream_with_id(
                 )
                 .await?;
                 match runtime.chat_stream(rt_req).await {
-                    Ok(rx) => {
+                    Ok(result) => {
+                        stream_conversation_id = result.conversation_id;
                         state
                             .observability
                             .record_chat_request(started_at.elapsed().as_millis() as u64);
@@ -1114,7 +1154,10 @@ pub async fn execute_chat_stream_with_id(
                             requested_model = %requested_model,
                             "Started streaming chat request via agent engine"
                         );
-                        return Ok(engine_events_to_chat_stream(prepared.model.clone(), rx));
+                        return Ok(engine_events_to_chat_stream(
+                            prepared.model.clone(),
+                            result.events,
+                        ));
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1136,7 +1179,10 @@ pub async fn execute_chat_stream_with_id(
     .await;
 
     match outcome {
-        Ok(stream) => Ok(finalize_stream(state, execution, stream, started_at, None)),
+        Ok(stream) => Ok(ChatStreamResponse {
+            stream: finalize_stream(state, execution, stream, started_at, None),
+            conversation_id: stream_conversation_id,
+        }),
         Err(err) => {
             finish_execution(
                 state,

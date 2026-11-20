@@ -622,3 +622,288 @@ async fn noop_summarizer_is_quiet() {
     let out = summarizer.summarize(&[]).await.expect("no-op never errors");
     assert_eq!(out, "", "no summary is an empty string, not an error");
 }
+
+// ---------------------------------------------------------------------------
+// Conversation id out to the client (Task 3).
+// ---------------------------------------------------------------------------
+
+use axum::{
+    body::{to_bytes, Body},
+    http::{Request, StatusCode},
+    response::Response,
+    routing::post,
+    Router,
+};
+use llama_r::adapters::execution::NoOpExecutionStore;
+use llama_r::adapters::mcp::StaticMcpRegistry;
+use llama_r::api::handlers::{chat, AppState};
+use llama_r::api::observability::AppObservability;
+use llama_r::config::ProviderKind;
+use llama_r::context::analyzer::ContextEnricher;
+use llama_r::context::store::ContextStore;
+use llama_r::domain::models::{ChatRequest, ChatResponse, ModelInfo};
+use llama_r::optimizer::metrics::TokenMetrics;
+use llama_r::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
+use llama_r::providers::registry::ProviderRegistry;
+use llama_r::providers::LLMProvider;
+use llama_r::services::agent_registry::AgentRegistry;
+use llama_r::services::agent_runtime::AgentRuntime;
+use llama_r::services::approval::ApprovalGate;
+use llama_r::services::provider_stack::ProviderStack;
+use llama_r::services::router_config::RouterConfig;
+use llama_r::services::skill_manager::SkillManager;
+use std::collections::VecDeque;
+use std::error::Error;
+use std::pin::Pin;
+use std::sync::RwLock;
+use tokio::sync::{mpsc, RwLock as TokioRwLock};
+use tokio_stream::Stream;
+use tower::ServiceExt;
+
+/// Returns a fixed answer so a turn reaches the engine without any network.
+struct FixedEngine {
+    text: String,
+}
+
+#[async_trait]
+impl AgentEngine for FixedEngine {
+    async fn run(&self, _req: AgentRunRequest) -> Result<AgentRunResult, String> {
+        Ok(AgentRunResult {
+            text: self.text.clone(),
+            tool_calls: 0,
+            iterations: 0,
+            model: "m".into(),
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        _req: AgentRunRequest,
+    ) -> Result<mpsc::Receiver<AgentRunEvent>, String> {
+        let (tx, rx) = mpsc::channel(8);
+        let text = self.text.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(AgentRunEvent::Token { text }).await;
+            let _ = tx
+                .send(AgentRunEvent::Completed {
+                    result: AgentRunResult {
+                        text: String::new(),
+                        tool_calls: 0,
+                        iterations: 0,
+                        model: "m".into(),
+                    },
+                })
+                .await;
+        });
+        Ok(rx)
+    }
+}
+
+/// The fallback provider is never reached on the engine path; it exists only so
+/// a `ProviderStack` can be built without a live upstream.
+struct StubProvider;
+
+#[async_trait]
+impl LLMProvider for StubProvider {
+    fn get_base_url(&self) -> String {
+        "http://stub".into()
+    }
+    async fn health_check(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        Ok(())
+    }
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn Error + Send + Sync>> {
+        Ok(Vec::new())
+    }
+    async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse, Box<dyn Error + Send + Sync>> {
+        Err("stub provider is not used on the engine path".into())
+    }
+    async fn chat_stream(
+        &self,
+        _req: ChatRequest,
+    ) -> Result<
+        Pin<
+            Box<
+                dyn Stream<
+                        Item = Result<
+                            llama_r::domain::models::ChatStreamEvent,
+                            Box<dyn Error + Send + Sync>,
+                        >,
+                    > + Send,
+            >,
+        >,
+        Box<dyn Error + Send + Sync>,
+    > {
+        Err("stub provider is not used on the engine path".into())
+    }
+}
+
+struct ChatWorld {
+    state: Arc<AppState>,
+}
+
+/// A real `AgentRuntime` + real chat dispatch, wired to a fake store and a fake
+/// engine. `RecordingStore::append_user` echoes a supplied id and returns the
+/// literal `generated-id` when none was supplied, so a test can tell whether the
+/// id on the response came from `append_user` rather than a second UUID.
+fn chat_world(persist_history: bool) -> ChatWorld {
+    let registry = Arc::new(AgentRegistry::new());
+    let mut agent = sample_agent(); // id "agent-a", project "proj"
+    agent.config.memory.persist_history = persist_history;
+    registry.register(agent, sample_scope());
+
+    let store = Arc::new(RecordingStore::new());
+    let enricher = Arc::new(ContextEnricher::new(
+        Arc::new(ContextStore::new()),
+        Arc::new(SkillManager::new()),
+        "fallback-model".into(),
+        Arc::new(ProviderRegistry::default()),
+        ProviderKind::Ollama,
+    ));
+    let runtime = Arc::new(AgentRuntime {
+        registry: registry.clone(),
+        engine: Arc::new(FixedEngine {
+            text: "hello from engine".into(),
+        }),
+        history: Some(store),
+        rag: None,
+        enricher: enricher.clone(),
+    });
+
+    let mut stack = ProviderStack::new(Arc::new(StubProvider), "fallback-model".to_string());
+    stack.provider_name = "ollama".to_string();
+    stack.agent_runtime = Some(runtime);
+
+    let state = Arc::new(AppState {
+        services: Arc::new(TokioRwLock::new(Arc::new(stack))),
+        agent_registry: registry,
+        skill_manager: Arc::new(SkillManager::new()),
+        context_store: Arc::new(ContextStore::new()),
+        context_enricher: Mutex::new(enricher),
+        metrics: Arc::new(TokenMetrics::new()),
+        observability: Arc::new(AppObservability::new()),
+        api_running: false.into(),
+        grpc_running: false.into(),
+        logs: Arc::new(Mutex::new(VecDeque::new())),
+        known_mcp_servers: RwLock::new(Vec::new()),
+        mcp_registry: Arc::new(StaticMcpRegistry::new()),
+        history_store: None,
+        router_config: Arc::new(RouterConfig::default()),
+        router_healthy: false.into(),
+        approval_gate: Arc::new(ApprovalGate::default()),
+        auto_decider: None,
+        execution_store: Arc::new(NoOpExecutionStore),
+        delegator: std::sync::OnceLock::new(),
+    });
+    ChatWorld { state }
+}
+
+async fn post_chat(state: Arc<AppState>, conversation_id: Option<&str>, stream: bool) -> Response {
+    let app = Router::new().route("/chat", post(chat)).with_state(state);
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/chat")
+        .header("content-type", "application/json")
+        .header("x-project", "proj")
+        .header("x-agent", "agent-a");
+    if let Some(id) = conversation_id {
+        builder = builder.header("x-conversation-id", id);
+    }
+    let body = serde_json::json!({
+        "model": "fallback-model",
+        "messages": [{ "role": "user", "content": "hello" }],
+        "stream": stream,
+    });
+    let request = builder.body(Body::from(body.to_string())).unwrap();
+    app.oneshot(request).await.unwrap()
+}
+
+fn response_header(resp: &Response) -> Option<String> {
+    resp.headers()
+        .get("x-conversation-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+async fn json_body(resp: Response) -> serde_json::Value {
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn generated_conversation_id_reaches_json_and_header() {
+    let world = chat_world(true);
+    let resp = post_chat(world.state.clone(), None, false).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let header = response_header(&resp).expect("X-Conversation-Id header on the JSON response");
+    assert_eq!(
+        header, "generated-id",
+        "the header must carry the id returned by append_user"
+    );
+
+    let body = json_body(resp).await;
+    assert_eq!(body["conversation_id"].as_str(), Some("generated-id"));
+    assert_eq!(body["conversation_id"].as_str(), Some(header.as_str()));
+}
+
+#[tokio::test]
+async fn supplied_conversation_id_is_echoed_unchanged() {
+    let world = chat_world(true);
+    let resp = post_chat(world.state.clone(), Some("client-supplied-42"), false).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let header = response_header(&resp).expect("X-Conversation-Id header on the JSON response");
+    assert_eq!(header, "client-supplied-42");
+
+    let body = json_body(resp).await;
+    assert_eq!(body["conversation_id"].as_str(), Some("client-supplied-42"));
+}
+
+#[tokio::test]
+async fn no_persist_history_means_no_id_and_no_header() {
+    let world = chat_world(false);
+    let resp = post_chat(world.state.clone(), None, false).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        response_header(&resp).is_none(),
+        "nothing was persisted, so no header"
+    );
+
+    let body = json_body(resp).await;
+    assert!(
+        body.get("conversation_id").is_none(),
+        "nothing was persisted, so the field is omitted: {body}"
+    );
+}
+
+#[tokio::test]
+async fn old_client_without_the_field_still_parses() {
+    // A payload from a client that predates the field: serde must default the
+    // missing `Option` to `None`, not reject the response.
+    let legacy = serde_json::json!({
+        "model": "m",
+        "created_at": "now",
+        "message": { "role": "assistant", "content": "hi" },
+        "done": true,
+    });
+    let dto: ChatResponse = serde_json::from_value(legacy).expect("legacy payload parses");
+    assert!(dto.conversation_id.is_none());
+
+    // And the field is omitted on the wire while it is `None`.
+    let wire = serde_json::to_value(&dto).unwrap();
+    assert!(
+        wire.get("conversation_id").is_none(),
+        "skip_serializing_if must omit a None conversation id"
+    );
+}
+
+#[tokio::test]
+async fn generated_conversation_id_reaches_stream_header() {
+    let world = chat_world(true);
+    let resp = post_chat(world.state.clone(), None, true).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let header = response_header(&resp).expect("X-Conversation-Id header on the SSE response");
+    assert_eq!(header, "generated-id");
+    // Drain the stream so the turn completes without a dangling task.
+    let _ = to_bytes(resp.into_body(), usize::MAX).await;
+}

@@ -467,6 +467,7 @@ impl llama_r::providers::LLMProvider for RecordingProvider {
             served_by: None,
             debug_prompt: None,
             debug_route: None,
+            conversation_id: None,
         })
     }
 

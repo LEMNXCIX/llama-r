@@ -155,6 +155,7 @@ impl LLMProvider for EchoProvider {
             served_by: None,
             debug_prompt: None,
             debug_route: None,
+            conversation_id: None,
         })
     }
     async fn chat_stream(

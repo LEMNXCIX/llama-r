@@ -59,6 +59,26 @@ pub struct RuntimeChatRequest {
     pub approval_event_tx: Option<tokio::sync::mpsc::Sender<crate::ports::engine::AgentRunEvent>>,
 }
 
+/// The answer plus the conversation the turn was persisted under, if any.
+///
+/// `conversation_id` is the id `append_user` returned — the one that actually
+/// has rows in the store — never a freshly minted uuid. It is `None` when no
+/// history was written (no agent, no store, or `persist_history = false`), so a
+/// caller never advertises a conversation a client cannot resume.
+pub struct RuntimeChatResult {
+    pub text: String,
+    pub conversation_id: Option<String>,
+}
+
+/// The event stream plus the conversation the turn was persisted under. The
+/// non-streaming surface carries the same id on a `ChatResponse` DTO field; the
+/// SSE surface has no body field before the stream starts, so the id rides on a
+/// response header built by the HTTP handler.
+pub struct RuntimeStreamResult {
+    pub events: mpsc::Receiver<AgentRunEvent>,
+    pub conversation_id: Option<String>,
+}
+
 impl AgentRuntime {
     /// Resolve the agent and settle on the system prompt.
     ///
@@ -122,7 +142,7 @@ impl AgentRuntime {
         })
     }
 
-    pub async fn chat(&self, req: RuntimeChatRequest) -> Result<String, AppError> {
+    pub async fn chat(&self, req: RuntimeChatRequest) -> Result<RuntimeChatResult, AppError> {
         let conversation_id = req.conversation_id.clone();
         let user_message = req.user_message.clone();
 
@@ -135,6 +155,10 @@ impl AgentRuntime {
         let scope = registered.scope.clone();
 
         let mut resolved_conv_id = conversation_id.clone();
+        // Echo only an id that was actually persisted. A supplied id with
+        // `persist_history = false` (or a failed append) must not be advertised:
+        // there is no conversation for the client to resume.
+        let mut persisted_conv_id: Option<String> = None;
 
         if let Some(history) = &self.history {
             if agent.config.memory.persist_history {
@@ -143,6 +167,7 @@ impl AgentRuntime {
                     .await
                 {
                     Ok(id) => {
+                        persisted_conv_id = Some(id.clone());
                         resolved_conv_id = Some(id);
                     }
                     Err(e) => {
@@ -200,14 +225,17 @@ impl AgentRuntime {
             }
         }
 
-        Ok(result.text)
+        Ok(RuntimeChatResult {
+            text: result.text,
+            conversation_id: persisted_conv_id,
+        })
     }
 
     /// Stream agent events (tokens / completed / errors). Tool events are reserved for later.
     pub async fn chat_stream(
         &self,
         req: RuntimeChatRequest,
-    ) -> Result<mpsc::Receiver<AgentRunEvent>, AppError> {
+    ) -> Result<RuntimeStreamResult, AppError> {
         let conversation_id = req.conversation_id.clone();
         let user_message = req.user_message.clone();
 
@@ -220,6 +248,7 @@ impl AgentRuntime {
         let scope = registered.scope.clone();
 
         let mut resolved_conv_id = conversation_id.clone();
+        let mut persisted_conv_id: Option<String> = None;
 
         if let Some(history) = &self.history {
             if agent.config.memory.persist_history {
@@ -228,6 +257,7 @@ impl AgentRuntime {
                     .await
                 {
                     Ok(id) => {
+                        persisted_conv_id = Some(id.clone());
                         resolved_conv_id = Some(id);
                     }
                     Err(e) => {
@@ -265,9 +295,14 @@ impl AgentRuntime {
         );
         let _guard = span.enter();
 
-        self.engine
+        let events = self
+            .engine
             .run_stream(run_req)
             .await
-            .map_err(AppError::Runtime)
+            .map_err(AppError::Runtime)?;
+        Ok(RuntimeStreamResult {
+            events,
+            conversation_id: persisted_conv_id,
+        })
     }
 }

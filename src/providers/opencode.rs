@@ -172,6 +172,7 @@ impl LLMProvider for OpenCodeProvider {
             served_by: None,
             debug_prompt: None,
             debug_route: None,
+            conversation_id: None,
         })
     }
 

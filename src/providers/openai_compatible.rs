@@ -213,6 +213,7 @@ impl LLMProvider for OpenAiCompatibleProvider {
             served_by: None,
             debug_prompt: None,
             debug_route: None,
+            conversation_id: None,
         })
     }
 
