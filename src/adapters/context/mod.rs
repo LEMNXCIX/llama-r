@@ -1,7 +1,11 @@
-//! Concrete `ContextCompactor` adapters.
+//! Concrete `ContextCompactor` and `ModelSelector` adapters.
 
+pub mod current_model_selector;
+pub mod router_model_selector;
 mod summarizing_compactor;
 
+pub use current_model_selector::CurrentModelSelector;
+pub use router_model_selector::RouterModelSelector;
 pub use summarizing_compactor::SummarizingCompactor;
 
 use crate::ports::compaction::{CompactRequest, CompactResult, ContextCompactor};

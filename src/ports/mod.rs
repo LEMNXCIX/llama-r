@@ -11,5 +11,6 @@ pub mod engine;
 pub mod execution;
 pub mod history;
 pub mod mcp;
+pub mod model_selection;
 pub mod rag;
 pub mod router;
