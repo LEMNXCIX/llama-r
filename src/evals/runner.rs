@@ -231,6 +231,7 @@ async fn execute_agent_case(case: &EvalCase) -> Result<Execution, String> {
             default_model: "llama3.2".into(),
             execution_id: Uuid::new_v4(),
             shared_budget: None,
+            delegation_context: None,
         })
         .await
         .map_err(|err| format!("case '{}': {err}", case.id))?;

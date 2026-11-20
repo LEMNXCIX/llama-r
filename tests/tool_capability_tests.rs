@@ -105,6 +105,7 @@ fn request(capabilities: ModelCapabilities, model: &str) -> AgentRunRequest {
         conversation_id: None,
         execution_id: uuid::Uuid::new_v4(),
         shared_budget: None,
+        delegation_context: None,
     }
 }
 

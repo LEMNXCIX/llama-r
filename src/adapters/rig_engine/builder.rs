@@ -672,6 +672,7 @@ mod tests {
             observability: None,
             delegator: None,
             delegate_bounds: None,
+            delegation_context: None,
             event_tx: None,
             operations: crate::adapters::rig_engine::operations::OperationContext::disabled(),
         }
@@ -706,6 +707,7 @@ mod tests {
             conversation_id: None,
             execution_id: uuid::Uuid::new_v4(),
             shared_budget: None,
+            delegation_context: None,
         }
     }
 

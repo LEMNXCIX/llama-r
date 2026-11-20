@@ -645,6 +645,7 @@ impl TuiApp {
                             // gives the run a valid tool-operation namespace.
                             execution_id: uuid::Uuid::new_v4(),
                             shared_budget: None,
+                            delegation_context: None,
                         })
                         .await
                         .map_err(|e| e.to_string())

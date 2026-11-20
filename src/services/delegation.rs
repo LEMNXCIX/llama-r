@@ -8,7 +8,7 @@
 use crate::api::chat_core::delegate_turn;
 use crate::api::handlers::AppState;
 use crate::domain::agent::Agent;
-use crate::ports::delegation::{DelegateRequest, DelegateResult, Delegator};
+use crate::ports::delegation::{DelegateRequest, DelegateResult, DelegationContext, Delegator};
 use crate::services::agent_registry::AgentRegistry;
 use async_trait::async_trait;
 use std::sync::{Arc, Weak};
@@ -133,9 +133,24 @@ impl Delegator for RuntimeDelegator {
         // Validate before spending any work: an unauthorised, cyclic or too-deep
         // child is a named error with zero child turns executed.
         let agent = validate_delegation(&self.registry, &req)?;
+        // The child inherits the request's chain (which now includes the
+        // caller) and depth, and the tightest limit seen so far: the parent's
+        // propagated bound and the target's own manifest maximum. This is what
+        // makes a grandchild's depth/cycle checks real instead of restarting.
+        let target_limit = agent
+            .config
+            .subagents
+            .as_ref()
+            .map(|policy| policy.effective_max_depth())
+            .unwrap_or_else(|| crate::domain::agent::SubagentsConfig::DEFAULT_MAX_DEPTH);
+        let child_context = DelegationContext {
+            chain: req.chain.clone(),
+            depth: req.depth,
+            effective_max_depth: req.effective_max_depth.min(target_limit),
+        };
         let state = self.app.upgrade().ok_or_else(|| {
             "delegation unavailable: application state has already been dropped".to_string()
         })?;
-        delegate_turn(&state, req, agent).await
+        delegate_turn(&state, req, agent, child_context).await
     }
 }

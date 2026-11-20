@@ -6,7 +6,7 @@ use crate::domain::models::{
 };
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
-use crate::ports::delegation::{DelegateRequest, DelegateResult, ToolBudget};
+use crate::ports::delegation::{DelegateRequest, DelegateResult, DelegationContext, ToolBudget};
 use crate::ports::engine::AgentRunEvent;
 use crate::ports::execution::ExecutionStore;
 use crate::services::agent_runtime::RuntimeChatRequest;
@@ -108,6 +108,10 @@ pub(crate) fn agent_not_found(target: &str, project_id: &str) -> AppError {
 /// rather than re-read: the engine's `default_model` and the provider used if
 /// the engine falls back must come from the same stack. A settings Apply that
 /// swaps both mid-request must not pair the old model with the new provider.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one request snapshot: identity, prompt inputs and the two additive delegation bounds (budget, context)"
+)]
 async fn build_runtime_request(
     services: &crate::services::provider_stack::ProviderStack,
     prepared: &ChatRequest,
@@ -116,6 +120,7 @@ async fn build_runtime_request(
     conversation_id: Option<String>,
     execution_id: Uuid,
     shared_budget: Option<Arc<dyn ToolBudget>>,
+    delegation_context: Option<DelegationContext>,
 ) -> Result<RuntimeChatRequest, AppError> {
     let (system, history, user_message) = split_engine_messages(&prepared.messages)?;
     Ok(RuntimeChatRequest {
@@ -129,6 +134,7 @@ async fn build_runtime_request(
         default_model: services.default_model.clone(),
         execution_id,
         shared_budget,
+        delegation_context,
     })
 }
 
@@ -768,7 +774,8 @@ pub async fn execute_chat_with_id(
     selection: AgentSelection<'_>,
     resume_execution_id: Option<Uuid>,
 ) -> Result<ChatResponse, AppError> {
-    execute_chat_with_id_and_budget(state, payload, selection, resume_execution_id, None).await
+    execute_chat_with_id_and_budget(state, payload, selection, resume_execution_id, None, None)
+        .await
 }
 
 /// The delegation-aware core behind [`execute_chat_with_id`]. The extra field is
@@ -783,6 +790,7 @@ pub(crate) async fn execute_chat_with_id_and_budget(
     selection: AgentSelection<'_>,
     resume_execution_id: Option<Uuid>,
     shared_budget: Option<Arc<dyn ToolBudget>>,
+    delegation_context: Option<DelegationContext>,
 ) -> Result<ChatResponse, AppError> {
     // ONE snapshot for the whole request. Every provider-dependent field below
     // — the agent runtime, the engine's default model, the chat provider and
@@ -870,6 +878,7 @@ pub(crate) async fn execute_chat_with_id_and_budget(
                     conversation_id,
                     run_id,
                     shared_budget,
+                    delegation_context,
                 )
                 .await?;
                 match runtime.chat(rt_req).await {
@@ -1029,6 +1038,9 @@ pub async fn execute_chat_stream_with_id(
                     // Streaming delegation is not part of this slice: child
                     // turns are always non-streaming, so no tree budget here.
                     None,
+                    // The root of a tree is non-streaming; a streaming turn
+                    // has no parent context to carry.
+                    None,
                 )
                 .await?;
                 match runtime.chat_stream(rt_req).await {
@@ -1081,9 +1093,11 @@ pub async fn execute_chat_stream_with_id(
 ///
 /// This is the re-entry point for delegation: a child is an ordinary chat turn
 /// with its own `execution_id`, its own manifest/scope and its own system
-/// prompt. Only three things are inherited, all of them bounds carried by the
-/// request: the shared tool budget, the deadline and the `task_id` used as the
-/// child conversation id. Nothing from the parent's prompt or scope is passed.
+/// prompt. Only four things are inherited, all of them bounds carried by the
+/// request: the shared tool budget, the deadline, the `task_id` used as the
+/// child conversation id, and the `DelegationContext` (ancestor chain, depth and
+/// tightest depth limit) that lets the child's own tools continue the tree.
+/// Nothing from the parent's prompt or scope is passed.
 ///
 /// A failure is a *named* error for the caller (the delegate tool turns it into
 /// a `ToolResult`) — it never escapes as an error of the parent chat turn.
@@ -1091,6 +1105,7 @@ pub async fn delegate_turn(
     state: &AppState,
     req: DelegateRequest,
     agent: crate::domain::agent::Agent,
+    child_context: DelegationContext,
 ) -> Result<DelegateResult, String> {
     // Reject an already-expired deadline before doing any work. This is what
     // guarantees "no child turn executed", rather than relying on tokio's
@@ -1124,8 +1139,14 @@ pub async fn delegate_turn(
         debug: false,
     };
 
-    let fut =
-        execute_chat_with_id_and_budget(state, payload, selection, None, Some(req.budget.clone()));
+    let fut = execute_chat_with_id_and_budget(
+        state,
+        payload,
+        selection,
+        None,
+        Some(req.budget.clone()),
+        Some(child_context),
+    );
     match tokio::time::timeout_at(tokio::time::Instant::from_std(req.deadline), fut).await {
         Ok(Ok(response)) => Ok(DelegateResult {
             answer: response.message.content,

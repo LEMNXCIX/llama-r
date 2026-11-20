@@ -17,6 +17,8 @@ use crate::api::observability::AppObservability;
 use crate::config::{Config, ProviderKind, OPENROUTER_BASE_URL};
 use crate::domain::scope::AgentScope;
 use crate::ports::auto::AutoDecider;
+#[cfg(feature = "rig-engine")]
+use crate::ports::delegation::DelegationContext;
 use crate::ports::delegation::Delegator;
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
 use crate::ports::execution::ExecutionStore;
@@ -470,6 +472,13 @@ impl RigAgentEngine {
                 // Bounds come from the calling agent's own manifest; the tool
                 // never invents a target, depth or recursion limit.
                 delegate_bounds: DelegateBounds::for_agent(&req.agent),
+                // A child turn carries its parent's bounds; the root's are
+                // derived from its own manifest. Both come from the request,
+                // never from a default invented in the bridge.
+                delegation_context: req
+                    .delegation_context
+                    .clone()
+                    .or_else(|| DelegationContext::root_for(&req.agent)),
                 event_tx: None,
                 operations: operations::OperationContext::new(
                     req.execution_id,
@@ -583,6 +592,13 @@ impl RigAgentEngine {
                 // Bounds come from the calling agent's own manifest; the tool
                 // never invents a target, depth or recursion limit.
                 delegate_bounds: DelegateBounds::for_agent(&req.agent),
+                // A child turn carries its parent's bounds; the root's are
+                // derived from its own manifest. Both come from the request,
+                // never from a default invented in the bridge.
+                delegation_context: req
+                    .delegation_context
+                    .clone()
+                    .or_else(|| DelegationContext::root_for(&req.agent)),
                 event_tx: Some(tx.clone()),
                 operations: operations::OperationContext::new(
                     req.execution_id,

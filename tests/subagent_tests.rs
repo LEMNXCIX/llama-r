@@ -8,7 +8,7 @@ use llama_r::adapters::rig_engine::limits::ToolCallBudget;
 use llama_r::domain::agent::{Agent, AgentConfig, RagWritePolicy, SubagentsConfig};
 use llama_r::domain::policy::PermissionPolicy;
 use llama_r::domain::scope::{AgentScope, ToolsAllow};
-use llama_r::ports::delegation::{DelegateRequest, ToolBudget};
+use llama_r::ports::delegation::{DelegateRequest, DelegationContext, ToolBudget};
 use llama_r::services::agent_registry::AgentRegistry;
 use llama_r::services::delegation::validate_delegation;
 use std::collections::HashSet;
@@ -286,6 +286,10 @@ fn chain_cycle_rejected_naming_id() {
 use async_trait::async_trait;
 use llama_r::adapters::execution::NoOpExecutionStore;
 use llama_r::adapters::mcp::StaticMcpRegistry;
+use llama_r::adapters::rig_engine::local_tools::{
+    DelegateBounds, LocalToolBridge, LocalToolDeps, LocalToolRegistry, BUILTIN_DELEGATE_ID,
+};
+use llama_r::adapters::rig_engine::operations::OperationContext;
 use llama_r::api::chat_core::execute_chat;
 use llama_r::api::handlers::AppState;
 use llama_r::api::observability::AppObservability;
@@ -980,4 +984,234 @@ async fn global_target_runs_unscoped_without_project_context() {
         !child.system_prompt.contains("parent-context"),
         "no coordinator project context leaks into a global delegate"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task 4 fix round 1: specialist selection and tree-wide recursion bounds.
+// ---------------------------------------------------------------------------
+
+/// A real delegate-tool bridge backed by `RuntimeDelegator`, so the tool call
+/// exercises the same allowlist / chain / depth validation a model would hit.
+fn delegate_bridge(
+    state: &Arc<AppState>,
+    registry: &Arc<AgentRegistry>,
+    caller_id: &str,
+    context: DelegationContext,
+) -> LocalToolBridge {
+    let caller = registry
+        .get_project_agent("proj", caller_id)
+        .unwrap_or_else(|| panic!("caller {caller_id} must be registered in proj"));
+    let bounds = DelegateBounds::for_agent(&caller)
+        .unwrap_or_else(|| panic!("caller {caller_id} must have a [subagents] policy"));
+    let delegator: Arc<dyn Delegator> = Arc::new(RuntimeDelegator::new(
+        registry.clone(),
+        Arc::downgrade(state),
+    ));
+    let deps = LocalToolDeps {
+        skill_manager: Arc::new(SkillManager::new()),
+        rag: None,
+        gate: state.approval_gate.clone(),
+        auto_decider: None,
+        observability: None,
+        delegator: Some(delegator),
+        delegate_bounds: Some(bounds),
+        delegation_context: Some(context),
+        event_tx: None,
+        operations: OperationContext::disabled(),
+    };
+    let tool = LocalToolRegistry::builtins()
+        .tools()
+        .iter()
+        .find(|t| t.id == BUILTIN_DELEGATE_ID)
+        .unwrap()
+        .clone();
+    let mut scoped = scope(caller_id, Some("proj"));
+    scoped.local_tools_allow = ToolsAllow::AllFromSources;
+    LocalToolBridge::new(
+        tool,
+        scoped,
+        Arc::new(Mutex::new(ToolCallBudget::new(8))),
+        deps,
+    )
+}
+
+fn root_context(max_depth: u32) -> DelegationContext {
+    DelegationContext {
+        chain: Vec::new(),
+        depth: 0,
+        effective_max_depth: max_depth,
+    }
+}
+
+fn with_subagents(id: &str, allowed: &[&str], max_depth: u32) -> Agent {
+    Agent {
+        id: id.into(),
+        project_id: Some("proj".into()),
+        config: AgentConfig {
+            name: id.into(),
+            subagents: Some(SubagentsConfig {
+                allowed: allowed.iter().map(|s| s.to_string()).collect(),
+                max_depth: Some(max_depth),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    }
+}
+
+#[tokio::test]
+async fn explicit_agent_id_selects_the_named_specialist() {
+    let registry = Arc::new(AgentRegistry::new());
+    register_real(&registry, parent_with(&["a", "b"], AgentConfig::default()));
+    register_real(&registry, agent("a", Some("proj"), None));
+    register_real(&registry, agent("b", Some("proj"), None));
+    let runs = RecordedRuns::default();
+    let state = test_state(
+        registry.clone(),
+        Arc::new(RecordingEngine {
+            runs: runs.clone(),
+            answer: "B_ANSWER".into(),
+            fail_on: None,
+            spend_budget: false,
+        }),
+        Arc::new(FakeProvider { fail: false }),
+    );
+    let bridge = delegate_bridge(&state, &registry, "parent", root_context(1));
+
+    let result = bridge
+        .invoke_json(serde_json::json!({"message": "x", "agent_id": "b"}))
+        .await
+        .expect("an allowed explicit target runs");
+    assert!(result.contains("B_ANSWER"));
+    let guard = runs.0.lock().unwrap();
+    assert_eq!(guard.len(), 1, "exactly one child turn ran");
+    assert_eq!(guard[0].agent.id, "b", "the named specialist was chosen");
+}
+
+#[tokio::test]
+async fn non_allowed_agent_id_is_rejected_by_name() {
+    let registry = Arc::new(AgentRegistry::new());
+    register_real(&registry, parent_with(&["a"], AgentConfig::default()));
+    register_real(&registry, agent("a", Some("proj"), None));
+    register_real(&registry, agent("outsider", Some("proj"), None));
+    let runs = RecordedRuns::default();
+    let state = test_state(
+        registry.clone(),
+        Arc::new(RecordingEngine {
+            runs: runs.clone(),
+            answer: "unused".into(),
+            fail_on: None,
+            spend_budget: false,
+        }),
+        Arc::new(FakeProvider { fail: false }),
+    );
+    let bridge = delegate_bridge(&state, &registry, "parent", root_context(1));
+
+    let err = bridge
+        .invoke_json(serde_json::json!({"message": "x", "agent_id": "outsider"}))
+        .await
+        .expect_err("a non-allowed id must be refused");
+    assert!(err.contains("outsider"), "error names the agent: {err}");
+    assert!(err.contains("allowlist"), "error names the reason: {err}");
+    assert!(
+        runs.0.lock().unwrap().is_empty(),
+        "no child turn ran for a non-allowed id"
+    );
+}
+
+#[tokio::test]
+async fn grandchild_request_carries_depth_two_and_the_full_ancestor_chain() {
+    let registry = Arc::new(AgentRegistry::new());
+    register_real(&registry, parent_with(&["b"], AgentConfig::default()));
+    register_real(&registry, with_subagents("b", &["c"], 2));
+    register_real(&registry, agent("c", Some("proj"), None));
+    let runs = RecordedRuns::default();
+    let state = test_state(
+        registry.clone(),
+        Arc::new(RecordingEngine {
+            runs: runs.clone(),
+            answer: "ok".into(),
+            fail_on: None,
+            spend_budget: false,
+        }),
+        Arc::new(FakeProvider { fail: false }),
+    );
+
+    // Level 1: the coordinator delegates to B.
+    delegate_bridge(&state, &registry, "parent", root_context(2))
+        .invoke_json(serde_json::json!({"message": "level-1"}))
+        .await
+        .expect("the first delegation runs");
+    let child_context = {
+        let guard = runs.0.lock().unwrap();
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].agent.id, "b");
+        guard[0]
+            .delegation_context
+            .clone()
+            .expect("the child turn carries a context")
+    };
+    assert_eq!(child_context.depth, 1);
+    assert_eq!(child_context.chain, vec!["proj/parent".to_string()]);
+
+    // Level 2: B's own tool uses the context the runtime actually produced.
+    delegate_bridge(&state, &registry, "b", child_context)
+        .invoke_json(serde_json::json!({"message": "level-2"}))
+        .await
+        .expect("the second delegation runs");
+    let guard = runs.0.lock().unwrap();
+    assert_eq!(guard.len(), 2, "two child turns ran");
+    let grandchild = &guard[1];
+    assert_eq!(grandchild.agent.id, "c");
+    let context = grandchild
+        .delegation_context
+        .as_ref()
+        .expect("the grandchild turn carries a context");
+    assert_eq!(context.depth, 2, "depth increments at every level");
+    assert_eq!(
+        context.chain,
+        vec!["proj/parent".to_string(), "proj/b".to_string()]
+    );
+    assert!(
+        context.chain.iter().any(|id| id == "proj/parent"),
+        "the coordinator's qualified id is still in the chain"
+    );
+}
+
+#[tokio::test]
+async fn cycle_back_to_the_coordinator_is_rejected_at_level_two() {
+    let registry = Arc::new(AgentRegistry::new());
+    register_real(&registry, parent_with(&["b"], AgentConfig::default()));
+    register_real(&registry, with_subagents("b", &["parent"], 2));
+    let runs = RecordedRuns::default();
+    let state = test_state(
+        registry.clone(),
+        Arc::new(RecordingEngine {
+            runs: runs.clone(),
+            answer: "ok".into(),
+            fail_on: None,
+            spend_budget: false,
+        }),
+        Arc::new(FakeProvider { fail: false }),
+    );
+
+    delegate_bridge(&state, &registry, "parent", root_context(2))
+        .invoke_json(serde_json::json!({"message": "level-1"}))
+        .await
+        .expect("the first delegation runs");
+    let child_context = runs.0.lock().unwrap()[0]
+        .delegation_context
+        .clone()
+        .expect("child context");
+
+    let err = delegate_bridge(&state, &registry, "b", child_context)
+        .invoke_json(serde_json::json!({"message": "level-2", "agent_id": "parent"}))
+        .await
+        .expect_err("delegating back to the coordinator must be refused");
+    assert!(err.contains("cycle"), "error names the reason: {err}");
+    assert!(
+        err.contains("proj/parent"),
+        "error names the cycle id: {err}"
+    );
+    assert_eq!(runs.0.lock().unwrap().len(), 1, "no third turn ran");
 }

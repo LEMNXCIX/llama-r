@@ -16,7 +16,9 @@ use llama_r::domain::agent::{Agent, AgentConfig, RagWritePolicy};
 use llama_r::domain::policy::{ApprovalPolicy, ApprovalRule, PermissionPolicy};
 use llama_r::domain::scope::{AgentScope, ToolRef, ToolsAllow};
 use llama_r::error::AppError;
-use llama_r::ports::delegation::{DelegateRequest, DelegateResult, Delegator, ToolBudget};
+use llama_r::ports::delegation::{
+    DelegateRequest, DelegateResult, DelegationContext, Delegator, ToolBudget,
+};
 use llama_r::ports::engine::{AgentRunEvent, AgentRunRequest};
 use llama_r::ports::execution::ExecutionStore;
 use llama_r::ports::mcp::{
@@ -134,6 +136,7 @@ fn request(capabilities: ModelCapabilities, model: &str, local: ToolsAllow) -> A
         conversation_id: None,
         execution_id: uuid::Uuid::new_v4(),
         shared_budget: None,
+        delegation_context: None,
     }
 }
 
@@ -206,6 +209,7 @@ fn skill_deps(skills_root: &std::path::Path) -> LocalToolDeps {
         observability: None,
         delegator: None,
         delegate_bounds: None,
+        delegation_context: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
@@ -220,6 +224,7 @@ fn empty_deps() -> LocalToolDeps {
         observability: None,
         delegator: None,
         delegate_bounds: None,
+        delegation_context: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
@@ -323,6 +328,7 @@ fn rag_deps(rag: Arc<ScopingFakeRag>) -> LocalToolDeps {
         observability: None,
         delegator: None,
         delegate_bounds: None,
+        delegation_context: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
@@ -829,8 +835,14 @@ fn fake_delegator(answer: &str) -> (Arc<dyn Delegator>, RecordedDelegations) {
 
 fn parent_bounds() -> DelegateBounds {
     DelegateBounds {
+        caller_qualified_id: "proj/parent".into(),
         target_agent_id: Some("child".into()),
-        chain: vec!["proj/parent".into()],
+    }
+}
+
+fn root_context() -> DelegationContext {
+    DelegationContext {
+        chain: Vec::new(),
         depth: 0,
         effective_max_depth: 2,
     }
@@ -843,9 +855,18 @@ fn delegate_scope(local: ToolsAllow) -> AgentScope {
 }
 
 fn delegate_deps(delegator: Arc<dyn Delegator>, bounds: Option<DelegateBounds>) -> LocalToolDeps {
+    delegate_deps_with_context(delegator, bounds, Some(root_context()))
+}
+
+fn delegate_deps_with_context(
+    delegator: Arc<dyn Delegator>,
+    bounds: Option<DelegateBounds>,
+    context: Option<DelegationContext>,
+) -> LocalToolDeps {
     let mut deps = empty_deps();
     deps.delegator = Some(delegator);
     deps.delegate_bounds = bounds;
+    deps.delegation_context = context;
     deps
 }
 
@@ -873,6 +894,10 @@ fn delegate_is_a_typed_builtin_tool() {
         Value::String("string".into())
     );
     assert_eq!(
+        tool.input_schema["properties"]["agent_id"]["type"],
+        Value::String("string".into())
+    );
+    assert_eq!(
         tool.input_schema["properties"]["task_id"]["type"],
         Value::String("string".into())
     );
@@ -883,7 +908,7 @@ fn delegate_is_a_typed_builtin_tool() {
     assert_eq!(
         tool.input_schema["required"].as_array().unwrap().len(),
         1,
-        "only message is required; task_id is optional"
+        "only message is required; agent_id and task_id are optional"
     );
 }
 
@@ -1166,6 +1191,10 @@ async fn delegate_bad_args_and_missing_companions_are_named_errors() {
             serde_json::json!({"message": "ok", "task_id": 7}),
             "task_id",
         ),
+        (
+            serde_json::json!({"message": "ok", "agent_id": 7}),
+            "agent_id",
+        ),
     ] {
         let err = bridge.invoke_json(args.clone()).await.unwrap_err();
         assert!(
@@ -1215,4 +1244,56 @@ async fn delegate_bad_args_and_missing_companions_are_named_errors() {
         .await
         .unwrap_err();
     assert!(err.contains("allowed"), "{err}");
+}
+
+#[tokio::test]
+async fn explicit_agent_id_overrides_the_default_target() {
+    let (delegator, seen) = fake_delegator("CHILD_ANSWER");
+    let bridge = LocalToolBridge::new(
+        builtin(BUILTIN_DELEGATE_ID),
+        delegate_scope(ToolsAllow::AllFromSources),
+        tool_budget(2),
+        delegate_deps(delegator, Some(parent_bounds())),
+    );
+
+    bridge
+        .invoke_json(serde_json::json!({"message": "x", "agent_id": "specialist-2"}))
+        .await
+        .expect("a well-formed explicit id runs");
+    let guard = seen.0.lock().unwrap();
+    assert_eq!(guard.len(), 1);
+    assert_eq!(
+        guard[0].agent_id, "specialist-2",
+        "the named specialist wins over the first allowed id"
+    );
+}
+
+#[tokio::test]
+async fn delegate_bridge_extends_the_chain_and_depth_from_its_context() {
+    let (delegator, seen) = fake_delegator("CHILD_ANSWER");
+    let context = DelegationContext {
+        chain: vec!["proj/coordinator".into()],
+        depth: 1,
+        effective_max_depth: 3,
+    };
+    let bridge = LocalToolBridge::new(
+        builtin(BUILTIN_DELEGATE_ID),
+        delegate_scope(ToolsAllow::AllFromSources),
+        tool_budget(2),
+        delegate_deps_with_context(delegator, Some(parent_bounds()), Some(context)),
+    );
+
+    bridge
+        .invoke_json(serde_json::json!({"message": "x"}))
+        .await
+        .expect("the delegate call runs");
+    let guard = seen.0.lock().unwrap();
+    assert_eq!(guard.len(), 1);
+    assert_eq!(
+        guard[0].chain,
+        vec!["proj/coordinator".to_string(), "proj/parent".to_string()],
+        "the caller's qualified id is appended to the inherited chain"
+    );
+    assert_eq!(guard[0].depth, 2, "depth increments at every level");
+    assert_eq!(guard[0].effective_max_depth, 3);
 }

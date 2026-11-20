@@ -236,6 +236,7 @@ fn request(agent: &str) -> RuntimeChatRequest {
         default_model: "global-model".to_string(),
         execution_id: uuid::Uuid::new_v4(),
         shared_budget: None,
+        delegation_context: None,
     }
 }
 

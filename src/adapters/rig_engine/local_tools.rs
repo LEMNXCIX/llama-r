@@ -55,34 +55,31 @@ pub enum LocalToolKind {
     Delegate,
 }
 
-/// Bounds a delegate call inherits from the calling agent's `[subagents]`
-/// policy. Built by the engine from the running agent, so the bridge never
-/// guesses a target, a depth or a recursion limit of its own.
+/// Caller facts the delegate tool needs but the scope cannot supply: its
+/// qualified id for the cycle-detection chain, and the default target from its
+/// `[subagents].allowed` list when the call does not name one. Both are derived
+/// by the engine from the running `Agent`; recursion bounds live separately in
+/// `DelegationContext`, which is threaded through the whole tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegateBounds {
-    /// The target id from `[subagents].allowed`. `None` means no target was
-    /// declared; the call then fails with a named error instead of delegating
-    /// to an agent the manifest never authorised.
+    /// Qualified id of the calling agent (`project::agent`, or the bare id for
+    /// a global), appended to the ancestor chain for the child.
+    pub caller_qualified_id: String,
+    /// The first allowed id from `[subagents].allowed`, used only when the tool
+    /// call omits `agent_id`. `None` means no target was declared.
     pub target_agent_id: Option<String>,
-    /// Qualified ids of the ancestors, starting with the caller.
-    pub chain: Vec<String>,
-    /// The caller's depth (0 at the root); the tool sends `depth + 1`.
-    pub depth: u32,
-    /// The caller's validated maximum depth from its manifest.
-    pub effective_max_depth: u32,
 }
 
 impl DelegateBounds {
-    /// Derive the bounds from the calling agent's own manifest. An agent with
-    /// no `[subagents]` policy has no bounds and no target, so dispatch refuses
-    /// with a named error rather than silently delegating somewhere.
+    /// Derive the caller facts from its own manifest. An agent with no
+    /// `[subagents]` policy has no default target; a call that omits `agent_id`
+    /// then refuses with a named error rather than delegating somewhere the
+    /// manifest never authorised.
     pub fn for_agent(agent: &Agent) -> Option<Self> {
         let policy = agent.config.subagents.as_ref()?;
         Some(Self {
+            caller_qualified_id: agent.qualified_id(),
             target_agent_id: policy.allowed.first().cloned(),
-            chain: vec![agent.qualified_id()],
-            depth: 0,
-            effective_max_depth: policy.effective_max_depth(),
         })
     }
 }
@@ -135,6 +132,7 @@ impl LocalToolRegistry {
                         "type": "object",
                         "properties": {
                             "message": { "type": "string" },
+                            "agent_id": { "type": "string" },
                             "task_id": { "type": "string" }
                         },
                         "required": ["message"]
@@ -266,7 +264,7 @@ mod bridge {
     use crate::api::observability::AppObservability;
     use crate::domain::scope::AgentScope;
     use crate::ports::auto::AutoDecider;
-    use crate::ports::delegation::{DelegateRequest, Delegator, ToolBudget};
+    use crate::ports::delegation::{DelegateRequest, DelegationContext, Delegator, ToolBudget};
     use crate::ports::engine::AgentRunEvent;
     use crate::ports::rag::RagStore;
     use crate::services::approval::ApprovalGate;
@@ -309,6 +307,10 @@ mod bridge {
         /// agent's `[subagents]` manifest. `None` means that agent has no
         /// delegation policy, so the tool refuses instead of inventing a target.
         pub delegate_bounds: Option<DelegateBounds>,
+        /// Recursion bounds for this turn (ancestor chain, depth, effective
+        /// maximum), carried from the parent's `DelegateRequest` or derived
+        /// from the root agent's manifest. `None` means no delegation context.
+        pub delegation_context: Option<DelegationContext>,
         /// `Some` on the streaming path (the `ApprovalRequired` event reaches
         /// the SSE caller); `None` on the non-streaming path.
         pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
@@ -444,10 +446,12 @@ mod bridge {
 
         /// Delegate one child turn through the injected `Delegator`. The caller
         /// identity and project come from the bridge's own scope, the recursion
-        /// bounds from the engine-derived manifest context, and the shared
-        /// allowance from this bridge's budget. The target is the first allowed
-        /// id in the caller's `[subagents]` policy — there is no schema field to
-        /// pick a different one, so an empty allowlist is a named refusal.
+        /// bounds from the tree's `DelegationContext`, and the shared allowance
+        /// from this bridge's budget. An explicit `agent_id` chooses a
+        /// specialist; without one the first `[subagents].allowed` id is used
+        /// as the single-specialist convenience. The delegator validates the
+        /// chosen id against the same allowlist, so a non-allowed id is a named
+        /// error rather than a silent fallback.
         ///
         /// Child-event forwarding is deliberately `None` here: the `EventForwarder`
         /// that enriches approval payloads with `task_id`/`depth` is wired in a
@@ -470,6 +474,15 @@ mod bridge {
                     ));
                 }
             };
+            let explicit_target = match args.get("agent_id") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(id)) if !id.trim().is_empty() => Some(id.clone()),
+                Some(_) => {
+                    return Err(format!(
+                        "local tool '{tool_id}': 'agent_id' must be a non-empty string when present"
+                    ));
+                }
+            };
 
             let delegator = self.deps.delegator.as_ref().ok_or_else(|| {
                 format!(
@@ -479,23 +492,31 @@ mod bridge {
             let bounds = self.deps.delegate_bounds.as_ref().ok_or_else(|| {
                 format!("local tool '{tool_id}': the calling agent has no [subagents] policy; delegation is unavailable")
             })?;
-            let target = bounds
-                .target_agent_id
-                .as_ref()
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| {
-                    format!("local tool '{tool_id}': the calling agent's [subagents].allowed is empty; no delegation target")
-                })?;
+            let target = match explicit_target {
+                Some(id) => id,
+                None => bounds
+                    .target_agent_id
+                    .clone()
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or_else(|| {
+                        format!("local tool '{tool_id}': the calling agent's [subagents].allowed is empty; no delegation target")
+                    })?,
+            };
+            let context = self.deps.delegation_context.as_ref().ok_or_else(|| {
+                format!("local tool '{tool_id}': no delegation context for this turn")
+            })?;
+            let mut chain = context.chain.clone();
+            chain.push(bounds.caller_qualified_id.clone());
 
             let request = DelegateRequest {
-                agent_id: target.clone(),
+                agent_id: target,
                 caller_agent_id: self.scope.agent_id.clone(),
                 project_id: self.scope.project_id.clone(),
                 message: message.to_string(),
                 task_id,
-                chain: bounds.chain.clone(),
-                depth: bounds.depth + 1,
-                effective_max_depth: bounds.effective_max_depth,
+                chain,
+                depth: context.depth + 1,
+                effective_max_depth: context.effective_max_depth,
                 // Leave the parent's own loop some room: the child's named
                 // timeout must arrive before the parent's run is cancelled.
                 deadline: Instant::now()

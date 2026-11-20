@@ -37,6 +37,7 @@ fn test_deps() -> LocalToolDeps {
         observability: None,
         delegator: None,
         delegate_bounds: None,
+        delegation_context: None,
         event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
@@ -162,6 +163,7 @@ fn request(provider: ProviderKind, model: &str) -> AgentRunRequest {
         conversation_id: None,
         execution_id: uuid::Uuid::new_v4(),
         shared_budget: None,
+        delegation_context: None,
     }
 }
 

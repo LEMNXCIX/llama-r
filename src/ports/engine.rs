@@ -4,7 +4,7 @@ use crate::config::ProviderKind;
 use crate::domain::agent::Agent;
 use crate::domain::models::ChatMessage;
 use crate::domain::scope::AgentScope;
-use crate::ports::delegation::ToolBudget;
+use crate::ports::delegation::{DelegationContext, ToolBudget};
 use crate::providers::capabilities::ModelCapabilities;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -31,6 +31,7 @@ impl std::fmt::Debug for AgentRunRequest {
                 "shared_budget",
                 &self.shared_budget.as_ref().map(|_| "<shared budget>"),
             )
+            .field("delegation_context", &self.delegation_context)
             .finish()
     }
 }
@@ -63,6 +64,10 @@ pub struct AgentRunRequest {
     /// `scope.max_tool_calls`. Additive by design: no existing engine signature
     /// changes, and a plain turn keeps its old behaviour byte for byte.
     pub shared_budget: Option<Arc<dyn ToolBudget>>,
+    /// Recursion bounds for this turn, carried from a parent's delegation.
+    /// `None` for an ordinary root turn, where the engine derives the bounds
+    /// from the resolved agent's own manifest. Additive, like `shared_budget`.
+    pub delegation_context: Option<DelegationContext>,
 }
 
 #[derive(Debug, Clone)]

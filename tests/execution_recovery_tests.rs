@@ -353,6 +353,7 @@ fn an_agent_run_request_carries_an_execution_id() {
     let req = AgentRunRequest {
         execution_id,
         shared_budget: None,
+        delegation_context: None,
         agent: Agent {
             id: "a".into(),
             project_id: None,

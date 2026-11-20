@@ -6,10 +6,38 @@
 //! a child a fresh allowance or a deeper recursion budget. This module is pure
 //! contract: the concrete runtime lives in a later task.
 
+use crate::domain::agent::Agent;
 use crate::ports::engine::AgentRunEvent;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// The recursion bounds a turn carries through a delegation tree.
+///
+/// `chain` holds the qualified ids of the turn's **ancestors**, oldest first —
+/// it does not include the current agent. A child's request extends it with the
+/// caller's qualified id, so cycle detection sees every ancestor at every level.
+/// `depth` is the number of delegations taken so far (0 at the root), and
+/// `effective_max_depth` is the tightest limit seen along the chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationContext {
+    pub chain: Vec<String>,
+    pub depth: u32,
+    pub effective_max_depth: u32,
+}
+
+impl DelegationContext {
+    /// Root bounds, derived from the running agent's `[subagents]` policy.
+    /// `None` means the agent does not delegate at all.
+    pub fn root_for(agent: &Agent) -> Option<Self> {
+        let policy = agent.config.subagents.as_ref()?;
+        Some(Self {
+            chain: Vec::new(),
+            depth: 0,
+            effective_max_depth: policy.effective_max_depth(),
+        })
+    }
+}
 
 /// The shared tool-call allowance for a whole delegation tree.
 ///

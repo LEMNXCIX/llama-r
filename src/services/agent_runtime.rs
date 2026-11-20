@@ -5,7 +5,7 @@ use crate::domain::models::ChatMessage;
 use crate::domain::scope::AgentScope;
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
-use crate::ports::delegation::ToolBudget;
+use crate::ports::delegation::{DelegationContext, ToolBudget};
 use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest};
 use crate::ports::history::ConversationStore;
 use crate::ports::rag::RagStore;
@@ -52,6 +52,8 @@ pub struct RuntimeChatRequest {
     /// The one tool allowance shared by a whole delegation tree, carried from a
     /// child turn's `DelegateRequest.budget`. `None` for an ordinary turn.
     pub shared_budget: Option<Arc<dyn ToolBudget>>,
+    /// The delegation bounds carried from a parent turn; `None` at the root.
+    pub delegation_context: Option<DelegationContext>,
 }
 
 impl AgentRuntime {
@@ -112,6 +114,7 @@ impl AgentRuntime {
             conversation_id: req.conversation_id,
             execution_id: req.execution_id,
             shared_budget: req.shared_budget,
+            delegation_context: req.delegation_context,
         })
     }
 

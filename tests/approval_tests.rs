@@ -369,6 +369,7 @@ fn local_bridge(
         observability: None,
         delegator: None,
         delegate_bounds: None,
+        delegation_context: None,
         event_tx,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     };
@@ -646,6 +647,7 @@ async fn build_tool_bridges_carries_gate_to_both_bridge_kinds() {
         observability: None,
         delegator: None,
         delegate_bounds: None,
+        delegation_context: None,
         event_tx: Some(tx),
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     };
@@ -1028,6 +1030,7 @@ fn e2e_request() -> AgentRunRequest {
         conversation_id: None,
         execution_id: Uuid::new_v4(),
         shared_budget: None,
+        delegation_context: None,
     }
 }
 

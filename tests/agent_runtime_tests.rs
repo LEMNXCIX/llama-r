@@ -137,6 +137,7 @@ fn request() -> RuntimeChatRequest {
         default_model: "fallback".to_string(),
         execution_id: uuid::Uuid::new_v4(),
         shared_budget: None,
+        delegation_context: None,
     }
 }
 
