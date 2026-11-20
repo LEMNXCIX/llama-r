@@ -39,6 +39,7 @@ fn test_deps() -> LocalToolDeps {
         delegate_bounds: None,
         delegation_context: None,
         event_tx: None,
+        tool_event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
 }
@@ -165,6 +166,7 @@ fn request(provider: ProviderKind, model: &str) -> AgentRunRequest {
         shared_budget: None,
         delegation_context: None,
         approval_event_tx: None,
+        tool_event_tx: None,
     }
 }
 

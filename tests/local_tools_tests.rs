@@ -19,7 +19,7 @@ use llama_r::error::AppError;
 use llama_r::ports::delegation::{
     DelegateRequest, DelegateResult, DelegationContext, Delegator, ToolBudget,
 };
-use llama_r::ports::engine::{AgentRunEvent, AgentRunRequest};
+use llama_r::ports::engine::{AgentRunEvent, AgentRunRequest, ToolEvent};
 use llama_r::ports::execution::ExecutionStore;
 use llama_r::ports::mcp::{
     filter_tools_for_scope, McpCallRequest, McpCallResult, McpClient, McpServerRegistry, McpToolDef,
@@ -138,6 +138,7 @@ fn request(capabilities: ModelCapabilities, model: &str, local: ToolsAllow) -> A
         shared_budget: None,
         delegation_context: None,
         approval_event_tx: None,
+        tool_event_tx: None,
     }
 }
 
@@ -212,6 +213,7 @@ fn skill_deps(skills_root: &std::path::Path) -> LocalToolDeps {
         delegate_bounds: None,
         delegation_context: None,
         event_tx: None,
+        tool_event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
 }
@@ -227,6 +229,7 @@ fn empty_deps() -> LocalToolDeps {
         delegate_bounds: None,
         delegation_context: None,
         event_tx: None,
+        tool_event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
 }
@@ -331,6 +334,7 @@ fn rag_deps(rag: Arc<ScopingFakeRag>) -> LocalToolDeps {
         delegate_bounds: None,
         delegation_context: None,
         event_tx: None,
+        tool_event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     }
 }
@@ -541,6 +545,48 @@ async fn local_bridge_rechecks_scope_and_shares_the_budget() {
             || err.to_ascii_lowercase().contains("exceeded"),
         "the second call hits the exhausted budget: {err}"
     );
+}
+
+#[tokio::test]
+async fn local_bridge_emits_one_tool_event_without_args() {
+    let dir = TempDir::new().unwrap();
+    write_skill(dir.path(), "known-skill", "the body");
+    let mut deps = skill_deps(dir.path());
+    let (tx, mut rx) = mpsc::channel(8);
+    deps.tool_event_tx = Some(tx);
+
+    let tool = LocalToolRegistry::builtins()
+        .tools()
+        .iter()
+        .find(|t| t.id == BUILTIN_SKILL_ID)
+        .unwrap()
+        .clone();
+    let bridge = LocalToolBridge::new(
+        tool,
+        scope(ToolsAllow::AllFromSources),
+        Arc::new(AsyncMutex::new(ToolCallBudget::new(4))),
+        deps,
+    );
+
+    // A successful call emits exactly one event: the bare local id and success.
+    // `ToolEvent` has no arguments field, so no tool input can reach the sink.
+    bridge
+        .invoke_json(serde_json::json!({"name": "known-skill"}))
+        .await
+        .unwrap();
+    let event: ToolEvent = rx.recv().await.expect("one tool event");
+    assert_eq!(event.tool_name, BUILTIN_SKILL_ID);
+    assert!(event.success);
+    assert!(rx.try_recv().is_err(), "exactly one event per call");
+
+    // A named refusal still emits one event, now with success = false.
+    bridge
+        .invoke_json(serde_json::json!({"name": "missing"}))
+        .await
+        .unwrap_err();
+    let event = rx.recv().await.expect("one tool event for the failure");
+    assert_eq!(event.tool_name, BUILTIN_SKILL_ID);
+    assert!(!event.success);
 }
 
 #[tokio::test]

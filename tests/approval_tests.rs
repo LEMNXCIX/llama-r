@@ -373,6 +373,7 @@ fn local_bridge(
         delegate_bounds: None,
         delegation_context: None,
         event_tx,
+        tool_event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     };
     let tool = LocalToolRegistry::builtins()
@@ -651,6 +652,7 @@ async fn build_tool_bridges_carries_gate_to_both_bridge_kinds() {
         delegate_bounds: None,
         delegation_context: None,
         event_tx: Some(tx),
+        tool_event_tx: None,
         operations: llama_r::adapters::rig_engine::operations::OperationContext::disabled(),
     };
     let mcp_tool = ScopedMcpTool {
@@ -1034,6 +1036,7 @@ fn e2e_request() -> AgentRunRequest {
         shared_budget: None,
         delegation_context: None,
         approval_event_tx: None,
+        tool_event_tx: None,
     }
 }
 

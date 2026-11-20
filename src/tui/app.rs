@@ -647,6 +647,7 @@ impl TuiApp {
                             shared_budget: None,
                             delegation_context: None,
                             approval_event_tx: None,
+                            tool_event_tx: None,
                         })
                         .await
                         .map(|result| result.text)

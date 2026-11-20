@@ -136,7 +136,8 @@ pub fn build_tool_bridges(
                 )
                 .with_operations(deps.operations.clone())
                 .with_auto_decider(deps.auto_decider.clone())
-                .with_observability(deps.observability.clone()),
+                .with_observability(deps.observability.clone())
+                .with_tool_event_tx(deps.tool_event_tx.clone()),
             ) as Box<dyn ToolDyn>,
             ScopedTool::Local(local) => Box::new(LocalToolBridge::new(
                 local,
@@ -674,6 +675,7 @@ mod tests {
             delegate_bounds: None,
             delegation_context: None,
             event_tx: None,
+            tool_event_tx: None,
             operations: crate::adapters::rig_engine::operations::OperationContext::disabled(),
         }
     }
@@ -709,6 +711,7 @@ mod tests {
             shared_budget: None,
             delegation_context: None,
             approval_event_tx: None,
+            tool_event_tx: None,
         }
     }
 

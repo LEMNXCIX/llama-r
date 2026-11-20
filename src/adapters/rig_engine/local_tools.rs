@@ -267,7 +267,7 @@ mod bridge {
     use crate::ports::delegation::{
         ChildEvent, DelegateRequest, DelegationContext, Delegator, EventForwarder, ToolBudget,
     };
-    use crate::ports::engine::AgentRunEvent;
+    use crate::ports::engine::{AgentRunEvent, ToolEvent};
     use crate::ports::rag::RagStore;
     use crate::services::approval::ApprovalGate;
     use crate::services::skill_manager::SkillManager;
@@ -317,6 +317,10 @@ mod bridge {
         /// `Some` on the streaming path (the `ApprovalRequired` event reaches
         /// the SSE caller); `None` on the non-streaming path.
         pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
+        /// The no-args tool-event sink, mirrored from `AgentRunRequest` so the
+        /// runtime can persist one row per finished tool call. `None` when no
+        /// conversation is being written (no store or `persist_history = false`).
+        pub tool_event_tx: Option<mpsc::Sender<ToolEvent>>,
         /// The turn's durable operation context, shared with the MCP bridge.
         /// Carries the `execution_id` the operation id is scoped to.
         pub operations: OperationContext,
@@ -340,6 +344,9 @@ mod bridge {
         /// counters are an explicit part of the bridge.
         pub observability: Option<Arc<AppObservability>>,
         pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
+        /// Cloned from `deps`, like the approval channel, so the bridge can
+        /// report the finished call without ever seeing its arguments.
+        pub tool_event_tx: Option<mpsc::Sender<ToolEvent>>,
         /// The same idempotency guard the MCP bridge uses. `Some` for every
         /// bridge built by the engine; a directly built test bridge can leave
         /// it out and execute without a store.
@@ -357,6 +364,7 @@ mod bridge {
             let auto_decider = deps.auto_decider.clone();
             let observability = deps.observability.clone();
             let event_tx = deps.event_tx.clone();
+            let tool_event_tx = deps.tool_event_tx.clone();
             let operations = Some(deps.operations.clone());
             Self {
                 tool,
@@ -367,6 +375,7 @@ mod bridge {
                 auto_decider,
                 observability,
                 event_tx,
+                tool_event_tx,
                 operations,
             }
         }
@@ -441,6 +450,18 @@ mod bridge {
                         tool_name: self.tool.id.clone(),
                         is_error: outcome.is_err(),
                         preview: String::new(),
+                    })
+                    .await;
+            }
+            // One history row per finished call. Success is known only here,
+            // after dispatch, so this is emitted alongside `ToolResult` rather
+            // than `ToolCall`. The bare id matches the local tool naming scheme
+            // used by approval rules and `called_tool`; no argument is copied.
+            if let Some(tx) = &self.tool_event_tx {
+                let _ = tx
+                    .send(ToolEvent {
+                        tool_name: self.tool.id.clone(),
+                        success: outcome.is_ok(),
                     })
                     .await;
             }

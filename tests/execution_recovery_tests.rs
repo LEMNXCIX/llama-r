@@ -355,6 +355,7 @@ fn an_agent_run_request_carries_an_execution_id() {
         shared_budget: None,
         delegation_context: None,
         approval_event_tx: None,
+        tool_event_tx: None,
         agent: Agent {
             id: "a".into(),
             project_id: None,

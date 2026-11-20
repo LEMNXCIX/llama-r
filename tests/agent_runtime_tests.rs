@@ -139,6 +139,7 @@ fn request() -> RuntimeChatRequest {
         shared_budget: None,
         delegation_context: None,
         approval_event_tx: None,
+        tool_event_tx: None,
     }
 }
 

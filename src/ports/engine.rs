@@ -32,6 +32,10 @@ impl std::fmt::Debug for AgentRunRequest {
                 &self.shared_budget.as_ref().map(|_| "<shared budget>"),
             )
             .field("delegation_context", &self.delegation_context)
+            .field(
+                "tool_event_tx",
+                &self.tool_event_tx.as_ref().map(|_| "<tool event sink>"),
+            )
             .finish()
     }
 }
@@ -73,6 +77,20 @@ pub struct AgentRunRequest {
     /// non-streaming `run_inner` wires it into `LocalToolDeps.event_tx` so a
     /// child tool's `ApprovalRequired` is not lost. `None` on ordinary turns.
     pub approval_event_tx: Option<tokio::sync::mpsc::Sender<AgentRunEvent>>,
+    /// Additive sink for the no-args tool-event log. Both tool bridges send one
+    /// event per finished call; `AgentRuntime` owns the receiver and persists
+    /// each event into the conversation that is already being written. The type
+    /// deliberately has no arguments field, so a tool input can never reach it.
+    pub tool_event_tx: Option<tokio::sync::mpsc::Sender<ToolEvent>>,
+}
+
+/// The only facts a tool call contributes to conversation history: its name and
+/// whether it succeeded. Arguments are never carried here — a tool input may hold
+/// an API key or a password, and the persisted `tool_events` row stores neither.
+#[derive(Debug, Clone)]
+pub struct ToolEvent {
+    pub tool_name: String,
+    pub success: bool,
 }
 
 #[derive(Debug, Clone)]

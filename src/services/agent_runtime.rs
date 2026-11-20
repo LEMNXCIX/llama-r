@@ -1,12 +1,13 @@
 //! Orchestrates a single agent turn: scope → (optional) history → engine → learn.
 
 use crate::context::analyzer::ContextEnricher;
+use crate::domain::agent::Agent;
 use crate::domain::models::ChatMessage;
 use crate::domain::scope::AgentScope;
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
 use crate::ports::delegation::{DelegationContext, ToolBudget};
-use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest};
+use crate::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, ToolEvent};
 use crate::ports::history::ConversationStore;
 use crate::ports::rag::RagStore;
 use crate::services::agent_registry::AgentRegistry;
@@ -57,6 +58,10 @@ pub struct RuntimeChatRequest {
     /// Event channel for a child turn whose approvals must be forwarded to the
     /// root's SSE. `None` for an ordinary or streaming-root turn.
     pub approval_event_tx: Option<tokio::sync::mpsc::Sender<crate::ports::engine::AgentRunEvent>>,
+    /// No-args tool-history sink. Callers leave this `None`: `AgentRuntime`
+    /// installs its own sink bound to the conversation it actually persisted,
+    /// and carries it into the engine request via `build_run_request`.
+    pub tool_event_tx: Option<mpsc::Sender<ToolEvent>>,
 }
 
 /// The answer plus the conversation the turn was persisted under, if any.
@@ -139,7 +144,72 @@ impl AgentRuntime {
             shared_budget: req.shared_budget,
             delegation_context: req.delegation_context,
             approval_event_tx: req.approval_event_tx,
+            tool_event_tx: req.tool_event_tx,
         })
+    }
+
+    /// Create the no-args tool-event sink for a turn that is being persisted.
+    /// The receiver is drained by a best-effort task writing into the same
+    /// conversation `append_user` just wrote; a store error is a warning, never
+    /// a failed chat. `None` when there is no store or nothing was persisted.
+    fn tool_event_sink(
+        &self,
+        persist_history: bool,
+        conversation_id: Option<String>,
+    ) -> Option<mpsc::Sender<ToolEvent>> {
+        if !persist_history {
+            return None;
+        }
+        let history = self.history.clone()?;
+        let cid = conversation_id?;
+        let (tx, mut rx) = mpsc::channel::<ToolEvent>(64);
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let Err(e) = history
+                    .append_tool_event(&cid, &event.tool_name, event.success)
+                    .await
+                {
+                    tracing::warn!(error = %e, tool = %event.tool_name, "Failed to persist tool event");
+                }
+            }
+        });
+        Some(tx)
+    }
+
+    /// Forward the engine's stream to the caller while capturing the final text
+    /// from `Completed`. The assistant row is written *before* that event is
+    /// forwarded, so a consumer draining to `done` can rely on the history being
+    /// there. Token events are never persisted individually — only the final
+    /// text, once, under the same id `append_user` used.
+    fn forward_stream_persistence(
+        &self,
+        mut events: mpsc::Receiver<AgentRunEvent>,
+        agent: Agent,
+        persist_history: bool,
+        conversation_id: Option<String>,
+    ) -> mpsc::Receiver<AgentRunEvent> {
+        let (tx, rx) = mpsc::channel(64);
+        let history = self.history.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if let AgentRunEvent::Completed { result } = &event {
+                    if persist_history {
+                        if let (Some(history), Some(cid)) = (&history, &conversation_id) {
+                            if let Err(e) = history
+                                .append_assistant(Some(cid), &agent, &result.text)
+                                .await
+                            {
+                                tracing::warn!(error = %e, "Failed to persist streaming assistant message");
+                            }
+                        }
+                    }
+                }
+                // A caller that stopped reading must not cost us the final
+                // answer: keep draining so `Completed` is still persisted.
+                let _ = tx.send(event).await;
+            }
+        });
+        rx
     }
 
     pub async fn chat(&self, req: RuntimeChatRequest) -> Result<RuntimeChatResult, AppError> {
@@ -153,6 +223,7 @@ impl AgentRuntime {
 
         let agent = registered.agent.clone();
         let scope = registered.scope.clone();
+        let persist_history = agent.config.memory.persist_history;
 
         let mut resolved_conv_id = conversation_id.clone();
         // Echo only an id that was actually persisted. A supplied id with
@@ -161,7 +232,7 @@ impl AgentRuntime {
         let mut persisted_conv_id: Option<String> = None;
 
         if let Some(history) = &self.history {
-            if agent.config.memory.persist_history {
+            if persist_history {
                 match history
                     .append_user(conversation_id.as_deref(), &agent, &user_message)
                     .await
@@ -191,9 +262,14 @@ impl AgentRuntime {
             }
         }
 
+        // One sink for both bridge kinds, bound to the id the user message was
+        // persisted under. The tools never see the store itself.
+        let tool_event_tx = self.tool_event_sink(persist_history, resolved_conv_id.clone());
+
         let mut updated_req = req;
         updated_req.conversation_id = resolved_conv_id;
         updated_req.history = req_history;
+        updated_req.tool_event_tx = tool_event_tx;
 
         let run_req = self.build_run_request(updated_req).await?;
 
@@ -231,7 +307,8 @@ impl AgentRuntime {
         })
     }
 
-    /// Stream agent events (tokens / completed / errors). Tool events are reserved for later.
+    /// Stream agent events (tokens / completed / errors), persisting the final
+    /// answer once and every finished tool call into the turn's conversation.
     pub async fn chat_stream(
         &self,
         req: RuntimeChatRequest,
@@ -246,12 +323,13 @@ impl AgentRuntime {
 
         let agent = registered.agent.clone();
         let scope = registered.scope.clone();
+        let persist_history = agent.config.memory.persist_history;
 
         let mut resolved_conv_id = conversation_id.clone();
         let mut persisted_conv_id: Option<String> = None;
 
         if let Some(history) = &self.history {
-            if agent.config.memory.persist_history {
+            if persist_history {
                 match history
                     .append_user(conversation_id.as_deref(), &agent, &user_message)
                     .await
@@ -281,9 +359,12 @@ impl AgentRuntime {
             }
         }
 
+        let tool_event_tx = self.tool_event_sink(persist_history, resolved_conv_id.clone());
+
         let mut updated_req = req;
-        updated_req.conversation_id = resolved_conv_id;
+        updated_req.conversation_id = resolved_conv_id.clone();
         updated_req.history = req_history;
+        updated_req.tool_event_tx = tool_event_tx;
 
         let run_req = self.build_run_request(updated_req).await?;
 
@@ -300,6 +381,11 @@ impl AgentRuntime {
             .run_stream(run_req)
             .await
             .map_err(AppError::Runtime)?;
+        // The engine's receiver is drained by a forwarder that writes the final
+        // answer before handing `Completed` to the caller, so the SSE `done`
+        // event and the persisted assistant row always agree.
+        let events =
+            self.forward_stream_persistence(events, agent, persist_history, resolved_conv_id);
         Ok(RuntimeStreamResult {
             events,
             conversation_id: persisted_conv_id,

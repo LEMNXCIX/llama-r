@@ -482,6 +482,7 @@ impl RigAgentEngine {
                     .clone()
                     .or_else(|| DelegationContext::root_for(&req.agent)),
                 event_tx: req.approval_event_tx.clone(),
+                tool_event_tx: req.tool_event_tx.clone(),
                 operations: operations::OperationContext::new(
                     req.execution_id,
                     self.execution_store.clone(),
@@ -602,6 +603,7 @@ impl RigAgentEngine {
                     .clone()
                     .or_else(|| DelegationContext::root_for(&req.agent)),
                 event_tx: Some(tx.clone()),
+                tool_event_tx: req.tool_event_tx.clone(),
                 operations: operations::OperationContext::new(
                     req.execution_id,
                     self.execution_store.clone(),

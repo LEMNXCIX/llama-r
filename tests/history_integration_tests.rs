@@ -56,8 +56,11 @@ fn sample_scope() -> AgentScope {
 #[derive(Default)]
 struct RecordedCalls {
     append_user_calls: usize,
+    assistant_messages: Vec<(Option<String>, String)>,
     summarize_ids: Vec<Option<String>>,
     tool_events: Vec<(String, String, bool)>,
+    tool_event_attempts: usize,
+    fail_tool_events: bool,
     purges: Vec<(u32, Option<HashMap<String, u32>>)>,
 }
 
@@ -74,8 +77,23 @@ impl RecordingStore {
         }
     }
 
+    /// A store whose `append_tool_event` always fails, to prove best effort.
+    fn failing_tool_events() -> Self {
+        let store = Self::new();
+        store.calls.lock().unwrap().fail_tool_events = true;
+        store
+    }
+
     fn append_user_calls(&self) -> usize {
         self.calls.lock().unwrap().append_user_calls
+    }
+
+    fn assistant_messages(&self) -> Vec<(Option<String>, String)> {
+        self.calls.lock().unwrap().assistant_messages.clone()
+    }
+
+    fn tool_event_attempts(&self) -> usize {
+        self.calls.lock().unwrap().tool_event_attempts
     }
 
     fn summarize_ids(&self) -> Vec<Option<String>> {
@@ -105,10 +123,15 @@ impl ConversationStore for RecordingStore {
 
     async fn append_assistant(
         &self,
-        _conversation_id: Option<&str>,
+        conversation_id: Option<&str>,
         _agent: &Agent,
-        _content: &str,
+        content: &str,
     ) -> Result<(), String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .assistant_messages
+            .push((conversation_id.map(str::to_string), content.to_string()));
         Ok(())
     }
 
@@ -133,11 +156,14 @@ impl ConversationStore for RecordingStore {
         tool_name: &str,
         success: bool,
     ) -> Result<(), String> {
-        self.calls.lock().unwrap().tool_events.push((
-            conversation_id.to_string(),
-            tool_name.to_string(),
-            success,
-        ));
+        let mut calls = self.calls.lock().unwrap();
+        calls.tool_event_attempts += 1;
+        if calls.fail_tool_events {
+            return Err("tool event store is down".into());
+        }
+        calls
+            .tool_events
+            .push((conversation_id.to_string(), tool_name.to_string(), success));
         Ok(())
     }
 
@@ -649,11 +675,13 @@ use llama_r::context::analyzer::ContextEnricher;
 use llama_r::context::store::ContextStore;
 use llama_r::domain::models::{ChatRequest, ChatResponse, ModelInfo};
 use llama_r::optimizer::metrics::TokenMetrics;
-use llama_r::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
+use llama_r::ports::engine::{
+    AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult, ToolEvent,
+};
 use llama_r::providers::registry::ProviderRegistry;
 use llama_r::providers::LLMProvider;
 use llama_r::services::agent_registry::AgentRegistry;
-use llama_r::services::agent_runtime::AgentRuntime;
+use llama_r::services::agent_runtime::{AgentRuntime, RuntimeChatRequest};
 use llama_r::services::approval::ApprovalGate;
 use llama_r::services::provider_stack::ProviderStack;
 use llama_r::services::router_config::RouterConfig;
@@ -932,4 +960,203 @@ async fn generated_conversation_id_reaches_stream_header() {
     assert_eq!(header, "generated-id");
     // Drain the stream so the turn completes without a dangling task.
     let _ = to_bytes(resp.into_body(), usize::MAX).await;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming assistant + tool-event sink (Task 4).
+// ---------------------------------------------------------------------------
+
+/// A runtime over one in-memory store and an arbitrary engine, so a test can
+/// observe exactly what a turn persisted without SQLite or a live upstream.
+fn runtime_with(store: Arc<RecordingStore>, engine: Arc<dyn AgentEngine>) -> AgentRuntime {
+    let registry = Arc::new(AgentRegistry::new());
+    let mut agent = sample_agent();
+    agent.config.memory.persist_history = true;
+    registry.register(agent, sample_scope());
+    AgentRuntime {
+        registry,
+        engine,
+        history: Some(store),
+        rag: None,
+        enricher: Arc::new(ContextEnricher::new(
+            Arc::new(ContextStore::new()),
+            Arc::new(SkillManager::new()),
+            "fallback-model".into(),
+            Arc::new(ProviderRegistry::default()),
+            ProviderKind::Ollama,
+        )),
+    }
+}
+
+fn runtime_request() -> RuntimeChatRequest {
+    RuntimeChatRequest {
+        project_id: Some("proj".into()),
+        agent_id: Some("agent-a".into()),
+        conversation_id: None,
+        user_message: "hello".into(),
+        history: Vec::new(),
+        model_override: None,
+        system_prompt: Some("sys".into()),
+        default_model: "fallback-model".into(),
+        execution_id: uuid::Uuid::new_v4(),
+        shared_budget: None,
+        delegation_context: None,
+        approval_event_tx: None,
+        tool_event_tx: None,
+    }
+}
+
+/// A token, a completed event carrying the full answer, and one tool event sent
+/// through the request's additive sink — the three things the real bridges and
+/// the Rig streaming driver emit, without a Rig loop or a network.
+struct ToolEventEngine {
+    tool_name: String,
+    final_text: String,
+}
+
+#[async_trait]
+impl AgentEngine for ToolEventEngine {
+    async fn run(&self, req: AgentRunRequest) -> Result<AgentRunResult, String> {
+        if let Some(tx) = &req.tool_event_tx {
+            let _ = tx
+                .send(ToolEvent {
+                    tool_name: self.tool_name.clone(),
+                    success: true,
+                })
+                .await;
+        }
+        Ok(AgentRunResult {
+            text: self.final_text.clone(),
+            tool_calls: 1,
+            iterations: 1,
+            model: "m".into(),
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        req: AgentRunRequest,
+    ) -> Result<mpsc::Receiver<AgentRunEvent>, String> {
+        let (tx, rx) = mpsc::channel(8);
+        let sink = req.tool_event_tx.clone();
+        let name = self.tool_name.clone();
+        let text = self.final_text.clone();
+        tokio::spawn(async move {
+            if let Some(sink) = sink {
+                let _ = sink
+                    .send(ToolEvent {
+                        tool_name: name,
+                        success: true,
+                    })
+                    .await;
+            }
+            let _ = tx.send(AgentRunEvent::Token { text: text.clone() }).await;
+            let _ = tx
+                .send(AgentRunEvent::Completed {
+                    result: AgentRunResult {
+                        text,
+                        tool_calls: 1,
+                        iterations: 1,
+                        model: "m".into(),
+                    },
+                })
+                .await;
+        });
+        Ok(rx)
+    }
+}
+
+/// The forwarder runs on its own task; give it a bounded window to drain.
+async fn wait_for(predicate: impl Fn() -> bool) {
+    for _ in 0..100 {
+        if predicate() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the background forwarder never reached the expected state");
+}
+
+#[tokio::test]
+async fn chat_stream_persists_final_assistant() {
+    let store = Arc::new(RecordingStore::new());
+    let runtime = runtime_with(
+        store.clone(),
+        Arc::new(ToolEventEngine {
+            tool_name: "fake__tool".into(),
+            final_text: "final streamed answer".into(),
+        }),
+    );
+
+    let result = runtime
+        .chat_stream(runtime_request())
+        .await
+        .expect("stream");
+    assert_eq!(result.conversation_id.as_deref(), Some("generated-id"));
+
+    let mut events = result.events;
+    while events.recv().await.is_some() {}
+
+    let assistant = store.assistant_messages();
+    assert_eq!(
+        assistant.len(),
+        1,
+        "one assistant row from Completed, not one per token: {assistant:?}"
+    );
+    assert_eq!(assistant[0].0.as_deref(), Some("generated-id"));
+    assert_eq!(assistant[0].1, "final streamed answer");
+}
+
+#[tokio::test]
+async fn tool_event_sink_carries_no_args() {
+    let store = Arc::new(RecordingStore::new());
+    let runtime = runtime_with(
+        store.clone(),
+        Arc::new(ToolEventEngine {
+            tool_name: "fake__tool".into(),
+            final_text: "done".into(),
+        }),
+    );
+
+    // A non-streaming turn writes one row through the sink.
+    let reply = runtime.chat(runtime_request()).await.expect("chat");
+    assert_eq!(reply.text, "done");
+    wait_for(|| !store.tool_events().is_empty()).await;
+
+    // A streaming turn writes one row through the very same sink. `ToolEvent`
+    // has only `tool_name` and `success` — there is no argument field to leak.
+    let streamed = runtime
+        .chat_stream(runtime_request())
+        .await
+        .expect("stream");
+    let mut events = streamed.events;
+    while events.recv().await.is_some() {}
+    wait_for(|| store.tool_events().len() >= 2).await;
+
+    let recorded = store.tool_events();
+    assert_eq!(recorded.len(), 2, "one row per tool call: {recorded:?}");
+    for (cid, name, success) in &recorded {
+        assert_eq!(cid, "generated-id");
+        assert_eq!(name, "fake__tool");
+        assert!(*success);
+    }
+}
+
+#[tokio::test]
+async fn tool_event_failure_is_best_effort() {
+    let store = Arc::new(RecordingStore::failing_tool_events());
+    let runtime = runtime_with(
+        store.clone(),
+        Arc::new(ToolEventEngine {
+            tool_name: "fake__tool".into(),
+            final_text: "done".into(),
+        }),
+    );
+
+    let reply = runtime
+        .chat(runtime_request())
+        .await
+        .expect("a store error must not fail the chat");
+    assert_eq!(reply.text, "done");
+    wait_for(|| store.tool_event_attempts() >= 1).await;
 }

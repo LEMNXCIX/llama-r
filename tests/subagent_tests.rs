@@ -1021,6 +1021,7 @@ fn delegate_bridge(
         delegate_bounds: Some(bounds),
         delegation_context: Some(context),
         event_tx: None,
+        tool_event_tx: None,
         operations: OperationContext::disabled(),
     };
     let tool = LocalToolRegistry::builtins()
@@ -1299,6 +1300,7 @@ fn delegate_bridge_observing(
         delegate_bounds: Some(bounds),
         delegation_context: Some(context),
         event_tx,
+        tool_event_tx: None,
         operations: OperationContext::disabled(),
     };
     let tool = LocalToolRegistry::builtins()

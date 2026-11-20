@@ -4,7 +4,7 @@ use crate::adapters::rig_engine::ScopedMcpTool;
 use crate::api::observability::AppObservability;
 use crate::ports::auto::AutoDecider;
 use crate::ports::delegation::ToolBudget;
-use crate::ports::engine::AgentRunEvent;
+use crate::ports::engine::{AgentRunEvent, ToolEvent};
 use crate::services::approval::ApprovalGate;
 use serde_json::Value;
 use std::sync::Arc;
@@ -38,6 +38,9 @@ pub struct McpToolBridge {
     /// caller; `None` on the non-streaming path, where the pending is discovered
     /// by polling `GET /api/approvals` instead. Both paths block on the gate.
     pub event_tx: Option<mpsc::Sender<AgentRunEvent>>,
+    /// The no-args history sink, mirrored from the request. One event is sent
+    /// per finished call with the qualified name and success flag only.
+    pub tool_event_tx: Option<mpsc::Sender<ToolEvent>>,
     /// The same idempotency guard `LocalToolBridge` uses, so an identical retry
     /// replays the stored result instead of calling MCP again. `None` for a
     /// bridge built directly (e.g. by a unit test): no store, no guard.
@@ -58,6 +61,7 @@ impl McpToolBridge {
             auto_decider: None,
             observability: None,
             event_tx,
+            tool_event_tx: None,
             operations: None,
         }
     }
@@ -80,6 +84,14 @@ impl McpToolBridge {
     /// signature stable for directly built test bridges.
     pub fn with_observability(mut self, observability: Option<Arc<AppObservability>>) -> Self {
         self.observability = observability;
+        self
+    }
+
+    /// Install the no-args history sink. A setter keeps `new`'s signature
+    /// stable for directly built test bridges, mirroring the other optional
+    /// boot-owned companions.
+    pub fn with_tool_event_tx(mut self, tool_event_tx: Option<mpsc::Sender<ToolEvent>>) -> Self {
+        self.tool_event_tx = tool_event_tx;
         self
     }
 
@@ -148,6 +160,18 @@ impl McpToolBridge {
                     tool_name: self.inner.def.name.clone(),
                     is_error: outcome.is_err(),
                     preview: String::new(),
+                })
+                .await;
+        }
+        // One history row per finished call. The qualified name is the same one
+        // approval rules and `called_tool` use; success is known only after the
+        // dispatch above. `ToolEvent` has no argument field, so nothing from
+        // `args` can travel into the persisted log.
+        if let Some(tx) = &self.tool_event_tx {
+            let _ = tx
+                .send(ToolEvent {
+                    tool_name: rig_tool_name(&self.inner.def.server_id, &self.inner.def.name),
+                    success: outcome.is_ok(),
                 })
                 .await;
         }
@@ -305,6 +329,29 @@ mod tests {
             0,
             "denied tools must not consume budget"
         );
+    }
+
+    #[tokio::test]
+    async fn tool_event_uses_the_qualified_name_without_args() {
+        let (tool, _calls) = make_scoped_tool(true);
+        let (tx, mut rx) = mpsc::channel(8);
+        let bridge = McpToolBridge::new(
+            tool,
+            Arc::new(Mutex::new(ToolCallBudget::new(5))),
+            Arc::new(ApprovalGate::default()),
+            None,
+        )
+        .with_tool_event_tx(Some(tx));
+
+        bridge
+            .invoke_json(serde_json::json!({"key": "value"}))
+            .await
+            .expect("allowed tool");
+
+        let event = rx.recv().await.expect("one tool event");
+        assert_eq!(event.tool_name, "mock__test_tool");
+        assert!(event.success);
+        assert!(rx.try_recv().is_err(), "exactly one event per call");
     }
 
     #[test]

@@ -147,6 +147,9 @@ async fn build_runtime_request(
         shared_budget,
         delegation_context,
         approval_event_tx,
+        // AgentRuntime installs its own tool-event sink bound to the
+        // conversation it persists; there is nothing to pass in from here.
+        tool_event_tx: None,
     })
 }
 
