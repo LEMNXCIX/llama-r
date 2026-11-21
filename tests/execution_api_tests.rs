@@ -339,8 +339,18 @@ async fn send(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value) 
     (status, value)
 }
 
+/// Admin-route tests run as a configured client: set the shared token once and
+/// present it on every request. The gate itself is tested in admin_auth_tests.
+const TEST_ADMIN_TOKEN: &str = "test-admin-token";
+
+fn admin_request() -> axum::http::request::Builder {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("ADMIN_TOKEN", TEST_ADMIN_TOKEN));
+    Request::builder().header("x-admin-token", TEST_ADMIN_TOKEN)
+}
+
 fn debug_req(method: &str, uri: &str) -> Request<Body> {
-    Request::builder()
+    admin_request()
         .method(method)
         .uri(uri)
         .header("x-debug", "true")
@@ -392,7 +402,7 @@ async fn observability_endpoints_gate_on_debug_and_redact_secrets() {
     // No X-Debug -> 403 before anything else.
     let (status, _) = send(
         &router,
-        Request::builder()
+        admin_request()
             .uri("/api/executions")
             .body(Body::empty())
             .unwrap(),

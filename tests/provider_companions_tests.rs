@@ -248,10 +248,17 @@ async fn rag_store_is_absent_when_the_selected_provider_has_no_embeddings() {
     );
     drop(services);
 
+    // Admin-route tests run as a configured client: set the shared token once
+    // and present it on every request. The gate itself is in admin_auth_tests.
+    const TEST_ADMIN_TOKEN: &str = "test-admin-token";
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| std::env::set_var("ADMIN_TOKEN", TEST_ADMIN_TOKEN));
+
     let router = build_router(state);
     let response = router
         .oneshot(
             Request::builder()
+                .header("x-admin-token", TEST_ADMIN_TOKEN)
                 .method("POST")
                 .uri("/api/rag/query")
                 .header("content-type", "application/json")

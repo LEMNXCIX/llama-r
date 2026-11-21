@@ -264,6 +264,21 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// These tests exercise the admin handlers as a configured client: set the
+/// shared token once and present it on every request. The gate itself — no
+/// token, wrong token, fail-closed — is covered by `admin_auth_tests.rs`.
+const TEST_ADMIN_TOKEN: &str = "test-admin-token";
+
+fn admin_token_ready() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| std::env::set_var("ADMIN_TOKEN", TEST_ADMIN_TOKEN));
+}
+
+fn admin_request() -> axum::http::request::Builder {
+    admin_token_ready();
+    Request::builder().header("x-admin-token", TEST_ADMIN_TOKEN)
+}
+
 #[tokio::test]
 async fn rag_admin_requires_debug_header() {
     let app = setup_app();
@@ -285,7 +300,7 @@ async fn rag_admin_requires_debug_header() {
             .router
             .clone()
             .oneshot(
-                Request::builder()
+                admin_request()
                     .method("POST")
                     .uri(uri)
                     .header("content-type", "application/json")
@@ -305,7 +320,7 @@ async fn rag_admin_requires_debug_header() {
             .router
             .clone()
             .oneshot(
-                Request::builder()
+                admin_request()
                     .method("POST")
                     .uri(uri)
                     .header("content-type", "application/json")
@@ -332,7 +347,7 @@ async fn rag_admin_reports_not_implemented_when_store_absent() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/rag/query")
                 .header("content-type", "application/json")
@@ -361,7 +376,7 @@ async fn rag_delete_document_reports_rag_disabled() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/rag/delete-document")
                 .header("content-type", "application/json")
@@ -394,7 +409,7 @@ async fn rag_delete_document_gate_precedes_body_validation() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/rag/delete-document")
                 .header("content-type", "application/json")
@@ -474,7 +489,7 @@ async fn health_should_report_runtime_status() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .uri("/api/health")
                 .body(Body::empty())
                 .unwrap(),
@@ -501,7 +516,7 @@ async fn agent_crud_should_round_trip_over_http() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/agents")
                 .header("content-type", "application/json")
@@ -516,7 +531,7 @@ async fn agent_crud_should_round_trip_over_http() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .uri("/api/agents/writer")
                 .body(Body::empty())
                 .unwrap(),
@@ -535,7 +550,7 @@ async fn agent_crud_should_round_trip_over_http() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("PUT")
                 .uri("/api/agents/writer")
                 .header("content-type", "application/json")
@@ -549,7 +564,7 @@ async fn agent_crud_should_round_trip_over_http() {
     let delete_response = app
         .router
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("DELETE")
                 .uri("/api/agents/writer")
                 .body(Body::empty())
@@ -582,7 +597,7 @@ async fn context_create_should_conflict_when_project_exists() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/contexts")
                 .header("content-type", "application/json")
@@ -596,7 +611,7 @@ async fn context_create_should_conflict_when_project_exists() {
     let second = app
         .router
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/contexts")
                 .header("content-type", "application/json")
@@ -632,7 +647,7 @@ async fn transport_layers_should_resolve_same_agent_and_fallback() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
@@ -676,7 +691,7 @@ async fn validation_errors_should_surface_for_http_and_grpc() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/chat")
                 .header("content-type", "application/json")
@@ -709,7 +724,7 @@ async fn mcp_should_respond_to_initialize_tools_and_tool_call() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/mcp")
                 .header("content-type", "application/json")
@@ -732,7 +747,7 @@ async fn mcp_should_respond_to_initialize_tools_and_tool_call() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/mcp")
                 .header("content-type", "application/json")
@@ -754,7 +769,7 @@ async fn mcp_should_respond_to_initialize_tools_and_tool_call() {
     let tool_call = app
         .router
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/mcp")
                 .header("content-type", "application/json")
@@ -785,7 +800,7 @@ async fn health_should_report_non_empty_metrics_after_traffic() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/chat")
                 .header("content-type", "application/json")
@@ -805,7 +820,7 @@ async fn health_should_report_non_empty_metrics_after_traffic() {
     let health = app
         .router
         .oneshot(
-            Request::builder()
+            admin_request()
                 .uri("/api/health")
                 .body(Body::empty())
                 .unwrap(),
@@ -839,7 +854,7 @@ async fn context_reanalyze_endpoint_should_refresh_existing_context() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/contexts")
                 .header("content-type", "application/json")
@@ -853,7 +868,7 @@ async fn context_reanalyze_endpoint_should_refresh_existing_context() {
     let response = app
         .router
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/contexts/refresh-project/analyze")
                 .body(Body::empty())
@@ -881,7 +896,7 @@ async fn a_put_preserves_a_curated_routing_hint_and_description() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/agents")
                 .header("content-type", "application/json")
@@ -916,7 +931,7 @@ async fn a_put_preserves_a_curated_routing_hint_and_description() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("PUT")
                 .uri("/api/agents/curada")
                 .header("content-type", "application/json")
@@ -1047,7 +1062,7 @@ async fn a_provider_swap_does_not_disturb_requests_already_in_flight() {
     let send = |r: axum::Router, body: String| async move {
         let response = r
             .oneshot(
-                Request::builder()
+                admin_request()
                     .method("POST")
                     .uri("/api/chat")
                     .header("content-type", "application/json")

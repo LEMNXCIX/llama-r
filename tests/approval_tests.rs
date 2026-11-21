@@ -754,6 +754,16 @@ fn api_state(gate: Arc<ApprovalGate>) -> Arc<AppState> {
     )
 }
 
+/// Admin-route tests run as a configured client: set the shared token once and
+/// present it on every request. The gate itself is tested in admin_auth_tests.
+const TEST_ADMIN_TOKEN: &str = "test-admin-token";
+
+fn admin_request() -> axum::http::request::Builder {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("ADMIN_TOKEN", TEST_ADMIN_TOKEN));
+    Request::builder().header("x-admin-token", TEST_ADMIN_TOKEN)
+}
+
 async fn call_api(
     state: &Arc<AppState>,
     method: &str,
@@ -761,7 +771,7 @@ async fn call_api(
     body: Option<serde_json::Value>,
 ) -> axum::response::Response {
     let payload = body.map(|b| b.to_string()).unwrap_or_default();
-    let request = Request::builder()
+    let request = admin_request()
         .method(method)
         .uri(uri)
         .header("content-type", "application/json")

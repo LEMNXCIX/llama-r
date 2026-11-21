@@ -93,13 +93,19 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// Compare two 32-byte digests in constant time: every byte is visited and
-/// OR-accumulated, so the running time does not depend on where (or whether)
-/// the first difference occurs.
-fn constant_time_eq(a: &[u8; DIGEST_LEN], b: &[u8; DIGEST_LEN]) -> bool {
-    let mut diff = 0u8;
-    for i in 0..DIGEST_LEN {
-        diff |= a[i] ^ b[i];
+/// Compare two byte strings in constant time: every byte of the shorter input
+/// is visited and OR-accumulated, so the running time does not depend on where
+/// (or whether) the first differing byte is. A length mismatch can never match
+/// — it is folded into the same accumulator rather than checked with an early
+/// `return`, so only the (non-secret) lengths can be inferred from timing.
+///
+/// Shared with the admin-token middleware: a token must be compared the same
+/// way as an HMAC digest, never with `==`, which short-circuits on the first
+/// differing byte.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().min(b.len()) {
+        diff |= (a[i] ^ b[i]) as usize;
     }
     diff == 0
 }

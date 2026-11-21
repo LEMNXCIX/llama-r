@@ -9,7 +9,8 @@ use crate::domain::models::{
     ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, JsonRpcRequest, JsonRpcResponse,
     ListModelsResponse, ModelInfo, RoutedDebug,
 };
-use utoipa::OpenApi;
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
+use utoipa::{Modify, OpenApi};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -80,9 +81,29 @@ use utoipa::OpenApi;
         (name = "Contexts", description = "Project context management"),
         (name = "MCP", description = "Model Context Protocol endpoints"),
         (name = "Router", description = "Routing decision dry-run, for tuning MIN_CONFIDENCE"),
-    )
+    ),
+    modifiers(&AdminTokenScheme)
 )]
 pub struct ApiDoc;
+
+/// Declares `securitySchemes.apiToken` in `/openapi.json`. The scheme carries
+/// only the header name — never a token value. A token lives in the environment
+/// and is read solely by the admin-auth middleware.
+struct AdminTokenScheme;
+
+impl Modify for AdminTokenScheme {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi
+            .components
+            .get_or_insert_with(utoipa::openapi::Components::new);
+        components.add_security_scheme(
+            "apiToken",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new(
+                crate::api::admin_auth::ADMIN_TOKEN_HEADER,
+            ))),
+        );
+    }
+}
 
 use axum::response::{Html, IntoResponse, Json};
 

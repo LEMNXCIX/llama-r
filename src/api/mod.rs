@@ -1,3 +1,4 @@
+pub mod admin_auth;
 pub mod agent_api;
 pub mod approval_api;
 pub mod chat_core;

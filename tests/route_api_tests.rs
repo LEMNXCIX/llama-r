@@ -432,13 +432,23 @@ fn preview_json(project_id: &str, prompt: &str) -> String {
     serde_json::json!({ "project_id": project_id, "prompt": prompt }).to_string()
 }
 
+/// Admin-route tests run as a configured client: set the shared token once and
+/// present it on every request. The gate itself is tested in admin_auth_tests.
+const TEST_ADMIN_TOKEN: &str = "test-admin-token";
+
+fn admin_request() -> axum::http::request::Builder {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| std::env::set_var("ADMIN_TOKEN", TEST_ADMIN_TOKEN));
+    Request::builder().header("x-admin-token", TEST_ADMIN_TOKEN)
+}
+
 /// Run the real gate, then the handler: the path every request takes.
 async fn call_preview(
     state: &Arc<AppState>,
     body: &str,
     debug: bool,
 ) -> Result<RoutePreviewResponse, AppError> {
-    let mut builder = Request::builder()
+    let mut builder = admin_request()
         .method("POST")
         .uri("/api/route")
         .header("content-type", "application/json");
@@ -577,7 +587,7 @@ async fn the_endpoint_is_mounted_behind_the_debug_gate() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/route")
                 .header("content-type", "application/json")
@@ -590,7 +600,7 @@ async fn the_endpoint_is_mounted_behind_the_debug_gate() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            admin_request()
                 .method("POST")
                 .uri("/api/route")
                 .header("content-type", "application/json")

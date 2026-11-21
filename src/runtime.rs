@@ -7,6 +7,7 @@ use crate::adapters::rag::{
     OpenRouterEmbeddings,
 };
 use crate::adapters::router::{LlamaCppRouter, OpenCodeRouter, OpenRouterRouter};
+use crate::api::admin_auth::require_admin;
 use crate::api::agent_api::{
     create_agent, delete_agent, get_agent, get_agent_scope, list_agents_api, update_agent,
 };
@@ -62,6 +63,7 @@ use crate::services::rag_ingest::RagIngestService;
 use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
 use axum::{
+    middleware::from_fn_with_state,
     routing::{get, post},
     Router,
 };
@@ -329,9 +331,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::http::HeaderName::from_static("x-agent"),
             axum::http::HeaderName::from_static("x-debug"),
             axum::http::HeaderName::from_static("x-conversation-id"),
+            axum::http::HeaderName::from_static("x-admin-token"),
         ]);
 
-    Router::new()
+    // Public surface: chat, webhooks, health, models, MCP, docs and the
+    // conversation/skill listing endpoints. None of these is admin-gated.
+    let public = Router::new()
         .route("/", get(|| async { "Llama-R API is running" }))
         .route("/health", get(health))
         .route("/chat", post(chat))
@@ -355,21 +360,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/models", get(list_models))
         .route("/api/chat", post(chat))
-        .route("/api/agents", get(list_agents_api).post(create_agent))
-        .route("/api/approvals", get(list_approvals))
-        .route("/api/approvals/:id", post(decide_approval))
-        .route("/api/agents/:id", get(get_agent).put(update_agent).delete(delete_agent))
-        .route("/api/agents/:id/scope", get(get_agent_scope))
-        .route("/api/contexts", get(list_contexts).post(create_context))
-        .route("/api/contexts/:id", get(get_context).put(update_context).delete(delete_context))
-        .route("/api/contexts/:id/analyze", post(analyze_project))
-        .route("/api/executions", get(list_executions))
-        .route("/api/executions/:id", get(get_execution))
-        .route("/api/executions/:id/retry", post(retry_execution))
-        .route("/api/rag/ingest", post(rag_ingest))
-        .route("/api/rag/query", post(rag_query))
-        .route("/api/rag/delete-document", post(rag_delete_document))
-        .route("/api/route", post(route_preview))
         .route("/api/skills", get(list_skills_api))
         .route("/api/conversations", get(list_conversations_handler))
         .route(
@@ -386,9 +376,38 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/webhooks/:channel", post(webhook))
         .route("/openapi.json", get(serve_openapi_json))
-        .route("/docs", get(serve_scalar_ui))
-        .layer(cors)
-        .with_state(state)
+        .route("/docs", get(serve_scalar_ui));
+
+    // Admin surface: one gate for every route below. `X-Debug` is still
+    // checked by the individual handlers that had it before — the token is
+    // additional, never a replacement. `from_fn` is axum's `from_fn_with_state`
+    // with `()` state; the `State<Arc<AppState>>` extractor here needs the real
+    // state, so this is the stateful form of the same from-function middleware.
+    let admin = Router::new()
+        .route("/api/agents", get(list_agents_api).post(create_agent))
+        .route("/api/approvals", get(list_approvals))
+        .route("/api/approvals/:id", post(decide_approval))
+        .route(
+            "/api/agents/:id",
+            get(get_agent).put(update_agent).delete(delete_agent),
+        )
+        .route("/api/agents/:id/scope", get(get_agent_scope))
+        .route("/api/contexts", get(list_contexts).post(create_context))
+        .route(
+            "/api/contexts/:id",
+            get(get_context).put(update_context).delete(delete_context),
+        )
+        .route("/api/contexts/:id/analyze", post(analyze_project))
+        .route("/api/executions", get(list_executions))
+        .route("/api/executions/:id", get(get_execution))
+        .route("/api/executions/:id/retry", post(retry_execution))
+        .route("/api/rag/ingest", post(rag_ingest))
+        .route("/api/rag/query", post(rag_query))
+        .route("/api/rag/delete-document", post(rag_delete_document))
+        .route("/api/route", post(route_preview))
+        .layer(from_fn_with_state(state.clone(), require_admin));
+
+    public.merge(admin).layer(cors).with_state(state)
 }
 
 pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime, AppError> {
