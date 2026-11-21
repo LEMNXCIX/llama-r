@@ -10,6 +10,8 @@
 use llama_r::adapters::channel::{load_channels, HmacSha256Verifier};
 use llama_r::domain::channel::{ChannelConfig, ChannelMode};
 use llama_r::ports::channel::ChannelSignatureVerifier;
+use llama_r::services::marker_template::render_markers;
+use serde_json::{json, Value};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
@@ -182,5 +184,142 @@ enabled = true
     assert!(
         !debug.contains(SENTINEL),
         "Debug leaked the secret value from the env var: {debug:?}"
+    );
+}
+
+// ── marker-template rendering (Task 2) ───────────────────────────────────────
+
+/// Caller-side helper Task 3 will use: no/blank template means the raw body is
+/// the user message; a non-blank template is rendered over the parsed payload
+/// instead. Kept here so the "absent template" contract is testable before the
+/// endpoint exists.
+fn message_from_template(
+    template: Option<&str>,
+    payload: &Value,
+    raw_body: &str,
+) -> Result<String, String> {
+    match template {
+        Some(t) if !t.trim().is_empty() => render_markers(t, payload),
+        _ => Ok(raw_body.to_string()),
+    }
+}
+
+#[test]
+fn marker_template_extracts_message() {
+    let payload = json!({
+        "action": "opened",
+        "sender": { "login": "octocat" },
+        "issue": { "title": "Hello" }
+    });
+
+    // Several markers embedded in prose; whitespace around the path inside the
+    // braces is trimmed before the dot-path lookup.
+    let out = render_markers(
+        "New issue from {{ sender.login }}: {{issue.title}}",
+        &payload,
+    )
+    .unwrap();
+    assert_eq!(out, "New issue from octocat: Hello");
+
+    // No markers means the template is returned verbatim — including literal
+    // single braces that are not a `{{...}}` marker.
+    let verbatim = render_markers("use {action} but not a marker", &payload).unwrap();
+    assert_eq!(verbatim, "use {action} but not a marker");
+}
+
+#[test]
+fn marker_template_handles_numbers_and_bools() {
+    let payload = json!({
+        "count": 42,
+        "ratio": 1.5,
+        "negative": -7,
+        "merged": true,
+        "draft": false
+    });
+    let out = render_markers(
+        "{{count}} / {{ratio}} / {{negative}} / {{merged}} / {{draft}}",
+        &payload,
+    )
+    .unwrap();
+    assert_eq!(out, "42 / 1.5 / -7 / true / false");
+}
+
+#[test]
+fn absent_template_uses_raw_body() {
+    let raw = "{\"sender\":{\"login\":\"octocat\"}}";
+    let payload: Value = serde_json::from_str(raw).unwrap();
+
+    // None, empty and blank templates all fall back to the raw body.
+    assert_eq!(message_from_template(None, &payload, raw).unwrap(), raw);
+    assert_eq!(message_from_template(Some(""), &payload, raw).unwrap(), raw);
+    assert_eq!(
+        message_from_template(Some("   "), &payload, raw).unwrap(),
+        raw
+    );
+
+    // A real template still renders rather than falling back to the raw body.
+    assert_eq!(
+        message_from_template(Some("{{sender.login}}"), &payload, raw).unwrap(),
+        "octocat"
+    );
+}
+
+#[test]
+fn unknown_marker_fails_without_echoing_body() {
+    const SENTINEL: &str = "TOP-SECRET-PAYLOAD-VALUE-DO-NOT-ECHO";
+    let payload = json!({
+        "sender": { "login": "octocat", "password": SENTINEL },
+        "token": SENTINEL,
+    });
+
+    // The missing path resolves through a parent object that itself holds a
+    // secret; a naive implementation that dumps the body on failure would leak
+    // it here.
+    let err = render_markers("{{sender.nonexistent}}", &payload).unwrap_err();
+    assert!(
+        err.contains("sender.nonexistent"),
+        "the error must name the missing path: {err:?}"
+    );
+    assert!(
+        !err.contains(SENTINEL),
+        "the error echoed body content: {err:?}"
+    );
+
+    let err2 = render_markers("{{no.such.path}}", &payload).unwrap_err();
+    assert!(
+        err2.contains("no.such.path"),
+        "an unknown root path must be named: {err2:?}"
+    );
+    assert!(
+        !err2.contains(SENTINEL),
+        "the error echoed body content: {err2:?}"
+    );
+}
+
+#[test]
+fn object_marker_is_a_named_error() {
+    let payload = json!({
+        "sender": { "login": "octocat" },
+        "items": [1, 2, 3],
+    });
+
+    let err = render_markers("{{sender}}", &payload).unwrap_err();
+    assert!(
+        err.contains("sender"),
+        "the error must name the path: {err:?}"
+    );
+    assert!(
+        err.contains("object"),
+        "the error must say the value is an object: {err:?}"
+    );
+
+    let err2 = render_markers("{{items}}", &payload).unwrap_err();
+    assert!(
+        err2.contains("items"),
+        "the error must name the path: {err2:?}"
+    );
+    assert!(
+        err2.contains("array"),
+        "the error must say the value is an array: {err2:?}"
     );
 }

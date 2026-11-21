@@ -6,6 +6,7 @@ pub mod agent_skill_sync;
 pub mod approval;
 pub mod context_assembler;
 pub mod delegation;
+pub mod marker_template;
 pub mod provider_stack;
 pub mod rag_ingest;
 pub mod redaction;
