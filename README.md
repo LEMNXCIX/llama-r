@@ -192,6 +192,7 @@ cargo run
 # 3. decidir sin ejecutar el chat (calibra MIN_CONFIDENCE)
 curl -s http://127.0.0.1:3000/api/route \
   -H 'Content-Type: application/json' -H 'X-Debug: true' \
+  -H 'X-Admin-Token: <token>' \
   -d '{"project_id":"mi-proyecto","prompt":"hazme un plan de comidas"}'
 
 # 4. chatear sin X-Agent: el router elige el agente
@@ -406,10 +407,11 @@ La tool se bloquea hasta que alguien decide, con un `approval_id` (UUID) ligado 
 
 ```bash
 # Ver pendientes (argumentos con campos sensibles redactados como [REDACTED]):
-curl -s http://127.0.0.1:3000/api/approvals
+curl -s http://127.0.0.1:3000/api/approvals -H 'X-Admin-Token: <token>'
 
 # Aprobar o denegar; args_hash es opcional (si se omite se usa el hash guardado):
 curl -s -X POST http://127.0.0.1:3000/api/approvals/<approval_id> \
+  -H 'X-Admin-Token: <token>' \
   -H 'Content-Type: application/json' \
   -d '{"approve": true}'
 ```
@@ -422,13 +424,16 @@ Cada turno de agente queda registrado en `data/history.db` (tablas `executions`,
 
 ```bash
 # Ver los turnos recientes (de más reciente a más antiguo; ?limit, default 50, max 200):
-curl -s http://127.0.0.1:3000/api/executions -H 'X-Debug: true'
+curl -s http://127.0.0.1:3000/api/executions \
+  -H 'X-Debug: true' -H 'X-Admin-Token: <token>'
 
 # Ver un turno y su log de eventos (argumentos/secrets redactados):
-curl -s http://127.0.0.1:3000/api/executions/<execution_id> -H 'X-Debug: true'
+curl -s http://127.0.0.1:3000/api/executions/<execution_id> \
+  -H 'X-Debug: true' -H 'X-Admin-Token: <token>'
 
 # Reintentar un turno Interrupted o Failed:
-curl -s -X POST http://127.0.0.1:3000/api/executions/<execution_id>/retry -H 'X-Debug: true'
+curl -s -X POST http://127.0.0.1:3000/api/executions/<execution_id>/retry \
+  -H 'X-Debug: true' -H 'X-Admin-Token: <token>'
 ```
 
 El reintento reutiliza el **mismo id** de ejecución: las herramientas ya completadas se replayan desde la caché (`operation_id = <execution_id>:<tool>:<args_hash_hex>`) en lugar de repetir sus efectos. Es recuperación **a nivel de turno**, no replay paso a paso: se re-ejecuta el turno desde el `user_message` guardado (`stream: false`, sin recargar el historial de conversación previo) y el modelo puede generar una respuesta distinta. El reintento da `200` si el turno se re-ejecuta, `400` id malformado, `403` sin `X-Debug` o fila legacy sin `user_message`, `404` id desconocido y `409` si el turno no está en estado reintentable. Sin store (build `--no-default-features` o fallo al abrirlo) la ejecución degrada a pass-through y el chat sigue funcionando. Queda diferido: backend Postgres/async, identidad de usuario en los endpoints (hoy hay un token compartido, no un principal), supresión de `once` tras el primer uso, dependencia OpenTelemetry (existe un exporter OTLP/HTTP crudo) y replay exacto de pasos. El modelo de decisión `Auto` ya está implementado (ver sección siguiente).

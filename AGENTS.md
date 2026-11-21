@@ -609,7 +609,7 @@ change.
 - Retracting a document is an explicit operation (`delete_document` / `POST /api/rag/delete-document`); it must never be inferred from empty content.
 - `FileRagStore` holds a per-collection lock across snapshot → write → publish, so concurrent writers to one collection cannot lose each other's updates, while disk I/O runs on `spawn_blocking` so it never stalls the runtime.
 - Chat path: when an agent has `rag_sources`, Rig `prepare()` queries the store and injects `## Retrieved knowledge` into the system prompt.
-- Debug API (requires header `X-Debug: true`):
+- Debug API (requires both `X-Debug: true` and the shared `X-Admin-Token`):
   - `POST /api/rag/ingest` — body: `project_id?`, `agent_id?`, `source_id`, `texts[]`, optional `files[]` under base dir. Response reports `chunks_written`, `files_read`, and `skipped[]` (paths not indexed, with a reason)
   - `POST /api/rag/query` — body: `project_id?`, `agent_id?`, `query`, `top_k?`
   - `POST /api/rag/delete-document` — body: `project_id?`, `agent_id?`, `source_id`, `doc_key`. Retracts one document (distinct from re-ingesting it empty, which is a no-op)
@@ -625,10 +625,12 @@ cargo run
 curl -s http://127.0.0.1:3000/api/rag/ingest \
   -H 'Content-Type: application/json' \
   -H 'X-Debug: true' \
+  -H 'X-Admin-Token: <token>' \
   -d '{"agent_id":"demo","source_id":"agent:demo/memory","texts":["Refunds within 24h."]}'
 curl -s http://127.0.0.1:3000/api/rag/query \
   -H 'Content-Type: application/json' \
   -H 'X-Debug: true' \
+  -H 'X-Admin-Token: <token>' \
   -d '{"agent_id":"demo","query":"refunds","top_k":3}'
 ```
 

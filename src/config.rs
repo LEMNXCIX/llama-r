@@ -304,13 +304,26 @@ impl Config {
         let approval_timeout_secs =
             u64_env("APPROVAL_TIMEOUT_SECS", DEFAULT_APPROVAL_TIMEOUT_SECS)?;
         let park_grace_ms = u64_env("PARK_GRACE_MS", DEFAULT_PARK_GRACE_MS)?;
-        let mut reaper_interval_secs =
-            u64_env("REAPER_INTERVAL_SECS", DEFAULT_REAPER_INTERVAL_SECS)?;
-        if reaper_interval_secs == 0 {
-            // Non-positive keeps the default, matching the old reaper helper:
-            // a bad value can never spin the task or stop boot.
-            reaper_interval_secs = DEFAULT_REAPER_INTERVAL_SECS;
-        }
+        // The reaper is the one numeric exception to "malformed is an error":
+        // any non-positive value (including a negative one, which `u64` cannot
+        // parse at all) keeps the default, matching the old helper. A value
+        // that is not an integer is still a config error naming the variable.
+        let reaper_interval_secs = match env::var("REAPER_INTERVAL_SECS") {
+            Ok(raw) => {
+                let seconds = raw.trim().parse::<i64>().map_err(|_| {
+                    AppError::Config(format!(
+                        "REAPER_INTERVAL_SECS must be a valid integer, received '{}'",
+                        raw
+                    ))
+                })?;
+                if seconds <= 0 {
+                    DEFAULT_REAPER_INTERVAL_SECS
+                } else {
+                    u64::try_from(seconds).unwrap_or(DEFAULT_REAPER_INTERVAL_SECS)
+                }
+            }
+            Err(_) => DEFAULT_REAPER_INTERVAL_SECS,
+        };
 
         let otel_enabled = env_truthy("OTEL_ENABLED", false);
         let otel_endpoint = env::var("OTEL_ENDPOINT")
@@ -787,9 +800,16 @@ mod tests {
         let _cwd = CwdGuard::fresh();
 
         // Numeric but non-positive keeps the default — matching the old helper,
-        // so a bad value can never spin the reaper task or stop boot.
-        env::set_var("REAPER_INTERVAL_SECS", "0");
-        assert_eq!(Config::from_env().unwrap().reaper_interval_secs, 5);
+        // so a bad value can never spin the reaper task or stop boot. A negative
+        // value used to be a u64 parse error that aborted boot.
+        for bad in ["0", "-1", "-999"] {
+            env::set_var("REAPER_INTERVAL_SECS", bad);
+            assert_eq!(
+                Config::from_env().unwrap().reaper_interval_secs,
+                5,
+                "REAPER_INTERVAL_SECS={bad} must fall back to 5"
+            );
+        }
     }
 
     #[test]
