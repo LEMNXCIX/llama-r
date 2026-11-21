@@ -5,6 +5,7 @@
 //! external apps.
 
 pub mod auto;
+pub mod channel;
 pub mod compaction;
 pub mod delegation;
 pub mod engine;
