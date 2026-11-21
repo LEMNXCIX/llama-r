@@ -232,6 +232,12 @@ POST /api/mcp
 ```
 Endpoint JSON-RPC para interactuar con el gateway como servidor MCP.
 
+### Webhooks (canales firmados)
+```
+POST /api/webhooks/:channel
+```
+Un canal firmado ejecuta un turno de agente. La firma se verifica sobre el cuerpo **crudo antes de parsear** el JSON: firma ausente, malformada o errónea, o canal sin secreto, dan un `401` genérico. Canal desconocido o desactivado da `404`. `mode = "sync"` responde `200` con el `ChatResponse`; `mode = "async"` (default) responde `202 {"execution_id": "..."}`, observable en `GET /api/executions/:id`. El scope y el gate de debug salen de `channels.toml`, nunca de la petición. Ver "Canales webhook (Fase 8)".
+
 ## Historial de conversaciones
 
 Cada turno de agente se persiste en SQLite cuando el agente tiene `[memory] persist_history = true` (feature `history`, activa por defecto; DB en `{LLAMA_R_DIR}/data/history.db`, ignorada por git). El esquema es aditivo (`IF NOT EXISTS`): un `history.db` antiguo se abre sin migración destructiva. Los ocho huecos conocidos del plan están cerrados (siete en código, el octavo por decisión documentada + test); ver [`PHASE_5_HISTORY_PLAN.md`](./PHASE_5_HISTORY_PLAN.md).
@@ -429,6 +435,36 @@ El reintento reutiliza el **mismo id** de ejecución: las herramientas ya comple
 
 **No se afirma:** ni integración con OpenTelemetry (los campos solo están listos para un futuro exportador, sin dependencia nueva), ni supresión de "primera vez" para `once`, ni coste real mientras el catálogo no tenga precios. El runner de evals tampoco incluye un check de aprobación `Auto` (`judge` solo califica respuestas).
 
+## Canales webhook (Fase 8)
+
+Un webhook entrante firmado se convierte en un turno de agente. El único endpoint nuevo es `POST /api/webhooks/:channel`. Los canales se definen en un `channels.toml` opcional del directorio base, que se carga **por petición** (como agentes y contextos): un cambio se aplica sin reiniciar. Sin archivo no hay canales y no hay aviso; un archivo ilegible o malformado produce un aviso con la ruta y un conjunto vacío — nunca bloquea el arranque.
+
+```toml
+[[channels]]
+id = "github"
+agent_id = "billing"
+project_id = "proj"          # opcional
+mode = "async"               # o "sync"; default async
+template = "{{action}} de {{sender.login}}"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_SECRET"  # NOMBRE de la variable, nunca el secreto
+enabled = true
+```
+
+- `id` — nombre en la ruta de la URL; un canal desconocido o desactivado da `404`.
+- `agent_id` — agente destino obligatorio; `project_id` opcional lo limita a un proyecto. Ambos salen de la config, nunca de los headers del emisor. El turno se despacha con un `AgentSelection` solo de config, con `debug` **siempre `false`**: el llamador no puede ampliar el scope ni activar `debug_prompt`/`debug_route`.
+- `mode` — `"sync"` ejecuta el turno en línea y responde `200` con el `ChatResponse`; `"async"` (default) crea el id **antes** de lanzar la tarea en proceso, responde `202 {"execution_id": "<uuid>"}` y el turno se observa en `GET /api/executions/:id` (el log de ejecución de Fase 7).
+- `template` — plantilla de marcadores opcional (abajo); ausente o en blanco, el mensaje es el cuerpo crudo.
+- `signature_header` — header con la firma; por defecto `X-Signature`.
+- `auth_env` — el **NOMBRE** de la variable de entorno con el secreto compartido, nunca el secreto. `ChannelConfig` no tiene campo de secreto, así que se puede hacer `Debug` y loguear sin riesgo; el valor se resuelve del entorno al atender la petición.
+- `enabled` — `bool`, default `true`.
+
+**Firma antes de parsear.** El puerto `ChannelSignatureVerifier` tiene un adaptador, `HmacSha256Verifier` (`src/adapters/channel/hmac.rs`): HMAC-SHA256 sobre los **bytes crudos** de la petición — sin parsear, recortar ni re-serializar — que acepta `sha256=<hex>` y `<hex>` suelto, decodifica 32 bytes y compara en tiempo constante. Falla cerrado: secreto ausente o vacío, header ausente o malformado, o discrepancia, todos dan el mismo `401 invalid signature`, genérico. Ningún cuerpo, firma ni secreto se refleja en una respuesta o un log; el único aviso nombra la variable, nunca su valor. El puerto es puro (cuerpo, header, secreto resuelto → `bool`) y se comprueba con vectores RFC 4231.
+
+**Plantillas de marcadores, sin Liquid.** Una plantilla es texto plano con marcadores `{{ruta.al.campo}}` que se sustituyen por escalares del JSON entrante: strings tal cual, números y booleanos como texto. **No hay motor Liquid, lenguaje de expresiones, escape HTML ni dependencia nueva.** Una ruta ausente o desconocida, un valor no escalar (objeto/array/null) o un `{{` sin cerrar dan un `400` nombrado que menciona solo la ruta de la plantilla — nunca el cuerpo —, así que un secreto en el payload no puede devolverse en el error. `message_from_template` mantiene en un solo sitio la regla «cuerpo crudo si no hay plantilla», compartida por producción y tests.
+
+**No se afirma:** ni cola de entrega, reintentos ni reaper en segundo plano — `async` es un único turno lanzado en proceso; ni identidad de usuario ni auth en el endpoint — la firma **es** la auth; ni esquemas de firma específicos de proveedor (un solo HMAC-SHA256, con header configurable); ni secreto o cuerpo en logs/errores; ni dependencia nueva (HMAC, decodificación hex y comparación en tiempo constante se apoyan en `sha2`, ya presente; no se añaden `hmac`/`hex`/`subtle`); ni cambio en puertos sagrados; ni otro endpoint además de `POST /api/webhooks/:channel`. Los agentes remotos y el sandbox siguen sin hacerse (ver "Subagentes (Fase 4)").
+
 ## Subagentes (Fase 4)
 
 Un agente puede delegar un turno a otros agentes solo con TOML. La tabla `[subagents]` deja de ser un stub inerte y pasa a ser una política tipada en `AgentConfig` (`Option<SubagentsConfig>`):
@@ -592,6 +628,7 @@ cargo run -- <comando>
 │   └── *.toml
 ├── providers.toml              # Perfiles de provider (opcional)
 ├── router.toml                 # Ajustes del router (opcional)
+├── channels.toml               # Canales webhook entrantes (opcional)
 └── logs/
     └── llama-r.log.YYYY-MM-DD
 ```

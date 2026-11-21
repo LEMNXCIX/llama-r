@@ -252,6 +252,13 @@ GET  /api/mcp
 POST /api/mcp
 ```
 
+### Webhooks (signed channels)
+```text
+POST /api/webhooks/:channel
+```
+
+A signed channel runs one agent turn. The signature is verified over the raw body **before** any JSON parsing: a missing/malformed/wrong signature, or a channel with no secret, is a generic `401`. Unknown or disabled channels are `404`. `mode = "sync"` answers `200` with the `ChatResponse`; `mode = "async"` (default) answers `202 {"execution_id": "..."}`, observable at `GET /api/executions/:id`. Scope and the debug gate come from `channels.toml`, never from the request. See "Webhook channels (Fase 8)".
+
 ### Approval (human-in-the-loop — no `X-Debug` required)
 ```text
 GET  /api/approvals
@@ -369,6 +376,7 @@ trace fields are only contract-ready for a future exporter.
 - `data/history.db`: SQLite conversation history (gitignored). The durable-execution store adds four tables to this **same** file with an additive, `IF NOT EXISTS` schema (no destructive migration, so an old `history.db` opens unchanged): `executions` (one agent turn), `execution_events` (append-only event log), `tool_operations` (idempotency cache keyed by `operation_id`) and `pending_approvals` (persisted human decisions). WAL mode is enabled. See "Durable execution and recovery".
 - `router.toml` (optional): router tuning — the two thresholds, `exclude`, and any of the `ROUTER_*` values; overrides the environment defaults
 - `providers.toml` (optional): provider profile registry — `type`, `base_url`, `api_key_env` (env var name, never a key) and `timeout_ms`; overlays the six built-in profiles
+- `channels.toml` (optional): inbound webhook channels — `[[channels]]` entries with `id`, `agent_id`, `project_id`, `mode`, `template`, `signature_header`, `auth_env` (the **name** of the env var holding the shared secret, never the secret) and `enabled`; loaded per request (see "Webhook channels (Fase 8)")
 - `logs/llama-r.log`: rolling application logs
 
 ## TUI
@@ -452,6 +460,28 @@ An `AgentExecution` (`src/domain/execution.rs`) is one agent **turn**, not one t
 **Deferred / not done**: no Postgres or other async backend (the port is ready, SQLite is the only adapter); no user identity/auth on the approval or execution endpoints; no "first use only" suppression for `Once` (it still behaves like `Always`); no OpenTelemetry exporter/integration (the trace fields are only contract-ready); no step-level replay. The `Auto` decision model itself **is** done (gate-time, router-backed, safe degradation). Rig still owns the tool loop, and the HTTP/gRPC/API ports are unchanged.
 
 Source modules: `src/domain/execution.rs`, `src/ports/execution.rs`, `src/adapters/execution/`, `src/adapters/rig_engine/operations.rs`, `src/api/execution_api.rs`, `src/services/approval.rs`, `src/runtime.rs` (boot recovery). End-to-end coverage: `tests/execution_store_tests.rs`, `tests/execution_api_tests.rs`, `tests/execution_recovery_tests.rs`, `tests/approval_tests.rs`.
+
+## Webhook channels (Fase 8)
+
+A signed inbound webhook becomes one agent turn. The sole endpoint is `POST /api/webhooks/:channel`; there is no other new surface. Channels live in the optional `channels.toml` in the base directory, loaded **per request** (like agents and contexts), so an edit takes effect without a restart. A missing file is fine (empty channel set); an unreadable or malformed one is a warning naming the path and an empty set — it never blocks boot.
+
+`channels.toml` is a list of `[[channels]]` entries:
+
+- `id` — the name in the URL path; an unknown or disabled channel is `404`.
+- `agent_id` — the required target agent; optional `project_id` scopes it to a project. Both come from config, never from the emitter's headers. The turn is dispatched with a config-only `AgentSelection` whose `debug` is **always `false`**, so a caller cannot widen scope or turn on debug evidence (`debug_prompt`/`debug_route`) through the request.
+- `mode` — `"sync"` or `"async"` (default `async`). `sync` runs the turn inline and answers `200` with the `ChatResponse`. `async` mints the execution id **before** spawning the in-process task, answers `202 {"execution_id": "<uuid>"}`, and the turn is observable through `GET /api/executions/:id` (the Fase 7 execution log).
+- `template` — optional marker template (see below); omitted or blank means the raw body is the user message.
+- `signature_header` — header carrying the signature, default `X-Signature`.
+- `auth_env` — the **NAME** of the environment variable holding the shared secret, never the secret itself. `ChannelConfig` has no secret field, so it is safe to derive `Debug` on and to log; the value is resolved from the environment at request time.
+- `enabled` — `bool`, default `true`.
+
+**Signature before parse.** The `ChannelSignatureVerifier` port has one adapter, `HmacSha256Verifier` (`src/adapters/channel/hmac.rs`): HMAC-SHA256 over the **raw request bytes** — no parsing, trimming or re-serialising first — accepting `sha256=<hex>` and bare `<hex>`, decoded to 32 bytes and compared in constant time. It is fail-closed: a missing/empty secret, a missing/malformed header or a mismatch all produce the same generic `401 invalid signature`. No body, signature or secret is echoed into a response or a log line; the only warning names the env var, never its value. The port is pure (body, header, resolved secret → `bool`) and checked against RFC 4231 vectors.
+
+**Marker templates, not Liquid.** A template is plain text with `{{path.to.field}}` markers replaced by scalars from the parsed JSON: strings as-is, numbers/booleans as their text form. There is **no Liquid engine, no expression language, no HTML escaping and no new dependency**. A missing/unknown path, a non-scalar (object/array/null) value or an unclosed `{{` is a named `400` error mentioning only the path from the template — never the payload body — so a secret in the payload cannot be echoed back. `message_from_template` keeps the "raw body when no template" rule in one place shared by production and tests.
+
+**Non-claims / not done:** no delivery queue, retries or background reaper — `async` is one in-process spawned turn; no user identity/auth on the endpoint — the signature **is** the auth; no provider-specific signature schemes (one HMAC-SHA256 scheme, one configurable header); no secret or body in logs/errors; no new dependency (HMAC, hex decode and constant-time compare are built on the existing `sha2` crate, `hmac`/`hex`/`subtle` are not added); no sacred-port change; no new endpoint beyond `POST /api/webhooks/:channel`. Remote agents and a sandbox remain undone (see "Subagent delegation (Fase 4)").
+
+Source modules: `src/domain/channel.rs`, `src/ports/channel.rs`, `src/adapters/channel/`, `src/services/marker_template.rs`, `src/api/webhook_api.rs`, `src/runtime.rs` (route + verifier). Coverage: `tests/webhook_tests.rs`.
 
 ## Subagent delegation (Fase 4)
 
