@@ -573,9 +573,7 @@ async fn restart_reaper_resumes_decided_orphan() {
 
     let state = reaper_state(gate.clone(), store.clone()).await;
 
-    let reaped = reap_once(&state, Duration::from_secs(5))
-        .await
-        .expect("reaper pass must not fail");
+    let reaped = reap_once(&state).await.expect("reaper pass must not fail");
     assert_eq!(reaped, 1, "the decided orphan is resumed exactly once");
 
     let resumed = store
@@ -630,7 +628,7 @@ async fn no_double_resume_when_live() {
     gate.park(approval_id);
 
     let state = reaper_state(gate, store.clone()).await;
-    let reaped = reap_once(&state, Duration::from_secs(5)).await.unwrap();
+    let reaped = reap_once(&state).await.unwrap();
     assert_eq!(reaped, 0, "a live parked approval is never reaped");
     assert_eq!(
         store.get(execution_id).await.unwrap().unwrap().status,
@@ -684,7 +682,7 @@ async fn deny_and_hash_mismatch_are_named_errors() {
     assert_eq!(gate.decision_for(mismatch_id), None);
 
     let state = reaper_state(gate, store.clone()).await;
-    let reaped = reap_once(&state, Duration::from_secs(5)).await.unwrap();
+    let reaped = reap_once(&state).await.unwrap();
     assert_eq!(reaped, 0, "neither a denial nor a hash mismatch is a grant");
     assert_eq!(
         store.get(denied_exec).await.unwrap().unwrap().status,
@@ -704,6 +702,6 @@ async fn unknown_or_failed_store_is_best_effort() {
 
     // A degraded/no store lists nothing: one pass is a clean no-op, never a
     // panic and never a failed boot.
-    let reaped = reap_once(&state, Duration::from_secs(5)).await.unwrap();
+    let reaped = reap_once(&state).await.unwrap();
     assert_eq!(reaped, 0);
 }

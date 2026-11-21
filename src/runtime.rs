@@ -671,7 +671,7 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     // rather than buried as a generic interrupted turn. Both steps are best
     // effort: a store error is a warning and never stops boot.
     let reaper_interval = crate::services::approval_reaper::reaper_interval_from_env();
-    if let Err(err) = crate::services::approval_reaper::reap_once(&state, reaper_interval).await {
+    if let Err(err) = crate::services::approval_reaper::reap_once(&state).await {
         tracing::warn!(error = %err, "Approval reaper first pass failed; boot continues");
     }
     if let Err(err) = mark_interrupted(execution_store.as_ref()).await {

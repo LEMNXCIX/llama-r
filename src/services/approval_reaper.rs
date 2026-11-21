@@ -44,9 +44,9 @@ pub fn reaper_interval_from_env() -> Duration {
 }
 
 /// One reaper pass. Returns the number of decided orphans resumed under their
-/// original execution id. `interval_for_log` is only used for diagnostics, so
-/// the same function is directly callable from tests without spawning a task.
-pub async fn reap_once(state: &AppState, interval_for_log: Duration) -> Result<usize, String> {
+/// original execution id. Takes only `state` so the pass is directly callable
+/// from tests without spawning a task; scheduling stays in the caller.
+pub async fn reap_once(state: &AppState) -> Result<usize, String> {
     let store = state.execution_store.as_ref();
     // `list_interrupted` returns `Running` + `WaitingApproval`; the reaper cares
     // only about the latter. Filtering here keeps the sacred port unchanged.
@@ -80,7 +80,6 @@ pub async fn reap_once(state: &AppState, interval_for_log: Duration) -> Result<u
         });
         let Some(grant) = grant else {
             tracing::debug!(
-                interval_ms = interval_for_log.as_millis(),
                 execution_id = %execution.id,
                 "waiting-approval turn has no resumable grant; skipping"
             );
@@ -110,7 +109,6 @@ pub async fn reap_once(state: &AppState, interval_for_log: Duration) -> Result<u
                 gate.unpark(approval_id);
                 reaped += 1;
                 tracing::info!(
-                    interval_ms = interval_for_log.as_millis(),
                     execution_id = %execution.id,
                     approval_id = %approval_id,
                     "resumed an orphaned parked approval under its original execution id"
@@ -134,7 +132,7 @@ pub fn spawn_approval_reaper(state: Arc<AppState>, interval: Duration) -> JoinHa
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            match reap_once(&state, interval).await {
+            match reap_once(&state).await {
                 Ok(count) if count > 0 => tracing::info!(
                     count,
                     interval_ms = interval.as_millis(),
