@@ -489,3 +489,221 @@ async fn park_wait_does_not_expire_after_timeout() {
         Ok(ApprovalDecision::Approved)
     ));
 }
+
+// ── Task 3: background reaper for orphaned parked approvals ─────────────────
+
+use chrono::Utc;
+use llama_r::adapters::execution::NoOpExecutionStore;
+use llama_r::ports::execution::{ApprovalDecisionRecord, PendingApprovalRecord};
+use llama_r::services::approval_reaper::reap_once;
+use std::sync::Arc;
+
+fn waiting_execution(id: Uuid) -> AgentExecution {
+    let mut execution = execution(id);
+    execution.status = ExecutionStatus::WaitingApproval;
+    execution
+}
+
+/// A durable pending row bound to one turn. `decision` is what a human recorded
+/// while no live oneshot existed (a restart rehydrates it into the gate).
+fn pending_record(
+    id: Uuid,
+    execution_id: Uuid,
+    decision: Option<ApprovalDecisionRecord>,
+    args: &Value,
+) -> PendingApprovalRecord {
+    let now = Utc::now();
+    PendingApprovalRecord {
+        id,
+        execution_id: Some(execution_id),
+        tool_name: "fake__tool".into(),
+        args: args.clone(),
+        args_hash: args_hash(args),
+        created_at: now,
+        decided: decision.is_some(),
+        decision: decision.clone(),
+        decided_at: decision.map(|_| now),
+    }
+}
+
+/// A state whose engine is the same gate the reaper inspects, so a resumed turn
+/// hits the gate's pre-resolved `request_for` seam rather than asking a human.
+async fn reaper_state(
+    gate: Arc<ApprovalGate>,
+    store: Arc<dyn ExecutionStore>,
+) -> Arc<llama_r::api::handlers::AppState> {
+    let engine = Arc::new(ParkingEngine { gate: gate.clone() });
+    test_state(gate, store, engine).await
+}
+
+#[tokio::test]
+async fn restart_reaper_resumes_decided_orphan() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        SqliteExecutionStore::new(dir.path().join("history.db")).expect("open execution store"),
+    ) as Arc<dyn ExecutionStore>;
+
+    let execution_id = Uuid::new_v4();
+    store
+        .create(&waiting_execution(execution_id))
+        .await
+        .unwrap();
+
+    let approval_id = Uuid::new_v4();
+    let args = json!({"table": "users"});
+    store
+        .save_pending_approval(&pending_record(
+            approval_id,
+            execution_id,
+            Some(ApprovalDecisionRecord::Approved),
+            &args,
+        ))
+        .await
+        .unwrap();
+
+    // Simulate a restart: a fresh gate rehydrates the decision with no live
+    // oneshot and an empty parked_live set — the orphan the reaper must resume.
+    let gate = Arc::new(ApprovalGate::parked().with_store(store.clone()));
+    gate.load_from_store().await.unwrap();
+    assert_eq!(
+        gate.decision_for(approval_id),
+        Some(ApprovalDecision::Approved)
+    );
+    assert!(!gate.is_parked_live(approval_id));
+
+    let state = reaper_state(gate.clone(), store.clone()).await;
+
+    let reaped = reap_once(&state, Duration::from_secs(5))
+        .await
+        .expect("reaper pass must not fail");
+    assert_eq!(reaped, 1, "the decided orphan is resumed exactly once");
+
+    let resumed = store
+        .get(execution_id)
+        .await
+        .unwrap()
+        .expect("execution row");
+    assert_eq!(resumed.status, ExecutionStatus::Completed);
+    assert_eq!(
+        resumed.id, execution_id,
+        "the turn is resumed under the same execution id"
+    );
+    assert_eq!(
+        store.list(10).await.unwrap().len(),
+        1,
+        "the retry did not mint a second execution"
+    );
+    assert!(
+        !gate.is_parked_live(approval_id),
+        "unpark is a no-op for an orphan"
+    );
+}
+
+#[tokio::test]
+async fn no_double_resume_when_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        SqliteExecutionStore::new(dir.path().join("history.db")).expect("open execution store"),
+    ) as Arc<dyn ExecutionStore>;
+
+    let execution_id = Uuid::new_v4();
+    store
+        .create(&waiting_execution(execution_id))
+        .await
+        .unwrap();
+    let approval_id = Uuid::new_v4();
+    let args = json!({"table": "users"});
+    store
+        .save_pending_approval(&pending_record(
+            approval_id,
+            execution_id,
+            Some(ApprovalDecisionRecord::Approved),
+            &args,
+        ))
+        .await
+        .unwrap();
+
+    let gate = Arc::new(ApprovalGate::parked().with_store(store.clone()));
+    gate.load_from_store().await.unwrap();
+    // A live turn is holding this approval open; decide unparks before firing,
+    // but a still-parked id must never be claimed by the reaper.
+    gate.park(approval_id);
+
+    let state = reaper_state(gate, store.clone()).await;
+    let reaped = reap_once(&state, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(reaped, 0, "a live parked approval is never reaped");
+    assert_eq!(
+        store.get(execution_id).await.unwrap().unwrap().status,
+        ExecutionStatus::WaitingApproval,
+        "the live turn is left untouched"
+    );
+}
+
+#[tokio::test]
+async fn deny_and_hash_mismatch_are_named_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        SqliteExecutionStore::new(dir.path().join("history.db")).expect("open execution store"),
+    ) as Arc<dyn ExecutionStore>;
+
+    let denied_exec = Uuid::new_v4();
+    let mismatch_exec = Uuid::new_v4();
+    store.create(&waiting_execution(denied_exec)).await.unwrap();
+    store
+        .create(&waiting_execution(mismatch_exec))
+        .await
+        .unwrap();
+
+    let args = json!({"table": "users"});
+    store
+        .save_pending_approval(&pending_record(
+            Uuid::new_v4(),
+            denied_exec,
+            Some(ApprovalDecisionRecord::Denied {
+                reason: "no".into(),
+            }),
+            &args,
+        ))
+        .await
+        .unwrap();
+    let mismatch_id = Uuid::new_v4();
+    store
+        .save_pending_approval(&pending_record(mismatch_id, mismatch_exec, None, &args))
+        .await
+        .unwrap();
+
+    let gate = Arc::new(ApprovalGate::parked().with_store(store.clone()));
+    gate.load_from_store().await.unwrap();
+
+    // A tampered argument hash is a named error and records no decision at all,
+    // so neither it nor a denial is a grant the reaper may act on.
+    assert_eq!(
+        gate.decide(mismatch_id, true, args_hash(&json!({"table": "orders"}))),
+        Err(llama_r::services::approval::ApprovalError::ArgsChanged),
+    );
+    assert_eq!(gate.decision_for(mismatch_id), None);
+
+    let state = reaper_state(gate, store.clone()).await;
+    let reaped = reap_once(&state, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(reaped, 0, "neither a denial nor a hash mismatch is a grant");
+    assert_eq!(
+        store.get(denied_exec).await.unwrap().unwrap().status,
+        ExecutionStatus::WaitingApproval
+    );
+    assert_eq!(
+        store.get(mismatch_exec).await.unwrap().unwrap().status,
+        ExecutionStatus::WaitingApproval
+    );
+}
+
+#[tokio::test]
+async fn unknown_or_failed_store_is_best_effort() {
+    let gate = Arc::new(ApprovalGate::parked());
+    let store: Arc<dyn ExecutionStore> = Arc::new(NoOpExecutionStore);
+    let state = reaper_state(gate, store).await;
+
+    // A degraded/no store lists nothing: one pass is a clean no-op, never a
+    // panic and never a failed boot.
+    let reaped = reap_once(&state, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(reaped, 0);
+}

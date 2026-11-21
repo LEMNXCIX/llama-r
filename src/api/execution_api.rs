@@ -217,6 +217,58 @@ async fn note_decided_approvals(state: &AppState, execution_id: Uuid) {
     }
 }
 
+/// Re-run a stored turn under its ORIGINAL id. Shared by the HTTP retry endpoint
+/// and the approval reaper so the replay-cache invariant lives in one place:
+/// `execute_chat_with_id` resumes the turn and every tool effect already
+/// recorded under this id is replayed rather than executed a second time.
+///
+/// The caller decides which statuses are retryable (HTTP: `Interrupted` /
+/// `Failed`; the reaper: an orphaned `WaitingApproval`), so this helper does no
+/// status gating of its own.
+pub(crate) async fn retry_turn(
+    state: &AppState,
+    id: Uuid,
+    execution: &AgentExecution,
+) -> Result<(), AppError> {
+    // A legacy row predating the `user_message` column has nothing to rebuild
+    // the turn from. Refuse it by name rather than silently sending an empty
+    // prompt through the engine.
+    let user_message = execution
+        .user_message
+        .as_deref()
+        .filter(|message| !message.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::Forbidden(format!(
+                "execution '{id}' has no stored user_message (legacy row); cannot retry without the original request"
+            ))
+        })?
+        .to_string();
+
+    // A decision made while no live oneshot existed is consumed by the gate's
+    // `request_for` when the retry reaches that tool. Log which ones are in play.
+    note_decided_approvals(state, id).await;
+
+    let (project_id, agent_id) = split_qualified_id(&execution.agent_qualified_id);
+    let payload = crate::domain::models::ChatRequest {
+        model: execution.model.clone(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: user_message,
+        }],
+        stream: false,
+    };
+    let selection = AgentSelection {
+        project_id: project_id.as_deref(),
+        agent_id: agent_id.as_deref(),
+        conversation_id: execution.conversation_id.as_deref(),
+        debug: false,
+    };
+
+    // The one line that makes the retry idempotent: reuse the original id.
+    execute_chat_with_id(state, payload, selection, Some(id)).await?;
+    Ok(())
+}
+
 /// `POST /api/executions/:id/retry` — re-run an interrupted/failed turn from
 /// scratch under the SAME id, so recorded tool effects are replayed.
 ///
@@ -253,42 +305,7 @@ pub async fn retry_execution(
         )));
     }
 
-    // A legacy row predating the `user_message` column has nothing to rebuild
-    // the turn from. Refuse it by name rather than silently sending an empty
-    // prompt through the engine.
-    let user_message = execution
-        .user_message
-        .as_deref()
-        .filter(|message| !message.trim().is_empty())
-        .ok_or_else(|| {
-            AppError::Forbidden(format!(
-                "execution '{id}' has no stored user_message (legacy row); cannot retry without the original request"
-            ))
-        })?
-        .to_string();
-
-    // A decision made while no live oneshot existed is consumed by the gate's
-    // `request_for` when the retry reaches that tool. Log which ones are in play.
-    note_decided_approvals(&state, id).await;
-
-    let (project_id, agent_id) = split_qualified_id(&execution.agent_qualified_id);
-    let payload = crate::domain::models::ChatRequest {
-        model: execution.model.clone(),
-        messages: vec![ChatMessage {
-            role: "user".to_string(),
-            content: user_message,
-        }],
-        stream: false,
-    };
-    let selection = AgentSelection {
-        project_id: project_id.as_deref(),
-        agent_id: agent_id.as_deref(),
-        conversation_id: execution.conversation_id.as_deref(),
-        debug: false,
-    };
-
-    // The one line that makes the retry idempotent: reuse the original id.
-    execute_chat_with_id(&state, payload, selection, Some(id)).await?;
+    retry_turn(&state, id, &execution).await?;
 
     let updated = state
         .execution_store

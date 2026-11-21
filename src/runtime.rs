@@ -610,11 +610,8 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     // Durable execution store, built from the same `history.db` as above and
     // owned by `AppState` (outside `ProviderStack`, so a hot Apply never drops
     // it). An unopenable store degrades to the no-op one instead of failing boot.
-    // One recovery pass marks crash-interrupted turns; no background task.
+    // Boot recovery and the approval reaper run once the state exists, below.
     let execution_store = build_execution_store();
-    if let Err(err) = mark_interrupted(execution_store.as_ref()).await {
-        tracing::warn!(error = %err, "Boot recovery could not list interrupted executions; continuing");
-    }
 
     // One `PROVIDER` selects chat, the decision router and embeddings. A
     // completed interactive setup already produced such a stack from the values
@@ -655,7 +652,7 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         known_mcp_servers,
         mcp_registry,
         history_store,
-        execution_store,
+        execution_store.clone(),
     );
     // Build the companions only now, from the state that owns the boot gate
     // *and* the boot `auto_decider`. `CompanionHandles::from_state` reads both,
@@ -667,6 +664,21 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     };
     build_companions_for_state(&state, &config, &mut stack);
     state.replace_services(stack).await;
+
+    // Approval reaper (Task 3): resume turns parked on a decision a human made
+    // while this process was down. The first pass runs BEFORE boot recovery
+    // marks mid-flight turns `Interrupted`, so a decided orphan is consumed
+    // rather than buried as a generic interrupted turn. Both steps are best
+    // effort: a store error is a warning and never stops boot.
+    let reaper_interval = crate::services::approval_reaper::reaper_interval_from_env();
+    if let Err(err) = crate::services::approval_reaper::reap_once(&state, reaper_interval).await {
+        tracing::warn!(error = %err, "Approval reaper first pass failed; boot continues");
+    }
+    if let Err(err) = mark_interrupted(execution_store.as_ref()).await {
+        tracing::warn!(error = %err, "Boot recovery could not list interrupted executions; continuing");
+    }
+    // The periodic pass catches any orphan that appears while the service runs.
+    crate::services::approval_reaper::spawn_approval_reaper(state.clone(), reaper_interval);
 
     // One probe at startup, then last-known-value: the ladder updates the flag
     // after every decision and `/api/health` never probes — the point of the
