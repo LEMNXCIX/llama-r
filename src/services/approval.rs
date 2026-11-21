@@ -26,6 +26,7 @@
 //! no-op), so the synchronous gate API can drive them with `block_on` without
 //! ever parking on a tokio primitive.
 
+use crate::domain::execution::ExecutionStatus;
 use crate::error::AppError;
 // The canonical argument hash lives in `services::redaction` so approval
 // binding and tool-call `operation_id` mint the same id from the same args.
@@ -34,7 +35,7 @@ use crate::ports::execution::{ApprovalDecisionRecord, ExecutionStore, PendingApp
 pub use crate::services::redaction::{args_hash, args_hash_hex};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -42,6 +43,52 @@ use uuid::Uuid;
 
 /// How long a pending approval stays valid before a reaper drops it.
 pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the HTTP chat handler waits for an approval turn before answering
+/// `202 ChatAck` instead of holding the request open.
+pub const DEFAULT_PARK_GRACE: Duration = Duration::from_millis(1000);
+
+/// Environment switch: with `APPROVAL_PARK` set to a truthy value the boot gate
+/// has no deadline at all (`timeout() == None`) and pending approvals wait for a
+/// human decision indefinitely. Missing/false keeps the 120 s default.
+pub const ENV_APPROVAL_PARK: &str = "APPROVAL_PARK";
+/// Override the gate deadline in seconds when parking is off. A missing,
+/// unparsable or non-positive value keeps [`DEFAULT_APPROVAL_TIMEOUT`].
+pub const ENV_APPROVAL_TIMEOUT_SECS: &str = "APPROVAL_TIMEOUT_SECS";
+/// Override the `202` acknowledgement grace in milliseconds.
+pub const ENV_PARK_GRACE_MS: &str = "PARK_GRACE_MS";
+
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+    )
+}
+
+/// Resolve the gate's deadline from the environment. `None` means park: the
+/// bridge awaits its oneshot with no `tokio::time::timeout` wrapper (Task 2).
+pub fn approval_timeout_from_env() -> Option<Duration> {
+    if env_truthy(ENV_APPROVAL_PARK) {
+        return None;
+    }
+    std::env::var(ENV_APPROVAL_TIMEOUT_SECS)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .or(Some(DEFAULT_APPROVAL_TIMEOUT))
+}
+
+/// Resolve the acknowledgement grace from the environment, falling back to
+/// one second when unset or malformed.
+pub fn park_grace_from_env() -> Duration {
+    std::env::var(ENV_PARK_GRACE_MS)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_PARK_GRACE)
+}
 
 /// The human's answer, delivered over the oneshot from [`ApprovalGate::request`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +144,16 @@ pub struct PendingApprovalView {
 /// `decide` (there is no background task to schedule or shut down).
 pub struct ApprovalGate {
     pending: RwLock<HashMap<Uuid, PendingApproval>>,
-    timeout: Duration,
+    /// `None` parks the wait: a pending approval never expires and the bridge
+    /// awaits its oneshot without a deadline. `Some(d)` keeps the legacy
+    /// bounded wait and the reaper that goes with it.
+    timeout: Option<Duration>,
+    /// Ids of live approvals whose turn is parked waiting for a decision. Set in
+    /// `request_for` and cleared in `decide` before the oneshot fires, so a
+    /// caller can tell which pending is actually holding a turn open. This is a
+    /// live-process index only; persisted pendings after a restart are not
+    /// parked because there is no oneshot to unblock.
+    parked_live: RwLock<HashSet<Uuid>>,
     /// Durable mirror, when one was installed. `None` keeps the primitive
     /// usable in tests and in degraded/no-store deployments.
     store: Option<Arc<dyn ExecutionStore>>,
@@ -110,6 +166,7 @@ impl std::fmt::Debug for ApprovalGate {
         f.debug_struct("ApprovalGate")
             .field("pending", &self.pending)
             .field("timeout", &self.timeout)
+            .field("parked_live", &self.parked_live)
             .field("durable", &self.store.is_some())
             .finish()
     }
@@ -146,10 +203,25 @@ impl Default for ApprovalGate {
 }
 
 impl ApprovalGate {
+    /// A gate with a finite deadline. Existing callers keep exactly this
+    /// behaviour; parking is opt-in through [`Self::parked`] or the environment.
     pub fn new(timeout: Duration) -> Self {
         Self {
             pending: RwLock::new(HashMap::new()),
-            timeout,
+            timeout: Some(timeout),
+            parked_live: RwLock::new(HashSet::new()),
+            store: None,
+        }
+    }
+
+    /// A gate whose pending approvals never expire. The bridge waits on its
+    /// oneshot with no deadline, so a turn parks until a human decides (or the
+    /// caller abandons it) instead of failing after 120 s.
+    pub fn parked() -> Self {
+        Self {
+            pending: RwLock::new(HashMap::new()),
+            timeout: None,
+            parked_live: RwLock::new(HashSet::new()),
             store: None,
         }
     }
@@ -162,12 +234,52 @@ impl ApprovalGate {
         self
     }
 
-    /// How long a pending decision stays valid. The bridge wraps its `rx.await`
-    /// in a `tokio::time::timeout` of this length so a request nobody decides
-    /// fails with a named error instead of hanging forever (the gate's own
-    /// reaper only runs when `request`/`decide` is next called).
-    pub fn timeout(&self) -> Duration {
+    /// How long a pending decision stays valid, or `None` when parked.
+    /// With `Some(d)` the bridge wraps `rx.await` in a `tokio::time::timeout`
+    /// so a request nobody decides fails with a named error; with `None` it
+    /// simply awaits, so the turn waits for a human indefinitely.
+    pub fn timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+
+    /// Whether this approval id is currently holding a live turn open.
+    pub fn is_parked_live(&self, id: Uuid) -> bool {
+        self.parked_live
+            .read()
+            .expect("approval gate lock poisoned")
+            .contains(&id)
+    }
+
+    /// Mark an approval as parking its turn. Called by `request_for` after the
+    /// pending has been persisted and the execution flipped to `WaitingApproval`.
+    pub fn park(&self, id: Uuid) {
+        self.parked_live
+            .write()
+            .expect("approval gate lock poisoned")
+            .insert(id);
+    }
+
+    /// Forget a parked approval. Called by `decide` *before* the oneshot fires,
+    /// so a client that observes the decision can never still see it parked.
+    pub fn unpark(&self, id: Uuid) {
+        self.parked_live
+            .write()
+            .expect("approval gate lock poisoned")
+            .remove(&id);
+    }
+
+    /// The first undecided live approval for one execution, if any. The HTTP
+    /// chat handler uses this to put an `approval_id` on the `202` acknowledgement
+    /// without changing the gate's public snapshot types.
+    pub fn live_approval_for_execution(&self, execution_id: Uuid) -> Option<Uuid> {
+        self.pending
+            .read()
+            .expect("approval gate lock poisoned")
+            .iter()
+            .find(|(_, entry)| {
+                entry.execution_id == Some(execution_id) && !entry.decided && entry.tx.is_some()
+            })
+            .map(|(id, _)| *id)
     }
 
     /// Register a pending approval with no execution scope (live request outside
@@ -271,7 +383,25 @@ impl ApprovalGate {
                     "Failed to persist pending approval; continuing without durability"
                 );
             }
+            // The turn really is waiting now, not merely Running with a timer.
+            // Best effort: a store error degrades to an unobserved status, never
+            // a failed tool call. This is a live request (the entry carries a
+            // oneshot), so it is also the one to mark as parked.
+            if let Some(execution_id) = execution_id {
+                if let Err(err) = futures::executor::block_on(store.set_status(
+                    execution_id,
+                    ExecutionStatus::WaitingApproval,
+                    None,
+                )) {
+                    tracing::warn!(
+                        error = %err,
+                        execution_id = %execution_id,
+                        "Failed to mark execution as waiting for approval; continuing"
+                    );
+                }
+            }
         }
+        self.park(id);
         (id, rx)
     }
 
@@ -331,6 +461,7 @@ impl ApprovalGate {
             .unwrap_or(false)
         {
             pending.remove(&id);
+            self.unpark(id);
             return Err(ApprovalError::Expired(id));
         }
         // Reap the rest while the write lock is already held. Decided entries
@@ -358,6 +489,9 @@ impl ApprovalGate {
             }
         };
         entry.decision = Some(decision.clone());
+        // Unpark before waking the bridge: an observer that sees the decision
+        // must never still see this approval as holding a turn open.
+        self.unpark(id);
         if let Some(tx) = entry.tx.take() {
             // The receiver may have been dropped (client disconnected); that
             // must not turn a valid decision into an error.
@@ -387,7 +521,16 @@ impl ApprovalGate {
     pub fn prune_expired(&self) {
         let now = Utc::now();
         let mut pending = self.pending.write().expect("approval gate lock poisoned");
-        pending.retain(|_, entry| entry.decided || !is_expired(entry, now, self.timeout));
+        let expired: HashSet<Uuid> = pending
+            .iter()
+            .filter(|(_, entry)| !entry.decided && is_expired(entry, now, self.timeout))
+            .map(|(id, _)| *id)
+            .collect();
+        pending.retain(|id, _| !expired.contains(id));
+        drop(pending);
+        for id in expired {
+            self.unpark(id);
+        }
     }
 
     /// Rehydrate pendings from the attached store at boot. Entries loaded this
@@ -450,10 +593,98 @@ fn decision_from_record(record: &ApprovalDecisionRecord) -> ApprovalDecision {
     }
 }
 
-fn is_expired(entry: &PendingApproval, now: DateTime<Utc>, timeout: Duration) -> bool {
-    match now.signed_duration_since(entry.created_at).to_std() {
-        Ok(elapsed) => elapsed >= timeout,
-        // A future-dated created_at (clock skew) is not expired.
-        Err(_) => false,
+fn is_expired(entry: &PendingApproval, now: DateTime<Utc>, timeout: Option<Duration>) -> bool {
+    match timeout {
+        None => false,
+        Some(timeout) => match now.signed_duration_since(entry.created_at).to_std() {
+            Ok(elapsed) => elapsed >= timeout,
+            // A future-dated created_at (clock skew) is not expired.
+            Err(_) => false,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EnvGuard {
+        previous: Vec<(&'static str, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn cleared() -> Self {
+            let lock = crate::core::paths::lock_env_for_tests();
+            let names = [
+                ENV_APPROVAL_PARK,
+                ENV_APPROVAL_TIMEOUT_SECS,
+                ENV_PARK_GRACE_MS,
+            ];
+            let previous = names
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect();
+            for name in names {
+                std::env::remove_var(name);
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.previous {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn env_park_disables_the_deadline_and_timeout_secs_is_the_fallback() {
+        let _env = EnvGuard::cleared();
+        assert_eq!(approval_timeout_from_env(), Some(DEFAULT_APPROVAL_TIMEOUT));
+
+        std::env::set_var(ENV_APPROVAL_TIMEOUT_SECS, "7");
+        assert_eq!(approval_timeout_from_env(), Some(Duration::from_secs(7)));
+
+        std::env::set_var(ENV_APPROVAL_PARK, "true");
+        assert_eq!(
+            approval_timeout_from_env(),
+            None,
+            "park wins over a timeout"
+        );
+
+        std::env::set_var(ENV_APPROVAL_PARK, "0");
+        assert_eq!(
+            approval_timeout_from_env(),
+            Some(Duration::from_secs(7)),
+            "a false switch keeps the configured deadline"
+        );
+
+        std::env::set_var(ENV_APPROVAL_TIMEOUT_SECS, "not-a-number");
+        assert_eq!(
+            approval_timeout_from_env(),
+            Some(DEFAULT_APPROVAL_TIMEOUT),
+            "a malformed timeout falls back rather than parking"
+        );
+    }
+
+    #[test]
+    fn grace_helpers_use_the_documented_default() {
+        let _env = EnvGuard::cleared();
+        assert_eq!(park_grace_from_env(), DEFAULT_PARK_GRACE);
+
+        std::env::set_var(ENV_PARK_GRACE_MS, "250");
+        assert_eq!(park_grace_from_env(), Duration::from_millis(250));
+
+        std::env::set_var(ENV_PARK_GRACE_MS, "bogus");
+        assert_eq!(park_grace_from_env(), DEFAULT_PARK_GRACE);
     }
 }

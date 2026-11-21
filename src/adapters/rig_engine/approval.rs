@@ -19,8 +19,8 @@
 //!   gate's SHA-256 hash; a changed hash is rejected by [`ApprovalGate::decide`].
 //!
 //! A dropped request leaves its pending entry in the gate until the gate's own
-//! reaper collects it (Fase 7 seeds a background reaper); the bridge's own
-//! timeout keeps that from hanging the tool call.
+//! reaper collects it; with a finite gate deadline the bridge's timeout keeps
+//! that from hanging the tool call, while a parked gate waits indefinitely.
 
 use crate::api::observability::AppObservability;
 use crate::domain::policy::{
@@ -145,20 +145,34 @@ pub async fn authorize(
                 })?;
             }
 
-            match tokio::time::timeout(gate.timeout(), rx).await {
-                Ok(Ok(GateDecision::Approved)) => Ok(()),
-                Ok(Ok(GateDecision::Denied { reason })) => Err(format!(
-                    "tool '{tool_name}' was not executed: approval denied ({reason})"
-                )),
-                // The pending was reaped or its sender dropped (client gone):
-                // a named refusal, never a silent empty success.
-                Ok(Err(_)) => Err(format!(
-                    "tool '{tool_name}' was not executed: the approval request was dropped or expired"
-                )),
-                Err(_) => Err(format!(
-                    "tool '{tool_name}' was not executed: approval timed out after {:?}",
-                    gate.timeout()
-                )),
+            // A parked gate has no deadline: await the oneshot directly instead
+            // of wrapping it in `tokio::time::timeout`. Deny / hash mismatch /
+            // expiry are still named errors — parking only removes the timer.
+            match gate.timeout() {
+                None => match rx.await {
+                    Ok(GateDecision::Approved) => Ok(()),
+                    Ok(GateDecision::Denied { reason }) => Err(format!(
+                        "tool '{tool_name}' was not executed: approval denied ({reason})"
+                    )),
+                    Err(_) => Err(format!(
+                        "tool '{tool_name}' was not executed: the approval request was dropped"
+                    )),
+                },
+                Some(timeout) => match tokio::time::timeout(timeout, rx).await {
+                    Ok(Ok(GateDecision::Approved)) => Ok(()),
+                    Ok(Ok(GateDecision::Denied { reason })) => Err(format!(
+                        "tool '{tool_name}' was not executed: approval denied ({reason})"
+                    )),
+                    // The pending was reaped or its sender dropped (client
+                    // gone): a named refusal, never a silent empty success.
+                    Ok(Err(_)) => Err(format!(
+                        "tool '{tool_name}' was not executed: the approval request was dropped or expired"
+                    )),
+                    Err(_) => Err(format!(
+                        "tool '{tool_name}' was not executed: approval timed out after {:?}",
+                        timeout
+                    )),
+                },
             }
         }
     }

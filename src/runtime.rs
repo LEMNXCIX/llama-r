@@ -632,7 +632,16 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     // safe: it rebuilds the engine but leaves pending decisions intact. The
     // durable store is attached so pendings/decisions survive a restart; a boot
     // reload rehydrates them without a oneshot (there is no live request yet).
-    let approval_gate = Arc::new(ApprovalGate::default().with_store(execution_store.clone()));
+    // `APPROVAL_PARK` / `APPROVAL_TIMEOUT_SECS` decide whether a pending waits
+    // forever or on the legacy deadline. Task 5 moves these to `Config`; until
+    // then the env helper is the single reader, mirroring Task 1's admin token.
+    let approval_gate = Arc::new(
+        match crate::services::approval::approval_timeout_from_env() {
+            Some(timeout) => ApprovalGate::new(timeout),
+            None => ApprovalGate::parked(),
+        }
+        .with_store(execution_store.clone()),
+    );
     if let Err(err) = approval_gate.load_from_store().await {
         tracing::warn!(error = %err, "Boot could not reload pending approvals; continuing");
     }

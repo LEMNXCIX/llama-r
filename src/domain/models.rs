@@ -91,6 +91,19 @@ pub struct ChatResponse {
     pub conversation_id: Option<String>,
 }
 
+/// The `202` acknowledgement for a chat turn that parked on a human approval.
+///
+/// `execution_id` is the durable turn the client can observe at
+/// `GET /api/executions/:id`; `approval_id` is the pending the human must decide
+/// at `POST /api/approvals/:id`. Both are plain string ids, never arguments or
+/// credentials, so the acknowledgement is safe to return before the turn ends.
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct ChatAck {
+    pub execution_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+}
+
 /// The routing decision, for the debug surface: what was offered, what the
 /// model answered, and what dispatch did about it.
 ///

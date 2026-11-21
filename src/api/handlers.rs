@@ -1,11 +1,13 @@
-use crate::api::chat_core::{execute_chat, execute_chat_stream_with_conversation_id};
+use crate::api::chat_core::{
+    execute_chat, execute_chat_stream_with_conversation_id, execute_chat_with_new_id,
+};
 use crate::api::mcp_api;
 use crate::api::observability::AppObservability;
-use crate::api::route_resolution::AgentSelection;
+use crate::api::route_resolution::{resolve_selection, AgentSelection};
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::ContextStore;
 use crate::domain::models::{
-    ChatRequest, ChatResponse, JsonRpcRequest, JsonRpcResponse, ListModelsResponse,
+    ChatAck, ChatRequest, ChatResponse, JsonRpcRequest, JsonRpcResponse, ListModelsResponse,
 };
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
@@ -16,7 +18,7 @@ use crate::ports::execution::ExecutionStore;
 use crate::ports::mcp::McpServerRegistry;
 use crate::ports::model_selection::ModelSelector;
 use crate::services::agent_registry::AgentRegistry;
-use crate::services::approval::ApprovalGate;
+use crate::services::approval::{park_grace_from_env, ApprovalGate};
 use crate::services::provider_stack::ProviderStack;
 use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
@@ -32,8 +34,9 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use tokio::sync::RwLock as TokioRwLock;
+use tokio::sync::{oneshot, RwLock as TokioRwLock};
 use tokio_stream::StreamExt as _;
+use uuid::Uuid;
 
 use crate::ports::compaction::ContextCompactor;
 use crate::ports::history::ConversationStore;
@@ -199,6 +202,26 @@ pub async fn list_models(
     Ok(Json(ListModelsResponse { models }))
 }
 
+/// Resolve the agent a dispatch would use and report whether its scope carries
+/// approval rules. This is the one check that decides whether a non-streaming
+/// chat needs the park-and-acknowledge path; a turn without rules must stay
+/// synchronous and byte-identical to the pre-parking behaviour.
+async fn turn_has_approval_rules(
+    state: &AppState,
+    payload: &ChatRequest,
+    selection: AgentSelection<'_>,
+) -> Result<bool, AppError> {
+    let resolved = resolve_selection(state, selection, &payload.messages).await?;
+    let agent = if resolved.project_id.is_some() || resolved.agent_id.is_some() {
+        state
+            .agent_registry
+            .resolve_agent(resolved.project_id.as_deref(), resolved.agent_id.as_deref())
+    } else {
+        state.agent_registry.get_agent(&payload.model)
+    };
+    Ok(agent.is_some_and(|agent| !agent.config.policy.approvals.is_empty()))
+}
+
 #[utoipa::path(
     post,
     path = "/chat",
@@ -206,6 +229,7 @@ pub async fn list_models(
     request_body = ChatRequest,
     responses(
         (status = 200, description = "Chat response (JSON for non-streaming, SSE stream for streaming). Also mounted at /api/chat", body = ChatResponse),
+        (status = 202, description = "Turn parked on a human approval; observe it at /api/executions/:id", body = ChatAck),
     )
 )]
 pub async fn chat(
@@ -243,6 +267,57 @@ pub async fn chat(
             Err(error) => Ok::<_, Infallible>(Event::default().data(format!("Error: {}", error))),
         });
         Ok((headers, Sse::new(sse_stream)).into_response())
+    } else if turn_has_approval_rules(&state, &payload, selection).await? {
+        // A gated turn may block on a human for far longer than an HTTP request
+        // should stay open. Mint the execution id up front, run the turn in a
+        // task, and acknowledge with the ids a human needs if it is still
+        // parked when the grace expires. Everything else stays synchronous.
+        let execution_id = Uuid::new_v4();
+        let (done_tx, done_rx) = oneshot::channel::<Result<ChatResponse, AppError>>();
+        let spawned_state = state.clone();
+        // `AgentSelection` borrows the headers; own the strings so the spawned
+        // task is `'static` while rebuilding the same selection inside it.
+        let project = selection.project_id.map(str::to_string);
+        let agent = selection.agent_id.map(str::to_string);
+        let conversation = selection.conversation_id.map(str::to_string);
+        let debug = selection.debug;
+        tokio::spawn(async move {
+            let owned = AgentSelection {
+                project_id: project.as_deref(),
+                agent_id: agent.as_deref(),
+                conversation_id: conversation.as_deref(),
+                debug,
+            };
+            let result =
+                execute_chat_with_new_id(&spawned_state, payload, owned, execution_id).await;
+            let _ = done_tx.send(result);
+        });
+
+        match tokio::time::timeout(park_grace_from_env(), done_rx).await {
+            Ok(Ok(Ok(response))) => {
+                let mut headers = axum::http::HeaderMap::new();
+                if let Some(cid) = &response.conversation_id {
+                    if let Ok(value) = axum::http::HeaderValue::from_str(cid) {
+                        headers.insert("x-conversation-id", value);
+                    }
+                }
+                Ok((headers, Json(response)).into_response())
+            }
+            Ok(Ok(Err(err))) => Err(err),
+            Ok(Err(_)) => Err(AppError::Runtime(
+                "approval turn ended without a response".into(),
+            )),
+            Err(_) => {
+                let ack = ChatAck {
+                    execution_id: execution_id.to_string(),
+                    approval_id: state
+                        .approval_gate
+                        .live_approval_for_execution(execution_id)
+                        .map(|id| id.to_string()),
+                };
+                Ok((axum::http::StatusCode::ACCEPTED, Json(ack)).into_response())
+            }
+        }
     } else {
         let response = execute_chat(&state, payload, selection).await?;
         let mut headers = axum::http::HeaderMap::new();
