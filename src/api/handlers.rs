@@ -17,6 +17,7 @@ use crate::ports::delegation::Delegator;
 use crate::ports::execution::ExecutionStore;
 use crate::ports::mcp::McpServerRegistry;
 use crate::ports::model_selection::ModelSelector;
+use crate::ports::telemetry::TraceExporter;
 use crate::services::agent_registry::AgentRegistry;
 use crate::services::approval::{park_grace_from_env, ApprovalGate};
 use crate::services::provider_stack::ProviderStack;
@@ -110,6 +111,12 @@ pub struct AppState {
     /// `ProviderStack`: a settings Apply rebuilds companions but must not drop
     /// the verifier a signed request depends on.
     pub channel_verifier: Arc<dyn ChannelSignatureVerifier>,
+    /// Best-effort trace exporter built once at boot from the environment
+    /// (`OTEL_ENABLED` and friends). `NoopExporter` when disabled, so the
+    /// default build issues zero telemetry requests. Like the gate and the
+    /// execution store it lives outside the hot-swapped `ProviderStack`: a
+    /// settings Apply rebuilds companions but must not change telemetry wiring.
+    pub exporter: Arc<dyn TraceExporter>,
 }
 
 impl AppState {

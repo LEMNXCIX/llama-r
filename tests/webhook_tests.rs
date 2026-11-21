@@ -590,6 +590,7 @@ async fn world_with_verifier(
         ),
         delegator: OnceLock::new(),
         channel_verifier: verifier,
+        exporter: Arc::new(llama_r::adapters::telemetry::NoopExporter),
     });
     let app = Router::new()
         .route("/api/webhooks/:channel", post(webhook))

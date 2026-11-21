@@ -11,6 +11,7 @@ use crate::ports::delegation::{
 };
 use crate::ports::engine::AgentRunEvent;
 use crate::ports::execution::ExecutionStore;
+use crate::ports::telemetry::TraceExporter;
 use crate::services::agent_runtime::RuntimeChatRequest;
 use crate::services::approval::args_hash_hex;
 use crate::services::redaction::redact_trace_payload;
@@ -331,18 +332,22 @@ pub fn trace_payload_for(
     })
 }
 
-/// Append a trace event for a finished turn, redacting its payload with the
-/// shared helper before it reaches the store. Best-effort: a store error is a
-/// warning, never a failed chat.
-pub async fn record_trace(store: &dyn ExecutionStore, execution: &AgentExecution, payload: &Value) {
-    let event = ExecutionEvent::new(
-        execution.id,
-        EventKind::TraceRecorded,
-        redact_trace_payload(payload),
-    );
+/// Append a trace event for a finished turn, then hand the SAME redacted
+/// payload to the exporter. Both are best-effort: a store or exporter error is
+/// a warning, never a failed chat. Redaction happens once here, so what reaches
+/// the collector cannot be wider than what reaches the execution store.
+pub async fn record_trace(
+    store: &dyn ExecutionStore,
+    exporter: &dyn TraceExporter,
+    execution: &AgentExecution,
+    payload: &Value,
+) {
+    let redacted = redact_trace_payload(payload);
+    let event = ExecutionEvent::new(execution.id, EventKind::TraceRecorded, redacted.clone());
     if let Err(err) = store.append_event(execution.id, &event).await {
         tracing::warn!(error = %err, "could not append execution TraceRecorded event");
     }
+    exporter.export(&redacted).await;
 }
 
 /// Finalize the turn on every outcome — engine success, engine failure answered
@@ -388,6 +393,7 @@ async fn finish_execution(
     }
     record_trace(
         store,
+        state.exporter.as_ref(),
         execution,
         &trace_payload_for(execution, usage, latency_ms, delegation_context),
     )
@@ -408,6 +414,10 @@ fn finalize_stream(
         return stream;
     }
     let store = state.execution_store.clone();
+    // The stream outlives the `&AppState` borrow; hold the exporter by clone so
+    // a streaming turn is exported through the very same companion as a
+    // non-streaming one (boot and settings Apply share that handle).
+    let exporter = state.exporter.clone();
     Box::pin(async_stream::stream! {
         let mut stream = stream;
         let mut error: Option<String> = None;
@@ -439,6 +449,7 @@ fn finalize_stream(
         let _ = store.append_event(execution.id, &event).await;
         record_trace(
             store.as_ref(),
+            exporter.as_ref(),
             &execution,
             &trace_payload_for(
                 &execution,

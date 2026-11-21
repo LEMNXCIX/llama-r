@@ -299,6 +299,7 @@ fn test_state_inner(
         execution_store,
         delegator: OnceLock::new(),
         channel_verifier: Arc::new(crate::adapters::channel::HmacSha256Verifier),
+        exporter: Arc::new(crate::adapters::telemetry::NoopExporter),
     });
     (temp_dir, state)
 }

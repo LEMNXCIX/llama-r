@@ -848,6 +848,7 @@ fn chat_world(persist_history: bool) -> ChatWorld {
         execution_store: Arc::new(NoOpExecutionStore),
         delegator: std::sync::OnceLock::new(),
         channel_verifier: Arc::new(llama_r::adapters::channel::HmacSha256Verifier),
+        exporter: Arc::new(llama_r::adapters::telemetry::NoopExporter),
     });
     ChatWorld { state, store }
 }

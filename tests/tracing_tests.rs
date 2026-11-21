@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use llama_r::adapters::context::NoopCompactor;
 use llama_r::adapters::mcp::StaticMcpRegistry;
+use llama_r::adapters::telemetry::NoopExporter;
 use llama_r::api::chat_core::{execute_chat, execute_chat_stream, record_trace, trace_payload};
 use llama_r::api::handlers::AppState;
 use llama_r::api::route_resolution::AgentSelection;
@@ -387,7 +388,7 @@ async fn record_trace_redacts_secrets_before_appending() {
         "provider": "ollama"
     });
 
-    record_trace(store.as_ref(), &execution, &payload).await;
+    record_trace(store.as_ref(), &NoopExporter, &execution, &payload).await;
 
     let events = store.get_events(execution.id).await.unwrap();
     let event = only_trace(&events);
@@ -673,7 +674,7 @@ async fn hierarchical_trace_payload_is_redacted_before_reaching_the_store() {
     payload["api_key"] = json!("sk-SHOULD-NOT-PERSIST");
     payload["depth"] = json!(1);
 
-    record_trace(store.as_ref(), &child, &payload).await;
+    record_trace(store.as_ref(), &NoopExporter, &child, &payload).await;
 
     let events = store.get_events(child.id).await.unwrap();
     let trace = only_trace(&events);

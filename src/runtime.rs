@@ -47,6 +47,7 @@ use crate::ports::mcp::McpServerRegistry;
 use crate::ports::model_selection::ModelSelector;
 use crate::ports::rag::{EmbeddingProvider, RagStore};
 use crate::ports::router::DecisionRouter;
+use crate::ports::telemetry::TraceExporter;
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::gemini::GeminiProvider;
 use crate::providers::ollama::OllamaProvider;
@@ -284,6 +285,11 @@ pub fn build_app_state_with_gate(
     // the same handle, exactly like the gate and the auto decider.
     let compactor: Arc<dyn ContextCompactor> = Arc::new(NoopCompactor);
 
+    // Telemetry is opt-in from the environment. Built once here and stored on
+    // AppState (outside the hot-swapped stack) so boot and a settings Apply
+    // share the exact same exporter handle through `CompanionHandles`.
+    let exporter = crate::adapters::telemetry::exporter_from_env();
+
     let state = Arc::new(AppState {
         services: Arc::new(TokioRwLock::new(Arc::new(stack))),
         agent_registry: agent_registry.clone(),
@@ -307,6 +313,7 @@ pub fn build_app_state_with_gate(
         execution_store,
         delegator: OnceLock::new(),
         channel_verifier: Arc::new(crate::adapters::channel::HmacSha256Verifier),
+        exporter,
     });
     // The delegator needs the *finished* Arc<AppState> so its Weak can upgrade
     // at chat time. Building it here means every state factory (boot and tests)
@@ -1399,6 +1406,10 @@ pub struct CompanionHandles {
     /// settings Apply so an engine rebuild keeps the same handle (and its
     /// `Weak<AppState>` still points at the live state).
     pub delegator: Option<Arc<dyn Delegator>>,
+    /// The boot-owned trace exporter, read from `AppState` on a settings Apply
+    /// just like the compactor and selector, so a provider swap never changes
+    /// where finished-turn traces are sent (or that they are disabled).
+    pub exporter: Arc<dyn TraceExporter>,
 }
 
 impl CompanionHandles {
@@ -1416,6 +1427,7 @@ impl CompanionHandles {
             observability: state.observability.clone(),
             execution_store: state.execution_store.clone(),
             delegator: state.delegator(),
+            exporter: state.exporter.clone(),
         }
     }
 }

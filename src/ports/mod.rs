@@ -15,3 +15,4 @@ pub mod mcp;
 pub mod model_selection;
 pub mod rag;
 pub mod router;
+pub mod telemetry;
