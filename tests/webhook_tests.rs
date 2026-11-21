@@ -132,6 +132,13 @@ impl EnvGuard {
         std::env::set_var(name, value);
         Self { name, previous }
     }
+
+    /// Explicitly remove a variable for a test, restoring it on drop.
+    fn unset(name: &'static str) -> Self {
+        let previous = std::env::var(name).ok();
+        std::env::remove_var(name);
+        Self { name, previous }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -322,27 +329,33 @@ use llama_r::adapters::context::{CurrentModelSelector, NoopCompactor};
 use llama_r::adapters::execution::SqliteExecutionStore;
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::api::execution_api::get_execution;
+use llama_r::api::handlers::AppState;
+use llama_r::api::observability::AppObservability;
 use llama_r::api::webhook_api::webhook;
 use llama_r::config::ProviderKind;
 use llama_r::context::analyzer::ContextEnricher;
 use llama_r::context::store::ContextStore;
 use llama_r::domain::agent::{Agent, AgentConfig};
 use llama_r::domain::models::{ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
+use llama_r::optimizer::metrics::TokenMetrics;
 use llama_r::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
 use llama_r::providers::registry::ProviderRegistry;
 use llama_r::providers::LLMProvider;
-use llama_r::runtime::build_app_state_with_gate;
 use llama_r::services::agent_registry::AgentRegistry;
 use llama_r::services::agent_runtime::AgentRuntime;
 use llama_r::services::approval::ApprovalGate;
 use llama_r::services::provider_stack::ProviderStack;
+use llama_r::services::router_config::RouterConfig;
 use llama_r::services::scope_builder::ScopeBuilder;
 use llama_r::services::skill_manager::SkillManager;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::error::Error as StdError;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::{OnceLock, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::RwLock as TokioRwLock;
 use tower::ServiceExt;
 
 /// Env vars are process-wide, so the webhook tests that point `LLAMA_R_DIR` at a
@@ -496,9 +509,31 @@ struct World {
     calls: Arc<Mutex<Vec<RecordedCall>>>,
 }
 
-/// A production-shaped world: real Router, real AppState builder (so the
-/// verifier companion is the boot one), real execution store, fake engine.
+/// A deliberately naive verifier that accepts an empty key: it models an HMAC
+/// implementation without the shipped adapter's empty-secret guard. The
+/// endpoint must fail closed on a missing secret on its own, not rely on the
+/// adapter happening to refuse an empty key.
+struct EmptyKeyAcceptingVerifier;
+
+impl ChannelSignatureVerifier for EmptyKeyAcceptingVerifier {
+    fn verify(&self, body: &[u8], header: &str, secret: &str) -> bool {
+        format!("sha256={}", sign_body(secret, body)) == header
+    }
+}
+
+/// A production-shaped world: real Router, real AppState, real HMAC verifier
+/// companion, real execution store, fake engine.
 async fn world(channels_toml: &str) -> World {
+    world_with_verifier(channels_toml, Arc::new(HmacSha256Verifier)).await
+}
+
+/// Same world, with a caller-supplied verifier installed on `AppState` before
+/// the Router takes its clone. Used to prove the endpoint's own fail-closed
+/// check independent of the adapter.
+async fn world_with_verifier(
+    channels_toml: &str,
+    verifier: Arc<dyn ChannelSignatureVerifier>,
+) -> World {
     let temp = tempfile::tempdir().unwrap();
     let dir_guard = EnvGuard::set("LLAMA_R_DIR", temp.path().to_str().unwrap());
     let secret_guard = EnvGuard::set(SECRET_ENV, SECRET);
@@ -514,6 +549,7 @@ async fn world(channels_toml: &str) -> World {
     register_agent(&registry, "billing", Some("proj"));
     register_agent(&registry, "admin", Some("other"));
 
+    let enricher = test_enricher();
     let mut stack = ProviderStack::new(Arc::new(StubProvider), "model-a");
     stack.provider_name = "ollama".into();
     stack.agent_runtime = Some(Arc::new(AgentRuntime {
@@ -521,26 +557,40 @@ async fn world(channels_toml: &str) -> World {
         engine,
         history: None,
         rag: None,
-        enricher: test_enricher(),
+        enricher: enricher.clone(),
         compactor: Arc::new(NoopCompactor),
         selector: Arc::new(CurrentModelSelector),
     }));
 
-    let store = Arc::new(
-        SqliteExecutionStore::new(temp.path().join("exec.db")).expect("execution store opens"),
-    );
-    let state = build_app_state_with_gate(
-        Arc::new(ApprovalGate::default()),
-        stack,
-        registry,
-        Arc::new(SkillManager::new()),
-        Arc::new(ContextStore::new()),
-        Arc::new(Mutex::new(VecDeque::new())),
-        vec![],
-        Arc::new(StaticMcpRegistry::new()),
-        None,
-        store,
-    );
+    // Built directly (rather than via the boot helper) because the boot helper
+    // installs a Weak delegator, which makes Arc::get_mut unavailable for
+    // swapping in the test verifier.
+    let state = Arc::new(AppState {
+        services: Arc::new(TokioRwLock::new(Arc::new(stack))),
+        agent_registry: registry,
+        skill_manager: Arc::new(SkillManager::new()),
+        context_store: Arc::new(ContextStore::new()),
+        context_enricher: Mutex::new(enricher),
+        metrics: Arc::new(TokenMetrics::new()),
+        observability: Arc::new(AppObservability::new()),
+        api_running: AtomicBool::new(false),
+        grpc_running: AtomicBool::new(false),
+        logs: Arc::new(Mutex::new(VecDeque::new())),
+        known_mcp_servers: RwLock::new(Vec::new()),
+        mcp_registry: Arc::new(StaticMcpRegistry::new()),
+        history_store: None,
+        router_config: Arc::new(RouterConfig::default()),
+        router_healthy: AtomicBool::new(false),
+        approval_gate: Arc::new(ApprovalGate::default()),
+        auto_decider: None,
+        compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(CurrentModelSelector),
+        execution_store: Arc::new(
+            SqliteExecutionStore::new(temp.path().join("exec.db")).expect("execution store opens"),
+        ),
+        delegator: OnceLock::new(),
+        channel_verifier: verifier,
+    });
     let app = Router::new()
         .route("/api/webhooks/:channel", post(webhook))
         .route("/api/executions/:id", get(get_execution))
@@ -928,5 +978,68 @@ enabled = true
     assert!(
         !log.contains(&signature),
         "log echoed the signature: {log:?}"
+    );
+}
+
+/// A channel whose shared secret is missing or empty must fail closed. The
+/// forgery this blocks is an HMAC computed over an EMPTY key: before the fix,
+/// `unwrap_or_default()` made that a valid signature for a misconfigured
+/// channel, letting anyone through. Both the 401 and zero agent calls are
+/// asserted, for unset and empty variables alike.
+#[tokio::test]
+async fn missing_or_empty_channel_secret_is_401_even_with_empty_key_signature() {
+    let _lock = ENV_LOCK.lock().await;
+    let w = world_with_verifier(
+        r#"
+[[channels]]
+id = "unset-secret"
+agent_id = "billing"
+project_id = "proj"
+mode = "sync"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_TASK3_UNSET_SECRET"
+enabled = true
+
+[[channels]]
+id = "empty-secret"
+agent_id = "billing"
+project_id = "proj"
+mode = "sync"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_TASK3_EMPTY_SECRET"
+enabled = true
+"#,
+        // A verifier WITHOUT the empty-secret guard makes this test fail on
+        // the pre-fix `unwrap_or_default()` code and pass only with the
+        // endpoint's own explicit check.
+        Arc::new(EmptyKeyAcceptingVerifier),
+    )
+    .await;
+    let _unset = EnvGuard::unset("WEBHOOK_TASK3_UNSET_SECRET");
+    let _empty = EnvGuard::set("WEBHOOK_TASK3_EMPTY_SECRET", "");
+
+    let body = r#"{"action":"opened"}"#;
+    // Exactly the signature an attacker would send when the key is empty.
+    let empty_key_signature = format!("sha256={}", sign_body("", body.as_bytes()));
+
+    for channel in ["unset-secret", "empty-secret"] {
+        let (status, value) = send(
+            &w.app,
+            channel,
+            body.as_bytes(),
+            Some(&empty_key_signature),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{channel}: {value:?}");
+        assert!(
+            !value.to_string().contains("WEBHOOK_TASK3_UNSET_SECRET")
+                && !value.to_string().contains("WEBHOOK_TASK3_EMPTY_SECRET"),
+            "the refusal must not name the variable's value or config: {value:?}"
+        );
+    }
+    assert!(
+        w.calls.lock().unwrap().is_empty(),
+        "no turn may reach an agent when the channel secret is missing"
     );
 }

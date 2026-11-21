@@ -64,7 +64,19 @@ pub async fn webhook(
     let bytes = to_bytes(body, MAX_BODY_BYTES)
         .await
         .map_err(|_| AppError::Validation("invalid body".into()))?;
-    let secret = std::env::var(&channel.auth_env).unwrap_or_default();
+    // Fail closed: a missing or empty secret must never become an empty HMAC
+    // key, which an attacker could use to forge a valid signature. The warning
+    // names only the variable, never its value (there is no value here).
+    let secret = match std::env::var(&channel.auth_env) {
+        Ok(value) if !value.is_empty() => value,
+        _ => {
+            tracing::warn!(
+                auth_env = %channel.auth_env,
+                "webhook channel has no shared secret; refusing request"
+            );
+            return Err(AppError::Unauthorized("invalid signature".into()));
+        }
+    };
     let signature = headers
         .get(channel.signature_header.as_str())
         .and_then(|value| value.to_str().ok())
