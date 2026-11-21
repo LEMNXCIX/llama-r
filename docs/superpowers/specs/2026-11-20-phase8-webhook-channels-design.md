@@ -3,7 +3,7 @@
 **Fecha:** 2026-11-20
 **Estado:** aprobado en brainstorming (diseño de 3 secciones), pendiente de revisión del spec
 **Alcance:** endpoint de webhook firmado que enruta a un agente configurado, con modo sync/async
-por canal y extracción del mensaje mediante plantilla Liquid.
+por canal y extracción del mensaje mediante una plantilla mínima de marcadores `{{campo.ruta}}` sobre el JSON.
 
 ## Contexto
 
@@ -14,8 +14,10 @@ confirmó que casi todo el plumbing ya existe: rutas axum con `Arc<AppState>`
 (`src/api/route_resolution.rs:14-25`, `src/api/grpc.rs:65-77`), `execute_chat` con solo
 `ChatRequest` + selection (`src/api/chat_core.rs:818-824`), `execution_id` durable observable en
 `GET /api/executions/:id` (`src/api/execution_api.rs:131-173`), el patrón `auth_env` que guarda
-**nombres** de variables y nunca secretos (`src/adapters/mcp/registry.rs:35-54`), y Liquid ya
-presente en el repo para routing.
+**nombres** de variables y nunca secretos (`src/adapters/mcp/registry.rs:35-54`). El repo **no**
+trae un motor de plantillas: las menciones a "Liquid" en el código son Liquid AI (el modelo d1 de
+decisiones), no un lenguaje de plantillas. Por eso se implementa un renderizador mínimo de
+marcadores `{{campo.ruta}}` sobre `serde_json::Value` (ya presente), sin añadir dependencias.
 
 Lo genuinamente nuevo: el endpoint, el mapeo payload→mensaje, la verificación HMAC, la config de
 canal y la semántica sync/async. No hay hoy ningún concepto de "channel" ni "webhook" como
@@ -26,7 +28,7 @@ Decisiones del brainstorming:
 - **Respuesta:** ambos modos, elegidos por canal (`sync` / `async`).
 - **Autenticación:** HMAC-SHA256 del body crudo con secreto por `auth_env`, comparado en tiempo
   constante; rechazo `401` antes de parsear.
-- **Payload:** plantilla Liquid opcional sobre el JSON; sin plantilla, el body crudo es el mensaje.
+- **Payload:** plantilla opcional de marcadores `{{campo.ruta}}` sobre el JSON; sin plantilla, el body crudo es el mensaje.
 - **Enfoque A:** `channels.toml` + un endpoint genérico, sin cola nueva.
 
 ## Goal
@@ -46,7 +48,7 @@ logs/errores y sin poder escalar el scope del agente.
 ## Decisiones de diseño
 
 1. **`ChannelConfig`** (`src/domain/channel.rs`): `id`, `agent_id`, `project_id: Option<String>`,
-   `mode: ChannelMode { Sync | Async }` (default `Async`), `template: Option<String>` (Liquid),
+   `mode: ChannelMode { Sync | Async }` (default `Async`), `template: Option<String>` (marcadores `{{campo.ruta}}`),
    `signature_header: String`, `auth_env: String` (nombre de la variable, nunca el secreto),
    `enabled: bool` (default `true`). `channels.toml` en la base dir: ausente = sin canales;
    malformado → warning con ruta y sin canales; boot continúa. Se relee en cada request (archivo
@@ -58,7 +60,7 @@ logs/errores y sin poder escalar el scope del agente.
    inválido. Puerto nuevo y aditivo; ningún puerto sagrado cambia.
 3. **Endpoint** `POST /api/webhooks/:channel` (`src/api/webhook_api.rs`): lee el body **crudo**
    antes de parsear JSON, resuelve el canal (deshabilitado/inexistente → `404`), verifica HMAC →
-   `401` antes de cualquier parsing, renderiza la plantilla Liquid sobre el JSON (o usa el body
+   `401` antes de cualquier parsing, renderiza los marcadores `{{campo.ruta}}` sobre el JSON (o usa el body
    crudo como mensaje) y construye `AgentSelection { project_id, agent_id, conversation_id: None,
    debug: false }` desde la config.
 4. **Modo `sync`:** llama a `execute_chat` y devuelve `200` con `ChatResponse`, o `502` si el
@@ -93,7 +95,7 @@ logs/errores y sin poder escalar el scope del agente.
 1. `POST /api/webhooks/:channel` con body crudo y cabecera de firma.
 2. Resolver canal desde `channels.toml` → `404` si no existe o está deshabilitado.
 3. Verificar HMAC sobre los bytes exactos → `401` si falla (antes de parsear).
-4. Parsear JSON, renderizar plantilla Liquid (o usar el body como mensaje).
+4. Parsear JSON, sustituir marcadores `{{campo.ruta}}` (o usar el body como mensaje).
 5. Construir `AgentSelection` desde la config + `ChatRequest` con un único mensaje user.
 6. Sync: `execute_chat` → `200` con la respuesta. Async: `begin_turn_execution` → spawn → `202`
    con `execution_id`.
@@ -112,7 +114,7 @@ logs/errores y sin poder escalar el scope del agente.
 
 - `hmac_valid_signature_reaches_agent`; `invalid_or_missing_signature_is_401_before_parsing`
   (body modificado con header válido se rechaza; formatos `sha256=` y hex).
-- `liquid_template_extracts_message`; `absent_template_uses_raw_body` (payload tipo GitHub).
+- `marker_template_extracts_message` (p. ej. `{{sender.login}}`); `absent_template_uses_raw_body` (payload tipo GitHub); `unknown_marker_fails_without_echoing_body`.
 - `sync_mode_returns_agent_answer`; `async_mode_returns_202_with_execution_id` + el turno aparece
   en `GET /api/executions/:id` con `Completed`/`Failed`.
 - `channel_cannot_force_debug_or_cross_project_agent`; `unknown_or_disabled_channel_is_404`;
