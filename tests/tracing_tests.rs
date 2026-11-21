@@ -291,6 +291,7 @@ fn build_state(
         Arc::new(StaticMcpRegistry::new()),
         None,
         store,
+        llama_r::config::Config::default(),
     );
     (dir, state)
 }

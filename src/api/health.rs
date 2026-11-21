@@ -202,6 +202,7 @@ mod tests {
         let skill_manager = Arc::new(SkillManager::new());
         let stack = ProviderStack::new(Arc::new(HealthyProvider), "fallback-model");
         let state = Arc::new(AppState {
+            config: crate::config::Config::default(),
             services: Arc::new(TokioRwLock::new(Arc::new(stack))),
             agent_registry: Arc::new(AgentRegistry::new()),
             context_enricher: Mutex::new(Arc::new(ContextEnricher::new(

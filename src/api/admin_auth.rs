@@ -6,9 +6,10 @@
 //! route added to the group inherits the gate, and a public route in the other
 //! group cannot acquire it by accident.
 //!
-//! The token is deliberately NOT on `AppState` in this task. Task 5 moves it
-//! to `Config`; until then `admin_token_from_env` is the only reader, so Task 1
-//! is self-contained and no config field or dependency is introduced.
+//! The token lives on `Config`, which `AppState` owns. Reading it from the
+//! state handle (instead of the environment per request) keeps one source of
+//! truth and means a rotated token takes effect exactly when the config is
+//! reloaded — the same moment the rest of the stack is rebuilt.
 
 use crate::adapters::channel::hmac::constant_time_eq;
 use crate::api::handlers::AppState;
@@ -30,33 +31,15 @@ pub const ADMIN_TOKEN_HEADER: &str = "X-Admin-Token";
 /// not in the body, a log line or a response header.
 const REFUSAL: &str = "admin authentication required";
 
-/// Read the shared admin token from the environment.
-///
-/// A missing or empty value is `None`, which makes every admin route fail
-/// closed. Reading it per request is cheap and keeps the gate in sync with a
-/// rotated value without a restart; Task 5 replaces this helper with the
-/// `Config` field while keeping the middleware signature unchanged.
-pub fn admin_token_from_env() -> Option<String> {
-    std::env::var("ADMIN_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty())
-}
-
 /// `from_fn` middleware guarding the admin router group.
-///
-/// `State` is unused in Task 1 but kept in the signature so Task 5 can read
-/// `Config` from it without changing any wiring.
 pub async fn require_admin(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     request: Request,
     next: Next,
 ) -> Response {
-    // Task 1 reads the token from the environment, not from the state handle.
-    let _ = &state;
-
     let presented = headers.get(ADMIN_TOKEN_HEADER);
-    let accepted = match (admin_token_from_env(), presented) {
+    let accepted = match (state.config.admin_token.as_deref(), presented) {
         (Some(expected), Some(actual)) => constant_time_eq(expected.as_bytes(), actual.as_bytes()),
         _ => false,
     };

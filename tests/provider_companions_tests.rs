@@ -128,6 +128,7 @@ fn config(provider: ProviderKind) -> Config {
         opencode_api_key: Some("opencode-secret-never-exposed".to_string()),
         opencode_url: "http://127.0.0.1:4096".to_string(),
         openai_base_url: None,
+        ..Config::default()
     }
 }
 
@@ -197,7 +198,16 @@ impl EmbeddingProvider for ProbeEmbedder {
     }
 }
 
+fn admin_token_ready() {
+    const TOKEN: &str = "test-admin-token";
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| std::env::set_var("ADMIN_TOKEN", TOKEN));
+}
+
 fn bare_state(stack: ProviderStack) -> Arc<AppState> {
+    // Config captures ADMIN_TOKEN when the state is built; seed it before that
+    // point so the admin-route test in this suite sees a configured client.
+    admin_token_ready();
     let mcp_registry: Arc<dyn McpServerRegistry> = Arc::new(StaticMcpRegistry::new());
     build_app_state(
         stack,
@@ -248,11 +258,9 @@ async fn rag_store_is_absent_when_the_selected_provider_has_no_embeddings() {
     );
     drop(services);
 
-    // Admin-route tests run as a configured client: set the shared token once
-    // and present it on every request. The gate itself is in admin_auth_tests.
+    // Admin-route tests run as a configured client (token seeded in
+    // `bare_state`); the gate itself is in admin_auth_tests.
     const TEST_ADMIN_TOKEN: &str = "test-admin-token";
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| std::env::set_var("ADMIN_TOKEN", TEST_ADMIN_TOKEN));
 
     let router = build_router(state);
     let response = router

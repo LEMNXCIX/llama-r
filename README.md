@@ -49,6 +49,14 @@ En el primer arranque, si falta `DEFAULT_MODEL`, Llama-R abre un setup interacti
 | `OPENCODE_URL` | `http://127.0.0.1:4096` | Origen de los endpoints generate/decisión de OpenCode |
 | `DEFAULT_MODEL` | — | Modelo por defecto (obligatorio) |
 | `LLAMA_R_DIR` | — | Directorio base override para datos |
+| `ADMIN_TOKEN` | — (fail-closed) | Secreto compartido para `X-Admin-Token` en las rutas admin; vacío/ausente = 401 en todas. En `.env` (modo `0600`), nunca en logs ni respuestas |
+| `APPROVAL_PARK` | `true` | `1`/`true`/`yes`/`on` = aprobación sin deadline; `false` restaura el timeout acotado |
+| `APPROVAL_TIMEOUT_SECS` | `120` | Deadline del gate cuando no se aparca; `0` = sin deadline. Malformado = error de config |
+| `PARK_GRACE_MS` | `1000` | Ms que espera el handler antes de responder `202` a un turno aparcado. Malformado = error de config |
+| `REAPER_INTERVAL_SECS` | `5` | Periodo del reaper de huérfanos; numérico no positivo cae a `5`, malformado = error de config |
+| `OTEL_ENABLED` | `false` | Export OTLP/HTTP opt-in; con `false` no se envía nada |
+| `OTEL_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | URL de trazas OTLP/HTTP, solo se lee si está activado |
+| `OTEL_SERVICE_NAME` | `llama-r` | Atributo `service.name` de cada span |
 
 Las claves `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` y `GEMINI_API_KEY` son **nombres** de variables referenciados por los perfiles integrados de `providers.toml` (`api_key_env`); `Config::from_env` lee directamente `OPENROUTER_API_KEY`, `OPENCODE_API_KEY` y `OPENAI_BASE_URL`. Ninguna clave aparece en health, logs, URLs ni la TUI (los tests lo comprueban).
 
@@ -249,7 +257,7 @@ Cada turno de agente se persiste en SQLite cuando el agente tiene `[memory] pers
 - **Eventos de herramientas:** se guardan el nombre de la herramienta y su éxito (`append_tool_event(conversation_id, tool_name, success)`), **sin argumentos ni salida**: ningún secreto puede llegar a esa tabla. Un sink aditivo en `AgentRunRequest` alimenta por igual los bridges MCP y los locales, en streaming y sin streaming.
 - **Retención:** `HISTORY_RETENTION_DAYS` (default 90), purge al arrancar y cada 24 h. El `retention_days` de `[memory]` de cada agente gana sobre el valor global para sus propias conversaciones; el mapa se reconstruye desde `AgentRegistry::list()` en el boot y en cada tick diario, así que un hot reload se aplica sin reiniciar. **`HISTORY_RETENTION_DAYS=0` es un kill-switch absoluto:** desactiva el purge por completo y ningún valor por agente puede reactivarlo.
 - **Concurrencia (gap 8 — decisión, no refactor):** se mantiene un `Mutex<Connection>` con WAL; no hay `tokio::sync::Mutex`, ni `spawn_blocking` por query, ni refactor async: solo se reconsiderarían con contención **medida**. Un test de dos appends concurrentes comprueba que ambas filas sobreviven.
-- **Best-effort:** fallos de persistencia, resumen o purge avisan con un warning y nunca rompen el chat. Queda diferido: reinyectar en el prompt los resúmenes guardados por el store de conversaciones (el bloque `## Conversation memory` del contexto activo es un resumen de compaction distinto, ver la sección siguiente), OpenTelemetry y auth en los endpoints de historial. La compaction por presupuesto y el model routing por complejidad ya están implementados.
+- **Best-effort:** fallos de persistencia, resumen o purge avisan con un warning y nunca rompen el chat. Queda diferido: reinyectar en el prompt los resúmenes guardados por el store de conversaciones (el bloque `## Conversation memory` del contexto activo es un resumen de compaction distinto, ver la sección siguiente), el crate OpenTelemetry (hay un exporter OTLP/HTTP crudo opt-in, ver abajo) y auth en los endpoints de historial (siguen públicos; el token admin cubre aprobaciones/ejecuciones/RAG/route/agentes/contextos). La compaction por presupuesto y el model routing por complejidad ya están implementados.
 
 API de administración:
 
@@ -271,7 +279,7 @@ Dos puertos aditivos —`ContextCompactor` (`src/ports/compaction.rs`) y `ModelS
 - **Colocación de la memoria** — el resumen del compactor se añade al system prompt como sección `## Conversation memory` **después** de las secciones de instrucciones y **antes** del historial que recibe el engine. Las secciones de instrucciones/reglas/skills/contexto/RAG se construyen una sola vez y se reinyectan byte-for-byte, así que son idénticas con o sin compaction; un prompt ya optimizado aportado por el llamador también se conserva literalmente.
 - **Degradación** — el selector usa el mismo `Arc<dyn DecisionRouter>` inyectado que el routing de agentes y `Auto` (sin crear un segundo router), configurado con `ROUTER_URL`/`router.toml`. Con el routing apagado o sin router disponible se instala `CurrentModelSelector` y se mantiene el modelo actual; un error del router, `Noul`, respuesta ausente, confianza no finita o baja, o una elección que nombra un modelo no declarado también conservan el modelo actual con un aviso. Un fallo del compactor avisa y vuelve al prompt y al historial originales: el chat nunca falla. En el boot se instala `NoopCompactor` por defecto; la summarización desplegada espera una estrategia real.
 
-**No se afirma:** ni precios reales de providers —`relative_cost` es un ordinal y nunca se convierte en `cost_usd`, y nada se escribe en `ModelCapabilities`—, ni OpenTelemetry, ni compaction de prompts internos de herramientas o RAG (solo del historial), ni modelo de decisión hardcodeado —la pregunta usa las claves de nivel `simple`/`complex` y el modelo es el que configure el router—, ni cambio en agentes que no declaren `model_candidates`, ni endpoint nuevo. Un hijo delegado (Fase 4) hereda el presupuesto pero ensambla **su propio** `ActiveContext` desde su manifiesto: nunca hereda el contexto del padre, igual que hereda scope cero. La ruta HTTP ya entrega sus instrucciones optimizadas mediante `assemble_with_instructions`, así que las métricas siguen siendo veraces y las herramientas de optimización no se ejecutan dos veces.
+**No se afirma:** ni precios reales de providers —`relative_cost` es un ordinal y nunca se convierte en `cost_usd`, y nada se escribe en `ModelCapabilities`—, ni dependencia OpenTelemetry (el exporter es OTLP/HTTP JSON crudo sobre `reqwest`), ni compaction de prompts internos de herramientas o RAG (solo del historial), ni modelo de decisión hardcodeado —la pregunta usa las claves de nivel `simple`/`complex` y el modelo es el que configure el router—, ni cambio en agentes que no declaren `model_candidates`, ni endpoint nuevo. Un hijo delegado (Fase 4) hereda el presupuesto pero ensambla **su propio** `ActiveContext` desde su manifiesto: nunca hereda el contexto del padre, igual que hereda scope cero. La ruta HTTP ya entrega sus instrucciones optimizadas mediante `assemble_with_instructions`, así que las métricas siguen siendo veraces y las herramientas de optimización no se ejecutan dos veces.
 
 Código: `src/context/active.rs`, `src/services/context_assembler.rs`, `src/ports/{compaction,model_selection}.rs`, `src/adapters/context/`, `src/providers/model_costs.rs`, `src/runtime.rs` (`build_model_selector`, companions), `src/api/agent_api.rs`. Cobertura: `tests/context_pipeline_tests.rs`.
 
@@ -406,7 +414,7 @@ curl -s -X POST http://127.0.0.1:3000/api/approvals/<approval_id> \
   -d '{"approve": true}'
 ```
 
-Errores: `400` hash malo/distinto, `404` id desconocido, `409` ya decidida, `410` expirada. Estos endpoints **no** requieren `X-Debug` (son la respuesta humana, no una vista de administración) y todavía no tienen identidad de usuario (autenticación diferida). Las aprobaciones **sí sobreviven a un reinicio**: los pendientes y las decisiones se guardan en el store de ejecución y se rehidratan al arrancar; una decisión tomada mientras no había petición viva es consumida por el reintento. También sobreviven a un cambio de provider en caliente desde la TUI.
+Errores: `400` hash malo/distinto, `404` id desconocido, `409` ya decidida, `410` expirada. Estos endpoints **no** requieren `X-Debug` (son la respuesta humana, no una vista de administración), pero sí el token admin compartido `X-Admin-Token` como el resto del grupo; siguen sin identidad de usuario (el token es un secreto compartido, no un principal). Las aprobaciones **sí sobreviven a un reinicio**: los pendientes y las decisiones se guardan en el store de ejecución y se rehidratan al arrancar; una decisión tomada mientras no había petición viva es consumida por el reintento. También sobreviven a un cambio de provider en caliente desde la TUI.
 
 ### Ejecución durable: observación y reintento
 
@@ -423,7 +431,7 @@ curl -s http://127.0.0.1:3000/api/executions/<execution_id> -H 'X-Debug: true'
 curl -s -X POST http://127.0.0.1:3000/api/executions/<execution_id>/retry -H 'X-Debug: true'
 ```
 
-El reintento reutiliza el **mismo id** de ejecución: las herramientas ya completadas se replayan desde la caché (`operation_id = <execution_id>:<tool>:<args_hash_hex>`) en lugar de repetir sus efectos. Es recuperación **a nivel de turno**, no replay paso a paso: se re-ejecuta el turno desde el `user_message` guardado (`stream: false`, sin recargar el historial de conversación previo) y el modelo puede generar una respuesta distinta. El reintento da `200` si el turno se re-ejecuta, `400` id malformado, `403` sin `X-Debug` o fila legacy sin `user_message`, `404` id desconocido y `409` si el turno no está en estado reintentable. Sin store (build `--no-default-features` o fallo al abrirlo) la ejecución degrada a pass-through y el chat sigue funcionando. Queda diferido: backend Postgres/async, identidad de usuario en los endpoints, supresión de `once` tras el primer uso, exportador OpenTelemetry y replay exacto de pasos. El modelo de decisión `Auto` ya está implementado (ver sección siguiente).
+El reintento reutiliza el **mismo id** de ejecución: las herramientas ya completadas se replayan desde la caché (`operation_id = <execution_id>:<tool>:<args_hash_hex>`) en lugar de repetir sus efectos. Es recuperación **a nivel de turno**, no replay paso a paso: se re-ejecuta el turno desde el `user_message` guardado (`stream: false`, sin recargar el historial de conversación previo) y el modelo puede generar una respuesta distinta. El reintento da `200` si el turno se re-ejecuta, `400` id malformado, `403` sin `X-Debug` o fila legacy sin `user_message`, `404` id desconocido y `409` si el turno no está en estado reintentable. Sin store (build `--no-default-features` o fallo al abrirlo) la ejecución degrada a pass-through y el chat sigue funcionando. Queda diferido: backend Postgres/async, identidad de usuario en los endpoints (hoy hay un token compartido, no un principal), supresión de `once` tras el primer uso, dependencia OpenTelemetry (existe un exporter OTLP/HTTP crudo) y replay exacto de pasos. El modelo de decisión `Auto` ya está implementado (ver sección siguiente).
 
 ### Decisión `Auto`, trazas y coste (Fase 6)
 
@@ -433,7 +441,7 @@ El reintento reutiliza el **mismo id** de ejecución: las herramientas ya comple
 
 **Coste y observabilidad.** `cost_usd` sale de `Usage::from_counts` a partir de los precios de `ModelCapabilities`; hoy el catálogo no tiene precios, así que el coste es `null` en la práctica — el cálculo existe y se prueba con precios inyectados, pero no se inventa ningún coste. El snapshot de observabilidad (`campo observability` de `/health`, `ObservabilitySnapshot`) expone además `auto_approved`, `auto_denied` y `auto_unavailable` (contadores de las decisiones `Auto` en el gate —un decider ausente cuenta como `unavailable`; `never`/`always`/`once` no los tocan—) y `cost_usd_total_micros` (coste real acumulado en microdólares enteros, saturante; sin entrada mientras los precios sean `None`).
 
-**No se afirma:** ni integración con OpenTelemetry (los campos solo están listos para un futuro exportador, sin dependencia nueva), ni supresión de "primera vez" para `once`, ni coste real mientras el catálogo no tenga precios. El runner de evals tampoco incluye un check de aprobación `Auto` (`judge` solo califica respuestas).
+**No se afirma:** ni dependencia/integración con OpenTelemetry (el exporter es OTLP/HTTP JSON crudo sobre `reqwest`, sin crate nuevo; con `OTEL_ENABLED=false` no envía nada), ni supresión de "primera vez" para `once`, ni coste real mientras el catálogo no tenga precios. El runner de evals tampoco incluye un check de aprobación `Auto` (`judge` solo califica respuestas).
 
 ## Canales webhook (Fase 8)
 
@@ -485,7 +493,7 @@ max_depth = 2                                   # niveles máximos desde el coor
 - **Trazas jerárquicas.** Cada turno emite su propio `TraceRecorded`; el payload gana los campos opcionales `parent_execution_id`, `root_execution_id` y `depth`, de modo que `GET /api/executions/<execution_id>` reconstruye el árbol. Se redacta con el mismo `redact_trace_payload` de Fase 6; sin backend nuevo.
 - **Aislamiento de fallos.** Un hijo ausente, provider caído, presupuesto agotado o timeout es un `ToolError` nombrado; el bucle del padre continúa y el modelo decide cómo responder, nunca un error del chat raíz. La idempotencia por `operation_id` hace que un reintento reprice los efectos de las tools del hijo en vez de repetirlos, y el deadline recursivo (`restante − 5 s`) hace que el timeout nombrado del hijo llegue antes de que se cancele el bucle del padre.
 
-**No se afirma:** ni agentes remotos ni sandbox (Fase 8), ni *steering* de mensajes a un hijo en vuelo, ni cambios en la TUI, ni dependencia o integración con OpenTelemetry (los campos de traza solo están listos para un futuro exportador), ni cambio alguno en agentes que no declaren `[subagents]` (v1 intacto), ni un endpoint nuevo.
+**No se afirma:** ni agentes remotos ni sandbox (Fase 8), ni *steering* de mensajes a un hijo en vuelo, ni cambios en la TUI, ni dependencia OpenTelemetry (el exporter opt-in es OTLP/HTTP crudo), ni cambio alguno en agentes que no declaren `[subagents]` (v1 intacto), ni un endpoint nuevo.
 
 ## Contexto de proyecto
 
@@ -580,12 +588,56 @@ informe se redactan antes de imprimirse.
 El runner no incluye un check del modelo `Auto` de aprobación (`judge` solo
 califica respuestas), aunque la política `Auto` ya existe en el gate. El coste
 por turno y las trazas sí existen en el log de ejecución y en el snapshot de
-observabilidad; OpenTelemetry sigue sin integrarse (solo contrato listo).
+observabilidad; no hay crate OpenTelemetry: el exporter opt-in publica esos campos ya redactados como OTLP/HTTP JSON con `reqwest` (ver la sección siguiente).
 
 ```bash
 cargo test --test provider_eval_smoke   # consume la suite incluida e imprime la tabla
 cargo test --test evals_tests           # pruebas del runner y sus checks
 ```
+
+## Auth admin, aparcamiento de aprobaciones y telemetría OTLP (cierre Fase 9)
+
+Tres capacidades opt-in comparten una regla: `Config` (`src/config.rs`) es la
+única fuente de verdad de sus variables de entorno. `from_env` las parsea,
+`save_to_env` las persiste en `.env` (modo `0600`, así el token admin sigue siendo
+un secreto), `CONFIG_ENV_VARS` aísla los tests y `AppState.config` es lo que
+leen el middleware, el handler de chat, el gate, el reaper y el exporter —
+ningún helper vuelve a leer el entorno por petición. Los números mal formados
+son un error de configuración que nombra la variable (salvo el intervalo del
+reaper: un valor numérico no positivo cae a `5`, como su helper anterior).
+
+1. **Token admin.** Un middleware `from_fn_with_state` (`src/api/admin_auth.rs`)
+   envuelve el sub-router admin en `build_router`: `/api/approvals*`,
+   `/api/executions*`, `/api/rag/*`, `/api/route`, `/api/contexts*`,
+   `/api/agents*`. El cliente envía `X-Admin-Token` y se compara en tiempo
+   constante con `state.config.admin_token`. Sin token o vacío, **todas** las
+   rutas admin fallan cerradas con un `401` fijo y genérico que nunca repite el
+   valor. `X-Debug` se suma, no se sustituye. `/chat`, `/api/chat`,
+   `/v1/chat/completions`, `/api/webhooks/:channel`, health, modelos, docs y el
+   historial de conversaciones siguen públicos.
+2. **Aparcamiento de aprobaciones.** `Config::approval_timeout()` devuelve
+   `None` cuando `APPROVAL_PARK` está activo o `APPROVAL_TIMEOUT_SECS` es `0`,
+   así una decisión humana pendiente nunca expira (`ApprovalGate::parked()`);
+   un turno gated no streaming responde `202 {"execution_id", "approval_id"?}`
+   tras `PARK_GRACE_MS`. El estado `WaitingApproval`, el índice `parked_live` y
+   el reaper de arranque (intervalo `REAPER_INTERVAL_SECS`) permiten reanudar un
+   huérfano ya decidido bajo su mismo id de ejecución, sin doble reanudo.
+3. **Telemetría OTLP.** `exporter_from_config` (`src/adapters/telemetry/mod.rs`)
+   devuelve un noop salvo que `OTEL_ENABLED` sea truthy. Activado, publica el
+   valor `TraceRecorded` ya redactado como un span OTLP/HTTP JSON con el
+   `reqwest` existente. Es best-effort: un fallo del colector nunca rompe el
+   arranque ni el chat, y no se envía credencial, argumento ni cuerpo alguno.
+
+Las ocho variables y sus defaults están en la tabla de "Variables de entorno".
+Cobertura: tests unitarios de `src/config.rs`, `tests/admin_auth_tests.rs`,
+`tests/approval_parking_tests.rs` y `tests/otlp_exporter_tests.rs`.
+
+**No se afirma:** ni crate ni SDK OpenTelemetry (OTLP/HTTP JSON crudo sobre
+`reqwest`); ni identidad de usuario (*principal*) — un token compartido, no auth
+por usuario; ni sandbox ni agentes remotos; ni motor de workflows externo (el
+reaper es una tarea en proceso); ni endpoint nuevo más allá del grupo admin ya
+existente, ni cambio en los contratos de chat, webhooks, gRPC u
+OpenAI-compatible; ni dependencia nueva; ni cambio en puertos sagrados.
 
 ## Instalación
 

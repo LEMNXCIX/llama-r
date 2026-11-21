@@ -3,8 +3,9 @@
 //! These tests drive the REAL `build_router`, so a route accidentally left in
 //! the public group (or a public route accidentally pulled into the admin
 //! group) fails here rather than in a hand-built fixture. The gate is the only
-//! thing that reads `ADMIN_TOKEN`; the token is never placed in `Config`, a log
-//! line, a response body or a response header in this task.
+//! thing that reads `ADMIN_TOKEN` into `Config` when the state is built, then
+//! compares from there — never echoed into a log line, a response body or a
+//! response header.
 
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
@@ -209,44 +210,28 @@ async fn send(
 #[tokio::test]
 async fn admin_token_required_on_all_admin_routes() {
     let _guard = EnvGuard::new();
-    let (_dir, state) = test_state();
-    let router = build_router(state);
 
-    // Token configured but not presented. X-Debug: true is present on every
-    // request: the token is additional to the debug gate, not a replacement.
-    std::env::set_var("ADMIN_TOKEN", TOKEN);
-    for (method, uri) in PROTECTED {
-        let (status, body) = send(&router, method, uri, None, true, "{}").await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "{method} {uri}, no header"
-        );
-        assert_eq!(body, admin_refusal(), "{method} {uri}, no header");
-    }
+    // The token is captured into Config when the state is built, so each case
+    // gets a fresh state with the environment already set.
+    for (label, token, debug) in [
+        ("no header", Some(TOKEN), true),
+        ("unset token", None, false),
+        ("empty token", Some(""), false),
+    ] {
+        match token {
+            Some(value) => std::env::set_var("ADMIN_TOKEN", value),
+            None => std::env::remove_var("ADMIN_TOKEN"),
+        }
+        let (_dir, state) = test_state();
+        let router = build_router(state);
 
-    // Fail closed when the token was never configured.
-    std::env::remove_var("ADMIN_TOKEN");
-    for (method, uri) in PROTECTED {
-        let (status, body) = send(&router, method, uri, None, false, "{}").await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "{method} {uri}, unset token"
-        );
-        assert_eq!(body, admin_refusal(), "{method} {uri}, unset token");
-    }
-
-    // An empty token is the same as no token.
-    std::env::set_var("ADMIN_TOKEN", "");
-    for (method, uri) in PROTECTED {
-        let (status, body) = send(&router, method, uri, None, false, "{}").await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "{method} {uri}, empty token"
-        );
-        assert_eq!(body, admin_refusal(), "{method} {uri}, empty token");
+        // X-Debug: true is present on the configured case: the token is
+        // additional to the debug gate, not a replacement.
+        for (method, uri) in PROTECTED {
+            let (status, body) = send(&router, method, uri, None, debug, "{}").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}, {label}");
+            assert_eq!(body, admin_refusal(), "{method} {uri}, {label}");
+        }
     }
 }
 

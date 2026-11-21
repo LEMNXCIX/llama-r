@@ -566,6 +566,7 @@ async fn world_with_verifier(
     // installs a Weak delegator, which makes Arc::get_mut unavailable for
     // swapping in the test verifier.
     let state = Arc::new(AppState {
+        config: llama_r::config::Config::default(),
         services: Arc::new(TokioRwLock::new(Arc::new(stack))),
         agent_registry: registry,
         skill_manager: Arc::new(SkillManager::new()),

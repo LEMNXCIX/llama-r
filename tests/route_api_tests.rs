@@ -387,6 +387,7 @@ fn state_with_agents(
     fake: Option<FakeRouter>,
     general: bool,
 ) -> (TempDir, Arc<AppState>) {
+    admin_token_ready();
     if router_enabled {
         std::env::set_var("ROUTER_ENABLED", "true");
     }
@@ -436,9 +437,13 @@ fn preview_json(project_id: &str, prompt: &str) -> String {
 /// present it on every request. The gate itself is tested in admin_auth_tests.
 const TEST_ADMIN_TOKEN: &str = "test-admin-token";
 
-fn admin_request() -> axum::http::request::Builder {
+fn admin_token_ready() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| std::env::set_var("ADMIN_TOKEN", TEST_ADMIN_TOKEN));
+}
+
+fn admin_request() -> axum::http::request::Builder {
+    admin_token_ready();
     Request::builder().header("x-admin-token", TEST_ADMIN_TOKEN)
 }
 

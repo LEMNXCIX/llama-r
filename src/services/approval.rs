@@ -41,54 +41,16 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-/// How long a pending approval stays valid before a reaper drops it.
-pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a pending approval stays valid before a reaper drops it. Kept as a
+/// `Duration` for the gate; its number comes from `Config` — the single source
+/// of truth for the `APPROVAL_TIMEOUT_SECS` env var.
+pub const DEFAULT_APPROVAL_TIMEOUT: Duration =
+    Duration::from_secs(crate::config::DEFAULT_APPROVAL_TIMEOUT_SECS);
 /// How long the HTTP chat handler waits for an approval turn before answering
-/// `202 ChatAck` instead of holding the request open.
-pub const DEFAULT_PARK_GRACE: Duration = Duration::from_millis(1000);
-
-/// Environment switch: with `APPROVAL_PARK` set to a truthy value the boot gate
-/// has no deadline at all (`timeout() == None`) and pending approvals wait for a
-/// human decision indefinitely. Missing/false keeps the 120 s default.
-pub const ENV_APPROVAL_PARK: &str = "APPROVAL_PARK";
-/// Override the gate deadline in seconds when parking is off. A missing,
-/// unparsable or non-positive value keeps [`DEFAULT_APPROVAL_TIMEOUT`].
-pub const ENV_APPROVAL_TIMEOUT_SECS: &str = "APPROVAL_TIMEOUT_SECS";
-/// Override the `202` acknowledgement grace in milliseconds.
-pub const ENV_PARK_GRACE_MS: &str = "PARK_GRACE_MS";
-
-fn env_truthy(name: &str) -> bool {
-    matches!(
-        std::env::var(name)
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase()),
-        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
-    )
-}
-
-/// Resolve the gate's deadline from the environment. `None` means park: the
-/// bridge awaits its oneshot with no `tokio::time::timeout` wrapper (Task 2).
-pub fn approval_timeout_from_env() -> Option<Duration> {
-    if env_truthy(ENV_APPROVAL_PARK) {
-        return None;
-    }
-    std::env::var(ENV_APPROVAL_TIMEOUT_SECS)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .or(Some(DEFAULT_APPROVAL_TIMEOUT))
-}
-
-/// Resolve the acknowledgement grace from the environment, falling back to
-/// one second when unset or malformed.
-pub fn park_grace_from_env() -> Duration {
-    std::env::var(ENV_PARK_GRACE_MS)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_PARK_GRACE)
-}
+/// `202 ChatAck` instead of holding the request open. Same single source for
+/// `PARK_GRACE_MS`.
+pub const DEFAULT_PARK_GRACE: Duration =
+    Duration::from_millis(crate::config::DEFAULT_PARK_GRACE_MS);
 
 /// The human's answer, delivered over the oneshot from [`ApprovalGate::request`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -608,83 +570,17 @@ fn is_expired(entry: &PendingApproval, now: DateTime<Utc>, timeout: Option<Durat
 mod tests {
     use super::*;
 
-    struct EnvGuard {
-        previous: Vec<(&'static str, Option<String>)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn cleared() -> Self {
-            let lock = crate::core::paths::lock_env_for_tests();
-            let names = [
-                ENV_APPROVAL_PARK,
-                ENV_APPROVAL_TIMEOUT_SECS,
-                ENV_PARK_GRACE_MS,
-            ];
-            let previous = names
-                .iter()
-                .map(|name| (*name, std::env::var(name).ok()))
-                .collect();
-            for name in names {
-                std::env::remove_var(name);
-            }
-            Self {
-                previous,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in &self.previous {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
-
+    /// The gate's `Duration` constants must stay derived from `Config`'s
+    /// numbers — one source of truth for the env var and its default.
     #[test]
-    fn env_park_disables_the_deadline_and_timeout_secs_is_the_fallback() {
-        let _env = EnvGuard::cleared();
-        assert_eq!(approval_timeout_from_env(), Some(DEFAULT_APPROVAL_TIMEOUT));
-
-        std::env::set_var(ENV_APPROVAL_TIMEOUT_SECS, "7");
-        assert_eq!(approval_timeout_from_env(), Some(Duration::from_secs(7)));
-
-        std::env::set_var(ENV_APPROVAL_PARK, "true");
+    fn gate_durations_match_config_defaults() {
         assert_eq!(
-            approval_timeout_from_env(),
-            None,
-            "park wins over a timeout"
+            DEFAULT_APPROVAL_TIMEOUT,
+            Duration::from_secs(crate::config::DEFAULT_APPROVAL_TIMEOUT_SECS)
         );
-
-        std::env::set_var(ENV_APPROVAL_PARK, "0");
         assert_eq!(
-            approval_timeout_from_env(),
-            Some(Duration::from_secs(7)),
-            "a false switch keeps the configured deadline"
+            DEFAULT_PARK_GRACE,
+            Duration::from_millis(crate::config::DEFAULT_PARK_GRACE_MS)
         );
-
-        std::env::set_var(ENV_APPROVAL_TIMEOUT_SECS, "not-a-number");
-        assert_eq!(
-            approval_timeout_from_env(),
-            Some(DEFAULT_APPROVAL_TIMEOUT),
-            "a malformed timeout falls back rather than parking"
-        );
-    }
-
-    #[test]
-    fn grace_helpers_use_the_documented_default() {
-        let _env = EnvGuard::cleared();
-        assert_eq!(park_grace_from_env(), DEFAULT_PARK_GRACE);
-
-        std::env::set_var(ENV_PARK_GRACE_MS, "250");
-        assert_eq!(park_grace_from_env(), Duration::from_millis(250));
-
-        std::env::set_var(ENV_PARK_GRACE_MS, "bogus");
-        assert_eq!(park_grace_from_env(), DEFAULT_PARK_GRACE);
     }
 }

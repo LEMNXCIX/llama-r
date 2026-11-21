@@ -194,6 +194,7 @@ async fn execute_agent_case(case: &EvalCase) -> Result<Execution, String> {
         opencode_api_key: None,
         opencode_url: "http://127.0.0.1:4096".into(),
         openai_base_url: None,
+        ..Config::default()
     };
     let engine = RigAgentEngine::new(
         server.url(),

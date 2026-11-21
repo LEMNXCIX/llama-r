@@ -277,6 +277,7 @@ fn test_state_inner(
     // No test here consults the router; the routing ladder is injected into the
     // stack by the tests that do.
     let state = Arc::new(AppState {
+        config: crate::config::Config::default(),
         services: Arc::new(TokioRwLock::new(Arc::new(stack))),
         agent_registry,
         skill_manager,

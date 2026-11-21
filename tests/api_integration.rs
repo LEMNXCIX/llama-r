@@ -215,6 +215,9 @@ fn setup_app() -> TestApp {
     let guard = test_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Config now owns the admin token, so seed it BEFORE build_app_state reads
+    // the environment rather than lazily at the first admin request.
+    admin_token_ready();
     // Clear the router's variables for the whole test: `build_app_state` reads
     // ambient `ROUTER_*`/`MIN_*`, and this suite asserts what `/api/health`
     // reports. `core::paths::lock_env_for_tests` is `#[cfg(test)]`-gated inside

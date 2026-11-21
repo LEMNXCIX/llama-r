@@ -26,22 +26,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
-/// How often the boot task checks for decided orphans. Task 5 moves this into
-/// `Config`; until then this helper is the single reader of the environment.
-pub const DEFAULT_REAPER_INTERVAL: Duration = Duration::from_secs(5);
-pub const ENV_REAPER_INTERVAL_SECS: &str = "REAPER_INTERVAL_SECS";
-
-/// Resolve the reaper interval from the environment. A missing, unparsable or
-/// non-positive value keeps the default, so a bad env value can never spin the
-/// task or stop boot.
-pub fn reaper_interval_from_env() -> Duration {
-    std::env::var(ENV_REAPER_INTERVAL_SECS)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_REAPER_INTERVAL)
-}
+/// How often the boot task checks for decided orphans. Derived from `Config` —
+/// the single source of truth for the `REAPER_INTERVAL_SECS` env var.
+pub const DEFAULT_REAPER_INTERVAL: Duration =
+    Duration::from_secs(crate::config::DEFAULT_REAPER_INTERVAL_SECS);
 
 /// One reaper pass. Returns the number of decided orphans resumed under their
 /// original execution id. Takes only `state` so the pass is directly callable

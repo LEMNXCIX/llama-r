@@ -4,6 +4,7 @@ use crate::api::chat_core::{
 use crate::api::mcp_api;
 use crate::api::observability::AppObservability;
 use crate::api::route_resolution::{resolve_selection, AgentSelection};
+use crate::config::Config;
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::ContextStore;
 use crate::domain::models::{
@@ -19,7 +20,7 @@ use crate::ports::mcp::McpServerRegistry;
 use crate::ports::model_selection::ModelSelector;
 use crate::ports::telemetry::TraceExporter;
 use crate::services::agent_registry::AgentRegistry;
-use crate::services::approval::{park_grace_from_env, ApprovalGate};
+use crate::services::approval::ApprovalGate;
 use crate::services::provider_stack::ProviderStack;
 use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
@@ -43,6 +44,11 @@ use crate::ports::compaction::ContextCompactor;
 use crate::ports::history::ConversationStore;
 
 pub struct AppState {
+    /// Boot configuration — the single source of truth for the admin token,
+    /// parking/grace/reaper timings and OTLP settings. Kept on the state handle
+    /// so the middleware and chat handler do not re-read the environment per
+    /// request, while the hot-swapped `ProviderStack` stays separate.
+    pub config: Config,
     /// The provider-dependent services, behind an `RwLock` so a new provider can
     /// be installed in the running process without rebuilding `AppState`. Every
     /// read clones the inner `Arc` before any `.await`; a snapshot taken before a
@@ -300,7 +306,12 @@ pub async fn chat(
             let _ = done_tx.send(result);
         });
 
-        match tokio::time::timeout(park_grace_from_env(), done_rx).await {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(state.config.park_grace_ms),
+            done_rx,
+        )
+        .await
+        {
             Ok(Ok(Ok(response))) => {
                 let mut headers = axum::http::HeaderMap::new();
                 if let Some(cid) = &response.conversation_id {

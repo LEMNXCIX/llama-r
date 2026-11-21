@@ -826,6 +826,7 @@ fn chat_world(persist_history: bool) -> ChatWorld {
     stack.agent_runtime = Some(runtime);
 
     let state = Arc::new(AppState {
+        config: llama_r::config::Config::default(),
         services: Arc::new(TokioRwLock::new(Arc::new(stack))),
         agent_registry: registry,
         skill_manager: Arc::new(SkillManager::new()),

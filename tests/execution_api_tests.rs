@@ -305,6 +305,12 @@ fn test_state(
         Arc::new(StaticMcpRegistry::new()),
         None,
         store,
+        // Config owns the admin token now; seed the same value the test's
+        // `admin_request` presents so the admin gate stays green.
+        llama_r::config::Config {
+            admin_token: Some(TEST_ADMIN_TOKEN.to_string()),
+            ..Default::default()
+        },
     );
     (dir, state)
 }

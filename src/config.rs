@@ -5,10 +5,50 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 
 /// Default OpenRouter endpoint. Shared by the chat provider and the Rig engine
 /// so the two cannot drift to different origins.
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+// Defaults for the admin / approval-parking / OTLP settings. Defined here so
+// `Config` is the single source of truth: the gate, reaper and exporter derive
+// their `Duration`s from these numbers instead of reading the environment
+// themselves.
+pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_PARK_GRACE_MS: u64 = 1000;
+pub const DEFAULT_REAPER_INTERVAL_SECS: u64 = 5;
+pub const DEFAULT_OTEL_ENDPOINT: &str = "http://127.0.0.1:4318/v1/traces";
+pub const DEFAULT_OTEL_SERVICE_NAME: &str = "llama-r";
+
+/// The four spellings treated as `true` by the boolean settings. Anything else
+/// (including an absent variable, which is handled by the caller's default) is
+/// `false`.
+fn env_truthy(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
+/// Parse an unsigned env var, or return its default when unset. A malformed
+/// value is a config error naming both the variable and what was received —
+/// no silent clamp. `0` is a valid value here; callers that need a positive
+/// number apply their own documented fallback.
+fn u64_env(name: &str, default: u64) -> Result<u64, AppError> {
+    match env::var(name) {
+        Ok(raw) => raw.trim().parse::<u64>().map_err(|_| {
+            AppError::Config(format!(
+                "{name} must be a valid non-negative integer, received '{}'",
+                raw
+            ))
+        }),
+        Err(_) => Ok(default),
+    }
+}
 
 /// Which upstream serves chat, the decision model and (where supported)
 /// embeddings. One value selects every service; there is no per-service mix.
@@ -97,9 +137,68 @@ pub struct Config {
     pub opencode_url: String,
     /// Optional override for OpenAI-compatible endpoint base URLs.
     pub openai_base_url: Option<String>,
+    /// Shared token guarding the admin endpoint group. `None` (missing or
+    /// empty) fails every admin route closed. Never logged or echoed.
+    pub admin_token: Option<String>,
+    /// When true, a pending human approval never expires (the bridge awaits
+    /// its oneshot with no deadline). Defaults to true.
+    pub approval_park: bool,
+    /// Bounded approval deadline in seconds, used when parking is off. `0` is
+    /// the other spelling of "no deadline".
+    pub approval_timeout_secs: u64,
+    /// How long the HTTP handler waits before acknowledging a parked turn.
+    pub park_grace_ms: u64,
+    /// How often the boot reaper checks for decided orphaned turns. A
+    /// non-positive value falls back to the default.
+    pub reaper_interval_secs: u64,
+    /// Opt-in OTLP/HTTP span exporter. Off by default, so an update that ships
+    /// it changes nothing until an operator enables it.
+    pub otel_enabled: bool,
+    /// OTLP/HTTP traces endpoint, read only on the enabled path.
+    pub otel_endpoint: String,
+    /// `service.name` resource attribute sent with each span.
+    pub otel_service_name: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            port: 3000,
+            provider: ProviderKind::default(),
+            ollama_url: "http://localhost:11434".to_string(),
+            default_model: String::new(),
+            embedding_model: "nomic-embed-text".to_string(),
+            embedding_dimensions: 768,
+            rag_enabled: true,
+            history_retention_days: 90,
+            openrouter_api_key: None,
+            opencode_api_key: None,
+            opencode_url: "http://127.0.0.1:4096".to_string(),
+            openai_base_url: None,
+            admin_token: None,
+            approval_park: true,
+            approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
+            park_grace_ms: DEFAULT_PARK_GRACE_MS,
+            reaper_interval_secs: DEFAULT_REAPER_INTERVAL_SECS,
+            otel_enabled: false,
+            otel_endpoint: DEFAULT_OTEL_ENDPOINT.to_string(),
+            otel_service_name: DEFAULT_OTEL_SERVICE_NAME.to_string(),
+        }
+    }
 }
 
 impl Config {
+    /// The gate's effective bridge deadline: `None` parks the turn when
+    /// `APPROVAL_PARK` is on or `APPROVAL_TIMEOUT_SECS` is zero, otherwise the
+    /// bounded timeout. One place so boot, tests and docs cannot disagree.
+    pub fn approval_timeout(&self) -> Option<Duration> {
+        if self.approval_park || self.approval_timeout_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.approval_timeout_secs))
+        }
+    }
+
     pub fn from_env() -> Result<Self, AppError> {
         dotenv().ok();
 
@@ -194,6 +293,37 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(90);
 
+        // Admin token: a secret stored verbatim, exactly like the other keys.
+        // Empty or absent means "not configured" — every admin route fails
+        // closed. It is written to `.env` (0600) by `save_to_env`, never logged.
+        let admin_token = env::var("ADMIN_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty());
+
+        let approval_park = env_truthy("APPROVAL_PARK", true);
+        let approval_timeout_secs =
+            u64_env("APPROVAL_TIMEOUT_SECS", DEFAULT_APPROVAL_TIMEOUT_SECS)?;
+        let park_grace_ms = u64_env("PARK_GRACE_MS", DEFAULT_PARK_GRACE_MS)?;
+        let mut reaper_interval_secs =
+            u64_env("REAPER_INTERVAL_SECS", DEFAULT_REAPER_INTERVAL_SECS)?;
+        if reaper_interval_secs == 0 {
+            // Non-positive keeps the default, matching the old reaper helper:
+            // a bad value can never spin the task or stop boot.
+            reaper_interval_secs = DEFAULT_REAPER_INTERVAL_SECS;
+        }
+
+        let otel_enabled = env_truthy("OTEL_ENABLED", false);
+        let otel_endpoint = env::var("OTEL_ENDPOINT")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_OTEL_ENDPOINT.to_string());
+        let otel_service_name = env::var("OTEL_SERVICE_NAME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_OTEL_SERVICE_NAME.to_string());
+
         Ok(Self {
             port,
             provider,
@@ -207,6 +337,14 @@ impl Config {
             opencode_api_key,
             opencode_url,
             openai_base_url,
+            admin_token,
+            approval_park,
+            approval_timeout_secs,
+            park_grace_ms,
+            reaper_interval_secs,
+            otel_enabled,
+            otel_endpoint,
+            otel_service_name,
         })
     }
 
@@ -240,6 +378,20 @@ impl Config {
                 "OPENAI_BASE_URL",
                 self.openai_base_url.clone().unwrap_or_default(),
             ),
+            ("ADMIN_TOKEN", self.admin_token.clone().unwrap_or_default()),
+            ("APPROVAL_PARK", self.approval_park.to_string()),
+            (
+                "APPROVAL_TIMEOUT_SECS",
+                self.approval_timeout_secs.to_string(),
+            ),
+            ("PARK_GRACE_MS", self.park_grace_ms.to_string()),
+            (
+                "REAPER_INTERVAL_SECS",
+                self.reaper_interval_secs.to_string(),
+            ),
+            ("OTEL_ENABLED", self.otel_enabled.to_string()),
+            ("OTEL_ENDPOINT", self.otel_endpoint.clone()),
+            ("OTEL_SERVICE_NAME", self.otel_service_name.clone()),
         ];
 
         for (key, value) in &updates {
@@ -334,6 +486,14 @@ mod tests {
         "OPENCODE_API_KEY",
         "OPENCODE_URL",
         "OPENAI_BASE_URL",
+        "ADMIN_TOKEN",
+        "APPROVAL_PARK",
+        "APPROVAL_TIMEOUT_SECS",
+        "PARK_GRACE_MS",
+        "REAPER_INTERVAL_SECS",
+        "OTEL_ENABLED",
+        "OTEL_ENDPOINT",
+        "OTEL_SERVICE_NAME",
     ];
 
     /// Clears every config env var on entry and restores them on drop. Held
@@ -472,6 +632,7 @@ mod tests {
             opencode_api_key: None,
             opencode_url: "http://127.0.0.1:4096".to_string(),
             openai_base_url: None,
+            ..Config::default()
         };
 
         config.save_to_env().expect("save config");
@@ -499,5 +660,206 @@ mod tests {
                 .any(|(key, value)| key == "OPENROUTER_API_KEY" && value == "ab=c d"),
             "the saved value must round-trip through dotenvy: {parsed:?}"
         );
+    }
+
+    // ---- Task 5: admin / parking / OTLP settings ----------------------------
+
+    /// Every new variable is in the guard, so `ConfigEnvGuard::cleared` really
+    /// does give each test the documented defaults instead of a leaked value.
+    #[test]
+    fn config_env_guard_covers_every_new_variable() {
+        for name in [
+            "ADMIN_TOKEN",
+            "APPROVAL_PARK",
+            "APPROVAL_TIMEOUT_SECS",
+            "PARK_GRACE_MS",
+            "REAPER_INTERVAL_SECS",
+            "OTEL_ENABLED",
+            "OTEL_ENDPOINT",
+            "OTEL_SERVICE_NAME",
+        ] {
+            assert!(
+                CONFIG_ENV_VARS.contains(&name),
+                "{name} missing from CONFIG_ENV_VARS"
+            );
+        }
+    }
+
+    #[test]
+    fn new_env_fields_have_the_documented_defaults() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        let config = Config::from_env().expect("config from a cleared env");
+        assert_eq!(config.admin_token, None);
+        assert!(config.approval_park, "APPROVAL_PARK defaults to true");
+        assert_eq!(config.approval_timeout_secs, 120);
+        assert_eq!(config.park_grace_ms, 1000);
+        assert_eq!(config.reaper_interval_secs, 5);
+        assert!(!config.otel_enabled);
+        assert_eq!(config.otel_endpoint, DEFAULT_OTEL_ENDPOINT);
+        assert_eq!(config.otel_service_name, DEFAULT_OTEL_SERVICE_NAME);
+        // Park is on by default, so the effective bridge deadline is unbounded.
+        assert_eq!(config.approval_timeout(), None);
+    }
+
+    #[test]
+    fn new_env_fields_parse_valid_values() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        env::set_var("ADMIN_TOKEN", "a-token");
+        env::set_var("APPROVAL_PARK", "false");
+        env::set_var("APPROVAL_TIMEOUT_SECS", "45");
+        env::set_var("PARK_GRACE_MS", "250");
+        env::set_var("REAPER_INTERVAL_SECS", "9");
+        env::set_var("OTEL_ENABLED", "yes");
+        env::set_var("OTEL_ENDPOINT", "http://collector:4318/v1/traces");
+        env::set_var("OTEL_SERVICE_NAME", "my-service");
+
+        let config = Config::from_env().expect("parse the new variables");
+        assert_eq!(config.admin_token.as_deref(), Some("a-token"));
+        assert!(!config.approval_park);
+        assert_eq!(config.approval_timeout_secs, 45);
+        assert_eq!(config.park_grace_ms, 250);
+        assert_eq!(config.reaper_interval_secs, 9);
+        assert!(config.otel_enabled);
+        assert_eq!(config.otel_endpoint, "http://collector:4318/v1/traces");
+        assert_eq!(config.otel_service_name, "my-service");
+        assert_eq!(config.approval_timeout(), Some(Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn truthy_switches_accept_the_four_spellings_and_reject_others() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        for truthy in ["1", "true", "YES", "on"] {
+            env::set_var("OTEL_ENABLED", truthy);
+            assert!(
+                Config::from_env().unwrap().otel_enabled,
+                "{truthy} must be truthy"
+            );
+        }
+        for falsy in ["0", "false", "no", "off", "maybe"] {
+            env::set_var("OTEL_ENABLED", falsy);
+            assert!(
+                !Config::from_env().unwrap().otel_enabled,
+                "{falsy} must be falsy"
+            );
+        }
+        // APPROVAL_PARK uses the same truthy parser; absence, not a falsy
+        // spelling, is what selects the `true` default.
+        env::set_var("APPROVAL_PARK", "off");
+        assert!(!Config::from_env().unwrap().approval_park);
+    }
+
+    #[test]
+    fn malformed_numeric_variables_are_config_errors_naming_the_variable() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        for (name, bad) in [
+            ("APPROVAL_TIMEOUT_SECS", "not-a-number"),
+            ("PARK_GRACE_MS", "12.5"),
+            ("REAPER_INTERVAL_SECS", "bogus"),
+        ] {
+            env::set_var(name, bad);
+            let err = Config::from_env().unwrap_err();
+            assert!(matches!(err, AppError::Config(_)), "{name}: {err}");
+            let message = err.to_string();
+            assert!(
+                message.contains(name) && message.contains(bad),
+                "error must name the variable and value: {message}"
+            );
+            env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn reaper_interval_non_positive_falls_back_to_the_default() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        // Numeric but non-positive keeps the default — matching the old helper,
+        // so a bad value can never spin the reaper task or stop boot.
+        env::set_var("REAPER_INTERVAL_SECS", "0");
+        assert_eq!(Config::from_env().unwrap().reaper_interval_secs, 5);
+    }
+
+    #[test]
+    fn a_zero_approval_timeout_means_no_deadline() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        env::set_var("APPROVAL_PARK", "false");
+        env::set_var("APPROVAL_TIMEOUT_SECS", "0");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.approval_timeout_secs, 0);
+        assert_eq!(
+            config.approval_timeout(),
+            None,
+            "zero is the other spelling of park"
+        );
+    }
+
+    #[test]
+    fn empty_admin_token_and_otel_labels_fall_back() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        env::set_var("ADMIN_TOKEN", "");
+        env::set_var("OTEL_ENDPOINT", "   ");
+        env::set_var("OTEL_SERVICE_NAME", "");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.admin_token, None, "an empty token is fail-closed");
+        assert_eq!(config.otel_endpoint, DEFAULT_OTEL_ENDPOINT);
+        assert_eq!(config.otel_service_name, DEFAULT_OTEL_SERVICE_NAME);
+    }
+
+    #[test]
+    fn save_to_env_round_trips_every_new_field() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        let config = Config {
+            admin_token: Some("secret-token".to_string()),
+            approval_park: false,
+            approval_timeout_secs: 45,
+            park_grace_ms: 250,
+            reaper_interval_secs: 9,
+            otel_enabled: true,
+            otel_endpoint: "http://collector:4318/v1/traces".to_string(),
+            otel_service_name: "my-service".to_string(),
+            ..Config::default()
+        };
+
+        config.save_to_env().expect("save config");
+        let reloaded = Config::from_env().expect("reload config");
+        assert_eq!(reloaded.admin_token.as_deref(), Some("secret-token"));
+        assert!(!reloaded.approval_park);
+        assert_eq!(reloaded.approval_timeout_secs, 45);
+        assert_eq!(reloaded.park_grace_ms, 250);
+        assert_eq!(reloaded.reaper_interval_secs, 9);
+        assert!(reloaded.otel_enabled);
+        assert_eq!(reloaded.otel_endpoint, "http://collector:4318/v1/traces");
+        assert_eq!(reloaded.otel_service_name, "my-service");
+
+        // The secret is on disk (mode 0600), never echoed in a log line here.
+        let parsed: Vec<(String, String)> = dotenvy::from_path_iter(".env")
+            .expect("open .env")
+            .map(|item| item.expect("parse .env line"))
+            .collect();
+        assert!(parsed
+            .iter()
+            .any(|(key, value)| key == "ADMIN_TOKEN" && value == "secret-token"));
     }
 }

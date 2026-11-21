@@ -1605,6 +1605,7 @@ async fn apply_rebuilds_companions_from_the_new_stack() {
         opencode_api_key: None,
         opencode_url: "http://127.0.0.1:4096".to_string(),
         openai_base_url: None,
+        ..Config::default()
     };
     let mut stack = build_provider_stack(&cfg).expect("ollama stack with embeddings");
     build_companions_for_state(&app.state, &cfg, &mut stack);

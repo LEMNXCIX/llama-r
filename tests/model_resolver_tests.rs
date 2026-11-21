@@ -65,6 +65,7 @@ fn config(provider: ProviderKind, default_model: &str) -> Config {
         opencode_api_key: None,
         opencode_url: "http://127.0.0.1:4096".to_string(),
         openai_base_url: None,
+        ..Config::default()
     }
 }
 

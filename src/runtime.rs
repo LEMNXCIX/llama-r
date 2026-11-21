@@ -189,6 +189,10 @@ pub fn build_app_state(
         // no durable store to install. Boot calls `build_app_state_with_gate`
         // directly with the real store built from the history DB path.
         Arc::new(NoOpExecutionStore),
+        // Non-boot callers get the same config the env describes; a malformed
+        // value falls back to the documented defaults rather than failing a
+        // test fixture. Boot passes its own already-parsed `Config` below.
+        Config::from_env().unwrap_or_default(),
     )
 }
 
@@ -211,6 +215,7 @@ pub fn build_app_state_with_gate(
     mcp_registry: Arc<dyn McpServerRegistry>,
     history_store: Option<Arc<dyn ConversationStore>>,
     execution_store: Arc<dyn ExecutionStore>,
+    config: Config,
 ) -> Arc<AppState> {
     let metrics = Arc::new(TokenMetrics::new());
     let default_model = stack.default_model.clone();
@@ -285,12 +290,13 @@ pub fn build_app_state_with_gate(
     // the same handle, exactly like the gate and the auto decider.
     let compactor: Arc<dyn ContextCompactor> = Arc::new(NoopCompactor);
 
-    // Telemetry is opt-in from the environment. Built once here and stored on
+    // Telemetry is opt-in from `Config`. Built once here and stored on
     // AppState (outside the hot-swapped stack) so boot and a settings Apply
     // share the exact same exporter handle through `CompanionHandles`.
-    let exporter = crate::adapters::telemetry::exporter_from_env();
+    let exporter = crate::adapters::telemetry::exporter_from_config(&config);
 
     let state = Arc::new(AppState {
+        config,
         services: Arc::new(TokioRwLock::new(Arc::new(stack))),
         agent_registry: agent_registry.clone(),
         skill_manager,
@@ -636,11 +642,10 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     // safe: it rebuilds the engine but leaves pending decisions intact. The
     // durable store is attached so pendings/decisions survive a restart; a boot
     // reload rehydrates them without a oneshot (there is no live request yet).
-    // `APPROVAL_PARK` / `APPROVAL_TIMEOUT_SECS` decide whether a pending waits
-    // forever or on the legacy deadline. Task 5 moves these to `Config`; until
-    // then the env helper is the single reader, mirroring Task 1's admin token.
+    // `Config::approval_timeout` decides whether a pending waits forever or on
+    // the bounded deadline — one source of truth shared with docs and tests.
     let approval_gate = Arc::new(
-        match crate::services::approval::approval_timeout_from_env() {
+        match config.approval_timeout() {
             Some(timeout) => ApprovalGate::new(timeout),
             None => ApprovalGate::parked(),
         }
@@ -660,6 +665,7 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         mcp_registry,
         history_store,
         execution_store.clone(),
+        config.clone(),
     );
     // Build the companions only now, from the state that owns the boot gate
     // *and* the boot `auto_decider`. `CompanionHandles::from_state` reads both,
@@ -677,7 +683,7 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     // marks mid-flight turns `Interrupted`, so a decided orphan is consumed
     // rather than buried as a generic interrupted turn. Both steps are best
     // effort: a store error is a warning and never stops boot.
-    let reaper_interval = crate::services::approval_reaper::reaper_interval_from_env();
+    let reaper_interval = std::time::Duration::from_secs(config.reaper_interval_secs);
     if let Err(err) = crate::services::approval_reaper::reap_once(&state).await {
         tracing::warn!(error = %err, "Approval reaper first pass failed; boot continues");
     }

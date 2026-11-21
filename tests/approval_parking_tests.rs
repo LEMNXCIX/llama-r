@@ -266,6 +266,9 @@ async fn test_state(
         std::sync::Arc::new(StaticMcpRegistry::new()) as std::sync::Arc<dyn McpServerRegistry>,
         None,
         store,
+        // The test env has already set ADMIN_TOKEN and PARK_GRACE_MS; read
+        // them through Config exactly as boot does.
+        llama_r::config::Config::from_env().expect("config from test env"),
     )
 }
 

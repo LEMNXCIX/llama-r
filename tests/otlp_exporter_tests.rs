@@ -2,15 +2,16 @@
 //!
 //! Every test talks to a real one-shot HTTP listener — no mocking of reqwest —
 //! so the path, the OTLP JSON shape and the best-effort contract are observed
-//! on the wire. The exporter is deliberately built from the same env helper
-//! the boot path uses, so "disabled means noop" is tested end to end.
+//! on the wire. The exporter is deliberately built from the same `Config` the
+//! boot path uses, so "disabled means noop" is tested end to end.
 
 #![allow(clippy::await_holding_lock)] // env guard held deliberately across .await to serialise tests
 
 use chrono::Utc;
 use llama_r::adapters::execution::NoOpExecutionStore;
-use llama_r::adapters::telemetry::{exporter_from_env, OtlpHttpExporter};
+use llama_r::adapters::telemetry::{exporter_from_config, OtlpHttpExporter};
 use llama_r::api::chat_core::record_trace;
+use llama_r::config::Config;
 use llama_r::domain::execution::{AgentExecution, ExecutionStatus};
 use llama_r::ports::telemetry::TraceExporter;
 use serde_json::{json, Value};
@@ -169,7 +170,8 @@ async fn otel_disabled_sends_nothing() {
         ("OTEL_ENDPOINT", &format!("{}/v1/traces", server.url)),
     ]);
 
-    let exporter = exporter_from_env();
+    let config = Config::from_env().expect("config reads OTEL_* from the env");
+    let exporter = exporter_from_config(&config);
     exporter.export(&json!({"trace_id": Uuid::new_v4()})).await;
 
     assert!(
@@ -180,7 +182,7 @@ async fn otel_disabled_sends_nothing() {
     // Control: the same factory with the flag on DOES post to this endpoint,
     // so the empty result above is the noop, not a misconfigured URL.
     std::env::set_var("OTEL_ENABLED", "true");
-    let enabled = exporter_from_env();
+    let enabled = exporter_from_config(&Config::from_env().expect("reload config"));
     enabled.export(&json!({"trace_id": Uuid::new_v4()})).await;
     assert_eq!(server.bodies().len(), 1, "the enabled control must post");
 }

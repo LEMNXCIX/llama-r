@@ -751,6 +751,12 @@ fn api_state(gate: Arc<ApprovalGate>) -> Arc<AppState> {
         Arc::new(StaticMcpRegistry::new()) as Arc<dyn McpServerRegistry>,
         None,
         Arc::new(llama_r::adapters::execution::NoOpExecutionStore),
+        // The token is captured into Config at state-build time; the test's
+        // `admin_request` presents the same value on every admin call.
+        llama_r::config::Config {
+            admin_token: Some(TEST_ADMIN_TOKEN.to_string()),
+            ..Default::default()
+        },
     )
 }
 
@@ -1012,6 +1018,7 @@ fn e2e_config(ollama_url: &str) -> Config {
         opencode_api_key: None,
         opencode_url: "http://127.0.0.1:4096".to_string(),
         openai_base_url: None,
+        ..Config::default()
     }
 }
 

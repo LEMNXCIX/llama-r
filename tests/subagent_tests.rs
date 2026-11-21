@@ -537,6 +537,7 @@ fn test_state(
         selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
     }));
     Arc::new(AppState {
+        config: llama_r::config::Config::default(),
         services: Arc::new(TokioRwLock::new(Arc::new(stack))),
         agent_registry: registry,
         skill_manager,
@@ -983,6 +984,7 @@ fn boot_and_apply_keep_the_delegator_on_the_engine() {
             opencode_api_key: None,
             opencode_url: "http://127.0.0.1:4096".into(),
             openai_base_url: None,
+            ..llama_r::config::Config::default()
         },
         Arc::new(SkillManager::new()),
         Arc::new(llama_r::adapters::rig_engine::local_tools::LocalToolRegistry::builtins()),
