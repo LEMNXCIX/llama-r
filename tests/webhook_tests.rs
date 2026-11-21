@@ -117,33 +117,70 @@ fn malformed_channels_toml_is_warned_and_empty() {
     );
 }
 
+/// Sets an env var for the duration of a test and restores its prior value on
+/// drop, so a sentinel never leaks into another test in this binary.
+struct EnvGuard {
+    name: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var(name).ok();
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
 #[test]
 fn auth_env_is_a_name_not_a_value() {
+    const AUTH_ENV: &str = "WEBHOOK_SECRET_TASK1_AUTH_ENV";
+    const SENTINEL: &str = "super-secret-value-TASK1-SENTINEL";
+
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("channels.toml"),
-        r#"
+        format!(
+            r#"
 [[channels]]
 id = "stripe"
 agent_id = "billing"
 mode = "async"
 signature_header = "X-Signature"
-auth_env = "WEBHOOK_SECRET"
+auth_env = "{AUTH_ENV}"
 enabled = true
-"#,
+"#
+        ),
     )
     .unwrap();
+
+    // Actually populate the variable named by `auth_env` with a distinctive
+    // sentinel before formatting, so the no-leak assertion below is real: if a
+    // secret field were ever added and captured this value, it would fail.
+    let _guard = EnvGuard::set(AUTH_ENV, SENTINEL);
 
     let channels = load_channels(tmp.path());
     assert_eq!(channels.len(), 1);
     let cfg: &ChannelConfig = &channels[0];
-    assert_eq!(cfg.auth_env, "WEBHOOK_SECRET");
+    assert_eq!(cfg.auth_env, AUTH_ENV);
     assert_eq!(cfg.mode, ChannelMode::Async);
     assert!(cfg.enabled);
 
-    // The struct holds the variable NAME and has no secret field: the secret
-    // value cannot appear in Debug even if an env var of that name is set.
+    // The struct holds the variable NAME and has no secret field: the sentinel
+    // value cannot appear in Debug even though the env var now holds it.
     let debug = format!("{cfg:?}");
-    assert!(debug.contains("WEBHOOK_SECRET"));
-    assert!(!debug.contains("super-secret-value"));
+    assert!(debug.contains(AUTH_ENV));
+    assert!(
+        !debug.contains(SENTINEL),
+        "Debug leaked the secret value from the env var: {debug:?}"
+    );
 }
