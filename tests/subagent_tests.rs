@@ -558,6 +558,7 @@ fn test_state(
         selector: Arc::new(llama_r::adapters::context::CurrentModelSelector),
         execution_store: Arc::new(NoOpExecutionStore),
         delegator: OnceLock::new(),
+        channel_verifier: Arc::new(llama_r::adapters::channel::HmacSha256Verifier),
     })
 }
 

@@ -298,6 +298,7 @@ fn test_state_inner(
         selector: Arc::new(crate::adapters::context::CurrentModelSelector),
         execution_store,
         delegator: OnceLock::new(),
+        channel_verifier: Arc::new(crate::adapters::channel::HmacSha256Verifier),
     });
     (temp_dir, state)
 }

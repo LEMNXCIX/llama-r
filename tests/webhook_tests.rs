@@ -10,7 +10,7 @@
 use llama_r::adapters::channel::{load_channels, HmacSha256Verifier};
 use llama_r::domain::channel::{ChannelConfig, ChannelMode};
 use llama_r::ports::channel::ChannelSignatureVerifier;
-use llama_r::services::marker_template::render_markers;
+use llama_r::services::marker_template::{message_from_template, render_markers};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -189,21 +189,6 @@ enabled = true
 
 // ── marker-template rendering (Task 2) ───────────────────────────────────────
 
-/// Caller-side helper Task 3 will use: no/blank template means the raw body is
-/// the user message; a non-blank template is rendered over the parsed payload
-/// instead. Kept here so the "absent template" contract is testable before the
-/// endpoint exists.
-fn message_from_template(
-    template: Option<&str>,
-    payload: &Value,
-    raw_body: &str,
-) -> Result<String, String> {
-    match template {
-        Some(t) if !t.trim().is_empty() => render_markers(t, payload),
-        _ => Ok(raw_body.to_string()),
-    }
-}
-
 #[test]
 fn marker_template_extracts_message() {
     let payload = json!({
@@ -321,5 +306,627 @@ fn object_marker_is_a_named_error() {
     assert!(
         err2.contains("array"),
         "the error must say the value is an array: {err2:?}"
+    );
+}
+
+// ── webhook endpoint (Task 3) ────────────────────────────────────────────────
+
+use async_trait::async_trait;
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+    routing::{get, post},
+    Router,
+};
+use llama_r::adapters::context::{CurrentModelSelector, NoopCompactor};
+use llama_r::adapters::execution::SqliteExecutionStore;
+use llama_r::adapters::mcp::StaticMcpRegistry;
+use llama_r::api::execution_api::get_execution;
+use llama_r::api::webhook_api::webhook;
+use llama_r::config::ProviderKind;
+use llama_r::context::analyzer::ContextEnricher;
+use llama_r::context::store::ContextStore;
+use llama_r::domain::agent::{Agent, AgentConfig};
+use llama_r::domain::models::{ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
+use llama_r::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
+use llama_r::providers::registry::ProviderRegistry;
+use llama_r::providers::LLMProvider;
+use llama_r::runtime::build_app_state_with_gate;
+use llama_r::services::agent_registry::AgentRegistry;
+use llama_r::services::agent_runtime::AgentRuntime;
+use llama_r::services::approval::ApprovalGate;
+use llama_r::services::provider_stack::ProviderStack;
+use llama_r::services::scope_builder::ScopeBuilder;
+use llama_r::services::skill_manager::SkillManager;
+use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
+use std::error::Error as StdError;
+use std::pin::Pin;
+use tokio::sync::Mutex as AsyncMutex;
+use tower::ServiceExt;
+
+/// Env vars are process-wide, so the webhook tests that point `LLAMA_R_DIR` at a
+/// temp dir must not overlap. A tokio mutex (Send guard) serialises them.
+static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+const SECRET_ENV: &str = "WEBHOOK_TASK3_SECRET";
+const SECRET: &str = "task3-shared-secret-sentinel";
+const PAYLOAD_SECRET: &str = "PAYLOAD-SECRET-SENTINEL-DO-NOT-ECHO";
+
+/// RFC 2104 HMAC-SHA256, only so a test can produce a valid header. The
+/// verifier itself has its own published-vector tests; this is a fixture.
+fn sign_body(secret: &str, body: &[u8]) -> String {
+    const B: usize = 64;
+    let mut key_block = [0u8; B];
+    if secret.len() > B {
+        key_block[..32].copy_from_slice(&Sha256::digest(secret.as_bytes()));
+    } else {
+        key_block[..secret.len()].copy_from_slice(secret.as_bytes());
+    }
+    let mut inner_pad = [0x36u8; B];
+    let mut outer_pad = [0x5cu8; B];
+    for i in 0..B {
+        inner_pad[i] ^= key_block[i];
+        outer_pad[i] ^= key_block[i];
+    }
+    let mut inner = Vec::with_capacity(B + body.len());
+    inner.extend_from_slice(&inner_pad);
+    inner.extend_from_slice(body);
+    let inner_hash = Sha256::digest(&inner);
+    let mut outer = Vec::with_capacity(B + 32);
+    outer.extend_from_slice(&outer_pad);
+    outer.extend_from_slice(&inner_hash);
+    Sha256::digest(&outer)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn signed(body: &str) -> String {
+    format!("sha256={}", sign_body(SECRET, body.as_bytes()))
+}
+
+#[derive(Debug, Clone)]
+struct RecordedCall {
+    agent_id: String,
+    project_id: Option<String>,
+    user_message: String,
+}
+
+struct RecordingEngine {
+    calls: Arc<Mutex<Vec<RecordedCall>>>,
+    text: String,
+}
+
+#[async_trait]
+impl AgentEngine for RecordingEngine {
+    async fn run(&self, req: AgentRunRequest) -> Result<AgentRunResult, String> {
+        self.calls.lock().unwrap().push(RecordedCall {
+            agent_id: req.agent.id.clone(),
+            project_id: req.agent.project_id.clone(),
+            user_message: req.user_message.clone(),
+        });
+        Ok(AgentRunResult {
+            text: self.text.clone(),
+            tool_calls: 0,
+            iterations: 1,
+            model: req.model,
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        req: AgentRunRequest,
+    ) -> Result<tokio::sync::mpsc::Receiver<AgentRunEvent>, String> {
+        let result = self.run(req).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let _ = tx.send(AgentRunEvent::Completed { result }).await;
+        Ok(rx)
+    }
+}
+
+/// A provider that is never reached on the engine path; it exists only so a
+/// real `ProviderStack` can be built without a live upstream.
+struct StubProvider;
+
+#[async_trait]
+impl LLMProvider for StubProvider {
+    fn get_base_url(&self) -> String {
+        "http://stub".into()
+    }
+    async fn health_check(&self) -> Result<(), Box<dyn StdError + Send + Sync>> {
+        Ok(())
+    }
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn StdError + Send + Sync>> {
+        Ok(Vec::new())
+    }
+    async fn chat(
+        &self,
+        _req: ChatRequest,
+    ) -> Result<ChatResponse, Box<dyn StdError + Send + Sync>> {
+        Err("stub provider is not used on the engine path".into())
+    }
+    async fn chat_stream(
+        &self,
+        _req: ChatRequest,
+    ) -> Result<
+        Pin<
+            Box<
+                dyn tokio_stream::Stream<
+                        Item = Result<ChatStreamEvent, Box<dyn StdError + Send + Sync>>,
+                    > + Send,
+            >,
+        >,
+        Box<dyn StdError + Send + Sync>,
+    > {
+        Err("stub provider is not used on the engine path".into())
+    }
+}
+
+fn register_agent(registry: &AgentRegistry, id: &str, project: Option<&str>) {
+    let agent = Agent {
+        id: id.to_string(),
+        project_id: project.map(str::to_string),
+        config: AgentConfig {
+            name: id.to_string(),
+            model: "model-a".into(),
+            system_prompt: format!("you are {id}"),
+            ..Default::default()
+        },
+    };
+    let scope = ScopeBuilder::build(&agent).expect("manifest builds a scope");
+    registry.register(agent, scope);
+}
+
+fn test_enricher() -> Arc<ContextEnricher> {
+    Arc::new(ContextEnricher::new(
+        Arc::new(ContextStore::new()),
+        Arc::new(SkillManager::new()),
+        "model-a".into(),
+        Arc::new(ProviderRegistry::default()),
+        ProviderKind::Ollama,
+    ))
+}
+
+struct World {
+    _temp: tempfile::TempDir,
+    _dir_guard: EnvGuard,
+    _secret_guard: EnvGuard,
+    app: Router,
+    calls: Arc<Mutex<Vec<RecordedCall>>>,
+}
+
+/// A production-shaped world: real Router, real AppState builder (so the
+/// verifier companion is the boot one), real execution store, fake engine.
+async fn world(channels_toml: &str) -> World {
+    let temp = tempfile::tempdir().unwrap();
+    let dir_guard = EnvGuard::set("LLAMA_R_DIR", temp.path().to_str().unwrap());
+    let secret_guard = EnvGuard::set(SECRET_ENV, SECRET);
+    std::fs::write(temp.path().join("channels.toml"), channels_toml).unwrap();
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let engine = Arc::new(RecordingEngine {
+        calls: calls.clone(),
+        text: "engine answer".into(),
+    });
+
+    let registry = Arc::new(AgentRegistry::new());
+    register_agent(&registry, "billing", Some("proj"));
+    register_agent(&registry, "admin", Some("other"));
+
+    let mut stack = ProviderStack::new(Arc::new(StubProvider), "model-a");
+    stack.provider_name = "ollama".into();
+    stack.agent_runtime = Some(Arc::new(AgentRuntime {
+        registry: registry.clone(),
+        engine,
+        history: None,
+        rag: None,
+        enricher: test_enricher(),
+        compactor: Arc::new(NoopCompactor),
+        selector: Arc::new(CurrentModelSelector),
+    }));
+
+    let store = Arc::new(
+        SqliteExecutionStore::new(temp.path().join("exec.db")).expect("execution store opens"),
+    );
+    let state = build_app_state_with_gate(
+        Arc::new(ApprovalGate::default()),
+        stack,
+        registry,
+        Arc::new(SkillManager::new()),
+        Arc::new(ContextStore::new()),
+        Arc::new(Mutex::new(VecDeque::new())),
+        vec![],
+        Arc::new(StaticMcpRegistry::new()),
+        None,
+        store,
+    );
+    let app = Router::new()
+        .route("/api/webhooks/:channel", post(webhook))
+        .route("/api/executions/:id", get(get_execution))
+        .with_state(state.clone());
+
+    World {
+        _temp: temp,
+        _dir_guard: dir_guard,
+        _secret_guard: secret_guard,
+        app,
+        calls,
+    }
+}
+
+async fn send(
+    app: &Router,
+    channel: &str,
+    body: &[u8],
+    signature: Option<&str>,
+    extra: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("/api/webhooks/{channel}"))
+        .header("content-type", "application/json");
+    if let Some(sig) = signature {
+        builder = builder.header("x-signature", sig);
+    }
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(Body::from(body.to_vec())).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
+const CHANNEL_SYNC: &str = r#"
+[[channels]]
+id = "github"
+agent_id = "billing"
+project_id = "proj"
+mode = "sync"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_TASK3_SECRET"
+template = "{{action}} by {{sender.login}}"
+enabled = true
+"#;
+
+#[tokio::test]
+async fn valid_signature_reaches_agent() {
+    let _lock = ENV_LOCK.lock().await;
+    let w = world(CHANNEL_SYNC).await;
+    let body = r#"{"action":"opened","sender":{"login":"octocat"}}"#;
+
+    let (status, value) = send(&w.app, "github", body.as_bytes(), Some(&signed(body)), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{value:?}");
+    // The response carries the agent's answer; the rendered message is what
+    // reached the agent, asserted on the recorded call below.
+    assert_eq!(value["message"]["content"], "engine answer");
+
+    let calls = w.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "exactly one agent turn");
+    assert_eq!(calls[0].agent_id, "billing");
+    assert_eq!(calls[0].project_id.as_deref(), Some("proj"));
+    assert_eq!(calls[0].user_message, "opened by octocat");
+}
+
+#[tokio::test]
+async fn invalid_or_missing_signature_is_401_before_parsing() {
+    let _lock = ENV_LOCK.lock().await;
+    let w = world(CHANNEL_SYNC).await;
+    let broken = "this is not json {{{";
+
+    // A bad signature over a malformed body is 401 — verification runs BEFORE
+    // JSON parsing, so the malformed body is never looked at.
+    let bad = format!("sha256={}", "0".repeat(64));
+    let (status, _) = send(&w.app, "github", broken.as_bytes(), Some(&bad), &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // No signature at all is also 401, even for a well-formed body.
+    let body = r#"{"action":"opened","sender":{"login":"octocat"}}"#;
+    let (status, _) = send(&w.app, "github", body.as_bytes(), None, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A valid signature over the same malformed body DOES reach parsing (400),
+    // which proves the 401 above was the gate, not a coincidence.
+    let (status, _) = send(
+        &w.app,
+        "github",
+        broken.as_bytes(),
+        Some(&signed(broken)),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        w.calls.lock().unwrap().is_empty(),
+        "no unsigned turn may reach an agent"
+    );
+}
+
+#[tokio::test]
+async fn sync_mode_returns_agent_answer() {
+    let _lock = ENV_LOCK.lock().await;
+    let w = world(
+        r#"
+[[channels]]
+id = "github"
+agent_id = "billing"
+project_id = "proj"
+mode = "sync"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_TASK3_SECRET"
+enabled = true
+"#,
+    )
+    .await;
+    let body = r#"{"action":"opened"}"#;
+
+    let (status, value) = send(&w.app, "github", body.as_bytes(), Some(&signed(body)), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{value:?}");
+    assert_eq!(value["message"]["role"], "assistant");
+    assert_eq!(value["message"]["content"], "engine answer");
+    assert_eq!(value["done"], true);
+    // No template means the raw body is the user message.
+    assert_eq!(w.calls.lock().unwrap()[0].user_message, body);
+}
+
+#[tokio::test]
+async fn async_mode_returns_202_with_execution_id() {
+    let _lock = ENV_LOCK.lock().await;
+    let w = world(
+        r#"
+[[channels]]
+id = "github"
+agent_id = "billing"
+project_id = "proj"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_TASK3_SECRET"
+enabled = true
+"#,
+    )
+    .await;
+    let body = r#"{"action":"opened"}"#;
+
+    let (status, value) = send(&w.app, "github", body.as_bytes(), Some(&signed(body)), &[]).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{value:?}");
+    let execution_id = value["execution_id"]
+        .as_str()
+        .expect("202 carries an execution_id");
+    assert!(!execution_id.is_empty());
+
+    // The id returned now MUST be the one observed in GET /api/executions/:id
+    // once the spawned turn has run and finalised.
+    let mut detail = Value::Null;
+    for _ in 0..100 {
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/executions/{execution_id}"))
+            .header("x-debug", "true")
+            .body(Body::empty())
+            .unwrap();
+        let response = w.app.clone().oneshot(request).await.unwrap();
+        if response.status() == StatusCode::OK {
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            detail = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            let status = detail["execution"]["status"].as_str().unwrap_or("");
+            if status == "Completed" || status == "Failed" {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(detail["execution"]["id"].as_str(), Some(execution_id));
+    let status = detail["execution"]["status"].as_str().unwrap_or("");
+    assert!(
+        status == "Completed" || status == "Failed",
+        "turn never reached a terminal status: {detail:?}"
+    );
+    assert_eq!(w.calls.lock().unwrap().len(), 1, "engine eventually ran");
+}
+
+#[tokio::test]
+async fn channel_cannot_force_debug_or_cross_project_agent() {
+    let _lock = ENV_LOCK.lock().await;
+    let w = world(
+        r#"
+[[channels]]
+id = "github"
+agent_id = "billing"
+project_id = "proj"
+mode = "sync"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_TASK3_SECRET"
+enabled = true
+
+[[channels]]
+id = "bad"
+agent_id = "admin"
+project_id = "proj"
+mode = "sync"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_TASK3_SECRET"
+enabled = true
+
+[[channels]]
+id = "ghost-async"
+agent_id = "ghost"
+project_id = "proj"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_TASK3_SECRET"
+enabled = true
+"#,
+    )
+    .await;
+    let body = r#"{"action":"opened"}"#;
+
+    // The emitter tries to force a cross-project agent and X-Debug. Neither
+    // header may change the selection built from the channel config.
+    let (status, value) = send(
+        &w.app,
+        "github",
+        body.as_bytes(),
+        Some(&signed(body)),
+        &[
+            ("x-project", "other"),
+            ("x-agent", "admin"),
+            ("x-debug", "true"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value:?}");
+    assert!(
+        value.get("debug_prompt").is_none() && value.get("debug_route").is_none(),
+        "emitter-supplied X-Debug must not reach dispatch: {value:?}"
+    );
+    {
+        let calls = w.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].agent_id, "billing");
+        assert_eq!(calls[0].project_id.as_deref(), Some("proj"));
+    }
+
+    // A channel configured with another project's agent cannot resolve inside
+    // its own project: the config-only selection yields the same 400 as a
+    // header-pinned request naming a missing agent.
+    let (status, _) = send(&w.app, "bad", body.as_bytes(), Some(&signed(body)), &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        w.calls.lock().unwrap().len(),
+        1,
+        "no cross-project turn ran"
+    );
+
+    // A missing agent is a 400 in async mode too — never a 202 for a turn
+    // that cannot dispatch.
+    let (status, _) = send(
+        &w.app,
+        "ghost-async",
+        body.as_bytes(),
+        Some(&signed(body)),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn unknown_or_disabled_channel_is_404() {
+    let _lock = ENV_LOCK.lock().await;
+    let w = world(
+        r#"
+[[channels]]
+id = "github"
+agent_id = "billing"
+project_id = "proj"
+mode = "sync"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_TASK3_SECRET"
+enabled = true
+
+[[channels]]
+id = "legacy"
+agent_id = "billing"
+project_id = "proj"
+mode = "sync"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_TASK3_SECRET"
+enabled = false
+"#,
+    )
+    .await;
+    let body = r#"{"action":"opened"}"#;
+
+    let (status, _) = send(&w.app, "nope", body.as_bytes(), Some(&signed(body)), &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&w.app, "legacy", body.as_bytes(), Some(&signed(body)), &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(w.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn secret_never_appears_in_error_or_log() {
+    let _lock = ENV_LOCK.lock().await;
+    let w = world(
+        r#"
+[[channels]]
+id = "github"
+agent_id = "billing"
+project_id = "proj"
+mode = "sync"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_TASK3_SECRET"
+template = "{{action}}"
+enabled = true
+
+[[channels]]
+id = "templbad"
+agent_id = "billing"
+project_id = "proj"
+mode = "sync"
+signature_header = "X-Signature"
+auth_env = "WEBHOOK_TASK3_SECRET"
+template = "{{no.such.path}}"
+enabled = true
+"#,
+    )
+    .await;
+
+    let body = format!(r#"{{"token":"{PAYLOAD_SECRET}","action":"opened"}}"#);
+    let signature = signed(&body);
+    let bad_signature = format!("sha256={}", "a".repeat(64));
+
+    let buf = SharedBuf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .without_time()
+        .with_target(false)
+        .finish();
+    // current_thread keeps the subscriber guard on the polling thread, so it
+    // stays installed across every `.await` below.
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    let (status, value) = send(&w.app, "github", body.as_bytes(), Some(&bad_signature), &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(!value.to_string().contains(PAYLOAD_SECRET));
+    assert!(!value.to_string().contains(SECRET));
+
+    // A valid signature, but the template names an unknown path: the error
+    // may name that path and nothing from the payload.
+    let (status, value) = send(&w.app, "templbad", body.as_bytes(), Some(&signature), &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value:?}");
+    let text = value.to_string();
+    assert!(
+        text.contains("no.such.path"),
+        "the error names the path: {text:?}"
+    );
+    assert!(
+        !text.contains(PAYLOAD_SECRET),
+        "the error echoed the body: {text:?}"
+    );
+    assert!(
+        !text.contains(SECRET),
+        "the error echoed the secret: {text:?}"
+    );
+
+    drop(_subscriber_guard);
+    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        !log.contains(PAYLOAD_SECRET),
+        "log echoed the body: {log:?}"
+    );
+    assert!(!log.contains(SECRET), "log echoed the secret: {log:?}");
+    assert!(
+        !log.contains(&bad_signature),
+        "log echoed the signature: {log:?}"
+    );
+    assert!(
+        !log.contains(&signature),
+        "log echoed the signature: {log:?}"
     );
 }

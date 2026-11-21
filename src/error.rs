@@ -23,6 +23,10 @@ pub enum AppError {
     Validation(String),
     #[error("Not found: {0}")]
     NotFound(String),
+    /// A generic authentication refusal. The message is fixed by the caller
+    /// (e.g. "invalid signature") so no credential, body or signature is echoed.
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
     #[error("Conflict: {0}")]
     Conflict(String),
     #[error("Forbidden: {0}")]
@@ -59,6 +63,7 @@ impl AppError {
             Self::Config(_) => "config_error",
             Self::Validation(_) => "validation_error",
             Self::NotFound(_) => "not_found",
+            Self::Unauthorized(_) => "unauthorized",
             Self::Conflict(_) => "conflict",
             Self::Forbidden(_) => "forbidden",
             Self::Unavailable(_) => "unavailable",
@@ -80,6 +85,7 @@ impl AppError {
         match self {
             Self::Validation(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             // A deliberately disabled feature is not a server fault.

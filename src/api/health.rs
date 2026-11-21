@@ -229,6 +229,7 @@ mod tests {
             selector: Arc::new(crate::adapters::context::CurrentModelSelector),
             execution_store: Arc::new(crate::adapters::execution::NoOpExecutionStore),
             delegator: std::sync::OnceLock::new(),
+            channel_verifier: Arc::new(crate::adapters::channel::HmacSha256Verifier),
         });
         (temp_dir, state)
     }

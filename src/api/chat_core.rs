@@ -203,6 +203,7 @@ async fn begin_turn_execution(
     conversation_id: Option<&str>,
     prepared: &ChatRequest,
     resume_execution_id: Option<Uuid>,
+    fresh_execution_id: Option<Uuid>,
 ) -> Option<AgentExecution> {
     let resuming = resume_execution_id.is_some();
     let execution = engine_ids.map(|(project_id, agent_id)| {
@@ -217,9 +218,12 @@ async fn begin_turn_execution(
             });
         new_execution(
             // A retry reuses the original id; that is the whole point — the
-            // idempotency guard keys its replay cache on it. A fresh turn mints
-            // a new id as before.
-            resume_execution_id.unwrap_or_else(Uuid::new_v4),
+            // idempotency guard keys its replay cache on it. A caller that must
+            // know the id before dispatch (an async webhook answering 202)
+            // supplies a fresh one; otherwise a new id is minted as before.
+            resume_execution_id
+                .or(fresh_execution_id)
+                .unwrap_or_else(Uuid::new_v4),
             qualified_id,
             services.provider_name.clone(),
             prepared.model.clone(),
@@ -841,6 +845,31 @@ pub async fn execute_chat_with_id(
         None,
         None,
         None,
+        None,
+    )
+    .await
+}
+
+/// Run a fresh turn under a caller-supplied execution id. Used by the async
+/// webhook path, which must know the id before answering `202` so the client
+/// can later observe the turn at `GET /api/executions/:id`. This is NOT a
+/// retry: the execution row is created with this id (`record_start`), not
+/// resumed, so no replay cache can apply.
+pub async fn execute_chat_with_new_id(
+    state: &AppState,
+    payload: ChatRequest,
+    selection: AgentSelection<'_>,
+    execution_id: Uuid,
+) -> Result<ChatResponse, AppError> {
+    execute_chat_with_id_and_budget(
+        state,
+        payload,
+        selection,
+        None,
+        None,
+        None,
+        None,
+        Some(execution_id),
     )
     .await
 }
@@ -851,6 +880,10 @@ pub async fn execute_chat_with_id(
 /// spend from it instead of minting a fresh one. Ordinary callers pass `None`
 /// and keep the exact behaviour they always had. Kept separate so no existing
 /// public signature changes — only this internal entry point knows it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one request snapshot plus the additive retry id, shared budget and fresh id for async webhooks"
+)]
 pub(crate) async fn execute_chat_with_id_and_budget(
     state: &AppState,
     payload: ChatRequest,
@@ -859,6 +892,7 @@ pub(crate) async fn execute_chat_with_id_and_budget(
     shared_budget: Option<Arc<dyn ToolBudget>>,
     delegation_context: Option<DelegationContext>,
     approval_event_tx: Option<tokio::sync::mpsc::Sender<AgentRunEvent>>,
+    fresh_execution_id: Option<Uuid>,
 ) -> Result<ChatResponse, AppError> {
     // ONE snapshot for the whole request. Every provider-dependent field below
     // — the agent runtime, the engine's default model, the chat provider and
@@ -900,6 +934,7 @@ pub(crate) async fn execute_chat_with_id_and_budget(
         selection.conversation_id,
         &prepared,
         resume_execution_id,
+        fresh_execution_id,
     )
     .await;
 
@@ -1089,6 +1124,7 @@ async fn execute_chat_stream_detail(
         selection.conversation_id,
         &prepared,
         resume_execution_id,
+        None,
     )
     .await;
     let run_id = execution
@@ -1303,6 +1339,7 @@ pub async fn delegate_turn(
         Some(req.budget.clone()),
         Some(child_context),
         approval_event_tx,
+        None,
     );
     match tokio::time::timeout_at(tokio::time::Instant::from_std(req.deadline), fut).await {
         Ok(Ok(response)) => Ok(DelegateResult {

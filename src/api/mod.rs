@@ -15,3 +15,4 @@ pub mod route_api;
 pub mod route_resolution;
 pub mod skill_api;
 pub mod sse;
+pub mod webhook_api;

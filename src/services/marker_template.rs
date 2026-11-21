@@ -15,6 +15,23 @@
 use serde_json::Value;
 use std::borrow::Cow;
 
+/// The message a webhook channel sends to its agent: a blank/absent template
+/// means the raw body is the message, a declared one is rendered over the
+/// parsed payload.
+///
+/// Kept here (next to the renderer) rather than in the HTTP handler so the
+/// rule has one definition that both production and tests exercise.
+pub fn message_from_template(
+    template: Option<&str>,
+    payload: &Value,
+    raw_body: &str,
+) -> Result<String, String> {
+    match template {
+        Some(t) if !t.trim().is_empty() => render_markers(t, payload),
+        _ => Ok(raw_body.to_string()),
+    }
+}
+
 /// Renders `template` by replacing each `{{path.to.field}}` marker with the
 /// scalar value found at that dot-path in `payload`.
 ///

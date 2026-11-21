@@ -27,6 +27,7 @@ use crate::api::observability::AppObservability;
 use crate::api::rag_api::{rag_delete_document, rag_ingest, rag_query};
 use crate::api::route_api::route_preview;
 use crate::api::skill_api::list_skills_api;
+use crate::api::webhook_api::webhook;
 use crate::config::{Config, ProviderKind, OPENROUTER_BASE_URL};
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::ContextStore;
@@ -303,6 +304,7 @@ pub fn build_app_state_with_gate(
         selector,
         execution_store,
         delegator: OnceLock::new(),
+        channel_verifier: Arc::new(crate::adapters::channel::HmacSha256Verifier),
     });
     // The delegator needs the *finished* Arc<AppState> so its Weak can upgrade
     // at chat time. Building it here means every state factory (boot and tests)
@@ -382,6 +384,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/conversations/:id/export",
             post(export_conversation_handler),
         )
+        .route("/api/webhooks/:channel", post(webhook))
         .route("/openapi.json", get(serve_openapi_json))
         .route("/docs", get(serve_scalar_ui))
         .layer(cors)

@@ -10,6 +10,7 @@ use crate::domain::models::{
 use crate::error::AppError;
 use crate::optimizer::metrics::TokenMetrics;
 use crate::ports::auto::AutoDecider;
+use crate::ports::channel::ChannelSignatureVerifier;
 use crate::ports::delegation::Delegator;
 use crate::ports::execution::ExecutionStore;
 use crate::ports::mcp::McpServerRegistry;
@@ -101,6 +102,11 @@ pub struct AppState {
     /// so a settings Apply cannot lose it. `None` until boot installs it; a
     /// caller that finds it absent gets a named error, never a panic.
     pub delegator: OnceLock<Arc<dyn Delegator>>,
+    /// Signature verifier for inbound webhook channels. Built once at boot from
+    /// the HMAC adapter and deliberately kept outside the hot-swapped
+    /// `ProviderStack`: a settings Apply rebuilds companions but must not drop
+    /// the verifier a signed request depends on.
+    pub channel_verifier: Arc<dyn ChannelSignatureVerifier>,
 }
 
 impl AppState {
