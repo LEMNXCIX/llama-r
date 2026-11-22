@@ -3,8 +3,10 @@
 //! OpenCode exposes a stateless one-shot text endpoint — not an OpenAI-shaped
 //! chat endpoint — so this module owns its wire shapes. An optional server
 //! password is sent as HTTP **basic auth** (`opencode:<password>`), never as a
-//! Bearer token and never in a URL. Streaming is unsupported: `chat_stream`
-//! returns `AppError::Unavailable` before opening a connection.
+//! Bearer token and never in a URL. The one-shot endpoint takes a `Model.Ref`
+//! object (`id`/`providerID`/`modelID`) and a `prompt` — resolved from
+//! `/api/model` when available, synthesized otherwise. Streaming is unsupported:
+//! `chat_stream` returns `AppError::Unavailable` before opening a connection.
 
 use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
 use crate::error::AppError;
@@ -48,6 +50,48 @@ impl OpenCodeProvider {
             Some(password) => builder.basic_auth("opencode", Some(password)),
             None => builder,
         }
+    }
+
+    /// Build the `Model.Ref` the generate endpoint expects. `/api/model` is the
+    /// authority for `providerID`/`modelID` (a bare id does not say which
+    /// provider serves it). A missing/unreachable catalog falls back to a
+    /// synthesized ref so an older server still works.
+    async fn model_ref(&self, model: &str) -> serde_json::Value {
+        let lookup = self
+            .with_auth(self.client.get(self.endpoint("/api/model")))
+            .send()
+            .await;
+        if let Ok(response) = lookup {
+            if response.status().is_success() {
+                if let Ok(value) = response.json::<serde_json::Value>().await {
+                    let entries = value
+                        .as_array()
+                        .or_else(|| value.get("data").and_then(|data| data.as_array()));
+                    if let Some(entry) = entries.and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|entry| entry.get("id").and_then(|id| id.as_str()) == Some(model))
+                    }) {
+                        return serde_json::json!({
+                            "id": entry.get("id").and_then(|id| id.as_str()).unwrap_or(model),
+                            "providerID": entry
+                                .get("providerID")
+                                .and_then(|id| id.as_str())
+                                .unwrap_or("opencode"),
+                            "modelID": entry
+                                .get("modelID")
+                                .and_then(|id| id.as_str())
+                                .unwrap_or(model),
+                        });
+                    }
+                }
+            }
+        }
+        serde_json::json!({
+            "id": model,
+            "providerID": "opencode",
+            "modelID": model,
+        })
     }
 }
 
@@ -143,8 +187,8 @@ impl LLMProvider for OpenCodeProvider {
             &request.model
         };
         let body = serde_json::json!({
-            "model": model,
-            "text": flatten_messages(&request.messages),
+            "model": self.model_ref(model).await,
+            "prompt": flatten_messages(&request.messages),
         });
         let resp = self
             .with_auth(

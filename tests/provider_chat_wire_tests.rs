@@ -221,9 +221,14 @@ async fn openrouter_sends_bearer_and_uses_v1_chat_completions() {
 
 #[tokio::test]
 async fn opencode_uses_generate_text_without_an_openai_path() {
-    let server =
-        FakeChatServer::start(&[("/api/experimental/generate/text", opencode_reply("Bonjour"))])
-            .await;
+    let server = FakeChatServer::start(&[
+        (
+            "/api/model",
+            serde_json::json!([{"id": "anthropic/claude", "providerID": "anthropic", "modelID": "claude"}]),
+        ),
+        ("/api/experimental/generate/text", opencode_reply("Bonjour")),
+    ])
+    .await;
     let provider = OpenCodeProvider::new(server.url(), None, "anthropic/claude".to_string());
 
     let response = provider.chat(chat_request("Hello")).await.unwrap();
@@ -231,15 +236,65 @@ async fn opencode_uses_generate_text_without_an_openai_path() {
     assert_eq!(response.message.role, "assistant");
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 1);
-    let request = &requests[0];
-    assert_eq!(request.path, "/api/experimental/generate/text");
+    assert_eq!(requests.len(), 2);
+    let request = requests
+        .iter()
+        .find(|request| request.path == "/api/experimental/generate/text")
+        .expect("generate/text request");
     assert!(
         header(&request.headers, "authorization").is_none(),
         "no configured key means no auth header"
     );
-    assert_eq!(request.body["model"], "anthropic/claude");
-    assert_eq!(request.body["text"], "Hello");
+    assert_eq!(request.body["model"]["id"], "anthropic/claude");
+    assert_eq!(request.body["model"]["providerID"], "anthropic");
+    assert_eq!(request.body["model"]["modelID"], "claude");
+    assert_eq!(request.body["prompt"], "Hello");
+    assert!(
+        request.body.get("text").is_none(),
+        "the legacy `text` field must not be sent"
+    );
+}
+
+#[tokio::test]
+async fn opencode_uses_catalog_provider_id_for_model_ref() {
+    let server = FakeChatServer::start(&[
+        (
+            "/api/model",
+            serde_json::json!([{"id": "google/gemini", "providerID": "vercel", "modelID": "gemini"}]),
+        ),
+        ("/api/experimental/generate/text", opencode_reply("ok")),
+    ])
+    .await;
+    let provider = OpenCodeProvider::new(server.url(), None, "google/gemini".to_string());
+
+    provider.chat(chat_request("Hi")).await.unwrap();
+
+    let request = server
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/api/experimental/generate/text")
+        .unwrap();
+    assert_eq!(request.body["model"]["providerID"], "vercel");
+    assert_eq!(request.body["model"]["modelID"], "gemini");
+}
+
+#[tokio::test]
+async fn opencode_synthesizes_model_ref_when_catalog_is_unavailable() {
+    let server =
+        FakeChatServer::start(&[("/api/experimental/generate/text", opencode_reply("ok"))]).await;
+    let provider = OpenCodeProvider::new(server.url(), None, "some-model".to_string());
+
+    provider.chat(chat_request("Hi")).await.unwrap();
+
+    let request = server
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/api/experimental/generate/text")
+        .unwrap();
+    assert_eq!(request.body["model"]["id"], "some-model");
+    assert_eq!(request.body["model"]["providerID"], "opencode");
+    assert_eq!(request.body["model"]["modelID"], "some-model");
+    assert_eq!(request.body["prompt"], "Hi");
 }
 
 #[tokio::test]
@@ -296,12 +351,15 @@ async fn opencode_sends_basic_auth_when_a_password_is_configured() {
     provider.chat(chat_request("Hello")).await.unwrap();
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 1);
+    // The model-catalog lookup and the generate call must both be authenticated.
+    assert_eq!(requests.len(), 2);
     // base64("opencode:secret") — basic auth, never Bearer.
-    assert_eq!(
-        header(&requests[0].headers, "authorization"),
-        Some("Basic b3BlbmNvZGU6c2VjcmV0")
-    );
+    for request in &requests {
+        assert_eq!(
+            header(&request.headers, "authorization"),
+            Some("Basic b3BlbmNvZGU6c2VjcmV0")
+        );
+    }
 }
 
 #[tokio::test]
