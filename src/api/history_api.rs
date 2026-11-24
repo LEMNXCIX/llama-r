@@ -52,7 +52,7 @@ pub async fn list_conversations_handler(
         (Some(p), Some(a)) => format!("{p}/{a}"),
         (Some(p), None) => format!("{p}/{p}"),
         (None, Some(a)) => a.clone(),
-        (None, None) => unreachable!(),
+        (None, None) => return Ok(Json(Vec::new())),
     };
 
     let records = history
