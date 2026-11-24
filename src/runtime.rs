@@ -931,26 +931,34 @@ fn chat_provider_from_profile(
 ) -> Arc<dyn LLMProvider + Send + Sync> {
     let key = profile_api_key(profile);
     let base_url = profile.base_url.clone();
+    let timeout = std::time::Duration::from_millis(profile.timeout_ms);
     match profile.kind {
-        ProviderKind::Ollama => Arc::new(OllamaProvider::new(
+        ProviderKind::Ollama => Arc::new(OllamaProvider::with_timeout(
             base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+            model.to_string(),
+            timeout,
         )),
-        ProviderKind::OpenRouter => Arc::new(OpenAiCompatibleProvider::new(
+        ProviderKind::OpenRouter => Arc::new(OpenAiCompatibleProvider::with_timeout(
             base_url.unwrap_or_else(|| OPENROUTER_BASE_URL.to_string()),
             key,
             model.to_string(),
+            timeout,
         )),
-        ProviderKind::OpenCode => Arc::new(OpenCodeProvider::new(
+        ProviderKind::OpenCode => Arc::new(OpenCodeProvider::with_timeout(
             base_url.unwrap_or_else(|| "http://127.0.0.1:4096".to_string()),
             if key.is_empty() { None } else { Some(key) },
             model.to_string(),
+            timeout,
         )),
-        ProviderKind::OpenAiCompatible => Arc::new(OpenAiCompatibleProvider::with_provider_name(
-            base_url.unwrap_or_else(|| "https://api.openai.com".to_string()),
-            key,
-            model.to_string(),
-            profile.name.clone(),
-        )),
+        ProviderKind::OpenAiCompatible => {
+            Arc::new(OpenAiCompatibleProvider::with_provider_name_and_timeout(
+                base_url.unwrap_or_else(|| "https://api.openai.com".to_string()),
+                key,
+                model.to_string(),
+                profile.name.clone(),
+                timeout,
+            ))
+        }
         ProviderKind::Anthropic => {
             Arc::new(AnthropicProvider::new(base_url, key, model.to_string()))
         }
@@ -1050,7 +1058,11 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
 
     match config.provider {
         ProviderKind::Ollama => {
-            provider = Arc::new(OllamaProvider::new(config.ollama_url.clone()));
+            provider = Arc::new(OllamaProvider::with_timeout(
+                config.ollama_url.clone(),
+                config.default_model.clone(),
+                std::time::Duration::from_millis(config.http_timeout_ms),
+            ));
             embeddings = Some(Arc::new(OllamaEmbeddings::new(
                 config.ollama_url.clone(),
                 config.embedding_model.clone(),
@@ -1065,10 +1077,11 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
                 .openai_base_url
                 .clone()
                 .unwrap_or_else(|| OPENROUTER_BASE_URL.to_string());
-            provider = Arc::new(OpenAiCompatibleProvider::new(
+            provider = Arc::new(OpenAiCompatibleProvider::with_timeout(
                 base_url,
                 config.openrouter_api_key.clone().unwrap_or_default(),
                 config.default_model.clone(),
+                std::time::Duration::from_millis(config.http_timeout_ms),
             ));
             embeddings = Some(Arc::new(OpenRouterEmbeddings::new(
                 config.openrouter_api_key.clone().unwrap_or_default(),
@@ -1086,10 +1099,11 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
             };
         }
         ProviderKind::OpenCode => {
-            provider = Arc::new(OpenCodeProvider::new(
+            provider = Arc::new(OpenCodeProvider::with_timeout(
                 config.opencode_url.clone(),
                 config.opencode_api_key.clone(),
                 config.default_model.clone(),
+                std::time::Duration::from_millis(config.http_timeout_ms),
             ));
             // OpenCode serves no embeddings endpoint. Ollama can supply them,
             // but only when a URL was configured: an empty OLLAMA_URL means no
@@ -1116,11 +1130,12 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.openai.com".to_string());
-            provider = Arc::new(OpenAiCompatibleProvider::with_provider_name(
+            provider = Arc::new(OpenAiCompatibleProvider::with_provider_name_and_timeout(
                 base_url.clone(),
                 key.clone(),
                 config.default_model.clone(),
                 config.provider.to_string(),
+                std::time::Duration::from_millis(config.http_timeout_ms),
             ));
             embeddings = Some(Arc::new(OpenAiCompatibleEmbeddings::new(
                 base_url,

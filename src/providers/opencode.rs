@@ -10,11 +10,13 @@
 
 use crate::domain::models::{ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo};
 use crate::error::AppError;
+use crate::net;
 use crate::providers::LLMProvider;
 use async_trait::async_trait;
 use reqwest::{Client, RequestBuilder};
 use std::error::Error;
 use std::pin::Pin;
+use std::time::Duration;
 use tokio_stream::Stream;
 
 const PROVIDER_NAME: &str = "opencode";
@@ -30,8 +32,17 @@ pub struct OpenCodeProvider {
 
 impl OpenCodeProvider {
     pub fn new(base_url: String, api_key: Option<String>, model: String) -> Self {
+        Self::with_timeout(base_url, api_key, model, Duration::from_millis(30_000))
+    }
+
+    pub fn with_timeout(
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+        timeout: Duration,
+    ) -> Self {
         Self {
-            client: Client::new(),
+            client: net::http_client(timeout).expect("validated timeout"),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,

@@ -1,5 +1,6 @@
 use crate::config::ProviderKind;
 use crate::domain::models::{ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo, Usage};
+use crate::net;
 use crate::providers::capabilities::capabilities_for;
 use crate::providers::LLMProvider;
 use async_trait::async_trait;
@@ -7,6 +8,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::pin::Pin;
+use std::time::Duration;
 use tokio_stream::{Stream, StreamExt};
 
 pub struct OllamaProvider {
@@ -16,8 +18,15 @@ pub struct OllamaProvider {
 
 impl OllamaProvider {
     pub fn new(base_url: String) -> Self {
+        Self::with_timeout(base_url, String::new(), Duration::from_millis(30_000))
+    }
+
+    /// Build an `OllamaProvider` whose outbound requests are bounded by
+    /// `timeout`. `model` is accepted for API symmetry with the other providers
+    /// and is not stored (Ollama resolves the model per request).
+    pub fn with_timeout(base_url: String, _model: String, timeout: Duration) -> Self {
         Self {
-            client: Client::new(),
+            client: net::http_client(timeout).expect("validated timeout"),
             base_url,
         }
     }
