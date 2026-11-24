@@ -8,6 +8,7 @@ pub mod domain;
 pub mod error;
 pub mod evals;
 pub mod mcp;
+pub mod net;
 pub mod optimizer;
 pub mod ports;
 pub mod providers;
