@@ -69,6 +69,11 @@ const PROTECTED: &[(&str, &str)] = &[
     ("PUT", "/api/agents/demo"),
     ("DELETE", "/api/agents/demo"),
     ("GET", "/api/agents/demo/scope"),
+    ("GET", "/api/conversations"),
+    ("GET", "/api/conversations/demo"),
+    ("DELETE", "/api/conversations/demo"),
+    ("GET", "/api/conversations/demo/messages"),
+    ("POST", "/api/conversations/demo/export"),
 ];
 
 /// The one fixed refusal body: no token, no reason, no echo. Pinning it as a
@@ -337,10 +342,10 @@ async fn chat_and_webhooks_unauthenticated() {
         assert_ne!(body, admin_body, "GET {uri} must not use the admin refusal");
     }
 
-    // These two listing endpoints were never in the protected set, so they
-    // keep their own status contract (200 or 501 without a store) — just not
-    // the admin refusal.
-    for uri in ["/api/skills", "/api/conversations"] {
+    // `/api/skills` was never in the protected set, so it keeps its own status
+    // contract (200 or 501 without a store) — just not the admin refusal.
+    // `/api/conversations` moved behind the admin token (Task 4).
+    for uri in ["/api/skills"] {
         let (status, body) = send(&router, "GET", uri, None, false, "").await;
         assert_ne!(
             status,

@@ -1,5 +1,6 @@
 use crate::api::chat_core::{
     execute_chat, execute_chat_stream_with_conversation_id, execute_chat_with_new_id,
+    require_messages,
 };
 use crate::api::mcp_api;
 use crate::api::observability::AppObservability;
@@ -224,6 +225,7 @@ async fn turn_has_approval_rules(
     payload: &ChatRequest,
     selection: AgentSelection<'_>,
 ) -> Result<bool, AppError> {
+    require_messages(payload)?;
     let resolved = resolve_selection(state, selection, &payload.messages).await?;
     let agent = if resolved.project_id.is_some() || resolved.agent_id.is_some() {
         state

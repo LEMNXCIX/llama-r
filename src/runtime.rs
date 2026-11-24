@@ -64,6 +64,7 @@ use crate::services::rag_ingest::RagIngestService;
 use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
 use axum::{
+    extract::DefaultBodyLimit,
     middleware::from_fn_with_state,
     routing::{get, post},
     Router,
@@ -75,7 +76,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::RwLock as TokioRwLock;
 use tonic::transport::Server as TonicServer;
-use tower_http::cors::{Any, CorsLayer};
+// `CorsLayer` is built by `crate::net::cors_layer`; no direct import needed.
 
 pub struct Runtime {
     pub config: Config,
@@ -334,21 +335,11 @@ pub fn build_app_state_with_gate(
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-            axum::http::HeaderName::from_static("x-project"),
-            axum::http::HeaderName::from_static("x-agent"),
-            axum::http::HeaderName::from_static("x-debug"),
-            axum::http::HeaderName::from_static("x-conversation-id"),
-            axum::http::HeaderName::from_static("x-admin-token"),
-        ]);
+    let cors =
+        crate::net::cors_layer(&state.config.cors_origins).expect("validated at config load");
 
     // Public surface: chat, webhooks, health, models, MCP, docs and the
-    // conversation/skill listing endpoints. None of these is admin-gated.
+    // skill listing endpoint. None of these is admin-gated.
     let public = Router::new()
         .route("/", get(|| async { "Llama-R API is running" }))
         .route("/health", get(health))
@@ -374,19 +365,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/models", get(list_models))
         .route("/api/chat", post(chat))
         .route("/api/skills", get(list_skills_api))
-        .route("/api/conversations", get(list_conversations_handler))
-        .route(
-            "/api/conversations/:id",
-            get(get_conversation_handler).delete(delete_conversation_handler),
-        )
-        .route(
-            "/api/conversations/:id/messages",
-            get(get_conversation_messages_handler),
-        )
-        .route(
-            "/api/conversations/:id/export",
-            post(export_conversation_handler),
-        )
         .route("/api/webhooks/:channel", post(webhook))
         .route("/openapi.json", get(serve_openapi_json))
         .route("/docs", get(serve_scalar_ui));
@@ -418,9 +396,26 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/rag/query", post(rag_query))
         .route("/api/rag/delete-document", post(rag_delete_document))
         .route("/api/route", post(route_preview))
+        .route("/api/conversations", get(list_conversations_handler))
+        .route(
+            "/api/conversations/:id",
+            get(get_conversation_handler).delete(delete_conversation_handler),
+        )
+        .route(
+            "/api/conversations/:id/messages",
+            get(get_conversation_messages_handler),
+        )
+        .route(
+            "/api/conversations/:id/export",
+            post(export_conversation_handler),
+        )
         .layer(from_fn_with_state(state.clone(), require_admin));
 
-    public.merge(admin).layer(cors).with_state(state)
+    public
+        .merge(admin)
+        .layer(cors)
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        .with_state(state)
 }
 
 pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime, AppError> {
