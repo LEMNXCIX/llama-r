@@ -43,7 +43,10 @@ fn default_cors_origins() -> Vec<String> {
 /// dropped; an empty list (absent, empty or only separators) means the
 /// documented default. `*` is refused rather than treated as "any origin", and
 /// every entry must be a valid header value so an unrepresentable origin fails
-/// at boot instead of at the CORS layer.
+/// at boot instead of at the CORS layer. Whitespace inside an entry is refused
+/// for the same reason: `HeaderValue::from_str` accepts visible ASCII, so
+/// `not a url` would otherwise pass here and be rejected later by
+/// `net::cors_layer`, making boot abort on a value config load accepted.
 fn cors_origins_from_env() -> Result<Vec<String>, AppError> {
     let Ok(raw) = env::var("CORS_ORIGINS") else {
         return Ok(default_cors_origins());
@@ -65,13 +68,22 @@ fn cors_origins_from_env() -> Result<Vec<String>, AppError> {
                 "CORS_ORIGINS cannot contain '*'".to_string(),
             ));
         }
-        // An origin is a header value: validating here rejects control
-        // characters before the CORS layer ever sees them.
-        axum::http::HeaderValue::from_str(origin).map_err(|_| {
+        let invalid = || {
             AppError::Config(format!(
                 "CORS_ORIGINS contains an invalid origin: '{origin}'"
             ))
-        })?;
+        };
+        // An origin is a scheme, a host and an optional port with no whitespace
+        // anywhere, so an interior space (or an empty entry) is refused here
+        // under the same message `net::cors_layer` uses. Otherwise config load
+        // would accept what that factory rejects, turning a config error into a
+        // boot abort.
+        if origin.is_empty() || origin.chars().any(char::is_whitespace) {
+            return Err(invalid());
+        }
+        // An origin is a header value: validating here rejects control
+        // characters before the CORS layer ever sees them.
+        axum::http::HeaderValue::from_str(origin).map_err(|_| invalid())?;
     }
 
     Ok(origins)
@@ -1019,6 +1031,26 @@ mod tests {
         assert_eq!(
             config.cors_origins,
             vec!["http://localhost:8080", "https://a.example"]
+        );
+    }
+
+    #[test]
+    fn cors_origins_interior_whitespace_is_a_config_error() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        // `HeaderValue::from_str` accepts visible ASCII, so this entry has to be
+        // refused structurally here: `net::cors_layer` refuses it too, and a
+        // config load that accepted it would make boot abort.
+        env::set_var("CORS_ORIGINS", "http://host with space");
+        let err = Config::from_env().expect_err("interior whitespace must be rejected");
+        assert!(matches!(err, AppError::Config(_)), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("CORS_ORIGINS"), "{message}");
+        assert!(
+            message.contains("CORS_ORIGINS contains an invalid origin: 'http://host with space'"),
+            "{message}"
         );
     }
 
