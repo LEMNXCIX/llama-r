@@ -1,5 +1,8 @@
 /target
 /target-tests
+/target-release
+/lcov.info
+*.profraw
 .worktrees
 /agents
 /contextos

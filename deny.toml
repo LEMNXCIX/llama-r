@@ -1,0 +1,30 @@
+# cargo-deny configuration — no `[advisories] ignore` entries are permitted.
+# An advisory must be fixed upstream or in this repo, never silenced here.
+
+[advisories]
+yanked = "warn"
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    # Added after `cargo deny check` reported them as rejected; each is a
+    # permissive, OSI-approved SPDX id from one named transitive crate, not a
+    # blanket allowance:
+    #   Unicode-3.0        — zerovec / icu_* (idna → url) and unicode-ident
+    #   CDLA-Permissive-2.0 — webpki-root-certs (rustls → reqwest)
+    #   Zlib               — foldhash (hashbrown → petgraph → prost-build)
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+highlight = "all"
