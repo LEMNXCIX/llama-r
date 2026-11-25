@@ -278,6 +278,20 @@ impl Config {
     pub fn from_env() -> Result<Self, AppError> {
         dotenv().ok();
 
+        // Secrets live in `.env`, so keep it private on boot too. Best effort:
+        // a restrictive chmod failing (e.g. on a filesystem without permissions)
+        // must never turn a successful load into an error, and the path — never
+        // any secret content — is the only thing named in the warning.
+        #[cfg(unix)]
+        {
+            let base_env = crate::core::paths::get_base_dir().join(".env");
+            restrict_env_permissions(&base_env);
+            let cwd_env = Path::new(".env");
+            if cwd_env != base_env.as_path() && cwd_env.exists() {
+                restrict_env_permissions(cwd_env);
+            }
+        }
+
         let raw_port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
         let port = raw_port.parse().map_err(|_| {
             AppError::Config(format!(
@@ -528,18 +542,28 @@ impl Config {
         // restrictive chmod failing (e.g. on a filesystem without permissions)
         // must never turn a successful save into an error.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(err) = fs::set_permissions(env_path, fs::Permissions::from_mode(0o600)) {
-                tracing::warn!(
-                    path = %env_path.display(),
-                    error = %err,
-                    "Could not restrict .env permissions to 0600"
-                );
-            }
-        }
+        restrict_env_permissions(env_path);
 
         Ok(())
+    }
+}
+
+/// Restrict the permissions of the file at `path` to `0600` on Unix. Best
+/// effort: a filesystem without permission support (or any other I/O error)
+/// must never turn a successful save/load into an error. The warning names only
+/// the path, never the file's contents.
+#[cfg(unix)]
+pub fn restrict_env_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if !path.exists() {
+        return;
+    }
+    if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "Could not restrict .env permissions to 0600"
+        );
     }
 }
 
