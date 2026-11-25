@@ -22,6 +22,7 @@ This file documents the current developer workflows and commands for working on 
 - A failed chat is retried in a **bounded** ladder: the same provider with `DEFAULT_MODEL`, then **one** next *usable* `providers.toml` profile in deterministic name order (profiles with no credential in their `api_key_env` are skipped). It never walks a chain. A fallback answer sets `ChatResponse.served_by` to the secret-free profile name; `ChatResponse.usage` carries upstream token counts, with `cost_usd` computed only when both catalog prices are known (none are set today, so cost stays absent). Streaming failover happens only while opening a stream, and a deliberate 501 is preserved rather than retried against another profile.
 - The provider being unreachable is **not** a startup failure. With `DEFAULT_MODEL` set, llama-r boots degraded and `GET /api/health` reports `"status":"degraded"` with the underlying cause; chat and RAG requests fail with a `502`/`500` naming the connection error. It recovers on its own once the provider is reachable.
 - Without a TTY (systemd, Docker, CI) run `llama-r --server-only` (also accepted as `llama-r run --server-only`): the HTTP and gRPC servers start and stay up until Ctrl-C/SIGTERM, with no TUI. Without that flag the interactive default still starts the TUI — and because `main` aborts both servers when `tui.run()` returns, a headless host without the flag tears them down immediately. `tests/headless_server_tests.rs` pins this: it spawns the real binary with no TTY and polls the real API.
+- **Graceful shutdown:** on Ctrl-C or SIGTERM the servers now drain in-flight requests before exiting (exit code 0). `HTTP_TIMEOUT_MS` and `CORS_ORIGINS` must be reviewed for any LAN deployment — the former bounds outbound calls and the latter is the only set of browser origins allowed to call the gateway.
 - Agent routing is **off by default** (`ROUTER_ENABLED=false`): an update that only ships the router changes nothing. When it is enabled, a chat request carrying `X-Project` but no `X-Agent` is routed to that project's most appropriate agent by a Liquid AI d1 decision model. d1 generates no tokens — it evaluates typed questions in one forward pass and returns calibrated probabilities — so Ollama cannot serve it (its endpoints are generative); it runs in a separate `llama-server` process (`llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0`, which serves `POST /v1/systemone`).
 - A missing or unreachable router is **not** a startup failure, mirroring the provider rule above: with `DEFAULT_MODEL` set llama-r boots and logs a warning, `GET /api/health` reports the router's state, and the requests that would have been routed degrade to the project's general agent — a project with no general agent to degrade to keeps failing with `400`, as it did before routing existed.
 - Routing lives inside the shared chat dispatch, so the HTTP chat endpoints and gRPC both inherit it (`src/api/grpc.rs` builds the same `AgentSelection` and calls the same `execute_chat`). The TUI does not route: it is a separate path, and there you pick an agent deliberately.
@@ -50,6 +51,8 @@ Primary environment variables:
 - `EMBEDDING_DIMENSIONS`: expected vector size, default `768`
 - `RAG_ENABLED`: build/use RAG store at runtime, default `true`
 - `HISTORY_RETENTION_DAYS`: purge conversations older than this many days, default `90`. `0` disables purging.
+- `HTTP_TIMEOUT_MS`: timeout for outbound provider/health HTTP requests, default `30000`. `0` is rejected (a request with no deadline can hang a connection forever).
+- `CORS_ORIGINS`: comma-separated allowlist of web origins permitted by CORS, default `http://localhost,http://127.0.0.1`. `*` is rejected (use an explicit origin). Required when exposing the gateway to a LAN browser; only listed origins receive `Access-Control-Allow-Origin`.
 - `ROUTER_ENABLED`: enable agent routing, default `false`. Off by default so an update that only ships the router changes nothing.
 - `ROUTER_URL`: decision-model origin (the separate `llama-server`), default `http://127.0.0.1:8080`. **Check the port against your build.** Recent llama.cpp defaults to **9931**, not 8080 — read the `listening on` line the server prints and set this to match.
 - `ROUTER_MODEL`: model label for the decision router, default `d1-3b`. It reaches only the adapter's own log line: the body sent to `POST /v1/systemone` is `{state, questions}`, with no model field, because the model is chosen by which `llama-server` process is running.
@@ -245,6 +248,8 @@ GET    /api/conversations/:id/messages
 DELETE /api/conversations/:id
 POST   /api/conversations/:id/export
 ```
+
+These endpoints are part of the **admin group** and require `X-Admin-Token` (breaking change vs. earlier releases, where they were public). A bare `GET /api/conversations` with no `project_id`/`agent_id` returns an empty page (`[]`) instead of every conversation; scope with `?project_id=...&agent_id=...`.
 
 ### MCP
 ```text
@@ -520,8 +525,9 @@ but non-positive value falls back to `5`, matching its old helper).
    constant time with `state.config.admin_token`. Missing or empty token fails
    **every** admin route closed with a fixed, generic `401` that never echoes
    the value. `X-Debug` is additional, not replaced. `/chat`, `/api/chat`,
-   `/v1/chat/completions`, `/api/webhooks/:channel`, health, models, docs and
-   the conversation-history endpoints stay public.
+   `/v1/chat/completions`, `/api/webhooks/:channel`, health, models, docs stay
+   public. Conversation-history endpoints are **admin-gated** (`X-Admin-Token`)
+   as of Fase 10-A (breaking change).
 2. **Approval parking.** `Config::approval_timeout()` returns `None` when
    `APPROVAL_PARK` is on or `APPROVAL_TIMEOUT_SECS` is `0`, so a pending human
    decision never expires (`ApprovalGate::parked()`); a non-streaming gated

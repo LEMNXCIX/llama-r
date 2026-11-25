@@ -557,7 +557,7 @@ pub fn engine_events_to_chat_stream(
 
 /// The one complaint an empty message list gets, checked before resolution so
 /// a request that cannot be answered at all never spends a decision.
-fn require_messages(payload: &ChatRequest) -> Result<(), AppError> {
+pub fn require_messages(payload: &ChatRequest) -> Result<(), AppError> {
     if payload.messages.is_empty() {
         return Err(AppError::Validation(
             "Missing required field: 'messages' cannot be empty.".to_string(),

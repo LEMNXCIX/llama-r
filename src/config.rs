@@ -21,6 +21,74 @@ pub const DEFAULT_REAPER_INTERVAL_SECS: u64 = 5;
 pub const DEFAULT_OTEL_ENDPOINT: &str = "http://127.0.0.1:4318/v1/traces";
 pub const DEFAULT_OTEL_SERVICE_NAME: &str = "llama-r";
 
+/// Default outbound HTTP request timeout, in milliseconds. Applied by the
+/// shared client factory, never read from the environment by an adapter.
+pub const DEFAULT_HTTP_TIMEOUT_MS: u64 = 30000;
+/// Default CORS allowlist: loopback only. A wildcard is never a default and is
+/// rejected outright rather than silently widened.
+pub const DEFAULT_CORS_ORIGINS: &str = "http://localhost,http://127.0.0.1";
+
+/// The documented default allowlist, derived from `DEFAULT_CORS_ORIGINS` so the
+/// constant and the parsed list cannot drift apart.
+fn default_cors_origins() -> Vec<String> {
+    DEFAULT_CORS_ORIGINS
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Parse `CORS_ORIGINS` as a comma-separated allowlist. Blank entries are
+/// dropped; an empty list (absent, empty or only separators) means the
+/// documented default. `*` is refused rather than treated as "any origin", and
+/// every entry must be a valid header value so an unrepresentable origin fails
+/// at boot instead of at the CORS layer. Whitespace inside an entry is refused
+/// for the same reason: `HeaderValue::from_str` accepts visible ASCII, so
+/// `not a url` would otherwise pass here and be rejected later by
+/// `net::cors_layer`, making boot abort on a value config load accepted.
+fn cors_origins_from_env() -> Result<Vec<String>, AppError> {
+    let Ok(raw) = env::var("CORS_ORIGINS") else {
+        return Ok(default_cors_origins());
+    };
+
+    let origins: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(str::to_string)
+        .collect();
+    if origins.is_empty() {
+        return Ok(default_cors_origins());
+    }
+
+    for origin in &origins {
+        if origin == "*" {
+            return Err(AppError::Config(
+                "CORS_ORIGINS cannot contain '*'".to_string(),
+            ));
+        }
+        let invalid = || {
+            AppError::Config(format!(
+                "CORS_ORIGINS contains an invalid origin: '{origin}'"
+            ))
+        };
+        // An origin is a scheme, a host and an optional port with no whitespace
+        // anywhere, so an interior space (or an empty entry) is refused here
+        // under the same message `net::cors_layer` uses. Otherwise config load
+        // would accept what that factory rejects, turning a config error into a
+        // boot abort.
+        if origin.is_empty() || origin.chars().any(char::is_whitespace) {
+            return Err(invalid());
+        }
+        // An origin is a header value: validating here rejects control
+        // characters before the CORS layer ever sees them.
+        axum::http::HeaderValue::from_str(origin).map_err(|_| invalid())?;
+    }
+
+    Ok(origins)
+}
+
 /// The four spellings treated as `true` by the boolean settings. Anything else
 /// (including an absent variable, which is handled by the caller's default) is
 /// `false`.
@@ -158,6 +226,12 @@ pub struct Config {
     pub otel_endpoint: String,
     /// `service.name` resource attribute sent with each span.
     pub otel_service_name: String,
+    /// Outbound HTTP request timeout in milliseconds. Must be greater than `0`;
+    /// `0` (a client with no deadline) is refused at boot.
+    pub http_timeout_ms: u64,
+    /// Allowed CORS origins. Loopback by default; `*` is refused rather than
+    /// widened, and an empty list means the default.
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for Config {
@@ -183,6 +257,8 @@ impl Default for Config {
             otel_enabled: false,
             otel_endpoint: DEFAULT_OTEL_ENDPOINT.to_string(),
             otel_service_name: DEFAULT_OTEL_SERVICE_NAME.to_string(),
+            http_timeout_ms: DEFAULT_HTTP_TIMEOUT_MS,
+            cors_origins: default_cors_origins(),
         }
     }
 }
@@ -201,6 +277,20 @@ impl Config {
 
     pub fn from_env() -> Result<Self, AppError> {
         dotenv().ok();
+
+        // Secrets live in `.env`, so keep it private on boot too. Best effort:
+        // a restrictive chmod failing (e.g. on a filesystem without permissions)
+        // must never turn a successful load into an error, and the path — never
+        // any secret content — is the only thing named in the warning.
+        #[cfg(unix)]
+        {
+            let base_env = crate::core::paths::get_base_dir().join(".env");
+            restrict_env_permissions(&base_env);
+            let cwd_env = Path::new(".env");
+            if cwd_env != base_env.as_path() && cwd_env.exists() {
+                restrict_env_permissions(cwd_env);
+            }
+        }
 
         let raw_port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
         let port = raw_port.parse().map_err(|_| {
@@ -337,6 +427,16 @@ impl Config {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_OTEL_SERVICE_NAME.to_string());
 
+        // A request with no deadline can hang a connection forever, so `0` is
+        // a configuration error rather than a silent "unbounded" spelling.
+        let http_timeout_ms = u64_env("HTTP_TIMEOUT_MS", DEFAULT_HTTP_TIMEOUT_MS)?;
+        if http_timeout_ms == 0 {
+            return Err(AppError::Config(
+                "HTTP_TIMEOUT_MS must be greater than 0".to_string(),
+            ));
+        }
+        let cors_origins = cors_origins_from_env()?;
+
         Ok(Self {
             port,
             provider,
@@ -358,6 +458,8 @@ impl Config {
             otel_enabled,
             otel_endpoint,
             otel_service_name,
+            http_timeout_ms,
+            cors_origins,
         })
     }
 
@@ -405,6 +507,8 @@ impl Config {
             ("OTEL_ENABLED", self.otel_enabled.to_string()),
             ("OTEL_ENDPOINT", self.otel_endpoint.clone()),
             ("OTEL_SERVICE_NAME", self.otel_service_name.clone()),
+            ("HTTP_TIMEOUT_MS", self.http_timeout_ms.to_string()),
+            ("CORS_ORIGINS", self.cors_origins.join(",")),
         ];
 
         for (key, value) in &updates {
@@ -438,18 +542,28 @@ impl Config {
         // restrictive chmod failing (e.g. on a filesystem without permissions)
         // must never turn a successful save into an error.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(err) = fs::set_permissions(env_path, fs::Permissions::from_mode(0o600)) {
-                tracing::warn!(
-                    path = %env_path.display(),
-                    error = %err,
-                    "Could not restrict .env permissions to 0600"
-                );
-            }
-        }
+        restrict_env_permissions(env_path);
 
         Ok(())
+    }
+}
+
+/// Restrict the permissions of the file at `path` to `0600` on Unix. Best
+/// effort: a filesystem without permission support (or any other I/O error)
+/// must never turn a successful save/load into an error. The warning names only
+/// the path, never the file's contents.
+#[cfg(unix)]
+pub fn restrict_env_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if !path.exists() {
+        return;
+    }
+    if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "Could not restrict .env permissions to 0600"
+        );
     }
 }
 
@@ -507,6 +621,8 @@ mod tests {
         "OTEL_ENABLED",
         "OTEL_ENDPOINT",
         "OTEL_SERVICE_NAME",
+        "HTTP_TIMEOUT_MS",
+        "CORS_ORIGINS",
     ];
 
     /// Clears every config env var on entry and restores them on drop. Held
@@ -690,6 +806,8 @@ mod tests {
             "OTEL_ENABLED",
             "OTEL_ENDPOINT",
             "OTEL_SERVICE_NAME",
+            "HTTP_TIMEOUT_MS",
+            "CORS_ORIGINS",
         ] {
             assert!(
                 CONFIG_ENV_VARS.contains(&name),
@@ -881,5 +999,135 @@ mod tests {
         assert!(parsed
             .iter()
             .any(|(key, value)| key == "ADMIN_TOKEN" && value == "secret-token"));
+    }
+
+    // ---- Fase 10-A: network hardening settings ------------------------------
+
+    #[test]
+    fn http_timeout_zero_is_a_config_error() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        env::set_var("HTTP_TIMEOUT_MS", "0");
+        let err = Config::from_env().expect_err("zero timeout must be rejected");
+        assert!(matches!(err, AppError::Config(_)), "{err}");
+        assert!(err.to_string().contains("HTTP_TIMEOUT_MS"), "{err}");
+    }
+
+    #[test]
+    fn http_timeout_defaults_to_30000_and_parses_a_positive_value() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        let config = Config::from_env().expect("config from a cleared env");
+        assert_eq!(config.http_timeout_ms, DEFAULT_HTTP_TIMEOUT_MS);
+        assert_eq!(config.http_timeout_ms, 30_000);
+
+        env::set_var("HTTP_TIMEOUT_MS", "5000");
+        assert_eq!(Config::from_env().unwrap().http_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn cors_origins_wildcard_is_a_config_error() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        env::set_var("CORS_ORIGINS", "*");
+        let err = Config::from_env().expect_err("wildcard origin must be rejected");
+        assert!(matches!(err, AppError::Config(_)), "{err}");
+        assert!(err.to_string().contains("CORS_ORIGINS"), "{err}");
+    }
+
+    #[test]
+    fn cors_origins_csv_is_parsed_and_trimmed() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        env::set_var(
+            "CORS_ORIGINS",
+            " http://localhost:8080 , https://a.example ",
+        );
+        let config = Config::from_env().expect("valid CSV");
+        assert_eq!(
+            config.cors_origins,
+            vec!["http://localhost:8080", "https://a.example"]
+        );
+    }
+
+    #[test]
+    fn cors_origins_interior_whitespace_is_a_config_error() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        // `HeaderValue::from_str` accepts visible ASCII, so this entry has to be
+        // refused structurally here: `net::cors_layer` refuses it too, and a
+        // config load that accepted it would make boot abort.
+        env::set_var("CORS_ORIGINS", "http://host with space");
+        let err = Config::from_env().expect_err("interior whitespace must be rejected");
+        assert!(matches!(err, AppError::Config(_)), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("CORS_ORIGINS"), "{message}");
+        assert!(
+            message.contains("CORS_ORIGINS contains an invalid origin: 'http://host with space'"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn cors_origins_default_to_loopback() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        let config = Config::from_env().expect("config from a cleared env");
+        assert_eq!(
+            config.cors_origins,
+            vec![
+                "http://localhost".to_string(),
+                "http://127.0.0.1".to_string()
+            ]
+        );
+
+        // An empty or whitespace-only list is the documented default, not an
+        // empty allowlist.
+        for empty in ["", " , , "] {
+            env::set_var("CORS_ORIGINS", empty);
+            assert_eq!(
+                Config::from_env().unwrap().cors_origins,
+                vec![
+                    "http://localhost".to_string(),
+                    "http://127.0.0.1".to_string()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn save_to_env_round_trips_http_timeout_and_cors_origins() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        let config = Config {
+            http_timeout_ms: 5000,
+            cors_origins: vec![
+                "https://a.example".to_string(),
+                "http://b.example".to_string(),
+            ],
+            ..Config::default()
+        };
+
+        config.save_to_env().expect("save config");
+        let reloaded = Config::from_env().expect("reload config");
+        assert_eq!(reloaded.http_timeout_ms, 5000);
+        assert_eq!(
+            reloaded.cors_origins,
+            vec!["https://a.example", "http://b.example"]
+        );
     }
 }

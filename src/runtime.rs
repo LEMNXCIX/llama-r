@@ -64,6 +64,7 @@ use crate::services::rag_ingest::RagIngestService;
 use crate::services::router_config::RouterConfig;
 use crate::services::skill_manager::SkillManager;
 use axum::{
+    extract::DefaultBodyLimit,
     middleware::from_fn_with_state,
     routing::{get, post},
     Router,
@@ -73,9 +74,10 @@ use std::fs;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use tokio::sync::watch;
 use tokio::sync::RwLock as TokioRwLock;
 use tonic::transport::Server as TonicServer;
-use tower_http::cors::{Any, CorsLayer};
+// `CorsLayer` is built by `crate::net::cors_layer`; no direct import needed.
 
 pub struct Runtime {
     pub config: Config,
@@ -334,21 +336,11 @@ pub fn build_app_state_with_gate(
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-            axum::http::HeaderName::from_static("x-project"),
-            axum::http::HeaderName::from_static("x-agent"),
-            axum::http::HeaderName::from_static("x-debug"),
-            axum::http::HeaderName::from_static("x-conversation-id"),
-            axum::http::HeaderName::from_static("x-admin-token"),
-        ]);
+    let cors =
+        crate::net::cors_layer(&state.config.cors_origins).expect("validated at config load");
 
     // Public surface: chat, webhooks, health, models, MCP, docs and the
-    // conversation/skill listing endpoints. None of these is admin-gated.
+    // skill listing endpoint. None of these is admin-gated.
     let public = Router::new()
         .route("/", get(|| async { "Llama-R API is running" }))
         .route("/health", get(health))
@@ -374,19 +366,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/models", get(list_models))
         .route("/api/chat", post(chat))
         .route("/api/skills", get(list_skills_api))
-        .route("/api/conversations", get(list_conversations_handler))
-        .route(
-            "/api/conversations/:id",
-            get(get_conversation_handler).delete(delete_conversation_handler),
-        )
-        .route(
-            "/api/conversations/:id/messages",
-            get(get_conversation_messages_handler),
-        )
-        .route(
-            "/api/conversations/:id/export",
-            post(export_conversation_handler),
-        )
         .route("/api/webhooks/:channel", post(webhook))
         .route("/openapi.json", get(serve_openapi_json))
         .route("/docs", get(serve_scalar_ui));
@@ -418,9 +397,26 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/rag/query", post(rag_query))
         .route("/api/rag/delete-document", post(rag_delete_document))
         .route("/api/route", post(route_preview))
+        .route("/api/conversations", get(list_conversations_handler))
+        .route(
+            "/api/conversations/:id",
+            get(get_conversation_handler).delete(delete_conversation_handler),
+        )
+        .route(
+            "/api/conversations/:id/messages",
+            get(get_conversation_messages_handler),
+        )
+        .route(
+            "/api/conversations/:id/export",
+            post(export_conversation_handler),
+        )
         .layer(from_fn_with_state(state.clone(), require_admin));
 
-    public.merge(admin).layer(cors).with_state(state)
+    public
+        .merge(admin)
+        .layer(cors)
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        .with_state(state)
 }
 
 pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime, AppError> {
@@ -814,6 +810,73 @@ fn router_origin(url: &str) -> Option<String> {
     }
 }
 
+/// Process-wide shutdown trigger. A `watch` channel retains the last value, so
+/// a `request_shutdown()` that fires before (or during) registration of a
+/// waiter is never lost — unlike `Notify`, whose `notify_waiters()` only wakes
+/// waiters already registered on first poll. Every `shutdown_signal()` future
+/// subscribes first, then re-checks the flag, closing the lost-wakeup window.
+static SHUTDOWN_WATCH: OnceLock<watch::Sender<bool>> = OnceLock::new();
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn shutdown_sender() -> &'static watch::Sender<bool> {
+    SHUTDOWN_WATCH.get_or_init(|| {
+        let (tx, _rx) = watch::channel(false);
+        tx
+    })
+}
+
+/// Trigger shutdown from within the process. Safe to call from any task; wakes
+/// every future currently awaiting [`shutdown_signal`]. Idempotent.
+pub fn request_shutdown() {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    let _ = shutdown_sender().send(true);
+}
+
+/// Whether shutdown has already been requested (in-process or via OS signal).
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::SeqCst) || *shutdown_sender().subscribe().borrow()
+}
+
+pub async fn shutdown_signal() {
+    // Capture the waiter FIRST so there is no window in which
+    // `request_shutdown()` can fire between the flag check and registration.
+    let mut rx = shutdown_sender().subscribe();
+
+    // Already triggered: resolve immediately instead of waiting.
+    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) || *rx.borrow() {
+        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        let _ = shutdown_sender().send(true);
+        tracing::info!("shutdown signal received");
+        return;
+    }
+
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %err, "Failed to listen for Ctrl-C");
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(err) => tracing::error!(error = %err, "Failed to listen for SIGTERM"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+        res = rx.changed() => { let _ = res; },
+    }
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    let _ = shutdown_sender().send(true);
+    tracing::info!("shutdown signal received");
+}
+
 pub async fn start_http_server(runtime: &Runtime) -> Result<tokio::task::JoinHandle<()>, AppError> {
     let listener = tokio::net::TcpListener::bind(runtime.http_addr)
         .await
@@ -827,8 +890,11 @@ pub async fn start_http_server(runtime: &Runtime) -> Result<tokio::task::JoinHan
     let state = runtime.state.clone();
     Ok(tokio::spawn(async move {
         state.api_running.store(true, Ordering::SeqCst);
-        if let Err(err) = axum::serve(listener, app).await {
-            state.api_running.store(false, Ordering::SeqCst);
+        let serve_result = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await;
+        state.api_running.store(false, Ordering::SeqCst);
+        if let Err(err) = serve_result {
             tracing::error!(error = %err, "HTTP server stopped unexpectedly");
         }
     }))
@@ -931,26 +997,34 @@ fn chat_provider_from_profile(
 ) -> Arc<dyn LLMProvider + Send + Sync> {
     let key = profile_api_key(profile);
     let base_url = profile.base_url.clone();
+    let timeout = std::time::Duration::from_millis(profile.timeout_ms);
     match profile.kind {
-        ProviderKind::Ollama => Arc::new(OllamaProvider::new(
+        ProviderKind::Ollama => Arc::new(OllamaProvider::with_timeout(
             base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+            model.to_string(),
+            timeout,
         )),
-        ProviderKind::OpenRouter => Arc::new(OpenAiCompatibleProvider::new(
+        ProviderKind::OpenRouter => Arc::new(OpenAiCompatibleProvider::with_timeout(
             base_url.unwrap_or_else(|| OPENROUTER_BASE_URL.to_string()),
             key,
             model.to_string(),
+            timeout,
         )),
-        ProviderKind::OpenCode => Arc::new(OpenCodeProvider::new(
+        ProviderKind::OpenCode => Arc::new(OpenCodeProvider::with_timeout(
             base_url.unwrap_or_else(|| "http://127.0.0.1:4096".to_string()),
             if key.is_empty() { None } else { Some(key) },
             model.to_string(),
+            timeout,
         )),
-        ProviderKind::OpenAiCompatible => Arc::new(OpenAiCompatibleProvider::with_provider_name(
-            base_url.unwrap_or_else(|| "https://api.openai.com".to_string()),
-            key,
-            model.to_string(),
-            profile.name.clone(),
-        )),
+        ProviderKind::OpenAiCompatible => {
+            Arc::new(OpenAiCompatibleProvider::with_provider_name_and_timeout(
+                base_url.unwrap_or_else(|| "https://api.openai.com".to_string()),
+                key,
+                model.to_string(),
+                profile.name.clone(),
+                timeout,
+            ))
+        }
         ProviderKind::Anthropic => {
             Arc::new(AnthropicProvider::new(base_url, key, model.to_string()))
         }
@@ -1050,7 +1124,11 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
 
     match config.provider {
         ProviderKind::Ollama => {
-            provider = Arc::new(OllamaProvider::new(config.ollama_url.clone()));
+            provider = Arc::new(OllamaProvider::with_timeout(
+                config.ollama_url.clone(),
+                config.default_model.clone(),
+                std::time::Duration::from_millis(config.http_timeout_ms),
+            ));
             embeddings = Some(Arc::new(OllamaEmbeddings::new(
                 config.ollama_url.clone(),
                 config.embedding_model.clone(),
@@ -1065,10 +1143,11 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
                 .openai_base_url
                 .clone()
                 .unwrap_or_else(|| OPENROUTER_BASE_URL.to_string());
-            provider = Arc::new(OpenAiCompatibleProvider::new(
+            provider = Arc::new(OpenAiCompatibleProvider::with_timeout(
                 base_url,
                 config.openrouter_api_key.clone().unwrap_or_default(),
                 config.default_model.clone(),
+                std::time::Duration::from_millis(config.http_timeout_ms),
             ));
             embeddings = Some(Arc::new(OpenRouterEmbeddings::new(
                 config.openrouter_api_key.clone().unwrap_or_default(),
@@ -1086,10 +1165,11 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
             };
         }
         ProviderKind::OpenCode => {
-            provider = Arc::new(OpenCodeProvider::new(
+            provider = Arc::new(OpenCodeProvider::with_timeout(
                 config.opencode_url.clone(),
                 config.opencode_api_key.clone(),
                 config.default_model.clone(),
+                std::time::Duration::from_millis(config.http_timeout_ms),
             ));
             // OpenCode serves no embeddings endpoint. Ollama can supply them,
             // but only when a URL was configured: an empty OLLAMA_URL means no
@@ -1116,11 +1196,12 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.openai.com".to_string());
-            provider = Arc::new(OpenAiCompatibleProvider::with_provider_name(
+            provider = Arc::new(OpenAiCompatibleProvider::with_provider_name_and_timeout(
                 base_url.clone(),
                 key.clone(),
                 config.default_model.clone(),
                 config.provider.to_string(),
+                std::time::Duration::from_millis(config.http_timeout_ms),
             ));
             embeddings = Some(Arc::new(OpenAiCompatibleEmbeddings::new(
                 base_url,
@@ -1592,12 +1673,12 @@ pub fn start_grpc_server(runtime: &Runtime) -> tokio::task::JoinHandle<()> {
     let grpc_service = GrpcService::new(state.clone());
     tokio::spawn(async move {
         state.grpc_running.store(true, Ordering::SeqCst);
-        if let Err(err) = TonicServer::builder()
+        let serve_result = TonicServer::builder()
             .add_service(LlamaGatewayServer::new(grpc_service))
-            .serve(grpc_addr)
-            .await
-        {
-            state.grpc_running.store(false, Ordering::SeqCst);
+            .serve_with_shutdown(grpc_addr, shutdown_signal())
+            .await;
+        state.grpc_running.store(false, Ordering::SeqCst);
+        if let Err(err) = serve_result {
             tracing::error!(error = %err, addr = %grpc_addr, "gRPC server stopped unexpectedly");
         }
     })

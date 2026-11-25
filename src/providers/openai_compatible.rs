@@ -11,6 +11,7 @@ use crate::domain::models::{
     ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ModelInfo, Usage,
 };
 use crate::error::AppError;
+use crate::net;
 use crate::providers::capabilities::capabilities_for;
 use crate::providers::LLMProvider;
 use async_trait::async_trait;
@@ -18,6 +19,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::pin::Pin;
+use std::time::Duration;
 use tokio_stream::Stream;
 
 const PROVIDER_NAME: &str = "openrouter";
@@ -44,6 +46,16 @@ impl OpenAiCompatibleProvider {
         Self::with_provider_name(base_url, api_key, model, PROVIDER_NAME)
     }
 
+    /// Build with an explicit timeout (default 30s when using `new`).
+    pub fn with_timeout(
+        base_url: String,
+        api_key: String,
+        model: String,
+        timeout: Duration,
+    ) -> Self {
+        Self::with_provider_name_and_timeout(base_url, api_key, model, PROVIDER_NAME, timeout)
+    }
+
     /// Same wire, a different label. Used for the direct OpenAI-compatible
     /// provider and for compatible gateways (Groq/Mistral/DeepSeek/xAI).
     pub fn with_provider_name(
@@ -52,8 +64,25 @@ impl OpenAiCompatibleProvider {
         model: String,
         provider_name: impl Into<String>,
     ) -> Self {
+        Self::with_provider_name_and_timeout(
+            base_url,
+            api_key,
+            model,
+            provider_name,
+            Duration::from_millis(30_000),
+        )
+    }
+
+    /// Same wire, a different label, with an explicit timeout.
+    pub fn with_provider_name_and_timeout(
+        base_url: impl Into<String>,
+        api_key: String,
+        model: String,
+        provider_name: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
         Self {
-            client: Client::new(),
+            client: net::http_client(timeout).expect("validated timeout"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
             model,
