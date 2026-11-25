@@ -17,10 +17,11 @@ use utoipa::{Modify, OpenApi};
     info(
         title = "Llama-R API",
         description = "Personal AI gateway — chat, agents, contexts, MCP, and health endpoints",
-        version = "0.1.0"
+        version = "0.2.0"
     ),
     paths(
         crate::api::health::health,
+        crate::api::metrics::metrics,
         crate::api::handlers::list_models,
         crate::api::handlers::chat,
         crate::api::handlers::openai_chat,

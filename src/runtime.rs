@@ -20,6 +20,7 @@ use crate::api::execution_api::{get_execution, list_executions, retry_execution}
 use crate::api::grpc::{pb::llama_gateway_server::LlamaGatewayServer, GrpcService};
 use crate::api::handlers::{chat, list_models, mcp_message, openai_chat, AppState};
 use crate::api::health::health;
+use crate::api::metrics::metrics;
 use crate::api::history_api::{
     delete_conversation_handler, export_conversation_handler, get_conversation_handler,
     get_conversation_messages_handler, list_conversations_handler,
@@ -344,6 +345,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let public = Router::new()
         .route("/", get(|| async { "Llama-R API is running" }))
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/chat", post(chat))
         .route("/models", get(list_models))
         .route("/v1/chat/completions", post(openai_chat))
