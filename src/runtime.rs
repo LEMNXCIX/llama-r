@@ -74,7 +74,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tokio::sync::RwLock as TokioRwLock;
 use tonic::transport::Server as TonicServer;
 // `CorsLayer` is built by `crate::net::cors_layer`; no direct import needed.
@@ -810,35 +810,42 @@ fn router_origin(url: &str) -> Option<String> {
     }
 }
 
-/// Process-wide shutdown trigger. A single `Notify` shared by every
-/// `shutdown_signal()` future and the in-process `request_shutdown()` entry
-/// point, so a trigger (Ctrl-C, SIGTERM, or an explicit call) resolves all
-/// waiters without depending on an external `kill` binary or on OS-signal
-/// registration timing.
-static SHUTDOWN_NOTIFY: OnceLock<Notify> = OnceLock::new();
+/// Process-wide shutdown trigger. A `watch` channel retains the last value, so
+/// a `request_shutdown()` that fires before (or during) registration of a
+/// waiter is never lost — unlike `Notify`, whose `notify_waiters()` only wakes
+/// waiters already registered on first poll. Every `shutdown_signal()` future
+/// subscribes first, then re-checks the flag, closing the lost-wakeup window.
+static SHUTDOWN_WATCH: OnceLock<watch::Sender<bool>> = OnceLock::new();
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-fn shutdown_notify() -> &'static Notify {
-    SHUTDOWN_NOTIFY.get_or_init(Notify::new)
+fn shutdown_sender() -> &'static watch::Sender<bool> {
+    SHUTDOWN_WATCH.get_or_init(|| {
+        let (tx, _rx) = watch::channel(false);
+        tx
+    })
 }
 
 /// Trigger shutdown from within the process. Safe to call from any task; wakes
 /// every future currently awaiting [`shutdown_signal`]. Idempotent.
 pub fn request_shutdown() {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
-    shutdown_notify().notify_waiters();
+    let _ = shutdown_sender().send(true);
 }
 
 /// Whether shutdown has already been requested (in-process or via OS signal).
 pub fn shutdown_requested() -> bool {
-    SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+    SHUTDOWN_REQUESTED.load(Ordering::SeqCst) || *shutdown_sender().subscribe().borrow()
 }
 
 pub async fn shutdown_signal() {
-    // Already triggered (e.g. `request_shutdown()` ran before this future was
-    // polled): resolve immediately instead of waiting for a notification that
-    // was already consumed.
-    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+    // Capture the waiter FIRST so there is no window in which
+    // `request_shutdown()` can fire between the flag check and registration.
+    let mut rx = shutdown_sender().subscribe();
+
+    // Already triggered: resolve immediately instead of waiting.
+    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) || *rx.borrow() {
+        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        let _ = shutdown_sender().send(true);
         tracing::info!("shutdown signal received");
         return;
     }
@@ -860,13 +867,13 @@ pub async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    let notified = shutdown_notify().notified();
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
-        _ = notified => {},
+        res = rx.changed() => { let _ = res; },
     }
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    let _ = shutdown_sender().send(true);
     tracing::info!("shutdown signal received");
 }
 
