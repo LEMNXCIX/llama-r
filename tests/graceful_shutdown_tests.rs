@@ -59,11 +59,8 @@ fn curl_health(url: &str) -> Result<String, ()> {
 #[tokio::test]
 async fn shutdown_signal_resolves_on_request_shutdown() {
     llama_r::runtime::request_shutdown();
-    let signal = tokio::time::timeout(
-        Duration::from_secs(2),
-        llama_r::runtime::shutdown_signal(),
-    )
-    .await;
+    let signal =
+        tokio::time::timeout(Duration::from_secs(2), llama_r::runtime::shutdown_signal()).await;
     assert!(
         signal.is_ok(),
         "request_shutdown did not resolve shutdown_signal"
@@ -77,11 +74,8 @@ async fn shutdown_signal_completes_on_sigterm() {
     // shutdown_signal() resolves immediately and we must not send a real
     // SIGTERM to the whole test process (it could terminate parallel tests).
     if llama_r::runtime::shutdown_requested() {
-        let signal = tokio::time::timeout(
-            Duration::from_secs(2),
-            llama_r::runtime::shutdown_signal(),
-        )
-        .await;
+        let signal =
+            tokio::time::timeout(Duration::from_secs(2), llama_r::runtime::shutdown_signal()).await;
         assert!(signal.is_ok(), "shutdown_signal did not resolve");
         return;
     }
@@ -95,11 +89,8 @@ async fn shutdown_signal_completes_on_sigterm() {
             .status();
     });
 
-    let signal = tokio::time::timeout(
-        Duration::from_secs(2),
-        llama_r::runtime::shutdown_signal(),
-    )
-    .await;
+    let signal =
+        tokio::time::timeout(Duration::from_secs(2), llama_r::runtime::shutdown_signal()).await;
     assert!(signal.is_ok(), "SIGTERM did not resolve shutdown_signal");
 }
 

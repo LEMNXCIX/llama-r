@@ -1,5 +1,7 @@
 use llama_r::cli::commands::{handle_cli, CliOutcome};
-use llama_r::runtime::{build_runtime, request_shutdown, shutdown_signal, start_grpc_server, start_http_server};
+use llama_r::runtime::{
+    build_runtime, request_shutdown, shutdown_signal, start_grpc_server, start_http_server,
+};
 use llama_r::tui::app::TuiApp;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
