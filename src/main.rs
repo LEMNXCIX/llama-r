@@ -1,5 +1,5 @@
 use llama_r::cli::commands::{handle_cli, CliOutcome};
-use llama_r::runtime::{build_runtime, start_grpc_server, start_http_server};
+use llama_r::runtime::{build_runtime, shutdown_signal, start_grpc_server, start_http_server};
 use llama_r::tui::app::TuiApp;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -116,16 +116,31 @@ async fn main() {
         // below took both servers down with it — so the documented
         // systemd/Docker/CI path could not actually serve anything.
         tracing::info!("Running without a TUI; press Ctrl-C to stop");
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            tracing::error!(error = %err, "Failed to listen for Ctrl-C");
-        }
+        shutdown_signal().await;
     } else {
         let mut tui = TuiApp::new(runtime.state.clone());
-        if let Err(err) = tui.run().await {
-            tracing::error!(error = %err, "TUI exited with error");
+        let mut tui_exited_normally = false;
+        tokio::select! {
+            res = tui.run() => {
+                tui_exited_normally = true;
+                if let Err(err) = res {
+                    tracing::error!(error = %err, "TUI exited with error");
+                }
+            }
+            _ = shutdown_signal() => {
+                tracing::info!("shutdown signal received");
+            }
+        }
+        // If the TUI exited on its own, nudge the process with SIGTERM so the
+        // servers' graceful-shutdown listeners resolve and we can drain.
+        if tui_exited_normally {
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(std::process::id().to_string())
+                .status();
         }
     }
 
-    http_server.abort();
-    grpc_server.abort();
+    let _ = http_server.await;
+    let _ = grpc_server.await;
 }

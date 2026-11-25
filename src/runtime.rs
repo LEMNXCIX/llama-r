@@ -809,6 +809,28 @@ fn router_origin(url: &str) -> Option<String> {
     }
 }
 
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %err, "Failed to listen for Ctrl-C");
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(err) => tracing::error!(error = %err, "Failed to listen for SIGTERM"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
+    tracing::info!("shutdown signal received");
+}
+
 pub async fn start_http_server(runtime: &Runtime) -> Result<tokio::task::JoinHandle<()>, AppError> {
     let listener = tokio::net::TcpListener::bind(runtime.http_addr)
         .await
@@ -822,8 +844,11 @@ pub async fn start_http_server(runtime: &Runtime) -> Result<tokio::task::JoinHan
     let state = runtime.state.clone();
     Ok(tokio::spawn(async move {
         state.api_running.store(true, Ordering::SeqCst);
-        if let Err(err) = axum::serve(listener, app).await {
-            state.api_running.store(false, Ordering::SeqCst);
+        let serve_result = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await;
+        state.api_running.store(false, Ordering::SeqCst);
+        if let Err(err) = serve_result {
             tracing::error!(error = %err, "HTTP server stopped unexpectedly");
         }
     }))
@@ -1602,12 +1627,12 @@ pub fn start_grpc_server(runtime: &Runtime) -> tokio::task::JoinHandle<()> {
     let grpc_service = GrpcService::new(state.clone());
     tokio::spawn(async move {
         state.grpc_running.store(true, Ordering::SeqCst);
-        if let Err(err) = TonicServer::builder()
+        let serve_result = TonicServer::builder()
             .add_service(LlamaGatewayServer::new(grpc_service))
-            .serve(grpc_addr)
-            .await
-        {
-            state.grpc_running.store(false, Ordering::SeqCst);
+            .serve_with_shutdown(grpc_addr, shutdown_signal())
+            .await;
+        state.grpc_running.store(false, Ordering::SeqCst);
+        if let Err(err) = serve_result {
             tracing::error!(error = %err, addr = %grpc_addr, "gRPC server stopped unexpectedly");
         }
     })
