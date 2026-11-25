@@ -131,7 +131,10 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     state.observability.record_http_request();
     let snapshot = state.observability.snapshot();
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         render(&snapshot),
     )
 }
@@ -166,7 +169,10 @@ mod tests {
         assert!(text.contains("llamar_chat_requests_total 2"));
         assert!(text.contains("llamar_avg_chat_latency_ms 250"));
         assert!(text.contains("llamar_cost_usd_total 1.234567"));
-        assert_eq!(text.lines().filter(|l| l.starts_with("llamar_")).count(), 16);
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("llamar_")).count(),
+            16
+        );
         assert!(!text.to_ascii_lowercase().contains("key"));
         assert!(!text.to_ascii_lowercase().contains("token"));
     }

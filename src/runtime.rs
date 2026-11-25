@@ -20,11 +20,11 @@ use crate::api::execution_api::{get_execution, list_executions, retry_execution}
 use crate::api::grpc::{pb::llama_gateway_server::LlamaGatewayServer, GrpcService};
 use crate::api::handlers::{chat, list_models, mcp_message, openai_chat, AppState};
 use crate::api::health::health;
-use crate::api::metrics::metrics;
 use crate::api::history_api::{
     delete_conversation_handler, export_conversation_handler, get_conversation_handler,
     get_conversation_messages_handler, list_conversations_handler,
 };
+use crate::api::metrics::metrics;
 use crate::api::observability::AppObservability;
 use crate::api::rag_api::{rag_delete_document, rag_ingest, rag_query};
 use crate::api::route_api::route_preview;
