@@ -57,8 +57,22 @@ En el primer arranque, si falta `DEFAULT_MODEL`, Llama-R abre un setup interacti
 | `OTEL_ENABLED` | `false` | Export OTLP/HTTP opt-in; con `false` no se envía nada |
 | `OTEL_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | URL de trazas OTLP/HTTP, solo se lee si está activado |
 | `OTEL_SERVICE_NAME` | `llama-r` | Atributo `service.name` de cada span |
+| `HTTP_TIMEOUT_MS` | `30000` | Timeout de las peticiones HTTP salientes (provider, health). `0` se rechaza |
+| `CORS_ORIGINS` | `http://localhost,http://127.0.0.1` | Lista separada por comas de orígenes web permitidos por CORS. `*` se rechaza (usa un origen explícito); solo los listados reciben `Access-Control-Allow-Origin`. Revisar en cualquier despliegue LAN |
+| `EMBEDDING_MODEL` | `nomic-embed-text` | Modelo de embeddings de Ollama para RAG |
+| `EMBEDDING_DIMENSIONS` | `768` | Tamaño esperado del vector de embeddings |
+| `RAG_ENABLED` | `true` | Construye/usa el almacén RAG en tiempo de ejecución |
+| `HISTORY_RETENTION_DAYS` | `90` | Purga conversaciones anteriores a N días; `0` desactiva |
 
 Las claves `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` y `GEMINI_API_KEY` son **nombres** de variables referenciados por los perfiles integrados de `providers.toml` (`api_key_env`); `Config::from_env` lee directamente `OPENROUTER_API_KEY`, `OPENCODE_API_KEY` y `OPENAI_BASE_URL`. Ninguna clave aparece en health, logs, URLs ni la TUI (los tests lo comprueban).
+
+### Despliegue en LAN / hardening operativo
+
+- **CORS:** para permitir un origen web añádelo a `CORS_ORIGINS` (separado por comas), p. ej. `CORS_ORIGINS=http://localhost:3000,http://192.168.1.10:3000`. El valor `*` se rechaza; solo los orígenes listados reciben `Access-Control-Allow-Origin`.
+- **Historial de conversaciones:** los endpoints `/api/conversations*` ahora requieren `X-Admin-Token` (cambio incompatible). Ejemplo: `curl -H 'X-Admin-Token: <token>' http://host:3000/api/conversations?project_id=p&agent_id=a`. Un `GET /api/conversations` sin `project_id`/`agent_id` devuelve una página vacía (`[]`).
+- **Tamaño de cuerpo:** las peticiones HTTP tienen un límite de 2 MiB; cuerpos mayores responden `413`.
+- **Apagado:** con `--server-only`, `Ctrl-C` o `SIGTERM` drenan las peticiones en curso y salen con código 0.
+- **`.env`:** se crea con modo `0600` en arranque; las claves nunca aparecen en logs ni en `/api/health`.
 
 ## Providers
 
