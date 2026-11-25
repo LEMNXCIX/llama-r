@@ -57,7 +57,35 @@ fn curl_health(url: &str) -> Result<String, ()> {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn shutdown_signal_resolves_on_request_shutdown() {
+    llama_r::runtime::request_shutdown();
+    let signal = tokio::time::timeout(
+        Duration::from_secs(2),
+        llama_r::runtime::shutdown_signal(),
+    )
+    .await;
+    assert!(
+        signal.is_ok(),
+        "request_shutdown did not resolve shutdown_signal"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn shutdown_signal_completes_on_sigterm() {
+    // If a previous test in this binary already triggered shutdown in-process,
+    // shutdown_signal() resolves immediately and we must not send a real
+    // SIGTERM to the whole test process (it could terminate parallel tests).
+    if llama_r::runtime::shutdown_requested() {
+        let signal = tokio::time::timeout(
+            Duration::from_secs(2),
+            llama_r::runtime::shutdown_signal(),
+        )
+        .await;
+        assert!(signal.is_ok(), "shutdown_signal did not resolve");
+        return;
+    }
+
     let pid = std::process::id();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;

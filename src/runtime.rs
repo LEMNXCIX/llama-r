@@ -74,6 +74,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use tokio::sync::Notify;
 use tokio::sync::RwLock as TokioRwLock;
 use tonic::transport::Server as TonicServer;
 // `CorsLayer` is built by `crate::net::cors_layer`; no direct import needed.
@@ -809,7 +810,39 @@ fn router_origin(url: &str) -> Option<String> {
     }
 }
 
+/// Process-wide shutdown trigger. A single `Notify` shared by every
+/// `shutdown_signal()` future and the in-process `request_shutdown()` entry
+/// point, so a trigger (Ctrl-C, SIGTERM, or an explicit call) resolves all
+/// waiters without depending on an external `kill` binary or on OS-signal
+/// registration timing.
+static SHUTDOWN_NOTIFY: OnceLock<Notify> = OnceLock::new();
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn shutdown_notify() -> &'static Notify {
+    SHUTDOWN_NOTIFY.get_or_init(Notify::new)
+}
+
+/// Trigger shutdown from within the process. Safe to call from any task; wakes
+/// every future currently awaiting [`shutdown_signal`]. Idempotent.
+pub fn request_shutdown() {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    shutdown_notify().notify_waiters();
+}
+
+/// Whether shutdown has already been requested (in-process or via OS signal).
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
+
 pub async fn shutdown_signal() {
+    // Already triggered (e.g. `request_shutdown()` ran before this future was
+    // polled): resolve immediately instead of waiting for a notification that
+    // was already consumed.
+    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        tracing::info!("shutdown signal received");
+        return;
+    }
+
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             tracing::error!(error = %err, "Failed to listen for Ctrl-C");
@@ -827,7 +860,13 @@ pub async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
+    let notified = shutdown_notify().notified();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+        _ = notified => {},
+    }
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     tracing::info!("shutdown signal received");
 }
 

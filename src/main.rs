@@ -1,5 +1,5 @@
 use llama_r::cli::commands::{handle_cli, CliOutcome};
-use llama_r::runtime::{build_runtime, shutdown_signal, start_grpc_server, start_http_server};
+use llama_r::runtime::{build_runtime, request_shutdown, shutdown_signal, start_grpc_server, start_http_server};
 use llama_r::tui::app::TuiApp;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -131,13 +131,11 @@ async fn main() {
                 tracing::info!("shutdown signal received");
             }
         }
-        // If the TUI exited on its own, nudge the process with SIGTERM so the
-        // servers' graceful-shutdown listeners resolve and we can drain.
+        // If the TUI exited on its own, trigger shutdown in-process so the
+        // servers' graceful-shutdown listeners resolve and we can drain. No
+        // external `kill` binary is required.
         if tui_exited_normally {
-            let _ = std::process::Command::new("kill")
-                .arg("-TERM")
-                .arg(std::process::id().to_string())
-                .status();
+            request_shutdown();
         }
     }
 
