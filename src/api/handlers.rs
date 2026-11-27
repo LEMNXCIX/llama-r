@@ -92,8 +92,11 @@ pub struct AppState {
     /// asking a human (the pre-Fase-6 behaviour).
     pub auto_decider: Option<Arc<dyn AutoDecider>>,
     /// Context-compaction strategy used by the assembler on every agent turn.
-    /// `NoopCompactor` by default; it lives outside the hot-swapped stack so a
-    /// settings Apply rebuilds the engine with the same strategy.
+    /// Boot installs `SummarizingCompactor` with the selected provider's
+    /// summarizer, or `NoopCompactor` when no summarizer is usable (never the
+    /// quiet summarizer with the real compactor — that would drop history).
+    /// It lives outside the hot-swapped stack so a settings Apply rebuilds the
+    /// engine with the same strategy.
     pub compactor: Arc<dyn ContextCompactor>,
     /// Best-effort model selector built at boot from the same decision router
     /// agent routing uses (or `CurrentModelSelector` when routing is off). Like

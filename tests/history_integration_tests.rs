@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 use llama_r::adapters::history::{NoopSummarizer, OllamaSummarizer, SqliteConversationStore};
+use llama_r::config::Config;
 use llama_r::domain::agent::{Agent, AgentConfig, RagWritePolicy};
 use llama_r::domain::models::ChatMessage;
 use llama_r::domain::policy::PermissionPolicy;
@@ -1261,7 +1262,12 @@ async fn concurrent_appends_keep_both_rows() {
 #[tokio::test]
 async fn boot_builds_ollama_summarizer_for_ollama() {
     let (url, seen, handle) = one_shot_ollama("boot summary").await;
-    let summarizer = build_summarizer(ProviderKind::Ollama, &url, "llama3.2");
+    let config = Config {
+        ollama_url: url.clone(),
+        default_model: "llama3.2".into(),
+        ..Config::default()
+    };
+    let summarizer = build_summarizer(&config, ProviderKind::Ollama, "llama3.2");
     let messages = vec![ExportMessage {
         id: "m1".into(),
         role: "user".into(),
@@ -1281,12 +1287,19 @@ async fn boot_builds_ollama_summarizer_for_ollama() {
     handle.await.unwrap();
 }
 
-/// Any other provider gets the quiet summarizer. Pointing a bogus Ollama URL at
-/// it would still return `Ok("")` — a real OllamaSummarizer would have failed to
-/// connect, so the empty answer proves the no-op strategy was installed.
+/// With no usable credential the boot installs the quiet summarizer, never a
+/// real one aimed at a wrong/empty endpoint. `is_noop()` is the seam Task 3 uses
+/// to pair this with `NoopCompactor` instead of the summarizing one.
 #[tokio::test]
-async fn boot_builds_noop_summarizer_for_non_ollama() {
-    let summarizer = build_summarizer(ProviderKind::OpenRouter, "http://127.0.0.1:1", "m");
+async fn boot_builds_noop_summarizer_when_a_key_is_missing() {
+    let config = Config {
+        provider: ProviderKind::OpenRouter,
+        default_model: "m".into(),
+        openrouter_api_key: None,
+        ..Config::default()
+    };
+    let summarizer = build_summarizer(&config, ProviderKind::OpenRouter, "m");
+    assert!(summarizer.is_noop());
     let messages = vec![ExportMessage {
         id: "m1".into(),
         role: "user".into(),
@@ -1300,7 +1313,7 @@ async fn boot_builds_noop_summarizer_for_non_ollama() {
         .expect("the no-op summarizer never errors, never dials out");
     assert_eq!(
         out, "",
-        "a non-Ollama boot must not POST to an Ollama endpoint"
+        "a boot without a key must not POST to an upstream endpoint"
     );
 }
 

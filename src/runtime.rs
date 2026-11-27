@@ -1,4 +1,6 @@
 use crate::adapters::auto::RouterAutoDecider;
+#[cfg(feature = "history")]
+use crate::adapters::context::SummarizingCompactor;
 use crate::adapters::context::{CurrentModelSelector, NoopCompactor, RouterModelSelector};
 use crate::adapters::execution::NoOpExecutionStore;
 use crate::adapters::mcp::{McpServerConfig, StaticMcpRegistry};
@@ -43,7 +45,7 @@ use crate::ports::delegation::Delegator;
 #[cfg(feature = "rig-engine")]
 use crate::ports::engine::AgentEngine;
 use crate::ports::execution::ExecutionStore;
-use crate::ports::history::ConversationStore;
+use crate::ports::history::{ConversationStore, Summarizer};
 use crate::ports::mcp::McpServerRegistry;
 use crate::ports::model_selection::ModelSelector;
 use crate::ports::rag::{EmbeddingProvider, RagStore};
@@ -196,6 +198,9 @@ pub fn build_app_state(
         // value falls back to the documented defaults rather than failing a
         // test fixture. Boot passes its own already-parsed `Config` below.
         Config::from_env().unwrap_or_default(),
+        // Non-boot callers have no conversation store to share a summarizer
+        // with, so they keep the fail-closed no-op compactor.
+        None,
     )
 }
 
@@ -219,6 +224,11 @@ pub fn build_app_state_with_gate(
     history_store: Option<Arc<dyn ConversationStore>>,
     execution_store: Arc<dyn ExecutionStore>,
     config: Config,
+    // The one summarizer boot built for both the conversation store and the
+    // compactor. `None` (every non-boot caller) means no summarizer is
+    // available, so the compactor stays a no-op instead of silently dropping
+    // history with an empty summary.
+    summarizer: Option<Arc<dyn Summarizer>>,
 ) -> Arc<AppState> {
     let metrics = Arc::new(TokenMetrics::new());
     let default_model = stack.default_model.clone();
@@ -287,11 +297,37 @@ pub fn build_app_state_with_gate(
     // the gate, decider and compactor.
     let selector = build_model_selector(&router_config, stack.router.as_ref());
 
-    // Compaction is transparent by default: without a usable summarizer there
-    // is no summary to inject, and an unknown context window already means no
-    // compaction. Stored on AppState so a settings Apply builds the engine from
-    // the same handle, exactly like the gate and the auto decider.
-    let compactor: Arc<dyn ContextCompactor> = Arc::new(NoopCompactor);
+    // Compaction follows the boot provider's summarizer — the SAME Arc the
+    // conversation store was built from, so boot creates only one HTTP client
+    // per provider. A missing URL/key yields a no-op summarizer, and pairing
+    // that with `SummarizingCompactor` would silently drop the oldest turns
+    // while returning no memory (D10); install `NoopCompactor` instead, which
+    // keeps history intact. Stored on AppState outside the hot-swapped stack so
+    // a settings Apply rebuilds the engine with this exact handle, like the
+    // gate and the auto decider.
+    #[cfg(feature = "history")]
+    let compactor: Arc<dyn ContextCompactor> = match summarizer.as_ref() {
+        Some(summarizer) if !summarizer.is_noop() => {
+            tracing::info!(
+                strategy = summarizer.strategy_name(),
+                "context compaction enabled with the provider summarizer"
+            );
+            Arc::new(SummarizingCompactor::new(summarizer.clone()))
+        }
+        _ => {
+            tracing::warn!(
+                "context compaction disabled: no usable summarizer; conversation history is kept intact"
+            );
+            Arc::new(NoopCompactor)
+        }
+    };
+    // No history in a light build means nothing to compact: stay no-op even if
+    // a caller supplies a summarizer.
+    #[cfg(not(feature = "history"))]
+    let compactor: Arc<dyn ContextCompactor> = {
+        let _ = summarizer;
+        Arc::new(NoopCompactor)
+    };
 
     // Telemetry is opt-in from `Config`. Built once here and stored on
     // AppState (outside the hot-swapped stack) so boot and a settings Apply
@@ -575,9 +611,20 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
     }
 
     let context_store = Arc::new(ContextStore::new());
-    // The summarizer speaks the Ollama `/api/chat` wire format, so it is only
-    // installed for providers that can serve it. See `build_history_store`.
-    let history_store = build_history_store(&config, config.provider);
+    // ONE summarizer for the whole process: the conversation store uses it for
+    // indexed summaries and `build_app_state_with_gate` clones the same Arc into
+    // the compactor. Building it here (rather than inside the state builder)
+    // lets both consumers share it; the selection itself lives in
+    // `build_summarizer`, which picks a provider-appropriate wire strategy.
+    #[cfg(feature = "history")]
+    let summarizer = Some(build_summarizer(
+        &config,
+        config.provider,
+        &config.default_model,
+    ));
+    #[cfg(not(feature = "history"))]
+    let summarizer: Option<Arc<dyn Summarizer>> = None;
+    let history_store = build_history_store(&config, summarizer.clone());
 
     if let Some(history_arc) = history_store.clone() {
         let retention = config.history_retention_days;
@@ -664,6 +711,7 @@ pub async fn build_runtime(logs: Arc<Mutex<VecDeque<String>>>) -> Result<Runtime
         history_store,
         execution_store.clone(),
         config.clone(),
+        summarizer,
     );
     // Build the companions only now, from the state that owns the boot gate
     // *and* the boot `auto_decider`. `CompanionHandles::from_state` reads both,
@@ -1361,31 +1409,118 @@ fn build_rag(
     (Some(store), Some(ingest))
 }
 
-/// Select the injected summarizer strategy at boot.
+/// Select the injected summarizer strategy at boot (or on a settings Apply).
 ///
-/// The summarizer POSTs an Ollama-wire `/api/chat`, so it is only wired for the
-/// Ollama provider. Other providers still persist conversations; only the
-/// best-effort summaries are disabled (with a warning), never pointed at a
-/// wrong/empty URL. This is a boot-time decision: history lives on `AppState`,
-/// not on the hot-swapped stack. Exposed for the integration tests that pin
-/// this degradation rule.
+/// Every provider gets a real strategy when a usable URL and credential are
+/// available:
+///
+/// | Provider | Strategy | URL / credential source |
+/// |---|---|---|
+/// | Ollama | `OllamaSummarizer` | `config.ollama_url` |
+/// | OpenRouter | `ChatCompletionsSummarizer` | `config.openai_base_url` (default `OPENROUTER_BASE_URL`) + `config.openrouter_api_key` |
+/// | OpenAI-compatible | `ChatCompletionsSummarizer` | profile `base_url` + profile key |
+/// | Anthropic | `ChatCompletionsSummarizer` | profile `base_url` + profile key |
+/// | Gemini | `ChatCompletionsSummarizer` | profile `base_url` + profile key |
+/// | OpenCode | `OpenCodeSummarizer` | `config.opencode_url` + `config.opencode_api_key` |
+///
+/// The three profile-based kinds reuse [`profile_for`] / [`profile_api_key`],
+/// so an operator override in `providers.toml` is honoured. For those kinds the
+/// profile is looked up by the `provider` argument (a temporary `Config` with
+/// that provider is passed to `profile_for`), so the selection follows the kind
+/// actually being built even when it differs from `config.provider`. The
+/// registry is loaded here once at boot/Apply time; it is not a hot-path cost.
+///
+/// A missing URL (or a missing key where one is required) installs
+/// `NoopSummarizer` with a warning that names the **variable**, never its
+/// value. OpenCode is the one exception to "missing key ⇒ noop": its password
+/// is optional (`None` means an unauthenticated local server), so only an empty
+/// `OPENCODE_URL` degrades. Callers can detect the quiet strategy with
+/// `is_noop` — this is the seam Task 3 uses to refuse pairing a
+/// no-op summarizer with the real `SummarizingCompactor`. The trait method is
+/// `crate::ports::history::Summarizer::is_noop`.
 #[cfg(feature = "history")]
 #[doc(hidden)]
 pub fn build_summarizer(
+    config: &Config,
     provider: ProviderKind,
-    ollama_url: &str,
     default_model: &str,
 ) -> Arc<dyn crate::ports::history::Summarizer> {
-    use crate::adapters::history::summarizer::{NoopSummarizer, OllamaSummarizer};
+    use crate::adapters::history::summarizer::{
+        ChatCompletionsSummarizer, NoopSummarizer, OllamaSummarizer, OpenCodeSummarizer,
+    };
 
-    if provider == ProviderKind::Ollama {
-        Arc::new(OllamaSummarizer::new(ollama_url, default_model))
-    } else {
+    /// The single degradation path: warn naming only the variable, never a value.
+    fn noop(provider: ProviderKind, variable: &str) -> Arc<dyn crate::ports::history::Summarizer> {
         tracing::warn!(
             provider = %provider,
-            "history summaries disabled: the summarizer speaks the Ollama wire format; conversations still persist"
+            variable = %variable,
+            "history summaries disabled: no usable URL/key; conversations still persist"
         );
         Arc::new(NoopSummarizer)
+    }
+
+    match provider {
+        ProviderKind::Ollama => {
+            if config.ollama_url.trim().is_empty() {
+                noop(provider, "OLLAMA_URL")
+            } else {
+                Arc::new(OllamaSummarizer::new(&config.ollama_url, default_model))
+            }
+        }
+        ProviderKind::OpenRouter => {
+            let key = config.openrouter_api_key.as_deref().unwrap_or("").trim();
+            if key.is_empty() {
+                return noop(provider, "OPENROUTER_API_KEY");
+            }
+            let base = config
+                .openai_base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(OPENROUTER_BASE_URL);
+            Arc::new(ChatCompletionsSummarizer::new(base, key, default_model))
+        }
+        ProviderKind::OpenAiCompatible | ProviderKind::Anthropic | ProviderKind::Gemini => {
+            let registry = load_provider_registry();
+            // `profile_for` reads `config.provider`; make it follow the kind we
+            // are actually building so a caller selecting a non-boot provider
+            // still gets that provider's profile (and key variable name).
+            let lookup = Config {
+                provider,
+                ..config.clone()
+            };
+            let profile = profile_for(&registry, &lookup);
+            let key = profile_api_key(&profile);
+            if key.trim().is_empty() {
+                let variable = profile
+                    .api_key_env
+                    .as_deref()
+                    .unwrap_or("profile api_key_env");
+                return noop(provider, variable);
+            }
+            let Some(base) = profile
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return noop(provider, "OPENAI_BASE_URL / providers.toml base_url");
+            };
+            Arc::new(ChatCompletionsSummarizer::new(base, key, default_model))
+        }
+        ProviderKind::OpenCode => {
+            if config.opencode_url.trim().is_empty() {
+                return noop(provider, "OPENCODE_URL");
+            }
+            // The password is optional: `None` means the local server has no
+            // password, and no Authorization header is sent.
+            let password = config.opencode_api_key.as_deref().map(str::to_string);
+            Arc::new(OpenCodeSummarizer::new(
+                &config.opencode_url,
+                password,
+                default_model,
+            ))
+        }
     }
 }
 
@@ -1420,20 +1555,27 @@ pub fn build_agent_retention_map(registry: &AgentRegistry) -> Option<HashMap<Str
 
 /// Build history store (SQLite) when feature is enabled.
 ///
-/// The summarizer is injected from [`build_summarizer`] so the boot provider
-/// decides the strategy: Ollama gets the Ollama-wire summarizer, every other
-/// provider gets the quiet one. This is a boot-time decision: history lives on
-/// `AppState`, not on the hot-swapped stack.
+/// The summarizer is the ONE boot built via [`build_summarizer`] and injected
+/// here so the conversation store and the compactor share the same client and
+/// strategy: a real summarizer for every provider with a usable URL/key, the
+/// quiet one only when a credential is missing. This is a boot-time decision:
+/// history lives on `AppState`, not on the hot-swapped stack.
 fn build_history_store(
-    config: &Config,
-    provider: ProviderKind,
+    _config: &Config,
+    summarizer: Option<Arc<dyn Summarizer>>,
 ) -> Option<Arc<dyn ConversationStore>> {
     #[cfg(feature = "history")]
     {
         use crate::adapters::history::SqliteConversationStore;
 
+        // Kept in the signature for the light-build branch below; with history
+        // on the path comes from the base dir, not from `Config`.
+        let _ = _config;
         let path = crate::core::paths::get_history_db_path();
-        let summarizer = build_summarizer(provider, &config.ollama_url, &config.default_model);
+        // Private helper with a single caller: boot always builds the shared
+        // summarizer before this call. Failing loudly here would reveal a
+        // wiring bug rather than silently building a second HTTP client.
+        let summarizer = summarizer.expect("boot builds one summarizer for store and compactor");
         match SqliteConversationStore::with_summarizer(&path, summarizer) {
             Ok(store) => {
                 tracing::info!(path = %path.display(), "History store (SQLite) initialized");
@@ -1448,7 +1590,7 @@ fn build_history_store(
 
     #[cfg(not(feature = "history"))]
     {
-        let _ = (config, provider);
+        let _ = (_config, summarizer);
         tracing::info!("History feature disabled at compile time");
         None
     }
@@ -1641,8 +1783,10 @@ pub fn build_companions(handles: &CompanionHandles, config: &Config, stack: &mut
                     config.provider,
                     stack.embeddings.clone(),
                 ),
-                // Default NoopCompactor, shared by boot and Apply through
-                // AppState so a provider swap cannot drop the strategy.
+                // The boot-installed compactor (real when the boot provider has
+                // a usable summarizer, no-op otherwise), shared by boot and
+                // Apply through AppState so a provider swap cannot drop the
+                // strategy or pair a quiet summarizer with silent history loss.
                 compactor: handles.compactor.clone(),
                 // Same selector (and router Arc) on boot and Apply, so a
                 // provider swap cannot drop complexity selection.
