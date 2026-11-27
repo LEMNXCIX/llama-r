@@ -11,6 +11,7 @@
 //! needed. `build_summarizer` is `#[cfg(feature = "history")]`, so is this file.
 
 #![cfg(feature = "history")]
+#![allow(clippy::await_holding_lock)] // env guard held deliberately across .await to serialise tests
 
 use axum::{body::to_bytes, extract::Request, http::StatusCode, routing::post, Json, Router};
 use llama_r::adapters::execution::NoOpExecutionStore;

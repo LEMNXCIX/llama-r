@@ -9,6 +9,7 @@
 //! gated the same way.
 
 #![cfg(feature = "history")]
+#![allow(clippy::await_holding_lock)] // env guard held deliberately across .await to serialise tests
 
 use axum::{
     body::to_bytes,
