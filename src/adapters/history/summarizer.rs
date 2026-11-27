@@ -53,6 +53,10 @@ impl OllamaSummarizer {
 
 #[async_trait]
 impl Summarizer for OllamaSummarizer {
+    fn strategy_name(&self) -> &'static str {
+        "ollama"
+    }
+
     async fn summarize(&self, messages: &[ExportMessage]) -> Result<String, String> {
         let body = serde_json::json!({
             "model": self.model,
@@ -135,6 +139,10 @@ impl ChatCompletionsSummarizer {
 
 #[async_trait]
 impl Summarizer for ChatCompletionsSummarizer {
+    fn strategy_name(&self) -> &'static str {
+        "chat-completions"
+    }
+
     async fn summarize(&self, messages: &[ExportMessage]) -> Result<String, String> {
         let body = serde_json::json!({
             "model": self.model,
@@ -204,6 +212,10 @@ impl OpenCodeSummarizer {
 
 #[async_trait]
 impl Summarizer for OpenCodeSummarizer {
+    fn strategy_name(&self) -> &'static str {
+        "opencode"
+    }
+
     async fn summarize(&self, messages: &[ExportMessage]) -> Result<String, String> {
         let body = serde_json::json!({
             "model": {
@@ -254,6 +266,14 @@ pub struct NoopSummarizer;
 
 #[async_trait]
 impl Summarizer for NoopSummarizer {
+    fn strategy_name(&self) -> &'static str {
+        "noop"
+    }
+
+    fn is_noop(&self) -> bool {
+        true
+    }
+
     async fn summarize(&self, _messages: &[ExportMessage]) -> Result<String, String> {
         Ok(String::new())
     }

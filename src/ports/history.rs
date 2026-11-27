@@ -64,6 +64,25 @@ pub struct ExportSummary {
 #[async_trait]
 pub trait Summarizer: Send + Sync {
     async fn summarize(&self, messages: &[ExportMessage]) -> Result<String, String>;
+
+    /// Stable, secret-free label for the concrete strategy.
+    ///
+    /// Production strategies override this with `ollama`, `chat-completions`,
+    /// `opencode` or `noop`; test fakes inherit the `custom` default. It is a
+    /// label only — no URL, credential or argument ever reaches it — so boot
+    /// code and selection tests can identify a strategy without downcasting.
+    fn strategy_name(&self) -> &'static str {
+        "custom"
+    }
+
+    /// Whether this is the deliberately quiet strategy (no URL/key available).
+    ///
+    /// Defaults to `false`; only the real `NoopSummarizer` overrides it. Boot
+    /// uses this to refuse pairing a no-op summarizer with the real
+    /// `SummarizingCompactor`, which would silently drop old turns.
+    fn is_noop(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait]
