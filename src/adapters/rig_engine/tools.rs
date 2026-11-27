@@ -10,15 +10,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-pub fn rig_tool_name(server_id: &str, tool_name: &str) -> String {
-    format!("{server_id}__{tool_name}")
-}
-
-pub fn parse_rig_tool_name(qualified: &str) -> Option<(String, String)> {
-    qualified
-        .split_once("__")
-        .map(|(s, t)| (s.to_string(), t.to_string()))
-}
+pub use crate::adapters::rig_engine::{parse_rig_tool_name, rig_tool_name};
 
 pub struct McpToolBridge {
     pub inner: ScopedMcpTool,

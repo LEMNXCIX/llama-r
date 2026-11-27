@@ -10,6 +10,20 @@ pub mod operations;
 #[cfg(feature = "rig-engine")]
 pub mod tools;
 
+/// Qualified MCP tool name (`server__tool`). Kept here, outside the
+/// `rig-engine` gate, so the SSE tool-event mapper can name tools identically
+/// in light builds too.
+pub fn rig_tool_name(server_id: &str, tool_name: &str) -> String {
+    format!("{server_id}__{tool_name}")
+}
+
+/// Inverse of [`rig_tool_name`]; `None` when there is no `__` separator.
+pub fn parse_rig_tool_name(qualified: &str) -> Option<(String, String)> {
+    qualified
+        .split_once("__")
+        .map(|(s, t)| (s.to_string(), t.to_string()))
+}
+
 #[cfg(feature = "rig-engine")]
 use crate::adapters::rig_engine::local_tools::{DelegateBounds, LocalToolDeps};
 use crate::adapters::rig_engine::local_tools::{LocalTool, LocalToolRegistry};

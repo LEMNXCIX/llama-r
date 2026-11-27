@@ -1414,15 +1414,17 @@ async fn child_approval_reaches_parent_sse_with_task_id_and_depth() {
         .expect("the delegate tool runs");
 
     let mut stream = engine_events_to_chat_stream("model".into(), parent_rx);
-    let event = stream
-        .next()
-        .await
-        .expect("the child approval reaches the parent stream")
-        .expect("a valid SSE event");
-    let approval = event
-        .approval
-        .as_ref()
-        .expect("the event carries approval info");
+    // The delegate tool call/result now reach the stream as tool events too;
+    // find the approval among them rather than assuming it is the first event.
+    let mut approval = None;
+    while let Some(event) = stream.next().await {
+        let event = event.expect("a valid SSE event");
+        if event.approval.is_some() {
+            approval = event.approval;
+            break;
+        }
+    }
+    let approval = approval.expect("the child approval reaches the parent stream");
     assert_eq!(approval.task_id.as_deref(), Some("task-42"));
     assert_eq!(approval.depth, Some(1));
     // The approval id remains the global UUID; it is not prefixed with the task.
