@@ -322,6 +322,7 @@ fn test_state(
             admin_token: Some(TEST_ADMIN_TOKEN.to_string()),
             ..Default::default()
         },
+        None,
     );
     (dir, state)
 }

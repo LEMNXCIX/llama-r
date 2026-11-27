@@ -293,6 +293,7 @@ fn build_state(
         None,
         store,
         llama_r::config::Config::default(),
+        None,
     );
     (dir, state)
 }

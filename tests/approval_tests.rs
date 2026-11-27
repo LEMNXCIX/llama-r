@@ -757,6 +757,7 @@ fn api_state(gate: Arc<ApprovalGate>) -> Arc<AppState> {
             admin_token: Some(TEST_ADMIN_TOKEN.to_string()),
             ..Default::default()
         },
+        None,
     )
 }
 

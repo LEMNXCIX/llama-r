@@ -269,6 +269,8 @@ async fn test_state(
         // The test env has already set ADMIN_TOKEN and PARK_GRACE_MS; read
         // them through Config exactly as boot does.
         llama_r::config::Config::from_env().expect("config from test env"),
+        // Test states have no shared summarizer: the compactor stays no-op.
+        None,
     )
 }
 
