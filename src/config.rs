@@ -310,15 +310,13 @@ impl Config {
             raw_provider.parse::<ProviderKind>()?
         };
 
-        let ollama_url = env::var("OLLAMA_URL")
-            .unwrap_or_else(|_| "http://localhost:11434".to_string())
-            .trim()
-            .to_string();
-        if ollama_url.is_empty() {
-            return Err(AppError::Config(
-                "OLLAMA_URL cannot be empty when provided".to_string(),
-            ));
-        }
+        // An explicitly empty OLLAMA_URL means "no Ollama": it skips the
+        // Ollama embeddings rung so an OpenAI-compatible fallback can be
+        // selected. An unset variable keeps the documented localhost default.
+        let ollama_url = match env::var("OLLAMA_URL") {
+            Ok(value) => value.trim().to_string(),
+            Err(_) => "http://localhost:11434".to_string(),
+        };
 
         let opencode_url = env::var("OPENCODE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:4096".to_string())
@@ -690,6 +688,33 @@ mod tests {
 
         let config = Config::from_env().expect("config from a cleared env");
         assert_eq!(config.provider, ProviderKind::Ollama);
+    }
+
+    #[test]
+    fn ollama_url_distinguishes_explicit_empty_from_unset() {
+        let _guard = crate::core::paths::lock_env_for_tests();
+        let _env = ConfigEnvGuard::cleared();
+        let _cwd = CwdGuard::fresh();
+
+        // Unset keeps the documented localhost default.
+        let config = Config::from_env().expect("config from a cleared env");
+        assert_eq!(config.ollama_url, "http://localhost:11434");
+
+        // Explicitly empty is valid and means "no Ollama", so the
+        // OpenAI-compatible embeddings fallback can be selected.
+        env::set_var("OLLAMA_URL", "");
+        let config = Config::from_env().expect("explicit empty OLLAMA_URL is valid");
+        assert_eq!(config.ollama_url, "");
+
+        // Whitespace-only is an explicit empty too, matching the parser's trim.
+        env::set_var("OLLAMA_URL", "   ");
+        let config = Config::from_env().expect("whitespace-only OLLAMA_URL is valid");
+        assert_eq!(config.ollama_url, "");
+
+        // A normal URL is still accepted and trimmed as before.
+        env::set_var("OLLAMA_URL", "  http://example:11434  ");
+        let config = Config::from_env().expect("normal OLLAMA_URL is valid");
+        assert_eq!(config.ollama_url, "http://example:11434");
     }
 
     #[test]
