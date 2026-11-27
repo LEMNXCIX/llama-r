@@ -41,12 +41,12 @@ En el primer arranque, si falta `DEFAULT_MODEL`, Llama-R abre un setup interacti
 |---|---|---|
 | `PORT` | `3000` | Puerto HTTP |
 | `PROVIDER` | `ollama` | Provider de arranque para chat, enrutado y embeddings: `ollama` \| `openrouter` \| `opencode` \| `openai-compatible` \| `anthropic` \| `gemini`. Un agente puede sobreescribirlo con su campo `provider` |
-| `OLLAMA_URL` | `http://localhost:11434` | URL de Ollama (también fallback de embeddings para providers sin endpoint propio: `opencode`, `anthropic`) |
+| `OLLAMA_URL` | `http://localhost:11434` | URL de Ollama (también fallback de embeddings preferido para providers sin endpoint propio: `opencode`, `anthropic`; si está vacía se usa `OPENAI_BASE_URL` + `OPENROUTER_API_KEY`) |
 | `OPENROUTER_API_KEY` | — | Clave Bearer de OpenRouter; se guarda en `.env` (modo `0600`), nunca en URLs/logs/health/pantalla |
 | `OPENAI_API_KEY` | — | Clave Bearer para `openai-compatible` (Groq/Mistral/DeepSeek/xAI/gateways propios) |
 | `ANTHROPIC_API_KEY` | — | Clave de Anthropic; viaja en la cabecera `x-api-key`, nunca en la URL |
 | `GEMINI_API_KEY` | — | Clave de Gemini; viaja en la cabecera `x-goog-api-key` (nunca `?key=` en la URL) |
-| `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` | Base OpenAI-compatible para OpenRouter y `openai-compatible` (este último no tiene default fijo) |
+| `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` | Base OpenAI-compatible para OpenRouter y `openai-compatible` (este último no tiene default fijo); con `OPENROUTER_API_KEY` también sirve de fallback de embeddings para `opencode`/`anthropic` |
 | `OPENCODE_API_KEY` | — | Contraseña del servidor OpenCode (HTTP basic auth); misma regla de secreto que las demás claves |
 | `OPENCODE_URL` | `http://127.0.0.1:4096` | Origen de los endpoints generate/decisión de OpenCode |
 | `DEFAULT_MODEL` | — | Modelo por defecto (obligatorio) |
@@ -100,14 +100,14 @@ El streaming y el uso de herramientas se deciden por la **capacidad del modelo r
 |---|---|---|---|---|---|---|
 | Chat no-streaming | sí | sí | sí | sí | sí | sí |
 | `stream: true` | sí | `501` | `501` | `501` (sin motor; ver nota\*) | `501` (sin motor; ver nota\*) | `501` (sin motor; ver nota\*) |
-| Embeddings / RAG | sí | sí | no (salvo fallback Ollama) | sí | no (salvo fallback Ollama) | sí |
+| Embeddings / RAG | sí | sí | no (salvo fallback Ollama u OpenAI-compatible) | sí | no (salvo fallback Ollama u OpenAI-compatible) | sí |
 | Router de decisión d1 | sí (llama.cpp) | sí (nativo) | sí (nativo) | sí (llama.cpp) | sí (llama.cpp) | sí (llama.cpp) |
 | Motor de agentes (Rig) | `rig-core` ollama | `rig-core` openrouter (tools/RAG/MCP) | no | cliente nativo\* | cliente nativo\* | cliente nativo\* |
 
 \* Existen clientes Rig nativos para OpenAI-compatible, Anthropic y Gemini, pero el selector de arranque (`engine_target_for`) solo acopla motor a Ollama y OpenRouter. En los otros tres (y en OpenCode) las peticiones con agente degradan a un chat directo del provider con un aviso explícito de que tools/RAG/MCP no están disponibles; `/api/health` lo reporta como `provider.agent_engine: false` junto a `provider.agent_engine_reason`.
 
 - **Streaming:** los modelos marcados como `streaming: true` con motor acoplado emiten tokens finales progresivamente (Nivel-A: token final + completado; los eventos de herramienta aún no se mapean a SSE). Los adaptadores directos distintos de Ollama rechazan `chat_stream` con `501 Unavailable` antes de abrir conexión, así que un stream sin agente (o sin motor) sigue devolviendo 501 aunque el catálogo diga que el modelo puede hacer streaming. El descubrimiento de herramientas MCP se omite para modelos sin `tool_calling`.
-- **Embeddings/RAG:** Ollama, OpenRouter, OpenAI-compatible y Gemini tienen adaptador de embeddings; Anthropic y OpenCode no. Sin `OLLAMA_URL` como fallback, RAG queda desactivado y `/api/rag/*` responde un `501` explícito que nombra los embeddings (no un `500`). Con `OLLAMA_URL`, los embeddings de Ollama pueden servir de fallback.
+- **Embeddings/RAG:** Ollama, OpenRouter, OpenAI-compatible y Gemini tienen adaptador de embeddings; Anthropic y OpenCode no. Sin ningún fallback (`OLLAMA_URL`, o `OPENAI_BASE_URL` junto con `OPENROUTER_API_KEY`), RAG queda desactivado y `/api/rag/*` responde un `501` explícito que nombra los embeddings (no un `500`). Con `OLLAMA_URL`, los embeddings de Ollama pueden servir de fallback (se prueba primero); si la URL está vacía, un endpoint OpenAI-compatible apuntado por `OPENAI_BASE_URL` y autenticado con `OPENROUTER_API_KEY` sirve los embeddings (`POST /v1/embeddings`; los orígenes de OpenRouter o con `/api/v1` usan la ruta de ese adaptador). La clave viaja en una cabecera, nunca en URLs, logs ni health.
 - **Fallback acotado:** si fallan el provider principal y su reintento con `DEFAULT_MODEL`, se prueba **un único** perfil siguiente usable (en orden determinista por nombre; se omiten perfiles sin credencial en su `api_key_env`). Nunca se recorre una cadena. `ChatResponse.served_by` nombra el perfil que respondió y `ChatResponse.usage` trae los tokens del upstream (`cost_usd` solo si hay precios en el catálogo, hoy ninguno). En streaming el failover solo ocurre al abrir el stream y un 501 deliberado no se reintenta.
 - **Router:** los seis providers pueden servir la decisión d1. Ollama, OpenAI-compatible, Anthropic y Gemini usan el `llama-server` aparte; OpenRouter y OpenCode tienen adaptadores nativos. El enrutado sigue **desactivado por defecto** (`ROUTER_ENABLED=false`) y no cambia cuando está off.
 
