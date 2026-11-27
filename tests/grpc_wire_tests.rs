@@ -207,7 +207,7 @@ fn grpc_stream_event_carries_approval_and_tool_without_raw_arguments() {
     // Fields 1-4 are conserved byte-for-byte.
     assert_eq!(mapped.model, "m");
     assert_eq!(mapped.created_at, "now");
-    assert_eq!(mapped.done, false);
+    assert!(!mapped.done);
     let message = mapped
         .message
         .as_ref()
