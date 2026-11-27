@@ -11,9 +11,15 @@
 
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::api::grpc::pb::llama_gateway_client::LlamaGatewayClient;
+use llama_r::api::grpc::pb::ChatStreamEvent as PbChatStreamEvent;
 use llama_r::api::grpc::pb::{ChatMessage, ChatRequest};
+use llama_r::api::grpc::to_proto_stream_event;
 use llama_r::api::handlers::AppState;
 use llama_r::context::store::ContextStore;
+use llama_r::domain::models::{
+    ApprovalInfo, ChatMessage as DomainChatMessage, ChatStreamEvent as DomainChatStreamEvent,
+    ToolStreamInfo,
+};
 use llama_r::ports::mcp::McpServerRegistry;
 use llama_r::providers::LLMProvider;
 use llama_r::runtime::build_app_state;
@@ -159,4 +165,128 @@ async fn a_real_grpc_chat_round_trip_uses_the_generated_codec() {
     assert_eq!(message.content, "respuesta");
 
     server.abort();
+}
+
+fn domain_stream_event(
+    approval: Option<ApprovalInfo>,
+    tool: Option<ToolStreamInfo>,
+) -> DomainChatStreamEvent {
+    DomainChatStreamEvent {
+        model: "m".to_string(),
+        created_at: "now".to_string(),
+        message: DomainChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+        },
+        done: false,
+        approval,
+        tool,
+    }
+}
+
+/// The same mapper the gRPC stream uses must carry both new fields across the
+/// wire, with only non-secret hashes and identifiers.
+#[test]
+fn grpc_stream_event_carries_approval_and_tool_without_raw_arguments() {
+    let mapped: PbChatStreamEvent = to_proto_stream_event(domain_stream_event(
+        Some(ApprovalInfo {
+            id: "ap-1".to_string(),
+            tool_name: "srv__t".to_string(),
+            args_hash: "deadbeef".to_string(),
+            task_id: Some("task-7".to_string()),
+            depth: Some(2),
+        }),
+        Some(ToolStreamInfo {
+            kind: "call".to_string(),
+            tool_name: "srv__t".to_string(),
+            is_error: None,
+            args_hash: Some("abc".to_string()),
+        }),
+    ));
+
+    // Fields 1-4 are conserved byte-for-byte.
+    assert_eq!(mapped.model, "m");
+    assert_eq!(mapped.created_at, "now");
+    assert_eq!(mapped.done, false);
+    let message = mapped
+        .message
+        .as_ref()
+        .expect("a message is always present");
+    assert_eq!(message.role, "assistant");
+    assert_eq!(message.content, "");
+
+    let tool = mapped
+        .tool
+        .as_ref()
+        .expect("tool field survives the gRPC wire");
+    assert_eq!(tool.kind, "call");
+    assert_eq!(tool.tool_name, "srv__t");
+    assert_eq!(tool.is_error, None);
+    assert_eq!(tool.args_hash.as_deref(), Some("abc"));
+
+    let approval = mapped
+        .approval
+        .as_ref()
+        .expect("approval field survives the gRPC wire");
+    assert_eq!(approval.id, "ap-1");
+    assert_eq!(approval.tool_name, "srv__t");
+    assert_eq!(approval.args_hash, "deadbeef");
+    assert_eq!(approval.task_id.as_deref(), Some("task-7"));
+    assert_eq!(approval.depth, Some(2));
+
+    // Raw arguments were never part of the domain event, so no secret can be
+    // present in the protobuf that crosses the gRPC codec.
+    let wire = format!("{mapped:?}");
+    assert!(!wire.contains("SECRET_VALUE"));
+}
+
+#[test]
+fn grpc_stream_event_maps_tool_result_without_args_hash() {
+    let mapped = to_proto_stream_event(domain_stream_event(
+        None,
+        Some(ToolStreamInfo {
+            kind: "result".to_string(),
+            tool_name: "search".to_string(),
+            is_error: Some(true),
+            args_hash: None,
+        }),
+    ));
+
+    let tool = mapped.tool.as_ref().expect("tool result must be mapped");
+    assert_eq!(tool.kind, "result");
+    assert_eq!(tool.tool_name, "search");
+    assert_eq!(tool.is_error, Some(true));
+    assert_eq!(tool.args_hash, None);
+    assert!(mapped.approval.is_none());
+}
+
+#[test]
+fn grpc_stream_event_leaves_optional_fields_unset_on_ordinary_events() {
+    let mapped = to_proto_stream_event(domain_stream_event(None, None));
+
+    assert_eq!(mapped.model, "m");
+    assert!(mapped.message.is_some());
+    assert!(!mapped.done);
+    assert!(mapped.approval.is_none());
+    assert!(mapped.tool.is_none());
+}
+
+#[test]
+fn grpc_approval_without_delegation_fields_leaves_them_unset() {
+    let mapped = to_proto_stream_event(domain_stream_event(
+        Some(ApprovalInfo {
+            id: "ap-2".to_string(),
+            tool_name: "local_tool".to_string(),
+            args_hash: "cafe".to_string(),
+            task_id: None,
+            depth: None,
+        }),
+        None,
+    ));
+
+    let approval = mapped.approval.as_ref().expect("approval must be mapped");
+    assert_eq!(approval.id, "ap-2");
+    assert_eq!(approval.task_id, None);
+    assert_eq!(approval.depth, None);
+    assert!(mapped.tool.is_none());
 }
