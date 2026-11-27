@@ -1120,6 +1120,13 @@ pub fn openai_compatible_embeddings_fallback(
     let dims = config.embedding_dimensions;
     let embedded: Arc<dyn EmbeddingProvider> =
         if base.contains("openrouter.ai") || base.trim_end_matches('/').ends_with("/api/v1") {
+            // `with_endpoint` expects an *origin*: it appends `/api/v1/embeddings`
+            // itself. `OPENAI_BASE_URL` is conventionally given with `/api/v1`
+            // (the documented OpenRouter value), so strip that suffix here —
+            // mirroring `OpenAiCompatibleEmbeddings::new`'s `/v1` strip — or the
+            // request lands on `/api/v1/api/v1/embeddings` and 404s.
+            let base = base.trim_end_matches('/');
+            let base = base.strip_suffix("/api/v1").unwrap_or(base);
             Arc::new(OpenRouterEmbeddings::with_endpoint(
                 base.to_string(),
                 key.to_string(),
