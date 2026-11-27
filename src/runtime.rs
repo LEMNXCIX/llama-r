@@ -1065,9 +1065,8 @@ fn build_fallback_provider(
 }
 
 /// Ollama can supply embeddings to a provider that has no endpoint of its own.
-/// An empty `OLLAMA_URL` means there is no fallback, so the capability is
-/// reported as missing rather than pointed at a default localhost that is not
-/// running.
+/// An empty `OLLAMA_URL` skips this rung — never a default localhost that is not
+/// running — and the caller may try the OpenAI-compatible fallback next.
 fn ollama_embeddings_fallback(
     config: &Config,
     provider: &str,
@@ -1075,7 +1074,7 @@ fn ollama_embeddings_fallback(
     if config.ollama_url.trim().is_empty() {
         tracing::warn!(
             provider,
-            "embeddings are disabled: this provider does not serve them and OLLAMA_URL is empty"
+            "embeddings are disabled: this provider does not serve them and no OLLAMA_URL or OPENAI_BASE_URL/OPENROUTER_API_KEY fallback is configured"
         );
         None
     } else {
@@ -1085,6 +1084,64 @@ fn ollama_embeddings_fallback(
             config.embedding_dimensions,
         )))
     }
+}
+
+/// An OpenAI-compatible origin can also serve embeddings to a provider with no
+/// endpoint of its own (notably OpenCode and Anthropic). It reuses the two
+/// settings that already exist for chat — `OPENAI_BASE_URL` and
+/// `OPENROUTER_API_KEY` — so no new configuration is introduced. Both must be
+/// present: an empty URL means there is no upstream, and an empty key would
+/// only turn a working primary connection error into a spurious 401.
+///
+/// OpenRouter's hosted origin (or any `/api/v1` origin) uses that adapter's
+/// path; every other origin is treated as a plain OpenAI-compatible endpoint.
+/// The key is never placed in a URL, an error or a log line — the warning below
+/// names only the provider and the two variable names.
+pub fn openai_compatible_embeddings_fallback(
+    config: &Config,
+    provider: &str,
+) -> Option<Arc<dyn EmbeddingProvider>> {
+    let base = config
+        .openai_base_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())?;
+    let Some(key) = config
+        .openrouter_api_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    else {
+        tracing::warn!(
+            provider,
+            "embeddings fallback: OPENAI_BASE_URL is set but OPENROUTER_API_KEY is empty"
+        );
+        return None;
+    };
+    let model = config.embedding_model.clone();
+    let dims = config.embedding_dimensions;
+    let embedded: Arc<dyn EmbeddingProvider> =
+        if base.contains("openrouter.ai") || base.trim_end_matches('/').ends_with("/api/v1") {
+            // `with_endpoint` expects an *origin*: it appends `/api/v1/embeddings`
+            // itself. `OPENAI_BASE_URL` is conventionally given with `/api/v1`
+            // (the documented OpenRouter value), so strip that suffix here —
+            // mirroring `OpenAiCompatibleEmbeddings::new`'s `/v1` strip — or the
+            // request lands on `/api/v1/api/v1/embeddings` and 404s.
+            let base = base.trim_end_matches('/');
+            let base = base.strip_suffix("/api/v1").unwrap_or(base);
+            Arc::new(OpenRouterEmbeddings::with_endpoint(
+                base.to_string(),
+                key.to_string(),
+                model,
+                dims,
+            ))
+        } else {
+            Arc::new(OpenAiCompatibleEmbeddings::new(
+                base.to_string(),
+                key.to_string(),
+                model,
+                dims,
+            ))
+        };
+    Some(embedded)
 }
 
 /// Build the whole provider-dependent stack from the single `PROVIDER` choice.
@@ -1173,10 +1230,12 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
                 config.default_model.clone(),
                 std::time::Duration::from_millis(config.http_timeout_ms),
             ));
-            // OpenCode serves no embeddings endpoint. Ollama can supply them,
-            // but only when a URL was configured: an empty OLLAMA_URL means no
-            // fallback exists, so report the capability as missing and say why.
-            embeddings = ollama_embeddings_fallback(config, "opencode");
+            // OpenCode serves no embeddings endpoint. Ollama can supply them
+            // when a URL was configured; otherwise an OpenAI-compatible URL +
+            // key can. With neither, the capability stays missing and health
+            // says why. No key value is ever logged.
+            embeddings = ollama_embeddings_fallback(config, "opencode")
+                .or_else(|| openai_compatible_embeddings_fallback(config, "opencode"));
             router = if router_config.enabled {
                 Some(Arc::new(OpenCodeRouter::new(
                     config.opencode_url.clone(),
@@ -1216,8 +1275,9 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
             // routing is enabled, exactly as on the Ollama path.
             router = None;
         }
-        // Anthropic serves no embeddings endpoint of its own; the Ollama
-        // fallback (when configured) is the only way to get them.
+        // Anthropic serves no embeddings endpoint of its own; an Ollama URL or
+        // an OpenAI-compatible URL + key can supply them. With neither, the
+        // capability stays missing and health says why.
         ProviderKind::Anthropic => {
             let profile = profile_for(&registry, config);
             provider = Arc::new(AnthropicProvider::new(
@@ -1225,7 +1285,8 @@ pub fn build_provider_stack(config: &Config) -> Result<ProviderStack, AppError> 
                 profile_api_key(&profile),
                 config.default_model.clone(),
             ));
-            embeddings = ollama_embeddings_fallback(config, "anthropic");
+            embeddings = ollama_embeddings_fallback(config, "anthropic")
+                .or_else(|| openai_compatible_embeddings_fallback(config, "anthropic"));
             router = None;
         }
         ProviderKind::Gemini => {
@@ -1280,7 +1341,7 @@ fn build_rag(
 
     let Some(embeddings) = embeddings else {
         tracing::warn!(
-            "RAG unavailable: the selected provider exposes no embeddings and no OLLAMA_URL fallback is configured"
+            "RAG unavailable: the selected provider exposes no embeddings and no OLLAMA_URL or OPENAI_BASE_URL/OPENROUTER_API_KEY fallback is configured"
         );
         return (None, None);
     };
