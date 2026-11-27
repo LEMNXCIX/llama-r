@@ -24,13 +24,24 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+      # Each OS artifact needs a unique basename: action-gh-release flattens
+      # all downloaded artifacts into one release, so two files named
+      # `llama-r` would collide and one binary would be silently dropped.
+      - name: Rename binary for release
+        shell: bash
+        run: |
+          case "${{ matrix.os }}" in
+            ubuntu-latest) mv target/release/llama-r target/release/llama-r-linux ;;
+            macos-latest) mv target/release/llama-r target/release/llama-r-macos ;;
+            windows-latest) mv target/release/llama-r.exe target/release/llama-r-windows.exe ;;
+            *) echo "Unknown OS: ${{ matrix.os }}" >&2; exit 1 ;;
+          esac
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: llama-r-${{ matrix.os }}
-          path: |
-            target/release/llama-r
-            target/release/llama-r.exe
+          path: target/release/llama-r-*
           if-no-files-found: error
 
   release:
