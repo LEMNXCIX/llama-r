@@ -1,5 +1,7 @@
 # Llama-R: Personal AI Gateway
 
+[![CI](https://github.com/LEMNXCIX/llama-r/actions/workflows/ci.yml/badge.svg)](https://github.com/LEMNXCIX/llama-r/actions/workflows/ci.yml)
+
 Llama-R es un gateway AI personal escrito en Rust que se sitúa frente a un provider de LLM (Ollama por defecto, o `openrouter`, `opencode`, `openai-compatible`, `anthropic` y `gemini`) y expone APIs unificadas para chatear con agentes especializados. Cada agente puede tener su propio provider y modelo, prompt de sistema, contexto de proyecto, herramientas MCP, reglas de optimización y política de acceso RAG.
 
 ## Arquitectura
@@ -162,6 +164,17 @@ Formatos: `cursor`, `gemini`, `claude`, `all`.
 GET /health
 GET /api/health
 ```
+
+### Métricas
+```
+GET /metrics
+```
+
+```bash
+curl http://127.0.0.1:3000/metrics
+```
+
+Expone los contadores de observabilidad en formato texto de Prometheus `0.0.4` (`llamar_chat_requests_total`, `llamar_http_requests_total`, latencias, enrutado, decisiones `Auto` y coste, entre otros). Es un endpoint **público**: no necesita `X-Debug` ni `X-Admin-Token`, y **no contiene secretos** — ninguna clave, token ni dato sensible se publica en las métricas. Los mismos contadores están disponibles en el campo `observability` de `/health` y en la TUI.
 
 ### Modelos
 ```
