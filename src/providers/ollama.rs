@@ -208,6 +208,7 @@ impl LLMProvider for OllamaProvider {
                                 message: body.message,
                                 done: body.done,
                                 approval: None,
+                                tool: None,
                             };
                         }
                         Err(e) => {

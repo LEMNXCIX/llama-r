@@ -498,6 +498,7 @@ impl llama_r::providers::LLMProvider for RecordingProvider {
             },
             done: true,
             approval: None,
+            tool: None,
         };
         Ok(Box::pin(tokio_stream::iter(vec![Ok(event)])))
     }

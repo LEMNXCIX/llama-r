@@ -186,6 +186,7 @@ impl LLMProvider for RecordingStreamProvider {
             },
             done: true,
             approval: None,
+            tool: None,
         })])))
     }
 }

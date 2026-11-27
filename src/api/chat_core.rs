@@ -488,6 +488,7 @@ pub fn engine_events_to_chat_stream(
                         },
                         done: false,
                         approval: None,
+                        tool: None,
                     });
                 }
                 AgentRunEvent::Completed { result } => {
@@ -506,6 +507,7 @@ pub fn engine_events_to_chat_stream(
                         },
                         done: true,
                         approval: None,
+                        tool: None,
                     });
                 }
                 AgentRunEvent::Error { message } => {
@@ -532,6 +534,7 @@ pub fn engine_events_to_chat_stream(
                             task_id,
                             depth,
                         }),
+                        tool: None,
                     });
                 }
                 AgentRunEvent::ToolCall { .. } | AgentRunEvent::ToolResult { .. } => {
@@ -550,6 +553,7 @@ pub fn engine_events_to_chat_stream(
                 },
                 done: true,
                 approval: None,
+                tool: None,
             });
         }
     })

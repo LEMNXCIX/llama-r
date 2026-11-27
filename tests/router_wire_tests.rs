@@ -341,6 +341,7 @@ impl LLMProvider for RecordingProvider {
             },
             done: true,
             approval: None,
+            tool: None,
         })])))
     }
 }

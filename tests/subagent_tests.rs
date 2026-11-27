@@ -447,6 +447,7 @@ impl LLMProvider for FakeProvider {
             },
             done: true,
             approval: None,
+            tool: None,
         })])))
     }
 }

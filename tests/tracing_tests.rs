@@ -197,6 +197,7 @@ impl LLMProvider for StubProvider {
             },
             done: true,
             approval: None,
+            tool: None,
         })])))
     }
 }
