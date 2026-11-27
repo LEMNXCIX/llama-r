@@ -10,4 +10,6 @@ pub mod summarizer;
 pub use sqlite::SqliteConversationStore;
 
 #[cfg(feature = "history")]
-pub use summarizer::{NoopSummarizer, OllamaSummarizer};
+pub use summarizer::{
+    ChatCompletionsSummarizer, NoopSummarizer, OllamaSummarizer, OpenCodeSummarizer,
+};
