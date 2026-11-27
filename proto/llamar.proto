@@ -26,11 +26,34 @@ message ChatResponse {
   bool done = 4;
 }
 
+// Non-secret approval identifiers attached to one stream event. Raw tool
+// arguments are deliberately absent: only the hash of the canonical args is
+// carried so a client can bind its decision to what a human saw.
+message ApprovalStreamInfo {
+  string id = 1;
+  string tool_name = 2;
+  string args_hash = 3;
+  optional string task_id = 4;
+  optional uint32 depth = 5;
+}
+
+// Non-secret progress information for one tool call/result. A call carries the
+// canonical args hash; a result carries only whether the tool failed. Raw
+// arguments and output previews are deliberately absent.
+message ToolStreamInfo {
+  string kind = 1;
+  string tool_name = 2;
+  optional bool is_error = 3;
+  optional string args_hash = 4;
+}
+
 message ChatStreamEvent {
   string model = 1;
   string created_at = 2;
   ChatMessage message = 3;
   bool done = 4;
+  optional ApprovalStreamInfo approval = 5;
+  optional ToolStreamInfo tool = 6;
 }
 
 // MCP Messages

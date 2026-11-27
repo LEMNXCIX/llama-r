@@ -189,6 +189,26 @@ pub struct ApprovalInfo {
     pub depth: Option<u32>,
 }
 
+/// Non-secret progress information attached to one SSE tool event.
+///
+/// A `call` carries the qualified tool name and the hash of its canonical
+/// arguments; a `result` carries the qualified name and whether it failed.
+/// Raw arguments and previews are deliberately absent — they may contain
+/// secrets.
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct ToolStreamInfo {
+    /// `"call"` or `"result"`.
+    pub kind: String,
+    /// Qualified tool name via `rig_tool_name` (`server__tool` or bare id).
+    pub tool_name: String,
+    /// Present on `"result"`: whether the tool failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+    /// Present on `"call"`: SHA-256 of the canonical arguments — never raw args.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args_hash: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct ChatStreamEvent {
     pub model: String,
@@ -199,6 +219,10 @@ pub struct ChatStreamEvent {
     /// existing SSE clients see an unchanged payload on ordinary events.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval: Option<ApprovalInfo>,
+    /// Present only on a tool call/result event. Skipped when absent so
+    /// existing SSE clients see an unchanged payload on ordinary events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<ToolStreamInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]

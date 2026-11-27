@@ -1,8 +1,9 @@
+use crate::adapters::rig_engine::rig_tool_name;
 use crate::api::handlers::AppState;
 use crate::api::route_resolution::{resolve_selection, AgentSelection, ResolvedSelection};
 use crate::domain::execution::{AgentExecution, EventKind, ExecutionEvent, ExecutionStatus};
 use crate::domain::models::{
-    ApprovalInfo, ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, Usage,
+    ApprovalInfo, ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, ToolStreamInfo, Usage,
 };
 use crate::error::AppError;
 use crate::optimizer::TokenOptimizer;
@@ -488,6 +489,7 @@ pub fn engine_events_to_chat_stream(
                         },
                         done: false,
                         approval: None,
+                        tool: None,
                     });
                 }
                 AgentRunEvent::Completed { result } => {
@@ -506,6 +508,7 @@ pub fn engine_events_to_chat_stream(
                         },
                         done: true,
                         approval: None,
+                        tool: None,
                     });
                 }
                 AgentRunEvent::Error { message } => {
@@ -532,10 +535,59 @@ pub fn engine_events_to_chat_stream(
                             task_id,
                             depth,
                         }),
+                        tool: None,
                     });
                 }
-                AgentRunEvent::ToolCall { .. } | AgentRunEvent::ToolResult { .. } => {
-                    // Tool progress is not mapped to ChatStreamEvent yet (Nivel-A streaming).
+                AgentRunEvent::ToolCall { server_id, tool_name, arguments } => {
+                    // Only the canonical hash crosses the stream: raw arguments
+                    // may carry credentials. A local tool has no server id and
+                    // keeps its bare id, like `rig_tool_name` would produce.
+                    let qualified = if server_id.is_empty() {
+                        tool_name
+                    } else {
+                        rig_tool_name(&server_id, &tool_name)
+                    };
+                    yield Ok(ChatStreamEvent {
+                        model: model.clone(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        message: ChatMessage {
+                            role: "assistant".to_string(),
+                            content: String::new(),
+                        },
+                        done: false,
+                        approval: None,
+                        tool: Some(ToolStreamInfo {
+                            kind: "call".into(),
+                            tool_name: qualified,
+                            is_error: None,
+                            args_hash: Some(args_hash_hex(&arguments)),
+                        }),
+                    });
+                }
+                AgentRunEvent::ToolResult { server_id, tool_name, is_error, .. } => {
+                    // A result never carries a hash or a preview: both can leak
+                    // output the caller must not see in the SSE channel.
+                    let qualified = if server_id.is_empty() {
+                        tool_name
+                    } else {
+                        rig_tool_name(&server_id, &tool_name)
+                    };
+                    yield Ok(ChatStreamEvent {
+                        model: model.clone(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        message: ChatMessage {
+                            role: "assistant".to_string(),
+                            content: String::new(),
+                        },
+                        done: false,
+                        approval: None,
+                        tool: Some(ToolStreamInfo {
+                            kind: "result".into(),
+                            tool_name: qualified,
+                            is_error: Some(is_error),
+                            args_hash: None,
+                        }),
+                    });
                 }
             }
         }
@@ -550,6 +602,7 @@ pub fn engine_events_to_chat_stream(
                 },
                 done: true,
                 approval: None,
+                tool: None,
             });
         }
     })

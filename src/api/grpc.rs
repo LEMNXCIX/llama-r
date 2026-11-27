@@ -1,7 +1,9 @@
 use crate::api::chat_core::{execute_chat, execute_chat_stream};
 use crate::api::handlers::AppState;
 use crate::api::route_resolution::AgentSelection;
-use crate::domain::models::{ChatMessage as DomainChatMessage, ChatRequest};
+use crate::domain::models::{
+    ChatMessage as DomainChatMessage, ChatRequest, ChatStreamEvent as DomainChatStreamEvent,
+};
 use crate::error::AppError;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -36,6 +38,37 @@ fn to_domain_request(req: pb::ChatRequest, stream: bool) -> ChatRequest {
             })
             .collect(),
         stream,
+    }
+}
+
+/// Map one domain stream event to its protobuf counterpart.
+///
+/// This is the exact mapping used by `chat_stream`, made public so the wire
+/// test can exercise it without standing up an agent with tools. Only hashes
+/// and identifiers cross the wire: raw tool arguments and output previews are
+/// not part of the domain event at all.
+pub fn to_proto_stream_event(event: DomainChatStreamEvent) -> pb::ChatStreamEvent {
+    pb::ChatStreamEvent {
+        model: event.model,
+        created_at: event.created_at,
+        message: Some(pb::ChatMessage {
+            role: event.message.role,
+            content: event.message.content,
+        }),
+        done: event.done,
+        approval: event.approval.map(|a| pb::ApprovalStreamInfo {
+            id: a.id,
+            tool_name: a.tool_name,
+            args_hash: a.args_hash,
+            task_id: a.task_id,
+            depth: a.depth,
+        }),
+        tool: event.tool.map(|t| pb::ToolStreamInfo {
+            kind: t.kind,
+            tool_name: t.tool_name,
+            is_error: t.is_error,
+            args_hash: t.args_hash,
+        }),
     }
 }
 
@@ -108,15 +141,7 @@ impl LlamaGateway for GrpcService {
             .map_err(|error| to_status(&self.state, error))?;
         let state = self.state.clone();
         let grpc_stream = stream.map(move |res| match res {
-            Ok(event) => Ok(pb::ChatStreamEvent {
-                model: event.model,
-                created_at: event.created_at,
-                message: Some(pb::ChatMessage {
-                    role: event.message.role,
-                    content: event.message.content,
-                }),
-                done: event.done,
-            }),
+            Ok(event) => Ok(to_proto_stream_event(event)),
             Err(error) => Err(to_status(&state, error)),
         });
 
