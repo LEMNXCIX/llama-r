@@ -1,0 +1,38 @@
+# cargo-deny configuration. Advisories are fixed upstream or here, never
+# silenced silently. The single exception below is named and reasoned.
+
+[advisories]
+yanked = "warn"
+# RUSTSEC-2026-0543: chrono is unmaintained. 0.4.45 is the latest release and
+# upstream states there is no safe upgrade ("No safe upgrade is available!").
+# `cargo audit` still runs as an independent gate. This single named, reasoned
+# exception is auditable in version control; no blanket `unmaintained = none`
+# is used and real vulnerabilities remain errors.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no safe upgrade; cargo audit remains an independent gate" },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    # Added after `cargo deny check` reported them as rejected; each is a
+    # permissive, OSI-approved SPDX id from one named transitive crate, not a
+    # blanket allowance:
+    #   Unicode-3.0        — zerovec / icu_* (idna → url) and unicode-ident
+    #   CDLA-Permissive-2.0 — webpki-root-certs (rustls → reqwest)
+    #   Zlib               — foldhash (hashbrown → petgraph → prost-build)
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+highlight = "all"

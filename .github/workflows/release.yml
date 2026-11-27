@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # dtolnay/rust-toolchain reads channel and components from the
+      # repository's rust-toolchain.toml when no inputs are given.
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      # Each OS artifact needs a unique basename: action-gh-release flattens
+      # all downloaded artifacts into one release, so two files named
+      # `llama-r` would collide and one binary would be silently dropped.
+      - name: Rename binary for release
+        shell: bash
+        run: |
+          case "${{ matrix.os }}" in
+            ubuntu-latest) mv target/release/llama-r target/release/llama-r-linux ;;
+            macos-latest) mv target/release/llama-r target/release/llama-r-macos ;;
+            windows-latest) mv target/release/llama-r.exe target/release/llama-r-windows.exe ;;
+            *) echo "Unknown OS: ${{ matrix.os }}" >&2; exit 1 ;;
+          esac
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-r-${{ matrix.os }}
+          path: target/release/llama-r-*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # GITHUB_TOKEN is implicit; no new secrets are required.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: CHANGELOG.md
+          files: artifacts/**

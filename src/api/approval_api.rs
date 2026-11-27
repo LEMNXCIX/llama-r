@@ -47,7 +47,7 @@ fn parse_hash_hex(hex: &str) -> Result<[u8; 32], AppError> {
         ));
     }
     let mut out = [0u8; 32];
-    for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(chunk).expect("hex bytes are ASCII");
         out[index] = u8::from_str_radix(pair, 16).expect("chunk already validated as hex");
     }

@@ -5,6 +5,8 @@
 //! `operation_id` guard replays an already-recorded tool result instead of
 //! repeating its side effect (the fake tool's counter stays at 1).
 
+#![allow(clippy::await_holding_lock)] // the env lock is held for the whole test by design
+
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -34,7 +36,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tower::ServiceExt;
@@ -273,6 +275,15 @@ fn install_agent(registry: &AgentRegistry, project: &str, agent: &str) {
     registry.reload_all(&[]).unwrap();
 }
 
+/// Serialise every test in this binary that mutates `LLAMA_R_DIR`: the
+/// variable is process-global, so two tests interleaving `set_var` with
+/// `install_agent`'s `reload_all` make one of them load an empty registry and
+/// fail with "Agent 'agent' not found for project 'proj'".
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn test_state(
     engine: Arc<dyn AgentEngine>,
     store: Arc<FakeStore>,
@@ -368,6 +379,9 @@ fn debug_req(method: &str, uri: &str) -> Request<Body> {
 
 #[tokio::test]
 async fn observability_endpoints_gate_on_debug_and_redact_secrets() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let store = Arc::new(FakeStore::default());
     // A structured message: the store redacts secret-bearing fields on write,
     // and the API must never echo them back.
@@ -447,6 +461,9 @@ async fn observability_endpoints_gate_on_debug_and_redact_secrets() {
 
 #[tokio::test]
 async fn the_load_bearing_retry_reuses_execution_id_and_does_not_reexecute_tools() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let store = Arc::new(FakeStore::default());
     let calls = Arc::new(AtomicU32::new(0));
     let seen_ids = Arc::new(Mutex::new(vec![]));
@@ -521,6 +538,9 @@ async fn the_load_bearing_retry_reuses_execution_id_and_does_not_reexecute_tools
 
 #[tokio::test]
 async fn retry_maps_unknown_wrong_status_and_legacy_null_message() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let store = Arc::new(FakeStore::default());
     let gate = Arc::new(ApprovalGate::default());
     let (_dir, state) = test_state(
@@ -594,6 +614,9 @@ async fn retry_maps_unknown_wrong_status_and_legacy_null_message() {
 
 #[tokio::test]
 async fn a_decided_approval_from_a_prior_run_is_consumed_by_the_retry() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // A pending registered under execution E is decided after a restart. A
     // fresh gate reloads the decision; requesting approval for the SAME tool and
     // args under E consumes it (no new pending, an immediately-approved result).

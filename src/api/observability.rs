@@ -137,7 +137,7 @@ impl AppObservability {
     }
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Default, Serialize, ToSchema)]
 pub struct ObservabilitySnapshot {
     pub http_requests: u64,
     pub chat_requests: u64,

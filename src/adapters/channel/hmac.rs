@@ -78,7 +78,7 @@ fn decode_signature_hex(header: &str) -> Option<[u8; DIGEST_LEN]> {
         return None;
     }
     let mut out = [0u8; DIGEST_LEN];
-    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (slot, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
         *slot = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
     }
     Some(out)

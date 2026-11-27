@@ -24,6 +24,7 @@ use crate::api::history_api::{
     delete_conversation_handler, export_conversation_handler, get_conversation_handler,
     get_conversation_messages_handler, list_conversations_handler,
 };
+use crate::api::metrics::metrics;
 use crate::api::observability::AppObservability;
 use crate::api::rag_api::{rag_delete_document, rag_ingest, rag_query};
 use crate::api::route_api::route_preview;
@@ -344,6 +345,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let public = Router::new()
         .route("/", get(|| async { "Llama-R API is running" }))
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/chat", post(chat))
         .route("/models", get(list_models))
         .route("/v1/chat/completions", post(openai_chat))

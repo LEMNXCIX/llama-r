@@ -187,6 +187,14 @@ It also carries a `provider` object: `{"name": …, "embeddings": bool, "reason"
 
 The response also carries an `observability` object (`ObservabilitySnapshot`, `src/api/observability.rs`) of atomic counters. Alongside the request/latency/routing counters it now exposes four Fase 6 fields: `auto_approved`, `auto_denied` and `auto_unavailable` count gate-time `Auto` decisions (`Allow`, `Deny`, and router error/no-decider respectively, including a missing decider as `auto_unavailable`), and `cost_usd_total_micros` accumulates real reported `cost_usd` in integer microdollars (saturating; no entry while catalog prices are `None`). Only an `Auto` rule reaches the `auto_*` counters — `Never`, `Always` and `Once` never touch them. The dashboard/TUI reads the same snapshot; no health contract change beyond these added fields, and no field carries a key.
 
+### Metrics
+
+```text
+GET /metrics
+```
+
+Prometheus text format 0.0.4 rendering of the same `ObservabilitySnapshot` (`src/api/metrics.rs`, 16 `llamar_*` series). This endpoint is public: it requires neither `X-Debug` nor `X-Admin-Token`, and it carries no secrets — no key, token or secret appears in the output.
+
 ### Basic Endpoints
 ```text
 GET  /
@@ -309,6 +317,8 @@ cargo test --test provider_eval_smoke
 # Declarative eval runner (checks, strict mode, called_tool, judge):
 cargo test --test evals_tests
 ```
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo audit`, `cargo clippy --all-targets -- -D warnings`, `cargo test --target-dir target-tests`, `CARGO_TARGET_DIR=target-tests cargo llvm-cov --all-features --lcov --output-path lcov.info --fail-under-lines 40`, `cargo deny check` and `cargo build --release --target-dir target-release`. The pinned toolchain and required components (`clippy`, `rustfmt`, `llvm-tools-preview`) live in `rust-toolchain.toml`; `tests/ci_config_tests.sh` checks the CI and release workflow configuration locally.
 
 ## Declarative evals
 

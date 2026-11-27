@@ -1,7 +1,12 @@
 [package]
 name = "llama-r"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/LEMNXCIX/llama-r"
+description = "Personal AI gateway with HTTP, OpenAI-compatible and gRPC APIs"
+authors = ["LEMNXCIX"]
+readme = "README.md"
 
 [features]
 default = ["rig-engine", "history"]
