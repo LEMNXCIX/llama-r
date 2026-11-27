@@ -52,14 +52,17 @@ const ROUTER_ENV_VARS: &[&str] = &[
     "MIN_SPECIALIZED",
 ];
 
-/// Credentials the new direct adapters read by *variable name* from their
-/// profile. Cleared so a stack test cannot accidentally pick up the developer's
-/// shell keys, and restored on drop.
+/// Credentials and fallback endpoint the adapters read. Cleared so a stack test
+/// cannot accidentally pick up the developer's shell keys/URL — in particular a
+/// `OPENAI_BASE_URL` would turn the "no embeddings" cases below into a working
+/// fallback — and restored on drop.
 const KEY_ENV_VARS: &[&str] = &[
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
     "LLAMA_R_TEST_CUSTOM_KEY",
+    "OPENAI_BASE_URL",
+    "OPENROUTER_API_KEY",
 ];
 
 struct EnvGuard {
@@ -212,12 +215,39 @@ fn opencode_without_ollama_has_no_embeddings_and_health_says_why() {
         "the reason must name the missing capability: {reason}"
     );
     assert!(
-        reason.contains("OLLAMA_URL") && reason.contains("opencode"),
-        "the reason must say why they are disabled: {reason}"
+        reason.contains("OLLAMA_URL")
+            && reason.contains("OPENAI_BASE_URL")
+            && reason.contains("OPENROUTER_API_KEY")
+            && reason.contains("opencode"),
+        "the reason must name both fallback routes and the provider: {reason}"
     );
     // A key must never leak into any health field.
     let all = serde_json::to_string(&response).expect("serialize health");
     assert!(!all.contains("opencode-secret-never-exposed"), "{all}");
+}
+
+/// With no Ollama URL but an OpenAI-compatible URL + key configured, the two
+/// providers that have no embeddings endpoint of their own must still get an
+/// embedder, and health must report the capability honestly (with no reason).
+#[test]
+fn opencode_and_anthropic_use_embeddings_fallback_when_url_and_key_are_configured() {
+    let _lock = test_lock();
+    let _env = EnvGuard::fresh();
+
+    for kind in [ProviderKind::OpenCode, ProviderKind::Anthropic] {
+        let mut cfg = config(kind);
+        cfg.openai_base_url = Some("https://example.test/v1".to_string());
+        let stack = build_provider_stack(&cfg).expect("build stack");
+        assert!(
+            stack.embeddings.is_some(),
+            "{kind}: OPENAI_BASE_URL + OPENROUTER_API_KEY must supply an embedder"
+        );
+        let response = health_response(stack);
+        assert!(response.provider.embeddings, "{kind}");
+        assert_eq!(response.provider.reason, None, "{kind}");
+        let all = serde_json::to_string(&response).expect("serialize health");
+        assert!(!all.contains("sk-secret-never-exposed"), "{kind}: {all}");
+    }
 }
 
 #[test]
@@ -464,7 +494,10 @@ fn direct_provider_capabilities_are_honest_and_keys_never_leak() {
         .expect("a missing capability must be explained");
     assert!(reason.contains("embeddings"), "{reason}");
     assert!(
-        reason.contains("OLLAMA_URL") && reason.contains("anthropic"),
+        reason.contains("OLLAMA_URL")
+            && reason.contains("OPENAI_BASE_URL")
+            && reason.contains("OPENROUTER_API_KEY")
+            && reason.contains("anthropic"),
         "{reason}"
     );
     let all = serde_json::to_string(&response).expect("serialize health");

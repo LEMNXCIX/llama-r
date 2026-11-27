@@ -61,6 +61,10 @@ const ROUTER_ENV_VARS: &[&str] = &[
     "MIN_SPECIALIZED",
 ];
 
+/// Cleared so a developer shell's `OPENAI_BASE_URL` cannot silently turn the
+/// "no embeddings ⇒ no RAG" case below into a working fallback.
+const EMBEDDINGS_ENV_VARS: &[&str] = &["OPENAI_BASE_URL", "OPENROUTER_API_KEY"];
+
 struct EnvGuard {
     saved: Vec<(&'static str, Option<String>)>,
     prev_dir: Option<String>,
@@ -71,9 +75,10 @@ impl EnvGuard {
     fn fresh() -> Self {
         let saved = ROUTER_ENV_VARS
             .iter()
+            .chain(EMBEDDINGS_ENV_VARS.iter())
             .map(|name| (*name, std::env::var(name).ok()))
             .collect();
-        for name in ROUTER_ENV_VARS {
+        for name in ROUTER_ENV_VARS.iter().chain(EMBEDDINGS_ENV_VARS.iter()) {
             std::env::remove_var(name);
         }
         let prev_dir = std::env::var("LLAMA_R_DIR").ok();
@@ -291,6 +296,43 @@ async fn rag_store_is_absent_when_the_selected_provider_has_no_embeddings() {
         body.to_ascii_lowercase().contains("embedding"),
         "the 501 reason must name the missing capability: {body}"
     );
+}
+
+/// OpenCode has no embeddings endpoint, but an OpenAI-compatible URL + key
+/// supplies one. The RAG store and ingest service must be built from it, just
+/// as they are for a provider with native embeddings — never a 501.
+#[tokio::test]
+async fn opencode_with_embeddings_fallback_builds_rag_store() {
+    let _lock = test_lock();
+    let _env = EnvGuard::fresh();
+
+    let mut cfg = config(ProviderKind::OpenCode);
+    cfg.openai_base_url = Some("https://example.test/v1".to_string());
+    let mut stack = build_provider_stack(&cfg).expect("build stack");
+    assert!(
+        stack.embeddings.is_some(),
+        "OPENAI_BASE_URL + OPENROUTER_API_KEY must supply an embedder"
+    );
+    stack.provider = Arc::new(LocalProvider {
+        answer: String::new(),
+    });
+    let state = bare_state(stack);
+    with_companions(&state, &cfg).await;
+
+    let services = state.services_snapshot().await;
+    assert!(
+        services.rag_store.is_some(),
+        "fallback embeddings must build a RAG store"
+    );
+    assert!(services.rag_ingest.is_some());
+    assert!(services.embeddings.is_some());
+    drop(services);
+
+    let response = health(State(state)).await.0;
+    assert!(response.provider.embeddings);
+    assert_eq!(response.provider.reason, None);
+    let all = serde_json::to_string(&response).expect("serialize health");
+    assert!(!all.contains("sk-secret-never-exposed"), "{all}");
 }
 
 /// For OpenRouter the stack carries OpenRouter embeddings, so a real RAG store

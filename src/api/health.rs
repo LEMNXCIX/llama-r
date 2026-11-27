@@ -76,7 +76,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
             None
         } else {
             Some(format!(
-                "embeddings are disabled: the '{}' provider does not serve them and no OLLAMA_URL fallback is configured",
+                "embeddings are disabled: the '{}' provider does not serve them and no OLLAMA_URL or OPENAI_BASE_URL/OPENROUTER_API_KEY fallback is configured",
                 services.provider_name
             ))
         },

@@ -34,7 +34,7 @@ fn require_debug(headers: &HeaderMap) -> Result<(), AppError> {
 /// 500 from an embedder pointed at an empty/unsupported URL.
 fn rag_unavailable() -> AppError {
     AppError::Unavailable(
-        "RAG is unavailable: RAG_ENABLED=false, or the selected provider exposes no embeddings (with no OLLAMA_URL fallback)".into(),
+        "RAG is unavailable: RAG_ENABLED=false, or the selected provider exposes no embeddings (with no OLLAMA_URL or OPENAI_BASE_URL/OPENROUTER_API_KEY fallback)".into(),
     )
 }
 
