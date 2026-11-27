@@ -1087,6 +1087,57 @@ fn ollama_embeddings_fallback(
     }
 }
 
+/// An OpenAI-compatible origin can also serve embeddings to a provider with no
+/// endpoint of its own (notably OpenCode and Anthropic). It reuses the two
+/// settings that already exist for chat — `OPENAI_BASE_URL` and
+/// `OPENROUTER_API_KEY` — so no new configuration is introduced. Both must be
+/// present: an empty URL means there is no upstream, and an empty key would
+/// only turn a working primary connection error into a spurious 401.
+///
+/// OpenRouter's hosted origin (or any `/api/v1` origin) uses that adapter's
+/// path; every other origin is treated as a plain OpenAI-compatible endpoint.
+/// The key is never placed in a URL, an error or a log line — the warning below
+/// names only the provider and the two variable names.
+pub fn openai_compatible_embeddings_fallback(
+    config: &Config,
+    provider: &str,
+) -> Option<Arc<dyn EmbeddingProvider>> {
+    let base = config
+        .openai_base_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())?;
+    let Some(key) = config
+        .openrouter_api_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    else {
+        tracing::warn!(
+            provider,
+            "embeddings fallback: OPENAI_BASE_URL is set but OPENROUTER_API_KEY is empty"
+        );
+        return None;
+    };
+    let model = config.embedding_model.clone();
+    let dims = config.embedding_dimensions;
+    let embedded: Arc<dyn EmbeddingProvider> =
+        if base.contains("openrouter.ai") || base.trim_end_matches('/').ends_with("/api/v1") {
+            Arc::new(OpenRouterEmbeddings::with_endpoint(
+                base.to_string(),
+                key.to_string(),
+                model,
+                dims,
+            ))
+        } else {
+            Arc::new(OpenAiCompatibleEmbeddings::new(
+                base.to_string(),
+                key.to_string(),
+                model,
+                dims,
+            ))
+        };
+    Some(embedded)
+}
+
 /// Build the whole provider-dependent stack from the single `PROVIDER` choice.
 ///
 /// One setting selects chat, the decision router and — where the upstream can
