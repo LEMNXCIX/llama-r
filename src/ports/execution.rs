@@ -66,6 +66,13 @@ pub trait ExecutionStore: Send + Sync {
         error: Option<&str>,
     ) -> Result<(), String>;
 
+    /// Advance the observation-only tool-loop cursor of a turn.
+    ///
+    /// Additive to the port: bridges write it next to each `CheckpointCreated`
+    /// so a retry can see how far the turn got. A failure is a warning in the
+    /// caller, never a failed tool call or chat.
+    async fn set_current_step(&self, execution_id: Uuid, step: u32) -> Result<(), String>;
+
     /// Read one turn, or `None` for an unknown id.
     async fn get(&self, execution_id: Uuid) -> Result<Option<AgentExecution>, String>;
 

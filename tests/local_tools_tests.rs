@@ -1109,6 +1109,9 @@ impl ExecutionStore for OpStore {
     ) -> Result<(), String> {
         Ok(())
     }
+    async fn set_current_step(&self, _execution_id: Uuid, _step: u32) -> Result<(), String> {
+        Ok(())
+    }
     async fn get(
         &self,
         _execution_id: Uuid,
