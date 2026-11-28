@@ -13,7 +13,7 @@ use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
 use llama_r::adapters::context::NoopCompactor;
 use llama_r::adapters::mcp::StaticMcpRegistry;
-use llama_r::adapters::rig_engine::operations::{operation_id, OperationContext};
+use llama_r::adapters::rig_engine::operations::{operation_id, run_idempotent, OperationContext};
 use llama_r::api::chat_core::execute_chat_with_id;
 use llama_r::api::handlers::AppState;
 use llama_r::api::route_resolution::AgentSelection;
@@ -79,6 +79,12 @@ impl ExecutionStore for FakeStore {
         if let Some(e) = self.executions.lock().unwrap().get_mut(&id) {
             e.status = status;
             e.error = error.map(str::to_string);
+        }
+        Ok(())
+    }
+    async fn set_current_step(&self, id: Uuid, step: u32) -> Result<(), String> {
+        if let Some(execution) = self.executions.lock().unwrap().get_mut(&id) {
+            execution.current_step = step;
         }
         Ok(())
     }
@@ -613,6 +619,287 @@ async fn retry_maps_unknown_wrong_status_and_legacy_null_message() {
     );
 }
 
+// ── Task 2: checkpoint-aware retry ────────────────────────────────────────
+
+/// Records the `user_message` the chat dispatch hands to the engine, so a test
+/// can see the resume note that `retry_turn` prefixed to it.
+#[derive(Default)]
+struct NoteSpy {
+    messages: Mutex<Vec<String>>,
+    iterations: Mutex<Vec<Option<usize>>>,
+}
+
+struct NoteEngine {
+    store: Arc<FakeStore>,
+    spy: Arc<NoteSpy>,
+}
+
+#[async_trait]
+impl AgentEngine for NoteEngine {
+    async fn run(&self, req: AgentRunRequest) -> Result<AgentRunResult, String> {
+        self.spy
+            .messages
+            .lock()
+            .unwrap()
+            .push(req.user_message.clone());
+        self.spy
+            .iterations
+            .lock()
+            .unwrap()
+            .push(req.max_iterations_override);
+        let ctx = OperationContext::new(req.execution_id, self.store.clone());
+        let text = run_idempotent(Some(&ctx), "db__write", &json!({"row": 1}), async {
+            Ok::<_, String>("write-0".into())
+        })
+        .await?;
+        Ok(AgentRunResult {
+            text,
+            tool_calls: 1,
+            iterations: 2,
+            model: req.model,
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        req: AgentRunRequest,
+    ) -> Result<mpsc::Receiver<AgentRunEvent>, String> {
+        let result = self.run(req).await?;
+        let (tx, rx) = mpsc::channel(2);
+        let _ = tx.send(AgentRunEvent::Completed { result }).await;
+        Ok(rx)
+    }
+}
+
+/// Seed one checkpoint and its stored tool result under the operation id the
+/// bridges mint (`{execution_id}:{tool}:{args_hash_hex}`).
+async fn seed_checkpoint(store: &FakeStore, id: Uuid, step: u32, tool: &str, result: Value) {
+    let hash = format!("{:064x}", step + 1);
+    store
+        .append_event(
+            id,
+            &ExecutionEvent::new(
+                id,
+                EventKind::CheckpointCreated,
+                json!({
+                    "step": step,
+                    "next_step_index": step + 1,
+                    "tool": tool,
+                    "args_hash": hash,
+                    "replayed": false,
+                    "status": "completed",
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .record_operation(&format!("{id}:{tool}:{hash}"), &result)
+        .await
+        .unwrap();
+}
+
+/// Seed a checkpoint with an explicit `status` — the default helper above only
+/// writes `completed`, so failure and replay cases need their own fixture.
+async fn seed_checkpoint_status(
+    store: &FakeStore,
+    id: Uuid,
+    step: u32,
+    tool: &str,
+    hash: &str,
+    status: &str,
+    result: Option<Value>,
+) {
+    store
+        .append_event(
+            id,
+            &ExecutionEvent::new(
+                id,
+                EventKind::CheckpointCreated,
+                json!({
+                    "step": step,
+                    "next_step_index": step + 1,
+                    "tool": tool,
+                    "args_hash": hash,
+                    "replayed": false,
+                    "status": status,
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    if let Some(result) = result {
+        store
+            .record_operation(&format!("{id}:{tool}:{hash}"), &result)
+            .await
+            .unwrap();
+    }
+}
+
+fn interrupted_turn(id: Uuid) -> AgentExecution {
+    AgentExecution {
+        id,
+        conversation_id: None,
+        agent_qualified_id: "proj::agent".into(),
+        provider: "ollama".into(),
+        model: "model-a".into(),
+        status: ExecutionStatus::Interrupted,
+        current_step: 2,
+        user_message: Some("original task".into()),
+        user_message_hash: "ab".repeat(32),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        finished_at: None,
+        error: None,
+    }
+}
+
+fn retry_request(uri: &str, body: Value) -> Request<Body> {
+    admin_request()
+        .method("POST")
+        .uri(uri)
+        .header("x-debug", "true")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn retry_prefixes_a_redacted_resume_note_from_checkpoints() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = Arc::new(FakeStore::default());
+    let spy = Arc::new(NoteSpy::default());
+    let (_dir, state) = test_state(
+        Arc::new(NoteEngine {
+            store: store.clone(),
+            spy: spy.clone(),
+        }),
+        store.clone(),
+        Arc::new(ApprovalGate::default()),
+    );
+    let id = Uuid::new_v4();
+    store.create(&interrupted_turn(id)).await.unwrap();
+    seed_checkpoint(
+        &store,
+        id,
+        0,
+        "db__write",
+        json!({"api_key": "sk-NOTE-SECRET", "rows": 3}),
+    )
+    .await;
+    seed_checkpoint(&store, id, 1, "local_echo", json!({"text": "done"})).await;
+
+    let router = build_router(state);
+    let uri = format!("/api/executions/{id}/retry");
+    let (status, body) = send(&router, retry_request(&uri, json!({"from_step": 0}))).await;
+    assert_eq!(status, StatusCode::OK, "retry body: {body}");
+
+    let messages = spy.messages.lock().unwrap();
+    assert_eq!(messages.len(), 1, "one retried engine turn");
+    let note = &messages[0];
+    assert!(note.contains("[Resume]"), "note: {note}");
+    assert!(
+        note.contains("paso 0") && note.contains("paso 1"),
+        "note: {note}"
+    );
+    assert!(
+        note.contains("db__write") && note.contains("local_echo"),
+        "note: {note}"
+    );
+    assert!(note.contains("[REDACTED]"), "note: {note}");
+    assert!(!note.contains("sk-NOTE-SECRET"), "note: {note}");
+    assert!(note.contains("\"rows\":3"), "note: {note}");
+    assert!(
+        note.ends_with("original task"),
+        "note must be a prefix: {note}"
+    );
+
+    // Default manifest budget is 6; two completed checkpoints leave 4.
+    assert_eq!(
+        spy.iterations.lock().unwrap().as_slice(),
+        [Some(4)],
+        "the retry's tool-loop budget is reduced by the completed steps"
+    );
+}
+
+#[tokio::test]
+async fn from_step_filters_earlier_checkpoints_and_empty_ranges_have_no_note() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = Arc::new(FakeStore::default());
+    let spy = Arc::new(NoteSpy::default());
+    let (_dir, state) = test_state(
+        Arc::new(NoteEngine {
+            store: store.clone(),
+            spy: spy.clone(),
+        }),
+        store.clone(),
+        Arc::new(ApprovalGate::default()),
+    );
+    let id = Uuid::new_v4();
+    store.create(&interrupted_turn(id)).await.unwrap();
+    seed_checkpoint(&store, id, 0, "db__write", json!({"n": 0})).await;
+    seed_checkpoint(&store, id, 1, "local_echo", json!({"n": 1})).await;
+    seed_checkpoint(&store, id, 2, "db__write", json!({"n": 2})).await;
+    let router = build_router(state);
+    let uri = format!("/api/executions/{id}/retry");
+
+    let (status, body) = send(&router, retry_request(&uri, json!({"from_step": 2}))).await;
+    assert_eq!(status, StatusCode::OK, "retry body: {body}");
+    {
+        let messages = spy.messages.lock().unwrap();
+        let note = messages.last().expect("one retried turn");
+        assert!(note.contains("paso 2"), "note: {note}");
+        assert!(!note.contains("paso 0"), "note: {note}");
+        assert!(!note.contains("paso 1"), "note: {note}");
+    }
+
+    // No checkpoint at or after the requested step: plain retry, no note.
+    store
+        .set_status(id, ExecutionStatus::Interrupted, None)
+        .await
+        .unwrap();
+    let (status, body) = send(&router, retry_request(&uri, json!({"from_step": 99}))).await;
+    assert_eq!(status, StatusCode::OK, "retry body: {body}");
+    let messages = spy.messages.lock().unwrap();
+    assert_eq!(messages.last().unwrap(), "original task");
+}
+
+#[tokio::test]
+async fn retry_without_checkpoints_keeps_the_original_user_message() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = Arc::new(FakeStore::default());
+    let spy = Arc::new(NoteSpy::default());
+    let (_dir, state) = test_state(
+        Arc::new(NoteEngine {
+            store: store.clone(),
+            spy: spy.clone(),
+        }),
+        store.clone(),
+        Arc::new(ApprovalGate::default()),
+    );
+    let id = Uuid::new_v4();
+    store.create(&interrupted_turn(id)).await.unwrap();
+
+    let router = build_router(state);
+    let uri = format!("/api/executions/{id}/retry");
+    // An absent body must still work: the body extractor is optional and last.
+    let (status, body) = send(&router, debug_req("POST", &uri)).await;
+    assert_eq!(status, StatusCode::OK, "retry body: {body}");
+    let messages = spy.messages.lock().unwrap();
+    assert_eq!(messages.as_slice(), ["original task"]);
+    assert_eq!(
+        spy.iterations.lock().unwrap().as_slice(),
+        [Some(6)],
+        "no completed steps subtract nothing from the manifest budget"
+    );
+}
+
 #[tokio::test]
 async fn a_decided_approval_from_a_prior_run_is_consumed_by_the_retry() {
     let _guard = env_lock()
@@ -664,5 +951,201 @@ async fn a_decided_approval_from_a_prior_run_is_consumed_by_the_retry() {
             .await
             .is_err(),
         "a different execution must not inherit the decision"
+    );
+}
+
+// ── final review fixes: failed/duplicate checkpoints and strict body ───────
+
+#[tokio::test]
+async fn failed_checkpoints_are_not_narrated_or_deducted_from_the_budget() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = Arc::new(FakeStore::default());
+    let spy = Arc::new(NoteSpy::default());
+    let (_dir, state) = test_state(
+        Arc::new(NoteEngine {
+            store: store.clone(),
+            spy: spy.clone(),
+        }),
+        store.clone(),
+        Arc::new(ApprovalGate::default()),
+    );
+    let id = Uuid::new_v4();
+    store.create(&interrupted_turn(id)).await.unwrap();
+    // The failed step cached no result: it must stay eligible for re-execution.
+    seed_checkpoint_status(&store, id, 0, "db__write", "aaa", "failed", None).await;
+    seed_checkpoint_status(
+        &store,
+        id,
+        1,
+        "local_echo",
+        "bbb",
+        "completed",
+        Some(json!({"ok": true})),
+    )
+    .await;
+
+    let router = build_router(state);
+    let uri = format!("/api/executions/{id}/retry");
+    let (status, body) = send(&router, retry_request(&uri, json!({"from_step": 0}))).await;
+    assert_eq!(status, StatusCode::OK, "retry body: {body}");
+
+    let messages = spy.messages.lock().unwrap();
+    let note = &messages[0];
+    assert!(note.contains("[Resume]"), "note: {note}");
+    assert!(
+        !note.contains("db__write"),
+        "a failed step must never be described as already done: {note}"
+    );
+    assert!(note.contains("paso 1"), "note: {note}");
+    assert!(note.ends_with("original task"), "note: {note}");
+    assert_eq!(
+        spy.iterations.lock().unwrap().as_slice(),
+        [Some(5)],
+        "only the one completed step is deducted from the manifest budget of 6"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_and_replayed_checkpoints_are_deducted_once() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = Arc::new(FakeStore::default());
+    let spy = Arc::new(NoteSpy::default());
+    let (_dir, state) = test_state(
+        Arc::new(NoteEngine {
+            store: store.clone(),
+            spy: spy.clone(),
+        }),
+        store.clone(),
+        Arc::new(ApprovalGate::default()),
+    );
+    let id = Uuid::new_v4();
+    store.create(&interrupted_turn(id)).await.unwrap();
+    // Two identical checkpoints for the same step, plus a replay of the same
+    // operation at the advanced cursor — all one recorded tool effect.
+    for step in [0, 0, 1] {
+        seed_checkpoint_status(
+            &store,
+            id,
+            step,
+            "db__write",
+            "aaa",
+            "completed",
+            Some(json!({"n": 0})),
+        )
+        .await;
+    }
+    // A genuinely different operation (same tool, different args hash).
+    seed_checkpoint_status(
+        &store,
+        id,
+        2,
+        "db__write",
+        "bbb",
+        "completed",
+        Some(json!({"n": 2})),
+    )
+    .await;
+
+    let router = build_router(state);
+    let uri = format!("/api/executions/{id}/retry");
+    let (status, body) = send(&router, retry_request(&uri, json!({"from_step": 0}))).await;
+    assert_eq!(status, StatusCode::OK, "retry body: {body}");
+
+    let messages = spy.messages.lock().unwrap();
+    let note = &messages[0];
+    assert_eq!(
+        note.matches("db__write").count(),
+        2,
+        "each distinct operation is listed once: {note}"
+    );
+    assert!(note.contains("paso 0") && note.contains("paso 2"), "{note}");
+    assert!(
+        !note.contains("paso 1"),
+        "the replay cursor is not a new step: {note}"
+    );
+    assert_eq!(
+        spy.iterations.lock().unwrap().as_slice(),
+        [Some(4)],
+        "duplicate checkpoints must not starve the tool-loop budget"
+    );
+}
+
+#[tokio::test]
+async fn malformed_retry_body_is_400_and_absent_body_defaults_to_step_zero() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = Arc::new(FakeStore::default());
+    let spy = Arc::new(NoteSpy::default());
+    let (_dir, state) = test_state(
+        Arc::new(NoteEngine {
+            store: store.clone(),
+            spy: spy.clone(),
+        }),
+        store.clone(),
+        Arc::new(ApprovalGate::default()),
+    );
+    let id = Uuid::new_v4();
+    store.create(&interrupted_turn(id)).await.unwrap();
+    seed_checkpoint_status(
+        &store,
+        id,
+        0,
+        "db__write",
+        "aaa",
+        "completed",
+        Some(json!({"n": 0})),
+    )
+    .await;
+    seed_checkpoint_status(
+        &store,
+        id,
+        1,
+        "local_echo",
+        "bbb",
+        "completed",
+        Some(json!({"n": 1})),
+    )
+    .await;
+
+    let router = build_router(state);
+    let uri = format!("/api/executions/{id}/retry");
+
+    // Malformed JSON and a wrong field type are both 400 — no silent from_step=0.
+    for raw in ["{not valid json", r#"{"from_step":"zero"}"#] {
+        let req = admin_request()
+            .method("POST")
+            .uri(&uri)
+            .header("x-debug", "true")
+            .header("content-type", "application/json")
+            .body(Body::from(raw.to_string()))
+            .unwrap();
+        let (status, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {raw} -> {body}");
+        assert!(
+            spy.messages.lock().unwrap().is_empty(),
+            "a rejected body must not start a retry"
+        );
+        assert_eq!(
+            store.get(id).await.unwrap().unwrap().status,
+            ExecutionStatus::Interrupted,
+            "the rejected retry left the turn untouched"
+        );
+    }
+
+    // No body at all still defaults to from_step = 0 (old no-body contract).
+    let (status, body) = send(&router, debug_req("POST", &uri)).await;
+    assert_eq!(status, StatusCode::OK, "retry body: {body}");
+    let messages = spy.messages.lock().unwrap();
+    let note = &messages[0];
+    assert!(note.contains("paso 0") && note.contains("paso 1"), "{note}");
+    assert_eq!(
+        spy.iterations.lock().unwrap().as_slice(),
+        [Some(4)],
+        "absent body keeps both completed steps in the budget"
     );
 }

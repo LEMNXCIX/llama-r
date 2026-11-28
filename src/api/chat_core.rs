@@ -122,7 +122,7 @@ pub(crate) fn agent_not_found(target: &str, project_id: &str) -> AppError {
 /// swaps both mid-request must not pair the old model with the new provider.
 #[allow(
     clippy::too_many_arguments,
-    reason = "one request snapshot: identity, prompt inputs and the two additive delegation bounds (budget, context)"
+    reason = "one request snapshot: identity, prompt inputs, the additive retry budget and the two delegation bounds (budget, context)"
 )]
 async fn build_runtime_request(
     services: &crate::services::provider_stack::ProviderStack,
@@ -131,6 +131,7 @@ async fn build_runtime_request(
     agent_id: Option<String>,
     conversation_id: Option<String>,
     execution_id: Uuid,
+    max_iterations_override: Option<usize>,
     shared_budget: Option<Arc<dyn ToolBudget>>,
     delegation_context: Option<DelegationContext>,
     approval_event_tx: Option<tokio::sync::mpsc::Sender<AgentRunEvent>>,
@@ -146,6 +147,7 @@ async fn build_runtime_request(
         system_prompt: system,
         default_model: services.default_model.clone(),
         execution_id,
+        max_iterations_override,
         shared_budget,
         delegation_context,
         approval_event_tx,
@@ -910,6 +912,31 @@ pub async fn execute_chat_with_id(
         None,
         None,
         None,
+        None,
+    )
+    .await
+}
+
+/// Retry dispatch with the reduced tool-loop budget computed from checkpoints.
+/// Kept separate from the public [`execute_chat_with_id`] so the ordinary chat
+/// contract (and its callers) stay byte-for-byte unchanged.
+pub(crate) async fn execute_chat_with_id_and_iterations(
+    state: &AppState,
+    payload: ChatRequest,
+    selection: AgentSelection<'_>,
+    resume_execution_id: Uuid,
+    max_iterations_override: Option<usize>,
+) -> Result<ChatResponse, AppError> {
+    execute_chat_with_id_and_budget(
+        state,
+        payload,
+        selection,
+        Some(resume_execution_id),
+        max_iterations_override,
+        None,
+        None,
+        None,
+        None,
     )
     .await
 }
@@ -933,6 +960,7 @@ pub async fn execute_chat_with_new_id(
         None,
         None,
         None,
+        None,
         Some(execution_id),
     )
     .await
@@ -946,13 +974,14 @@ pub async fn execute_chat_with_new_id(
 /// public signature changes — only this internal entry point knows it.
 #[allow(
     clippy::too_many_arguments,
-    reason = "one request snapshot plus the additive retry id, shared budget and fresh id for async webhooks"
+    reason = "one request snapshot plus the additive retry id/budget, shared tool budget and fresh id for async webhooks"
 )]
 pub(crate) async fn execute_chat_with_id_and_budget(
     state: &AppState,
     payload: ChatRequest,
     selection: AgentSelection<'_>,
     resume_execution_id: Option<Uuid>,
+    max_iterations_override: Option<usize>,
     shared_budget: Option<Arc<dyn ToolBudget>>,
     delegation_context: Option<DelegationContext>,
     approval_event_tx: Option<tokio::sync::mpsc::Sender<AgentRunEvent>>,
@@ -1044,6 +1073,7 @@ pub(crate) async fn execute_chat_with_id_and_budget(
                     agent_id,
                     conversation_id,
                     run_id,
+                    max_iterations_override,
                     shared_budget,
                     delegation_context.clone(),
                     approval_event_tx,
@@ -1236,6 +1266,9 @@ async fn execute_chat_stream_detail(
                     agent_id,
                     conversation_id,
                     run_id,
+                    // Retries are non-streaming, so a streaming turn never
+                    // carries a checkpoint-derived iteration budget.
+                    None,
                     // Streaming delegation is not part of this slice: child
                     // turns are always non-streaming, so no tree budget here.
                     None,
@@ -1399,6 +1432,7 @@ pub async fn delegate_turn(
         state,
         payload,
         selection,
+        None,
         None,
         Some(req.budget.clone()),
         Some(child_context),

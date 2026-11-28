@@ -46,7 +46,9 @@ pub struct AgentExecution {
     pub provider: String,
     pub model: String,
     pub status: ExecutionStatus,
-    /// How far the tool loop got. Observation only — there is no step replay.
+    /// Cursor advanced by each checkpoint; used to number steps and steer a
+    /// checkpoint-informed retry. The model re-decides its answer — there is no
+    /// byte-exact step replay.
     pub current_step: u32,
     /// The turn input, redacted before persistence. `None` only for legacy rows.
     pub user_message: Option<String>,
@@ -69,7 +71,9 @@ pub enum EventKind {
     ToolCallRequested,
     /// A tool call returned, or its stored result was replayed.
     ToolCallCompleted,
-    /// An explicit checkpoint marker (no step replay is performed from it).
+    /// A checkpoint emitted after a tool call. Carries step/tool/args_hash so a
+    /// retry can steer the model past completed steps; tool effects replay via
+    /// `operation_id`. The model itself re-decides its answer (Rig owns the loop).
     CheckpointCreated,
     /// The turn blocked on a human decision.
     WaitingApproval,

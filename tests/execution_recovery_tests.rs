@@ -63,6 +63,12 @@ impl ExecutionStore for FakeStore {
         }
         Ok(())
     }
+    async fn set_current_step(&self, execution_id: Uuid, step: u32) -> Result<(), String> {
+        if let Some(execution) = self.executions.lock().unwrap().get_mut(&execution_id) {
+            execution.current_step = step;
+        }
+        Ok(())
+    }
     async fn get(&self, execution_id: Uuid) -> Result<Option<AgentExecution>, String> {
         Ok(self.executions.lock().unwrap().get(&execution_id).cloned())
     }
@@ -352,6 +358,7 @@ fn an_agent_run_request_carries_an_execution_id() {
     let execution_id = Uuid::new_v4();
     let req = AgentRunRequest {
         execution_id,
+        max_iterations_override: None,
         shared_budget: None,
         delegation_context: None,
         approval_event_tx: None,

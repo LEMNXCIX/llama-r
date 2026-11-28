@@ -267,6 +267,19 @@ impl ExecutionStore for SqliteExecutionStore {
         Ok(())
     }
 
+    async fn set_current_step(&self, execution_id: Uuid, step: u32) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| format!("lock poisoned: {e}"))?;
+        conn.execute(
+            "UPDATE executions SET current_step = ?1, updated_at = ?2 WHERE id = ?3",
+            params![step, ts_text(&Utc::now()), execution_id.to_string()],
+        )
+        .map_err(|e| format!("db update current_step error: {e}"))?;
+        Ok(())
+    }
+
     async fn get(&self, execution_id: Uuid) -> Result<Option<AgentExecution>, String> {
         let sql = format!("SELECT {EXECUTION_COLUMNS} FROM executions WHERE id = ?1");
         Ok(self

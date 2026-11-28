@@ -1024,6 +1024,7 @@ fn runtime_request() -> RuntimeChatRequest {
         system_prompt: Some("sys".into()),
         default_model: "fallback-model".into(),
         execution_id: uuid::Uuid::new_v4(),
+        max_iterations_override: None,
         shared_budget: None,
         delegation_context: None,
         approval_event_tx: None,

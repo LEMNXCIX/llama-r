@@ -90,7 +90,9 @@ pub async fn reap_once(state: &AppState) -> Result<usize, String> {
             continue;
         }
 
-        match retry_turn(state, execution.id, &execution).await {
+        // An orphan has no operator-supplied checkpoint range: replay with all
+        // recorded steps, exactly as before Task 2.
+        match retry_turn(state, execution.id, &execution, 0).await {
             Ok(()) => {
                 // No-op for an orphan (it was never parked here), kept explicit
                 // so the invariant "a resumed approval is never parked" holds.

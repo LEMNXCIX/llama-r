@@ -90,6 +90,12 @@ impl ExecutionStore for FakeStore {
         }
         Ok(())
     }
+    async fn set_current_step(&self, id: Uuid, step: u32) -> Result<(), String> {
+        if let Some(execution) = self.executions.lock().unwrap().get_mut(&id) {
+            execution.current_step = step;
+        }
+        Ok(())
+    }
     async fn get(&self, id: Uuid) -> Result<Option<AgentExecution>, String> {
         Ok(self.executions.lock().unwrap().get(&id).cloned())
     }
