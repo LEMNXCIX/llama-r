@@ -69,7 +69,9 @@ pub enum EventKind {
     ToolCallRequested,
     /// A tool call returned, or its stored result was replayed.
     ToolCallCompleted,
-    /// An explicit checkpoint marker (no step replay is performed from it).
+    /// A checkpoint emitted after a tool call. Carries step/tool/args_hash so a
+    /// retry can steer the model past completed steps; tool effects replay via
+    /// `operation_id`. The model itself re-decides its answer (Rig owns the loop).
     CheckpointCreated,
     /// The turn blocked on a human decision.
     WaitingApproval,
