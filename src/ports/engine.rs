@@ -27,6 +27,7 @@ impl std::fmt::Debug for AgentRunRequest {
             .field("history", &self.history)
             .field("conversation_id", &self.conversation_id)
             .field("execution_id", &self.execution_id)
+            .field("max_iterations_override", &self.max_iterations_override)
             .field(
                 "shared_budget",
                 &self.shared_budget.as_ref().map(|_| "<shared budget>"),
@@ -62,6 +63,11 @@ pub struct AgentRunRequest {
     /// supply one; a fresh `Uuid::new_v4()` is correct for a one-shot turn that
     /// has no execution record (e.g. the TUI).
     pub execution_id: Uuid,
+    /// Per-turn tool-loop budget override for a checkpoint-informed retry. The
+    /// engine's limit is `unwrap_or(scope.max_iterations)`, so `None` keeps the
+    /// agent manifest's budget byte for byte. Additive: no `AgentEngine` method
+    /// signature changes, and no other caller has to opt in.
+    pub max_iterations_override: Option<usize>,
     /// The one tool-call allowance shared by a whole delegation tree. `Some` on
     /// a child turn threaded from its parent's `DelegateRequest.budget`; `None`
     /// for an ordinary turn, where the engine mints a fresh allowance from

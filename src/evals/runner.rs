@@ -235,6 +235,7 @@ async fn execute_agent_case(case: &EvalCase) -> Result<Execution, String> {
             system_prompt: Some("You are an eval fixture agent.".into()),
             default_model: "llama3.2".into(),
             execution_id: Uuid::new_v4(),
+            max_iterations_override: None,
             shared_budget: None,
             delegation_context: None,
             approval_event_tx: None,

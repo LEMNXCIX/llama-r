@@ -644,6 +644,7 @@ impl TuiApp {
                             // has no durable turn record; a fresh id still
                             // gives the run a valid tool-operation namespace.
                             execution_id: uuid::Uuid::new_v4(),
+                            max_iterations_override: None,
                             shared_budget: None,
                             delegation_context: None,
                             approval_event_tx: None,

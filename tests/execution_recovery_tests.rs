@@ -358,6 +358,7 @@ fn an_agent_run_request_carries_an_execution_id() {
     let execution_id = Uuid::new_v4();
     let req = AgentRunRequest {
         execution_id,
+        max_iterations_override: None,
         shared_budget: None,
         delegation_context: None,
         approval_event_tx: None,

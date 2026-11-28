@@ -1051,6 +1051,7 @@ fn e2e_request() -> AgentRunRequest {
         history: Vec::new(),
         conversation_id: None,
         execution_id: Uuid::new_v4(),
+        max_iterations_override: None,
         shared_budget: None,
         delegation_context: None,
         approval_event_tx: None,

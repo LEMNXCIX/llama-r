@@ -61,6 +61,10 @@ pub struct RuntimeChatRequest {
     /// caller resolves the agent (`chat_core`) so the execution record, its
     /// events and the tool-operation ids all share one identity.
     pub execution_id: Uuid,
+    /// Tool-loop budget for a checkpoint-informed retry: `Some(n)` lowers the
+    /// agent's `max_iterations` for this one turn; `None` leaves the manifest's
+    /// budget untouched. Threaded into `AgentRunRequest` by `build_run_request`.
+    pub max_iterations_override: Option<usize>,
     /// The one tool allowance shared by a whole delegation tree, carried from a
     /// child turn's `DelegateRequest.budget`. `None` for an ordinary turn.
     pub shared_budget: Option<Arc<dyn ToolBudget>>,
@@ -111,8 +115,20 @@ impl AgentRuntime {
             .resolve(req.project_id.as_deref(), req.agent_id.as_deref())
             .ok_or_else(|| AppError::NotFound("agent not found".into()))?;
 
-        let scope: AgentScope = registered.scope.clone();
+        let mut scope: AgentScope = registered.scope.clone();
         let agent = registered.agent.clone();
+
+        // A checkpoint-informed retry gets a smaller tool-loop allowance. The
+        // engine already reads `scope.max_iterations` for its turn cap, so
+        // applying the additive override here keeps every engine (and the
+        // delegation path) on the same budget without changing the engine port.
+        // `None` is a no-op; a zero or an oversized value is clamped to `[1,
+        // u32::MAX]` rather than rejected, since this comes from best-effort
+        // bookkeeping and must never fail a chat.
+        if let Some(override_iterations) = req.max_iterations_override {
+            let effective = override_iterations.max(1);
+            scope.max_iterations = u32::try_from(effective).unwrap_or(u32::MAX);
+        }
 
         let current_model = req.model_override.unwrap_or_else(|| {
             if agent.config.model.is_empty() {
@@ -169,6 +185,7 @@ impl AgentRuntime {
             history: assembled.context.history,
             conversation_id: req.conversation_id,
             execution_id: req.execution_id,
+            max_iterations_override: req.max_iterations_override,
             shared_budget: req.shared_budget,
             delegation_context: req.delegation_context,
             approval_event_tx: req.approval_event_tx,
