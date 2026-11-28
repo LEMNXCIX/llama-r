@@ -76,6 +76,29 @@ pub trait ExecutionStore: Send + Sync {
     /// Read one turn, or `None` for an unknown id.
     async fn get(&self, execution_id: Uuid) -> Result<Option<AgentExecution>, String>;
 
+    /// Atomically claim a turn for retry: move it to `to` only while its status
+    /// is one of `from`. `Ok(true)` means this caller owns the transition;
+    /// `Ok(false)` means the row is gone or another caller changed it first.
+    ///
+    /// The default is a non-atomic read-then-write for the in-memory test fakes,
+    /// which never race. A real store MUST override it with one conditional
+    /// update so two concurrent retries cannot both start the same turn.
+    async fn claim_for_retry(
+        &self,
+        execution_id: Uuid,
+        from: &[ExecutionStatus],
+        to: ExecutionStatus,
+    ) -> Result<bool, String> {
+        let Some(execution) = self.get(execution_id).await? else {
+            return Ok(false);
+        };
+        if !from.contains(&execution.status) {
+            return Ok(false);
+        }
+        self.set_status(execution_id, to, None).await?;
+        Ok(true)
+    }
+
     /// List turns in `Running` or `WaitingApproval` — the ones a crash may have
     /// interrupted. Used at boot by the recovery marker.
     async fn list_interrupted(&self) -> Result<Vec<AgentExecution>, String>;

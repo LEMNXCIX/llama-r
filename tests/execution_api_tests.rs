@@ -12,6 +12,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
 use llama_r::adapters::context::NoopCompactor;
+use llama_r::adapters::execution::NoOpExecutionStore;
 use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::adapters::rig_engine::operations::{operation_id, run_idempotent, OperationContext};
 use llama_r::api::chat_core::execute_chat_with_id;
@@ -1148,4 +1149,214 @@ async fn malformed_retry_body_is_400_and_absent_body_defaults_to_step_zero() {
         [Some(4)],
         "absent body keeps both completed steps in the budget"
     );
+}
+
+// ── Task 1: atomic claim closes the concurrent retry race ──────────────────
+
+#[tokio::test]
+async fn noop_store_grants_every_claim_so_degraded_retry_still_works() {
+    // The no-op store has no row to gate on; a claim must be granted so a retry
+    // in a degraded (no SQLite) boot is never blocked by durability being off.
+    let claimed = NoOpExecutionStore
+        .claim_for_retry(
+            Uuid::new_v4(),
+            &[ExecutionStatus::Interrupted],
+            ExecutionStatus::Running,
+        )
+        .await
+        .unwrap();
+    assert!(claimed, "degraded boot must be able to retry");
+}
+
+#[tokio::test]
+async fn concurrent_http_retries_yield_one_success_and_one_conflict() {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = Arc::new(FakeStore::default());
+    let (_dir, state) = test_state(
+        Arc::new(SpyEngine {
+            store: store.clone(),
+            calls: Arc::new(AtomicU32::new(0)),
+            seen_ids: Arc::new(Mutex::new(vec![])),
+        }),
+        store.clone(),
+        Arc::new(ApprovalGate::default()),
+    );
+    let id = Uuid::new_v4();
+    store.create(&interrupted_turn(id)).await.unwrap();
+    let router = build_router(state);
+    let uri = format!("/api/executions/{id}/retry");
+
+    let (first, second) = tokio::join!(
+        send(&router, retry_request(&uri, json!({}))),
+        send(&router, retry_request(&uri, json!({}))),
+    );
+    let statuses = [first.0, second.0];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::OK)
+            .count(),
+        1,
+        "only one concurrent retry may run: {statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT)
+            .count(),
+        1,
+        "the losing retry must be refused: {statuses:?}"
+    );
+}
+
+#[cfg(feature = "history")]
+mod claim_contract {
+    use super::*;
+    use llama_r::adapters::execution::SqliteExecutionStore;
+    use std::sync::Arc;
+
+    fn store() -> (TempDir, Arc<SqliteExecutionStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteExecutionStore::new(dir.path().join("history.db")).expect("open execution store"),
+        );
+        (dir, store)
+    }
+
+    fn seed(
+        status: ExecutionStatus,
+        finished_at: Option<DateTime<Utc>>,
+        error: Option<&str>,
+    ) -> AgentExecution {
+        AgentExecution {
+            id: Uuid::new_v4(),
+            conversation_id: None,
+            agent_qualified_id: "proj::agent".into(),
+            provider: "ollama".into(),
+            model: "model-a".into(),
+            status,
+            current_step: 2,
+            user_message: Some("original task".into()),
+            user_message_hash: "ab".repeat(32),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            finished_at,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_from_interrupted_moves_to_running_and_clears_terminal_fields() {
+        let (_dir, store) = store();
+        let execution = seed(
+            ExecutionStatus::Interrupted,
+            Some(Utc::now()),
+            Some("crash"),
+        );
+        store.create(&execution).await.unwrap();
+
+        let claimed = store
+            .claim_for_retry(
+                execution.id,
+                &[ExecutionStatus::Interrupted, ExecutionStatus::Failed],
+                ExecutionStatus::Running,
+            )
+            .await
+            .unwrap();
+        assert!(claimed, "an interrupted turn is claimable");
+
+        let after = store.get(execution.id).await.unwrap().unwrap();
+        assert_eq!(after.status, ExecutionStatus::Running);
+        assert_eq!(
+            after.finished_at, None,
+            "a restart clears the old finish time"
+        );
+        assert_eq!(after.error, None, "a restart clears the old error");
+    }
+
+    #[tokio::test]
+    async fn claim_from_completed_is_false_and_leaves_the_row_untouched() {
+        let (_dir, store) = store();
+        let finished_at = Utc::now();
+        let execution = seed(
+            ExecutionStatus::Completed,
+            Some(finished_at),
+            Some("old error"),
+        );
+        store.create(&execution).await.unwrap();
+
+        let claimed = store
+            .claim_for_retry(
+                execution.id,
+                &[ExecutionStatus::Interrupted, ExecutionStatus::Failed],
+                ExecutionStatus::Running,
+            )
+            .await
+            .unwrap();
+        assert!(!claimed, "a finished turn is never claimable");
+        assert_eq!(
+            store.get(execution.id).await.unwrap().unwrap(),
+            execution,
+            "a losing claim must not mutate the row at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_claims_on_one_row_have_exactly_one_winner() {
+        let (_dir, store) = store();
+        let execution = seed(
+            ExecutionStatus::Interrupted,
+            Some(Utc::now()),
+            Some("crash"),
+        );
+        store.create(&execution).await.unwrap();
+
+        let (first, second) = tokio::join!(
+            store.claim_for_retry(
+                execution.id,
+                &[ExecutionStatus::Interrupted, ExecutionStatus::Failed],
+                ExecutionStatus::Running,
+            ),
+            store.claim_for_retry(
+                execution.id,
+                &[ExecutionStatus::Interrupted, ExecutionStatus::Failed],
+                ExecutionStatus::Running,
+            ),
+        );
+        let results = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            results.iter().filter(|claimed| **claimed).count(),
+            1,
+            "exactly one of two concurrent claims wins: {results:?}"
+        );
+        let after = store.get(execution.id).await.unwrap().unwrap();
+        assert_eq!(after.status, ExecutionStatus::Running);
+        assert_eq!(after.finished_at, None);
+        assert_eq!(after.error, None);
+    }
+
+    #[tokio::test]
+    async fn claim_from_waiting_approval_succeeds_once_for_the_reaper() {
+        let (_dir, store) = store();
+        let execution = seed(ExecutionStatus::WaitingApproval, None, None);
+        store.create(&execution).await.unwrap();
+
+        let from = [ExecutionStatus::WaitingApproval];
+        assert!(
+            store
+                .claim_for_retry(execution.id, &from, ExecutionStatus::Running)
+                .await
+                .unwrap(),
+            "an orphaned parked approval is claimable by the reaper"
+        );
+        assert!(
+            !store
+                .claim_for_retry(execution.id, &from, ExecutionStatus::Running)
+                .await
+                .unwrap(),
+            "a second reaper pass must not claim it again"
+        );
+    }
 }
