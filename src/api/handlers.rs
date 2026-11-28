@@ -1,10 +1,10 @@
 use crate::api::chat_core::{
-    execute_chat, execute_chat_stream_with_conversation_id, execute_chat_with_new_id,
-    require_messages,
+    execute_chat_resolved, execute_chat_stream_with_conversation_id,
+    execute_chat_with_new_id_resolved, require_messages,
 };
 use crate::api::mcp_api;
 use crate::api::observability::AppObservability;
-use crate::api::route_resolution::{resolve_selection, AgentSelection};
+use crate::api::route_resolution::{resolve_selection, AgentSelection, ResolvedSelection};
 use crate::config::Config;
 use crate::context::analyzer::ContextEnricher;
 use crate::context::store::ContextStore;
@@ -219,23 +219,29 @@ pub async fn list_models(
     Ok(Json(ListModelsResponse { models }))
 }
 
-/// Resolve the agent a dispatch would use and report whether its scope carries
-/// approval rules. This is the one check that decides whether a non-streaming
-/// chat needs the park-and-acknowledge path; a turn without rules must stay
-/// synchronous and byte-identical to the pre-parking behaviour.
-async fn turn_has_approval_rules(
+/// Report whether the agent the request was resolved to carries approval
+/// rules. This is the one check that decides whether a non-streaming chat needs
+/// the park-and-acknowledge path; a turn without rules must stay synchronous and
+/// byte-identical to the pre-parking behaviour.
+///
+/// The selection is resolved by the caller **once**, before this check, and the
+/// same owned value is threaded into the executed turn. Resolving here too (as
+/// this function used to) spent a second d1 decision on every routed chat — and
+/// on a gated turn the spawned task could execute a *different* agent than the
+/// one whose policy was checked.
+fn turn_has_approval_rules(
     state: &AppState,
-    payload: &ChatRequest,
-    selection: AgentSelection<'_>,
+    resolved: &ResolvedSelection,
+    model: &str,
 ) -> Result<bool, AppError> {
-    require_messages(payload)?;
-    let resolved = resolve_selection(state, selection, &payload.messages).await?;
     let agent = if resolved.project_id.is_some() || resolved.agent_id.is_some() {
         state
             .agent_registry
             .resolve_agent(resolved.project_id.as_deref(), resolved.agent_id.as_deref())
     } else {
-        state.agent_registry.get_agent(&payload.model)
+        // No project and no agent was resolved (a direct model request): keep
+        // the model-id fallback a headerless caller has always had.
+        state.agent_registry.get_agent(model)
     };
     Ok(agent.is_some_and(|agent| !agent.config.policy.approvals.is_empty()))
 }
@@ -285,71 +291,93 @@ pub async fn chat(
             Err(error) => Ok::<_, Infallible>(Event::default().data(format!("Error: {}", error))),
         });
         Ok((headers, Sse::new(sse_stream)).into_response())
-    } else if turn_has_approval_rules(&state, &payload, selection).await? {
-        // A gated turn may block on a human for far longer than an HTTP request
-        // should stay open. Mint the execution id up front, run the turn in a
-        // task, and acknowledge with the ids a human needs if it is still
-        // parked when the grace expires. Everything else stays synchronous.
-        let execution_id = Uuid::new_v4();
-        let (done_tx, done_rx) = oneshot::channel::<Result<ChatResponse, AppError>>();
-        let spawned_state = state.clone();
-        // `AgentSelection` borrows the headers; own the strings so the spawned
-        // task is `'static` while rebuilding the same selection inside it.
-        let project = selection.project_id.map(str::to_string);
-        let agent = selection.agent_id.map(str::to_string);
-        let conversation = selection.conversation_id.map(str::to_string);
-        let debug = selection.debug;
-        tokio::spawn(async move {
-            let owned = AgentSelection {
-                project_id: project.as_deref(),
-                agent_id: agent.as_deref(),
-                conversation_id: conversation.as_deref(),
-                debug,
-            };
-            let result =
-                execute_chat_with_new_id(&spawned_state, payload, owned, execution_id).await;
-            let _ = done_tx.send(result);
-        });
-
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(state.config.park_grace_ms),
-            done_rx,
-        )
-        .await
-        {
-            Ok(Ok(Ok(response))) => {
-                let mut headers = axum::http::HeaderMap::new();
-                if let Some(cid) = &response.conversation_id {
-                    if let Ok(value) = axum::http::HeaderValue::from_str(cid) {
-                        headers.insert("x-conversation-id", value);
-                    }
-                }
-                Ok((headers, Json(response)).into_response())
-            }
-            Ok(Ok(Err(err))) => Err(err),
-            Ok(Err(_)) => Err(AppError::Runtime(
-                "approval turn ended without a response".into(),
-            )),
-            Err(_) => {
-                let ack = ChatAck {
-                    execution_id: execution_id.to_string(),
-                    approval_id: state
-                        .approval_gate
-                        .live_approval_for_execution(execution_id)
-                        .map(|id| id.to_string()),
-                };
-                Ok((axum::http::StatusCode::ACCEPTED, Json(ack)).into_response())
-            }
-        }
     } else {
-        let response = execute_chat(&state, payload, selection).await?;
-        let mut headers = axum::http::HeaderMap::new();
-        if let Some(cid) = &response.conversation_id {
-            if let Ok(value) = axum::http::HeaderValue::from_str(cid) {
-                headers.insert("x-conversation-id", value);
+        // One resolution for the whole non-streaming path: the same
+        // `ResolvedSelection` decides which agent's policy is checked below and
+        // which agent the executed turn uses. Old code resolved once here (in
+        // `turn_has_approval_rules`) and again inside dispatch, spending two d1
+        // decisions and allowing the two to disagree on the target agent.
+        // Empty messages are refused before a decision is spent, exactly as
+        // the check inside dispatch did before resolution moved up here.
+        require_messages(&payload)?;
+        let resolved = resolve_selection(&state, selection, &payload.messages).await?;
+
+        if turn_has_approval_rules(&state, &resolved, &payload.model)? {
+            // A gated turn may block on a human for far longer than an HTTP request
+            // should stay open. Mint the execution id up front, run the turn in a
+            // task, and acknowledge with the ids a human needs if it is still
+            // parked when the grace expires. Everything else stays synchronous.
+            let execution_id = Uuid::new_v4();
+            let (done_tx, done_rx) = oneshot::channel::<Result<ChatResponse, AppError>>();
+            let spawned_state = state.clone();
+            // `AgentSelection` borrows the headers; own the strings so the spawned
+            // task is `'static` while rebuilding the same selection inside it.
+            let project = selection.project_id.map(str::to_string);
+            let agent = selection.agent_id.map(str::to_string);
+            let conversation = selection.conversation_id.map(str::to_string);
+            let debug = selection.debug;
+            // The resolved selection is owned by this task and borrowed only
+            // for the call below, so the agent that runs is the one whose
+            // approval policy was just checked — with no second resolution.
+            tokio::spawn(async move {
+                let owned = AgentSelection {
+                    project_id: project.as_deref(),
+                    agent_id: agent.as_deref(),
+                    conversation_id: conversation.as_deref(),
+                    debug,
+                };
+                let result = execute_chat_with_new_id_resolved(
+                    &spawned_state,
+                    payload,
+                    owned,
+                    execution_id,
+                    Some(&resolved),
+                )
+                .await;
+                let _ = done_tx.send(result);
+            });
+
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(state.config.park_grace_ms),
+                done_rx,
+            )
+            .await
+            {
+                Ok(Ok(Ok(response))) => {
+                    let mut headers = axum::http::HeaderMap::new();
+                    if let Some(cid) = &response.conversation_id {
+                        if let Ok(value) = axum::http::HeaderValue::from_str(cid) {
+                            headers.insert("x-conversation-id", value);
+                        }
+                    }
+                    Ok((headers, Json(response)).into_response())
+                }
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(_)) => Err(AppError::Runtime(
+                    "approval turn ended without a response".into(),
+                )),
+                Err(_) => {
+                    let ack = ChatAck {
+                        execution_id: execution_id.to_string(),
+                        approval_id: state
+                            .approval_gate
+                            .live_approval_for_execution(execution_id)
+                            .map(|id| id.to_string()),
+                    };
+                    Ok((axum::http::StatusCode::ACCEPTED, Json(ack)).into_response())
+                }
             }
+        } else {
+            let response =
+                execute_chat_resolved(&state, payload, selection, Some(&resolved)).await?;
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(cid) = &response.conversation_id {
+                if let Ok(value) = axum::http::HeaderValue::from_str(cid) {
+                    headers.insert("x-conversation-id", value);
+                }
+            }
+            Ok((headers, Json(response)).into_response())
         }
-        Ok((headers, Json(response)).into_response())
     }
 }
 
