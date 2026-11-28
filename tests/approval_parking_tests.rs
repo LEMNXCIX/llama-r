@@ -21,20 +21,24 @@ use llama_r::domain::execution::{AgentExecution, ExecutionStatus};
 use llama_r::domain::models::{ChatAck, ChatRequest, ChatResponse, ModelInfo};
 use llama_r::domain::policy::{ApprovalPolicy, ApprovalRule, PermissionPolicy};
 use llama_r::domain::scope::{AgentScope, ToolsAllow};
+use llama_r::error::AppError;
 use llama_r::ports::engine::{AgentEngine, AgentRunEvent, AgentRunRequest, AgentRunResult};
 use llama_r::ports::execution::ExecutionStore;
 use llama_r::ports::mcp::McpServerRegistry;
+use llama_r::ports::router::{Answer, DecisionRequest, DecisionResponse, DecisionRouter};
 use llama_r::providers::LLMProvider;
 use llama_r::runtime::build_app_state_with_gate;
 use llama_r::services::agent_registry::AgentRegistry;
+use llama_r::services::agent_router::{CHOICE_KEY, NOUL_KEY};
 use llama_r::services::agent_runtime::AgentRuntime;
 use llama_r::services::approval::{args_hash, args_hash_hex, ApprovalDecision, ApprovalGate};
 use llama_r::services::provider_stack::ProviderStack;
 use llama_r::services::skill_manager::SkillManager;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -223,19 +227,15 @@ fn agent(id: &str, policy: PermissionPolicy) -> (Agent, AgentScope) {
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "one fixture: gate, store, engine and the two registered agents"
+    reason = "one fixture: gate, store, engine, optional router and the registry under test"
 )]
-async fn test_state(
+async fn state_with_registry(
     gate: std::sync::Arc<ApprovalGate>,
     store: std::sync::Arc<dyn ExecutionStore>,
     engine: std::sync::Arc<dyn AgentEngine>,
+    router: Option<std::sync::Arc<dyn DecisionRouter>>,
+    registry: std::sync::Arc<AgentRegistry>,
 ) -> std::sync::Arc<llama_r::api::handlers::AppState> {
-    let registry = std::sync::Arc::new(AgentRegistry::new());
-    let (a, a_scope) = agent("approval-agent", approval_policy());
-    registry.register(a, a_scope);
-    let (p, p_scope) = agent("plain-agent", PermissionPolicy::default());
-    registry.register(p, p_scope);
-
     let enricher = std::sync::Arc::new(ContextEnricher::new(
         std::sync::Arc::new(ContextStore::new()),
         std::sync::Arc::new(SkillManager::new()),
@@ -254,6 +254,10 @@ async fn test_state(
     };
     let mut stack = ProviderStack::new(std::sync::Arc::new(NoopProvider), "m");
     stack.agent_runtime = Some(std::sync::Arc::new(runtime));
+    // An injected router is kept: `build_app_state_with_gate` only builds its
+    // own when the stack has none, so this is exactly how a test fake reaches
+    // `resolve_selection`.
+    stack.router = router;
 
     build_app_state_with_gate(
         gate,
@@ -272,6 +276,19 @@ async fn test_state(
         // Test states have no shared summarizer: the compactor stays no-op.
         None,
     )
+}
+
+async fn test_state(
+    gate: std::sync::Arc<ApprovalGate>,
+    store: std::sync::Arc<dyn ExecutionStore>,
+    engine: std::sync::Arc<dyn AgentEngine>,
+) -> std::sync::Arc<llama_r::api::handlers::AppState> {
+    let registry = std::sync::Arc::new(AgentRegistry::new());
+    let (a, a_scope) = agent("approval-agent", approval_policy());
+    registry.register(a, a_scope);
+    let (p, p_scope) = agent("plain-agent", PermissionPolicy::default());
+    registry.register(p, p_scope);
+    state_with_registry(gate, store, engine, None, registry).await
 }
 
 async fn call(
@@ -709,4 +726,266 @@ async fn unknown_or_failed_store_is_best_effort() {
     // panic and never a failed boot.
     let reaped = reap_once(&state).await.unwrap();
     assert_eq!(reaped, 0);
+}
+
+// ── Fase 10-D1 Task 2: one d1 decision per approval-gated turn ───────────────
+
+/// A `DecisionRouter` that counts every `decide()` and answers from a fixed
+/// sequence of candidate keys (the last key repeats). That lets a test both
+/// count decisions and hand the two successive resolutions different answers —
+/// which is what makes "the agent checked is the agent executed" observable.
+#[derive(Clone)]
+struct CountingRouter {
+    calls: std::sync::Arc<AtomicUsize>,
+    keys: std::sync::Arc<Vec<String>>,
+}
+
+impl CountingRouter {
+    fn always(key: &str) -> (Self, std::sync::Arc<AtomicUsize>) {
+        Self::sequence(&[key])
+    }
+
+    fn sequence(keys: &[&str]) -> (Self, std::sync::Arc<AtomicUsize>) {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let router = Self {
+            calls: calls.clone(),
+            keys: std::sync::Arc::new(keys.iter().map(|key| key.to_string()).collect()),
+        };
+        (router, calls)
+    }
+}
+
+#[async_trait]
+impl DecisionRouter for CountingRouter {
+    async fn decide(&self, _request: DecisionRequest) -> Result<DecisionResponse, AppError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let key = self
+            .keys
+            .get(n)
+            .or_else(|| self.keys.last())
+            .cloned()
+            .unwrap_or_default();
+        Ok(choice_for(&key))
+    }
+}
+
+/// A response picking `key` comfortably above both default thresholds, so a
+/// decision that was actually spent is visible in the resolved agent.
+fn choice_for(key: &str) -> DecisionResponse {
+    DecisionResponse {
+        answers: BTreeMap::from([
+            (
+                CHOICE_KEY.to_string(),
+                Answer::Choice {
+                    key: key.to_string(),
+                    confidence: 0.95,
+                    probabilities: BTreeMap::from([(key.to_string(), 0.95)]),
+                },
+            ),
+            (NOUL_KEY.to_string(), Answer::Noul { value: 0.95 }),
+        ]),
+    }
+}
+
+/// A parking engine that also records which agent the runtime handed it. This
+/// is the "policy-checked agent == executed agent" observable: the router's
+/// first pick is the one whose approval policy was checked, and the engine must
+/// be handed that same agent, not the one a second resolution would pick.
+struct RecordingParkingEngine {
+    gate: std::sync::Arc<ApprovalGate>,
+    seen_agent: std::sync::Arc<Mutex<Option<String>>>,
+}
+
+#[async_trait]
+impl AgentEngine for RecordingParkingEngine {
+    async fn run(&self, req: AgentRunRequest) -> Result<AgentRunResult, String> {
+        *self.seen_agent.lock().unwrap() = Some(req.agent.id.clone());
+        let args = json!({"table": "users"});
+        let (_id, rx) = self
+            .gate
+            .request_for(Some(req.execution_id), "fake__tool", &args);
+        match rx.await {
+            Ok(ApprovalDecision::Approved) => Ok(AgentRunResult {
+                text: "approved after parking".into(),
+                tool_calls: 1,
+                iterations: 1,
+                model: req.model,
+            }),
+            Ok(ApprovalDecision::Denied { reason }) => Err(format!("denied: {reason}")),
+            Err(_) => Err("approval sender dropped".into()),
+        }
+    }
+
+    async fn run_stream(
+        &self,
+        _req: AgentRunRequest,
+    ) -> Result<mpsc::Receiver<AgentRunEvent>, String> {
+        Err("streaming not used by these tests".into())
+    }
+}
+
+fn project_agent(project_id: &str, id: &str, policy: PermissionPolicy) -> (Agent, AgentScope) {
+    let config = AgentConfig {
+        model: "m".into(),
+        policy: policy.clone(),
+        ..Default::default()
+    };
+    (
+        Agent {
+            id: id.into(),
+            project_id: Some(project_id.into()),
+            config,
+        },
+        scope(policy),
+    )
+}
+
+/// Routing-enabled state over project `fudi`: the general agent (the fallback),
+/// a gated specialist and a plain specialist, plus the counting router.
+async fn routing_state(
+    gate: std::sync::Arc<ApprovalGate>,
+    store: std::sync::Arc<dyn ExecutionStore>,
+    engine: std::sync::Arc<dyn AgentEngine>,
+    router: std::sync::Arc<dyn DecisionRouter>,
+) -> std::sync::Arc<llama_r::api::handlers::AppState> {
+    let registry = std::sync::Arc::new(AgentRegistry::new());
+    let (general, general_scope) = project_agent("fudi", "fudi", PermissionPolicy::default());
+    registry.register(general, general_scope);
+    let (gated, gated_scope) = project_agent("fudi", "gated", approval_policy());
+    registry.register(gated, gated_scope);
+    let (plain, plain_scope) = project_agent("fudi", "plain", PermissionPolicy::default());
+    registry.register(plain, plain_scope);
+    state_with_registry(gate, store, engine, Some(router), registry).await
+}
+
+fn project_body() -> Value {
+    json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "do it"}]
+    })
+}
+
+#[tokio::test]
+async fn a_gated_chat_spends_exactly_one_d1_decision() {
+    let _env = TestEnv::fresh();
+    std::env::set_var("ROUTER_ENABLED", "true");
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(
+        SqliteExecutionStore::new(dir.path().join("history.db")).expect("open execution store"),
+    );
+    let gate = std::sync::Arc::new(ApprovalGate::parked().with_store(store.clone()));
+    let (router, calls) = CountingRouter::always("fudi::gated");
+    let state = routing_state(
+        gate.clone(),
+        store,
+        std::sync::Arc::new(ParkingEngine { gate: gate.clone() }),
+        std::sync::Arc::new(router),
+    )
+    .await;
+    assert!(
+        state.router_config.enabled,
+        "routing must be on for this test to spend a decision at all"
+    );
+
+    let response = call(&state, "/chat", &[("x-project", "fudi")], project_body()).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ack: ChatAck = serde_json::from_slice(&bytes).expect("a ChatAck body");
+    assert!(
+        ack.approval_id.is_some(),
+        "the turn must have reached the engine (and parked) before the acknowledgement"
+    );
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the single routing decision is reused for both the policy check and the spawned turn"
+    );
+}
+
+#[tokio::test]
+async fn the_agent_checked_for_approval_is_the_one_that_runs() {
+    let _env = TestEnv::fresh();
+    std::env::set_var("ROUTER_ENABLED", "true");
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(
+        SqliteExecutionStore::new(dir.path().join("history.db")).expect("open execution store"),
+    );
+    let gate = std::sync::Arc::new(ApprovalGate::parked().with_store(store.clone()));
+    // First decision picks the gated agent (whose policy is checked); a
+    // hypothetical second decision picks the plain one. With the old double
+    // resolution the engine would run the plain agent and this test fails.
+    let (router, calls) = CountingRouter::sequence(&["fudi::gated", "fudi::plain"]);
+    let seen = std::sync::Arc::new(Mutex::new(None));
+    let engine = std::sync::Arc::new(RecordingParkingEngine {
+        gate: gate.clone(),
+        seen_agent: seen.clone(),
+    });
+    let state = routing_state(gate, store, engine, std::sync::Arc::new(router)).await;
+
+    let response = call(&state, "/chat", &[("x-project", "fudi")], project_body()).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ack: ChatAck = serde_json::from_slice(&bytes).expect("a ChatAck body");
+    assert!(
+        ack.approval_id.is_some(),
+        "the turn must have reached the engine (and parked) before the acknowledgement"
+    );
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one decision, not a second one inside the spawned task"
+    );
+    assert_eq!(
+        seen.lock().unwrap().as_deref(),
+        Some("gated"),
+        "the engine must run the agent whose approval policy was checked"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_agent_header_still_spends_no_decision() {
+    let _env = TestEnv::fresh();
+    std::env::set_var("ROUTER_ENABLED", "true");
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(
+        SqliteExecutionStore::new(dir.path().join("history.db")).expect("open execution store"),
+    );
+    let gate = std::sync::Arc::new(ApprovalGate::parked().with_store(store.clone()));
+    let (router, calls) = CountingRouter::always("fudi::gated");
+    // A global gated agent, pinned by X-Agent: resolution never consults the
+    // router on either the check or the spawned turn.
+    let registry = std::sync::Arc::new(AgentRegistry::new());
+    let (a, a_scope) = agent("approval-agent", approval_policy());
+    registry.register(a, a_scope);
+    let (p, p_scope) = agent("plain-agent", PermissionPolicy::default());
+    registry.register(p, p_scope);
+    let state = state_with_registry(
+        gate.clone(),
+        store,
+        std::sync::Arc::new(ParkingEngine { gate: gate.clone() }),
+        Some(std::sync::Arc::new(router)),
+        registry,
+    )
+    .await;
+
+    let response = call(
+        &state,
+        "/chat",
+        &[("x-agent", "approval-agent")],
+        chat_body("approval-agent"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "an explicit X-Agent pins the target and must never spend a d1 decision"
+    );
 }

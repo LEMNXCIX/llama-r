@@ -327,6 +327,8 @@ service LlamaGateway {
 
 Headers: `x-project`, `x-agent` en metadatos gRPC.
 
+`ConnectMcp` (stream bidireccional de `McpMessage`) despacha cada mensaje con el mismo handler que `POST /api/mcp`: se parsea `json_rpc` como `JsonRpcRequest` (si está vacío se usan `method`/`params`), un envelope malformado responde con un error JSON-RPC `code = -32700` en ese frame y el stream sigue abierto, y una notificación sin `id` (HTTP 204) no genera frame. Los frames de salida solo llevan `json_rpc`; `method`/`params` quedan vacíos. Un `tools/call` con regla de aprobación puede bloquear el stream hasta que una persona decida: el park-and-ack de `handlers.rs` es solo de chat y no aplica aquí (comportamiento heredado del dispatch MCP HTTP, no una regresión).
+
 ## Agentes
 
 ### Formato TOML

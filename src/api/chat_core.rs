@@ -890,7 +890,24 @@ pub async fn execute_chat(
     payload: ChatRequest,
     selection: AgentSelection<'_>,
 ) -> Result<ChatResponse, AppError> {
-    execute_chat_with_id(state, payload, selection, None).await
+    execute_chat_resolved(state, payload, selection, None).await
+}
+
+/// Resolved-aware counterpart of [`execute_chat`]. `Some(resolved)` reuses a
+/// selection the caller already paid a d1 decision for (the approval-gated chat
+/// path, which checks the same agent's policy before spawning the turn); `None`
+/// keeps the ordinary path's single resolution. The public wrappers stay
+/// unchanged — they are these variants called with `None`.
+pub async fn execute_chat_resolved(
+    state: &AppState,
+    payload: ChatRequest,
+    selection: AgentSelection<'_>,
+    resolved: Option<&ResolvedSelection>,
+) -> Result<ChatResponse, AppError> {
+    execute_chat_with_id_and_budget(
+        state, payload, selection, None, None, None, None, None, None, resolved,
+    )
+    .await
 }
 
 /// Same dispatch as [`execute_chat`], but with an explicit execution id to reuse.
@@ -908,6 +925,7 @@ pub async fn execute_chat_with_id(
         payload,
         selection,
         resume_execution_id,
+        None,
         None,
         None,
         None,
@@ -937,6 +955,7 @@ pub(crate) async fn execute_chat_with_id_and_iterations(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -952,6 +971,22 @@ pub async fn execute_chat_with_new_id(
     selection: AgentSelection<'_>,
     execution_id: Uuid,
 ) -> Result<ChatResponse, AppError> {
+    execute_chat_with_new_id_resolved(state, payload, selection, execution_id, None).await
+}
+
+/// Resolved-aware counterpart of [`execute_chat_with_new_id`]. Used by the
+/// spawned approval-gated turn: the task owns the `ResolvedSelection` the
+/// policy check already used and passes a borrow of it here, so the agent that
+/// runs is the one whose approval policy was checked and no second d1 decision
+/// is spent. The spawned task's strings are already `'static`; the resolved
+/// borrow lives only for the duration of this call inside that task.
+pub async fn execute_chat_with_new_id_resolved(
+    state: &AppState,
+    payload: ChatRequest,
+    selection: AgentSelection<'_>,
+    execution_id: Uuid,
+    resolved: Option<&ResolvedSelection>,
+) -> Result<ChatResponse, AppError> {
     execute_chat_with_id_and_budget(
         state,
         payload,
@@ -962,6 +997,7 @@ pub async fn execute_chat_with_new_id(
         None,
         None,
         Some(execution_id),
+        resolved,
     )
     .await
 }
@@ -969,12 +1005,15 @@ pub async fn execute_chat_with_new_id(
 /// The delegation-aware core behind [`execute_chat_with_id`]. The extra field is
 /// the one tool allowance a whole delegation tree shares: a child turn carries
 /// its parent's `Arc<dyn ToolBudget>` here so both bridge kinds in the child
-/// spend from it instead of minting a fresh one. Ordinary callers pass `None`
-/// and keep the exact behaviour they always had. Kept separate so no existing
-/// public signature changes — only this internal entry point knows it.
+/// spend from it instead of minting a fresh one. The last field is the optional
+/// already-resolved selection: `Some` reuses the decision a caller spent before
+/// entering dispatch (the approval-gated chat path); `None` resolves here as
+/// before. Ordinary callers pass `None` for all of them and keep the exact
+/// behaviour they always had. Kept separate so no existing public signature
+/// changes — only this internal entry point knows it.
 #[allow(
     clippy::too_many_arguments,
-    reason = "one request snapshot plus the additive retry id/budget, shared tool budget and fresh id for async webhooks"
+    reason = "one request snapshot plus the additive retry id/budget, shared tool budget, fresh id for async webhooks and the pre-resolved selection"
 )]
 pub(crate) async fn execute_chat_with_id_and_budget(
     state: &AppState,
@@ -986,6 +1025,7 @@ pub(crate) async fn execute_chat_with_id_and_budget(
     delegation_context: Option<DelegationContext>,
     approval_event_tx: Option<tokio::sync::mpsc::Sender<AgentRunEvent>>,
     fresh_execution_id: Option<Uuid>,
+    resolved_override: Option<&ResolvedSelection>,
 ) -> Result<ChatResponse, AppError> {
     // ONE snapshot for the whole request. Every provider-dependent field below
     // — the agent runtime, the engine's default model, the chat provider and
@@ -1004,7 +1044,14 @@ pub(crate) async fn execute_chat_with_id_and_budget(
     require_messages(&payload)?;
     // Resolve next: from here on the selection is the router's answer or
     // the header's, in one shape, and every step below reads that shape.
-    let resolved = resolve_selection(state, selection, &payload.messages).await?;
+    // A caller that already resolved (the approval-gated chat path) supplies
+    // that answer here, so the one decision it spent is not spent a second
+    // time inside the spawned turn. The clone is cheap and keeps this core
+    // independent of the caller's lifetime.
+    let resolved = match resolved_override {
+        Some(resolved) => resolved.clone(),
+        None => resolve_selection(state, selection, &payload.messages).await?,
+    };
     let requested_model = resolved.requested_target(&payload.model);
     let original_model = payload.model.clone();
     let engine_ids = engine_target(state, &resolved, &original_model);
@@ -1166,7 +1213,7 @@ pub async fn execute_chat_stream_with_id(
     resume_execution_id: Option<Uuid>,
 ) -> Result<AppChatStream, AppError> {
     Ok(
-        execute_chat_stream_detail(state, payload, selection, resume_execution_id)
+        execute_chat_stream_detail(state, payload, selection, resume_execution_id, None)
             .await?
             .stream,
     )
@@ -1181,7 +1228,19 @@ pub async fn execute_chat_stream_with_conversation_id(
     payload: ChatRequest,
     selection: AgentSelection<'_>,
 ) -> Result<ChatStreamResponse, AppError> {
-    execute_chat_stream_detail(state, payload, selection, None).await
+    execute_chat_stream_resolved(state, payload, selection, None).await
+}
+
+/// Resolved-aware counterpart of [`execute_chat_stream_with_conversation_id`].
+/// `Some(resolved)` reuses a selection the caller already resolved; `None`
+/// keeps the ordinary single-resolution path. The public wrapper is unchanged.
+pub async fn execute_chat_stream_resolved(
+    state: &AppState,
+    payload: ChatRequest,
+    selection: AgentSelection<'_>,
+    resolved: Option<&ResolvedSelection>,
+) -> Result<ChatStreamResponse, AppError> {
+    execute_chat_stream_detail(state, payload, selection, None, resolved).await
 }
 
 /// The streaming dispatch body, shared by the public wrappers above.
@@ -1190,6 +1249,7 @@ async fn execute_chat_stream_detail(
     mut payload: ChatRequest,
     selection: AgentSelection<'_>,
     resume_execution_id: Option<Uuid>,
+    resolved_override: Option<&ResolvedSelection>,
 ) -> Result<ChatStreamResponse, AppError> {
     // The one snapshot for this request, for the same reason as `execute_chat`:
     // every field the engine and fallback read comes from this single stack.
@@ -1200,7 +1260,12 @@ async fn execute_chat_stream_detail(
     // type feeds `requested_target`, `engine_target` and `prepare_request`
     // here too.
     require_messages(&payload)?;
-    let resolved = resolve_selection(state, selection, &payload.messages).await?;
+    // The same reuse seam as the non-streaming core: a caller that already
+    // resolved (e.g. a future gated stream) does not spend a second decision.
+    let resolved = match resolved_override {
+        Some(resolved) => resolved.clone(),
+        None => resolve_selection(state, selection, &payload.messages).await?,
+    };
     let requested_model = resolved.requested_target(&payload.model);
     let original_model = payload.model.clone();
     let engine_ids = engine_target(state, &resolved, &original_model);
@@ -1437,6 +1502,7 @@ pub async fn delegate_turn(
         Some(req.budget.clone()),
         Some(child_context),
         approval_event_tx,
+        None,
         None,
     );
     match tokio::time::timeout_at(tokio::time::Instant::from_std(req.deadline), fut).await {

@@ -502,7 +502,8 @@ pub(crate) async fn retry_turn(
 /// - `400` malformed id or malformed JSON body;
 /// - `403` no `X-Debug`, or a legacy row with no stored `user_message`;
 /// - `404` unknown id;
-/// - `409` the turn is not in a retryable status (`Interrupted`/`Failed`).
+/// - `409` the turn is not in a retryable status (`Interrupted`/`Failed`), or
+///   another concurrent retry already claimed it.
 pub async fn retry_execution(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -544,6 +545,24 @@ pub async fn retry_execution(
         return Err(AppError::Conflict(format!(
             "execution '{id}' is {:?}; only interrupted or failed turns can be retried",
             execution.status
+        )));
+    }
+
+    // Claim before doing any work. The status check above is only a read: two
+    // concurrent requests can both pass it. The claim is a single conditional
+    // write in a real store, so exactly one caller reaches `retry_turn`.
+    let claimed = state
+        .execution_store
+        .claim_for_retry(
+            id,
+            &[ExecutionStatus::Interrupted, ExecutionStatus::Failed],
+            ExecutionStatus::Running,
+        )
+        .await
+        .map_err(AppError::Runtime)?;
+    if !claimed {
+        return Err(AppError::Conflict(format!(
+            "execution '{id}' was claimed by another retry; only one retry can run at a time"
         )));
     }
 

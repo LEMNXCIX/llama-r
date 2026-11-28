@@ -16,7 +16,7 @@ use crate::ports::execution::{ApprovalDecisionRecord, ExecutionStore, PendingApp
 use crate::services::redaction::{redact_secrets, redact_trace_payload};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -265,6 +265,51 @@ impl ExecutionStore for SqliteExecutionStore {
         )
         .map_err(|e| format!("db update status error: {e}"))?;
         Ok(())
+    }
+
+    async fn claim_for_retry(
+        &self,
+        execution_id: Uuid,
+        from: &[ExecutionStatus],
+        to: ExecutionStatus,
+    ) -> Result<bool, String> {
+        if from.is_empty() {
+            return Ok(false);
+        }
+        // ONE conditional UPDATE is the whole claim: the status test and the
+        // write commit together, so two concurrent retries cannot both win.
+        // Statuses use the same JSON text `create`/`set_status` write, and the
+        // reset of finished_at/error mirrors re-running the turn from scratch.
+        let placeholders = (0..from.len())
+            .map(|index| format!("?{}", index + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE executions SET status = ?1, updated_at = ?2, finished_at = NULL, error = NULL \
+             WHERE id = ?{} AND status IN ({placeholders}) RETURNING id",
+            from.len() + 3
+        );
+        let mut values = Vec::with_capacity(from.len() + 3);
+        values.push(to_json_text(&to)?);
+        values.push(ts_text(&Utc::now()));
+        for status in from {
+            values.push(to_json_text(status)?);
+        }
+        values.push(execution_id.to_string());
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| format!("lock poisoned: {e}"))?;
+        match conn.query_row(
+            &sql,
+            params_from_iter(values.iter().map(String::as_str)),
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(_) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(format!("db claim execution error: {e}")),
+        }
     }
 
     async fn set_current_step(&self, execution_id: Uuid, step: u32) -> Result<(), String> {

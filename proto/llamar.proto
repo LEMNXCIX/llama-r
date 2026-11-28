@@ -19,11 +19,27 @@ message ChatRequest {
   bool stream = 3;
 }
 
+// Per-response token accounting, when the upstream reported any. `cost_usd`
+// is optional because no fabricated price is ever sent: it stays unset unless
+// the catalog knew both token prices.
+message Usage {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  optional double cost_usd = 3;
+}
+
 message ChatResponse {
   string model = 1;
   string created_at = 2;
   ChatMessage message = 3;
   bool done = 4;
+  // The conversation a persisted turn was stored under, so a client can echo
+  // it back as x-conversation-id to continue the thread.
+  optional string conversation_id = 5;
+  // The secret-free profile name that actually answered, when a fallback was
+  // used. Never a credential value.
+  optional string served_by = 6;
+  optional Usage usage = 7;
 }
 
 // Non-secret approval identifiers attached to one stream event. Raw tool

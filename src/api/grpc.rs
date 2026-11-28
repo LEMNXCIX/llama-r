@@ -1,14 +1,17 @@
 use crate::api::chat_core::{execute_chat, execute_chat_stream};
 use crate::api::handlers::AppState;
+use crate::api::mcp_api;
 use crate::api::route_resolution::AgentSelection;
 use crate::domain::models::{
     ChatMessage as DomainChatMessage, ChatRequest, ChatStreamEvent as DomainChatStreamEvent,
+    JsonRpcRequest,
 };
 use crate::error::AppError;
+use axum::{body::to_bytes, http::StatusCode};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::{Stream, StreamExt};
-use tonic::{Request, Response, Status, Streaming};
+use tonic::{Code, Request, Response, Status, Streaming};
 
 pub mod pb {
     tonic::include_proto!("llamar");
@@ -79,14 +82,46 @@ fn metadata_value(metadata: &tonic::metadata::MetadataMap, key: &str) -> Option<
         .map(str::to_string)
 }
 
+/// Map a domain error to the gRPC code matching its HTTP counterpart in
+/// `AppError::status_code()` (`error.rs`). The match is exhaustive on purpose:
+/// adding an `AppError` variant must force a decision here instead of silently
+/// collapsing a deliberate 501 or a 502 into a generic Internal.
+///
+/// The message is `AppError::Display`, which never carries a credential value.
+pub fn grpc_code(error: &AppError) -> Code {
+    match error {
+        // 400 Bad Request
+        AppError::Validation(_) | AppError::ApprovalArgsChanged(_) => Code::InvalidArgument,
+        // 401 Unauthorized
+        AppError::Unauthorized(_) => Code::Unauthenticated,
+        // 403 Forbidden
+        AppError::Forbidden(_) => Code::PermissionDenied,
+        // 404 Not Found
+        AppError::NotFound(_) | AppError::ApprovalNotFound(_) => Code::NotFound,
+        // 409 Conflict
+        AppError::Conflict(_) | AppError::ApprovalAlreadyDecided(_) => Code::AlreadyExists,
+        // 410 Gone — the pending expired and must be re-requested.
+        AppError::ApprovalExpired(_) => Code::DeadlineExceeded,
+        // 501 Not Implemented — a deliberately disabled feature is not a server
+        // fault. Kept distinct from Provider below so a client can tell "this
+        // capability is off" from "the upstream went away".
+        AppError::Unavailable(_) => Code::Unimplemented,
+        // 502 Bad Gateway — the upstream failed.
+        AppError::Provider(_) => Code::Unavailable,
+        // 500 Internal Server Error
+        AppError::Config(_)
+        | AppError::Io(_)
+        | AppError::SerdeJson(_)
+        | AppError::Toml(_)
+        | AppError::Reqwest(_)
+        | AppError::Notify(_)
+        | AppError::Runtime(_) => Code::Internal,
+    }
+}
+
 fn to_status(state: &AppState, error: AppError) -> Status {
     state.observability.record_grpc_error();
-    match error {
-        AppError::Validation(message) => Status::invalid_argument(message),
-        AppError::NotFound(message) => Status::not_found(message),
-        AppError::Conflict(message) => Status::already_exists(message),
-        other => Status::internal(other.to_string()),
-    }
+    Status::new(grpc_code(&error), error.to_string())
 }
 
 #[tonic::async_trait]
@@ -117,6 +152,13 @@ impl LlamaGateway for GrpcService {
                 content: response.message.content,
             }),
             done: response.done,
+            conversation_id: response.conversation_id,
+            served_by: response.served_by,
+            usage: response.usage.map(|usage| pb::Usage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cost_usd: usage.cost_usd,
+            }),
         }))
     }
 
@@ -157,13 +199,65 @@ impl LlamaGateway for GrpcService {
         request: Request<Streaming<pb::McpMessage>>,
     ) -> Result<Response<Self::ConnectMcpStream>, Status> {
         let mut in_stream = request.into_inner();
+        let state = self.state.clone();
         let output = async_stream::try_stream! {
             while let Some(msg) = in_stream.next().await {
                 let msg = msg?;
+                // `json_rpc` is the single source of truth, just like the body
+                // of POST /api/mcp. The separate method/params fields are a
+                // fallback for legacy clients that only send those two.
+                let req: JsonRpcRequest = if msg.json_rpc.is_empty() {
+                    JsonRpcRequest {
+                        jsonrpc: "2.0".to_string(),
+                        id: None,
+                        method: msg.method,
+                        params: serde_json::from_str(&msg.params)
+                            .unwrap_or(serde_json::Value::Null),
+                    }
+                } else {
+                    match serde_json::from_str(&msg.json_rpc) {
+                        Ok(req) => req,
+                        Err(_) => {
+                            // A bad envelope is a per-message protocol error,
+                            // not a stream error: answer with the standard
+                            // -32700 parse error and keep reading the stream.
+                            yield pb::McpMessage {
+                                json_rpc: serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": serde_json::Value::Null,
+                                    "error": { "code": -32700, "message": "Parse error" },
+                                })
+                                .to_string(),
+                                method: String::new(),
+                                params: String::new(),
+                            };
+                            continue;
+                        }
+                    }
+                };
+                // Same dispatch as POST /api/mcp (`mcp_message` is a thin
+                // wrapper around this call), so validation, redaction and tool
+                // behaviour cannot drift between the two surfaces.
+                //
+                // A `tools/call` with an approval rule can park this stream
+                // until a human decides: the HTTP park-and-ack in
+                // `handlers.rs` is chat-only and does not apply here. That is
+                // inherited MCP behaviour, not a regression introduced here.
+                let resp = mcp_api::handle_message(state.clone(), req).await;
+                // Notifications carry no id; the handler answers 204 and there
+                // is deliberately no frame to forward.
+                if resp.status() == StatusCode::NO_CONTENT {
+                    continue;
+                }
+                let bytes = to_bytes(resp.into_body(), 2 * 1024 * 1024)
+                    .await
+                    .map_err(|error| {
+                        Status::internal(format!("failed to read MCP response body: {error}"))
+                    })?;
                 yield pb::McpMessage {
-                    json_rpc: msg.json_rpc,
-                    method: msg.method,
-                    params: msg.params,
+                    json_rpc: String::from_utf8_lossy(&bytes).into_owned(),
+                    method: String::new(),
+                    params: String::new(),
                 };
             }
         };

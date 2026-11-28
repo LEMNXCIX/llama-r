@@ -76,16 +76,31 @@ pub async fn reap_once(state: &AppState) -> Result<usize, String> {
         let approval_id = grant.id;
 
         // Claim the orphan before re-running so a second pass cannot race in
-        // and resume the same turn. The retry helper flips it back to Running
-        // and finalizes it; reusing the id is what engages the replay cache.
-        if let Err(err) = store
-            .set_status(execution.id, ExecutionStatus::Running, None)
+        // and resume the same turn. The claim is conditional on the row still
+        // being `WaitingApproval`; the retry helper then finalizes it, and
+        // reusing the id is what engages the replay cache.
+        let claimed = match store
+            .claim_for_retry(
+                execution.id,
+                &[ExecutionStatus::WaitingApproval],
+                ExecutionStatus::Running,
+            )
             .await
         {
-            tracing::warn!(
-                error = %err,
+            Ok(claimed) => claimed,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    execution_id = %execution.id,
+                    "approval reaper could not claim an orphan; continuing"
+                );
+                continue;
+            }
+        };
+        if !claimed {
+            tracing::debug!(
                 execution_id = %execution.id,
-                "approval reaper could not claim an orphan; continuing"
+                "orphan was claimed by another reaper pass; skipping"
             );
             continue;
         }

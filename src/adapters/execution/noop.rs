@@ -45,6 +45,17 @@ impl ExecutionStore for NoOpExecutionStore {
         Ok(())
     }
 
+    // There is no row to gate on and no concurrency to arbitrate: a degraded
+    // boot must still be able to retry, so every claim is granted.
+    async fn claim_for_retry(
+        &self,
+        _execution_id: Uuid,
+        _from: &[ExecutionStatus],
+        _to: ExecutionStatus,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+
     async fn set_current_step(&self, _execution_id: Uuid, _step: u32) -> Result<(), String> {
         Ok(())
     }

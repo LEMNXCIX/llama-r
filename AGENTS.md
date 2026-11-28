@@ -265,6 +265,8 @@ GET  /api/mcp
 POST /api/mcp
 ```
 
+The gRPC `ConnectMcp` bidi stream (`proto/llamar.proto`) dispatches every inbound `McpMessage` through the same `mcp_api::handle_message` as `POST /api/mcp`: `json_rpc` is parsed as a `JsonRpcRequest` (an empty `json_rpc` falls back to `method`/`params`), a malformed envelope answers a JSON-RPC `-32700` parse-error frame and the stream stays open, and a notification with no `id` (HTTP 204) emits no frame. Outbound frames carry only `json_rpc`; `method`/`params` are empty. A `tools/call` with an approval rule can park the stream until a human decides — the chat-only park-and-ack in `handlers.rs` does not apply to MCP, which is inherited HTTP MCP behaviour rather than a regression. `tests/grpc_wire_tests.rs` pins HTTP/gRPC parity.
+
 ### Webhooks (signed channels)
 ```text
 POST /api/webhooks/:channel
