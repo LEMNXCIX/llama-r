@@ -8,7 +8,7 @@ use crate::error::AppError;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::{Stream, StreamExt};
-use tonic::{Request, Response, Status, Streaming};
+use tonic::{Code, Request, Response, Status, Streaming};
 
 pub mod pb {
     tonic::include_proto!("llamar");
@@ -79,14 +79,46 @@ fn metadata_value(metadata: &tonic::metadata::MetadataMap, key: &str) -> Option<
         .map(str::to_string)
 }
 
+/// Map a domain error to the gRPC code matching its HTTP counterpart in
+/// `AppError::status_code()` (`error.rs`). The match is exhaustive on purpose:
+/// adding an `AppError` variant must force a decision here instead of silently
+/// collapsing a deliberate 501 or a 502 into a generic Internal.
+///
+/// The message is `AppError::Display`, which never carries a credential value.
+pub fn grpc_code(error: &AppError) -> Code {
+    match error {
+        // 400 Bad Request
+        AppError::Validation(_) | AppError::ApprovalArgsChanged(_) => Code::InvalidArgument,
+        // 401 Unauthorized
+        AppError::Unauthorized(_) => Code::Unauthenticated,
+        // 403 Forbidden
+        AppError::Forbidden(_) => Code::PermissionDenied,
+        // 404 Not Found
+        AppError::NotFound(_) | AppError::ApprovalNotFound(_) => Code::NotFound,
+        // 409 Conflict
+        AppError::Conflict(_) | AppError::ApprovalAlreadyDecided(_) => Code::AlreadyExists,
+        // 410 Gone — the pending expired and must be re-requested.
+        AppError::ApprovalExpired(_) => Code::DeadlineExceeded,
+        // 501 Not Implemented — a deliberately disabled feature is not a server
+        // fault. Kept distinct from Provider below so a client can tell "this
+        // capability is off" from "the upstream went away".
+        AppError::Unavailable(_) => Code::Unimplemented,
+        // 502 Bad Gateway — the upstream failed.
+        AppError::Provider(_) => Code::Unavailable,
+        // 500 Internal Server Error
+        AppError::Config(_)
+        | AppError::Io(_)
+        | AppError::SerdeJson(_)
+        | AppError::Toml(_)
+        | AppError::Reqwest(_)
+        | AppError::Notify(_)
+        | AppError::Runtime(_) => Code::Internal,
+    }
+}
+
 fn to_status(state: &AppState, error: AppError) -> Status {
     state.observability.record_grpc_error();
-    match error {
-        AppError::Validation(message) => Status::invalid_argument(message),
-        AppError::NotFound(message) => Status::not_found(message),
-        AppError::Conflict(message) => Status::already_exists(message),
-        other => Status::internal(other.to_string()),
-    }
+    Status::new(grpc_code(&error), error.to_string())
 }
 
 #[tonic::async_trait]
@@ -117,6 +149,13 @@ impl LlamaGateway for GrpcService {
                 content: response.message.content,
             }),
             done: response.done,
+            conversation_id: response.conversation_id,
+            served_by: response.served_by,
+            usage: response.usage.map(|usage| pb::Usage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cost_usd: usage.cost_usd,
+            }),
         }))
     }
 

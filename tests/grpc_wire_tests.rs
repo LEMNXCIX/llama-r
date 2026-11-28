@@ -13,7 +13,7 @@ use llama_r::adapters::mcp::StaticMcpRegistry;
 use llama_r::api::grpc::pb::llama_gateway_client::LlamaGatewayClient;
 use llama_r::api::grpc::pb::ChatStreamEvent as PbChatStreamEvent;
 use llama_r::api::grpc::pb::{ChatMessage, ChatRequest};
-use llama_r::api::grpc::to_proto_stream_event;
+use llama_r::api::grpc::{grpc_code, to_proto_stream_event};
 use llama_r::api::handlers::AppState;
 use llama_r::context::store::ContextStore;
 use llama_r::domain::models::{
@@ -61,11 +61,15 @@ impl LLMProvider for EchoProvider {
                 content: "respuesta".to_string(),
             },
             done: true,
-            usage: None,
-            served_by: None,
+            usage: Some(llama_r::domain::models::Usage {
+                input_tokens: 12,
+                output_tokens: 34,
+                cost_usd: Some(0.5),
+            }),
+            served_by: Some("profile".to_string()),
             debug_prompt: None,
             debug_route: None,
-            conversation_id: None,
+            conversation_id: Some("c-1".to_string()),
         })
     }
     async fn chat_stream(
@@ -157,14 +161,145 @@ async fn a_real_grpc_chat_round_trip_uses_the_generated_codec() {
         .await
         .expect("the gRPC call must succeed through the new codec");
 
+    let response = response.into_inner();
+
+    // Fields 1-4 are conserved byte-for-byte.
     let message = response
-        .into_inner()
         .message
+        .as_ref()
         .expect("a chat response always carries a message");
     assert_eq!(message.role, "assistant");
     assert_eq!(message.content, "respuesta");
+    assert_eq!(response.model, "fallback-model");
+    assert!(!response.created_at.is_empty());
+    assert!(response.done);
+
+    // The three new fields must survive the full tonic-prost encode/decode
+    // round trip, not just exist in the generated struct.
+    assert_eq!(response.conversation_id.as_deref(), Some("c-1"));
+    assert_eq!(response.served_by.as_deref(), Some("profile"));
+    let usage = response.usage.expect("usage survives the gRPC wire");
+    assert_eq!(usage.input_tokens, 12);
+    assert_eq!(usage.output_tokens, 34);
+    assert_eq!(usage.cost_usd, Some(0.5));
 
     server.abort();
+}
+
+/// Every `AppError` variant maps to one deterministic `tonic::Code`. The table
+/// is exhaustive on purpose: adding a variant to `AppError` must force this
+/// test to be updated, which is what keeps the gRPC contract from silently
+/// collapsing a deliberate 501 or a 502 into a generic Internal.
+#[test]
+fn grpc_code_maps_all_app_error_variants() {
+    use llama_r::error::AppError;
+    use tonic::Code;
+
+    let reqwest_error = reqwest::Client::new().get("http://[").build().unwrap_err();
+    let cases: Vec<(AppError, Code, &'static str)> = vec![
+        (AppError::Config("x".into()), Code::Internal, "Config"),
+        (
+            AppError::Validation("x".into()),
+            Code::InvalidArgument,
+            "Validation",
+        ),
+        (AppError::NotFound("x".into()), Code::NotFound, "NotFound"),
+        (
+            AppError::Unauthorized("x".into()),
+            Code::Unauthenticated,
+            "Unauthorized",
+        ),
+        (
+            AppError::Conflict("x".into()),
+            Code::AlreadyExists,
+            "Conflict",
+        ),
+        (
+            AppError::Forbidden("x".into()),
+            Code::PermissionDenied,
+            "Forbidden",
+        ),
+        (
+            AppError::Unavailable("x".into()),
+            Code::Unimplemented,
+            "Unavailable",
+        ),
+        (
+            AppError::Provider("x".into()),
+            Code::Unavailable,
+            "Provider",
+        ),
+        (
+            AppError::Io(std::io::Error::other("x")),
+            Code::Internal,
+            "Io",
+        ),
+        (
+            AppError::SerdeJson(serde_json::from_str::<()>("{").unwrap_err()),
+            Code::Internal,
+            "SerdeJson",
+        ),
+        (
+            AppError::Toml(toml::from_str::<()>("x = [").unwrap_err()),
+            Code::Internal,
+            "Toml",
+        ),
+        (AppError::Reqwest(reqwest_error), Code::Internal, "Reqwest"),
+        (
+            AppError::Notify(notify::Error::generic("x")),
+            Code::Internal,
+            "Notify",
+        ),
+        (AppError::Runtime("x".into()), Code::Internal, "Runtime"),
+        (
+            AppError::ApprovalNotFound("x".into()),
+            Code::NotFound,
+            "ApprovalNotFound",
+        ),
+        (
+            AppError::ApprovalExpired("x".into()),
+            Code::DeadlineExceeded,
+            "ApprovalExpired",
+        ),
+        (
+            AppError::ApprovalAlreadyDecided("x".into()),
+            Code::AlreadyExists,
+            "ApprovalAlreadyDecided",
+        ),
+        (
+            AppError::ApprovalArgsChanged("x".into()),
+            Code::InvalidArgument,
+            "ApprovalArgsChanged",
+        ),
+    ];
+    assert_eq!(
+        cases.len(),
+        18,
+        "the table must cover all 18 AppError variants"
+    );
+    for (error, expected, label) in cases {
+        assert_eq!(
+            grpc_code(&error),
+            expected,
+            "variant {label} (code {}) mapped incorrectly",
+            error.code()
+        );
+    }
+}
+
+/// A deliberately disabled feature is NOT the same failure as an upstream
+/// that went away. The client distinguishes 501 from 502, so the gRPC codes
+/// must not collapse the two into Internal or into each other.
+#[test]
+fn grpc_code_distinguishes_deliberate_unavailable_from_provider_failure() {
+    use llama_r::error::AppError;
+    use tonic::Code;
+
+    let disabled = grpc_code(&AppError::Unavailable("feature off".into()));
+    let upstream = grpc_code(&AppError::Provider("connection refused".into()));
+    assert_eq!(disabled, Code::Unimplemented);
+    assert_eq!(upstream, Code::Unavailable);
+    assert_ne!(disabled, upstream);
 }
 
 fn domain_stream_event(
