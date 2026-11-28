@@ -24,12 +24,14 @@ use crate::domain::models::ChatMessage;
 use crate::error::AppError;
 use crate::services::redaction::redact_secrets;
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::HeaderMap,
     Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -230,6 +232,83 @@ async fn note_decided_approvals(state: &AppState, execution_id: Uuid) {
     }
 }
 
+/// Identity of one recorded tool operation, independent of how many times it
+/// was checkpointed. A replay emits a fresh `CheckpointCreated` for an
+/// operation already in the idempotency cache, so the event log can hold the
+/// same `(tool, args_hash)` more than once — usually at a different step.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CheckpointKey {
+    tool: String,
+    args_hash: String,
+}
+
+/// A completed, deduplicated checkpoint ready for result lookup and formatting.
+#[derive(Debug, Clone)]
+struct CompletedCheckpoint {
+    step: u32,
+    tool: String,
+    args_hash: String,
+}
+
+/// Select the checkpoints that count as completed steps. Pure, so the two
+/// load-bearing rules — a failed checkpoint never counts, and a replayed
+/// operation counts once — can be unit tested without a store.
+///
+/// `status: "failed"` means the tool produced no cached result, so the retry
+/// must be free to execute it; a missing status is treated as completed for
+/// backward compatibility with checkpoints written before the field existed.
+/// Duplicates are keyed by `(tool, args_hash)` (the `operation_id` identity
+/// minus the execution id). Keeping the first occurrence retains the earliest
+/// step, so the note points at the next genuinely new step instead of a
+/// replay's advanced cursor.
+fn completed_checkpoints(events: Vec<ExecutionEvent>, from_step: u32) -> Vec<CompletedCheckpoint> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for event in events
+        .into_iter()
+        .filter(|event| event.kind == EventKind::CheckpointCreated)
+    {
+        if event.payload.get("status").and_then(Value::as_str) == Some("failed") {
+            continue;
+        }
+        let Some(step) = event
+            .payload
+            .get("step")
+            .and_then(Value::as_u64)
+            .and_then(|step| u32::try_from(step).ok())
+        else {
+            continue;
+        };
+        if step < from_step {
+            continue;
+        }
+        let tool = event
+            .payload
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let args_hash = event
+            .payload
+            .get("args_hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !seen.insert(CheckpointKey {
+            tool: tool.clone(),
+            args_hash: args_hash.clone(),
+        }) {
+            continue;
+        }
+        out.push(CompletedCheckpoint {
+            step,
+            tool,
+            args_hash,
+        });
+    }
+    out
+}
+
 /// One checkpoint turned into a line of the resume note. Results are already
 /// redacted and truncated by the time this struct is built, so the formatter is
 /// a pure function that can be unit tested without a store or an async runtime.
@@ -296,10 +375,11 @@ fn format_resume_note(entries: &[ResumeEntry], from_step: u32) -> String {
     note
 }
 
-/// Read checkpoints and their stored tool results, best effort. A failed store
-/// read logs a warning and degrades to no note — never a failed retry. Returns
-/// the note and the number of checkpoints it covers (used to shrink the
-/// retry's tool-loop budget).
+/// Read completed checkpoints and their stored tool results, best effort. A
+/// failed store read logs a warning and degrades to no note — never a failed
+/// retry. Returns the note and the number of distinct completed steps it
+/// covers (used to shrink the retry's tool-loop budget): failed checkpoints are
+/// excluded and replay duplicates count once.
 async fn resume_note(state: &AppState, id: Uuid, from_step: u32) -> (String, usize) {
     let events = match state.execution_store.get_events(id).await {
         Ok(events) => events,
@@ -309,31 +389,12 @@ async fn resume_note(state: &AppState, id: Uuid, from_step: u32) -> (String, usi
         }
     };
     let mut entries = Vec::new();
-    for event in events
-        .into_iter()
-        .filter(|event| event.kind == EventKind::CheckpointCreated)
-    {
-        let Some(step) = event.payload.get("step").and_then(Value::as_u64) else {
-            continue;
-        };
-        let Ok(step) = u32::try_from(step) else {
-            continue;
-        };
-        if step < from_step {
-            continue;
-        }
-        let tool = event
-            .payload
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        let args_hash = event
-            .payload
-            .get("args_hash")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+    for checkpoint in completed_checkpoints(events, from_step) {
+        let CompletedCheckpoint {
+            step,
+            tool,
+            args_hash,
+        } = checkpoint;
         // `operation_id` is `{execution_id}:{tool}:{args_hash_hex}`; the
         // checkpoint already carries the hex hash, so no re-hash is needed
         // (and re-hashing the hash would miss every stored result).
@@ -438,7 +499,7 @@ pub(crate) async fn retry_turn(
 /// `step >= N`; an absent body (or `0`) resumes from the beginning.
 ///
 /// - `200` the turn re-ran; the response is the updated execution;
-/// - `400` malformed id;
+/// - `400` malformed id or malformed JSON body;
 /// - `403` no `X-Debug`, or a legacy row with no stored `user_message`;
 /// - `404` unknown id;
 /// - `409` the turn is not in a retryable status (`Interrupted`/`Failed`).
@@ -447,13 +508,25 @@ pub async fn retry_execution(
     headers: HeaderMap,
     Path(raw_id): Path<String>,
     // The body extractor must be LAST: axum allows only one extractor to read
-    // the request body, and `Option<Json<_>>` keeps an empty/absent body valid
-    // (the old no-body contract) while accepting `{"from_step": N}`.
-    body: Option<Json<RetryBody>>,
+    // the request body. Raw bytes are parsed below instead of `Option<Json<_>>`
+    // because axum's `Option<T>` swallows *every* inner rejection, which made a
+    // malformed body silently become `from_step = 0`. An empty body keeps the
+    // old no-body contract; a present but invalid body is a 400.
+    body: Bytes,
 ) -> Result<Json<ExecutionDto>, AppError> {
     require_debug(&headers)?;
     state.observability.record_http_request();
     let id = parse_id(&raw_id)?;
+    // Only an absent/empty body (or JSON `null`) defaults to step 0. Malformed
+    // JSON and a wrong `from_step` type are rejected — the error message is
+    // fixed so no caller-supplied body content can be echoed back.
+    let from_step = if body.is_empty() {
+        0
+    } else {
+        let body: Option<RetryBody> = serde_json::from_slice(&body)
+            .map_err(|_| AppError::Validation("malformed retry body".into()))?;
+        body.and_then(|body| body.from_step).unwrap_or(0)
+    };
     let execution = state
         .execution_store
         .get(id)
@@ -474,7 +547,6 @@ pub async fn retry_execution(
         )));
     }
 
-    let from_step = body.and_then(|Json(body)| body.from_step).unwrap_or(0);
     retry_turn(&state, id, &execution, from_step).await?;
 
     let updated = state
@@ -559,5 +631,84 @@ mod tests {
         let long = redacted_result_text(&serde_json::json!("x".repeat(500)));
         assert_eq!(long.chars().count(), 200);
         assert!(long.ends_with('…'));
+    }
+
+    fn checkpoint_event(step: u32, tool: &str, hash: &str, status: Option<&str>) -> ExecutionEvent {
+        let mut payload = serde_json::json!({
+            "step": step,
+            "tool": tool,
+            "args_hash": hash,
+        });
+        if let Some(status) = status {
+            payload["status"] = serde_json::json!(status);
+        }
+        ExecutionEvent::new(Uuid::new_v4(), EventKind::CheckpointCreated, payload)
+    }
+
+    fn as_entries(checkpoints: Vec<CompletedCheckpoint>) -> Vec<ResumeEntry> {
+        checkpoints
+            .into_iter()
+            .map(|checkpoint| ResumeEntry {
+                step: checkpoint.step,
+                tool: checkpoint.tool,
+                args_hash: checkpoint.args_hash,
+                result: "resultado".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn failed_checkpoints_are_neither_listed_nor_counted_as_completed() {
+        let events = vec![
+            checkpoint_event(0, "db__write", "aaa", Some("failed")),
+            checkpoint_event(1, "local_echo", "bbb", Some("completed")),
+            // No status: checkpoints written before the field existed still count.
+            checkpoint_event(2, "legacy_tool", "ccc", None),
+            // Non-checkpoint events never enter the note.
+            ExecutionEvent::new(
+                Uuid::new_v4(),
+                EventKind::ToolCallCompleted,
+                serde_json::json!({"step": 3}),
+            ),
+        ];
+        let selected = completed_checkpoints(events, 0);
+        assert_eq!(selected.len(), 2, "only completed/legacy checkpoints count");
+        assert_eq!(selected[0].tool, "local_echo");
+        assert_eq!(selected[1].tool, "legacy_tool");
+        let note = format_resume_note(&as_entries(selected), 0);
+        assert!(
+            !note.contains("db__write"),
+            "failed step is not 'already done': {note}"
+        );
+        assert!(note.contains("paso 1") && note.contains("paso 2"), "{note}");
+    }
+
+    #[test]
+    fn duplicate_and_replayed_checkpoints_count_once_and_keep_the_first_step() {
+        let events = vec![
+            checkpoint_event(0, "db__write", "aaa", Some("completed")),
+            // Exact duplicate of the same (step, tool, args_hash).
+            checkpoint_event(0, "db__write", "aaa", Some("completed")),
+            // A replay of the same operation at an advanced cursor.
+            checkpoint_event(1, "db__write", "aaa", Some("completed")),
+            // A genuinely different operation: same tool, different args hash.
+            checkpoint_event(2, "db__write", "bbb", Some("completed")),
+        ];
+        let selected = completed_checkpoints(events, 0);
+        assert_eq!(selected.len(), 2, "one entry per distinct operation");
+        assert_eq!(
+            selected[0].step, 0,
+            "the earliest step is kept, not the replay's"
+        );
+        assert_eq!(selected[0].args_hash, "aaa");
+        assert_eq!(selected[1].step, 2);
+        assert_eq!(selected[1].args_hash, "bbb");
+        let note = format_resume_note(&as_entries(selected), 0);
+        assert_eq!(
+            note.matches("db__write").count(),
+            2,
+            "each operation is listed once, not three times: {note}"
+        );
+        assert!(note.contains("Continúa desde el paso 3"), "{note}");
     }
 }

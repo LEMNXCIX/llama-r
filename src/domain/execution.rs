@@ -46,7 +46,9 @@ pub struct AgentExecution {
     pub provider: String,
     pub model: String,
     pub status: ExecutionStatus,
-    /// How far the tool loop got. Observation only — there is no step replay.
+    /// Cursor advanced by each checkpoint; used to number steps and steer a
+    /// checkpoint-informed retry. The model re-decides its answer — there is no
+    /// byte-exact step replay.
     pub current_step: u32,
     /// The turn input, redacted before persistence. `None` only for legacy rows.
     pub user_message: Option<String>,
