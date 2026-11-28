@@ -1,10 +1,13 @@
 use crate::api::chat_core::{execute_chat, execute_chat_stream};
 use crate::api::handlers::AppState;
+use crate::api::mcp_api;
 use crate::api::route_resolution::AgentSelection;
 use crate::domain::models::{
     ChatMessage as DomainChatMessage, ChatRequest, ChatStreamEvent as DomainChatStreamEvent,
+    JsonRpcRequest,
 };
 use crate::error::AppError;
+use axum::{body::to_bytes, http::StatusCode};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::{Stream, StreamExt};
@@ -196,13 +199,65 @@ impl LlamaGateway for GrpcService {
         request: Request<Streaming<pb::McpMessage>>,
     ) -> Result<Response<Self::ConnectMcpStream>, Status> {
         let mut in_stream = request.into_inner();
+        let state = self.state.clone();
         let output = async_stream::try_stream! {
             while let Some(msg) = in_stream.next().await {
                 let msg = msg?;
+                // `json_rpc` is the single source of truth, just like the body
+                // of POST /api/mcp. The separate method/params fields are a
+                // fallback for legacy clients that only send those two.
+                let req: JsonRpcRequest = if msg.json_rpc.is_empty() {
+                    JsonRpcRequest {
+                        jsonrpc: "2.0".to_string(),
+                        id: None,
+                        method: msg.method,
+                        params: serde_json::from_str(&msg.params)
+                            .unwrap_or(serde_json::Value::Null),
+                    }
+                } else {
+                    match serde_json::from_str(&msg.json_rpc) {
+                        Ok(req) => req,
+                        Err(_) => {
+                            // A bad envelope is a per-message protocol error,
+                            // not a stream error: answer with the standard
+                            // -32700 parse error and keep reading the stream.
+                            yield pb::McpMessage {
+                                json_rpc: serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": serde_json::Value::Null,
+                                    "error": { "code": -32700, "message": "Parse error" },
+                                })
+                                .to_string(),
+                                method: String::new(),
+                                params: String::new(),
+                            };
+                            continue;
+                        }
+                    }
+                };
+                // Same dispatch as POST /api/mcp (`mcp_message` is a thin
+                // wrapper around this call), so validation, redaction and tool
+                // behaviour cannot drift between the two surfaces.
+                //
+                // A `tools/call` with an approval rule can park this stream
+                // until a human decides: the HTTP park-and-ack in
+                // `handlers.rs` is chat-only and does not apply here. That is
+                // inherited MCP behaviour, not a regression introduced here.
+                let resp = mcp_api::handle_message(state.clone(), req).await;
+                // Notifications carry no id; the handler answers 204 and there
+                // is deliberately no frame to forward.
+                if resp.status() == StatusCode::NO_CONTENT {
+                    continue;
+                }
+                let bytes = to_bytes(resp.into_body(), 2 * 1024 * 1024)
+                    .await
+                    .map_err(|error| {
+                        Status::internal(format!("failed to read MCP response body: {error}"))
+                    })?;
                 yield pb::McpMessage {
-                    json_rpc: msg.json_rpc,
-                    method: msg.method,
-                    params: msg.params,
+                    json_rpc: String::from_utf8_lossy(&bytes).into_owned(),
+                    method: String::new(),
+                    params: String::new(),
                 };
             }
         };
